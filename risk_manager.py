@@ -634,12 +634,17 @@ class RiskManager:
 
         # --- Instanciation lazy des sous-modules internes (si non injectés) ---
 
-            # Respecte la signature réelle: on passe la config, pas des kwargs ad-hoc
-        self.vol_manager = VolatilityManager(cfg=self.bot_cfg)
+        if self.vol_manager is None:
+            self.vol_manager = VolatilityManager(cfg=self.bot_cfg)
+        else:
+            logger.debug("[RiskManager] using injected VolatilityManager: %s", type(self.vol_manager).__name__)
 
+        if self.slip_collector is None:
+            self.slip_collector = SlippageAndFeesCollector(cfg=self.bot_cfg)
+        else:
+            logger.debug("[RiskManager] using injected SlippageAndFeesCollector: %s",
+                         type(self.slip_collector).__name__)
 
-            # Signature réelle: cfg + lookback optionnel (piloté par bot_cfg si présent)
-        self.slip_collector = SlippageAndFeesCollector(cfg=self.bot_cfg)
         # Contrat fort pour le collector de slippage
         if self.slip_collector is None:
             raise RuntimeError("slip_collector manquant (contractuel)")
@@ -650,10 +655,13 @@ class RiskManager:
                 "slip_collector doit exposer ingest_slippage_bps(pair, exchange, side, qty, slip_bps, ts_ns=None)"
             )
 
+        if self.rebalancing is None:
+            self.rebalancing = RebalancingManager(rm=self, enabled_exchanges=self.exchanges)
+        else:
+            logger.debug("[RiskManager] using injected RebalancingManager: %s", type(self.rebalancing).__name__)
 
-            # IMPORTANT: passe explicitement les exchanges actifs pour éviter cfg.enabled_exchanges=None
-        self.rebalancing = RebalancingManager(rm=self, enabled_exchanges=self.exchanges)
-
+        # Harmonise les alias legacy
+        self.slippage_collector = self.slip_collector
         # Expose aussi "rebal_mgr" (utilisé ailleurs)
         self.rebal_mgr = self.rebalancing
         # --- fin instanciation lazy ---
@@ -662,6 +670,14 @@ class RiskManager:
         for sm in (self.vol_manager, self.slip_collector, self.rebalancing):
             if sm and getattr(sm, "set_event_sink", None):
                 sm.set_event_sink(self._submodule_event)
+        if self.rebalancing:
+            cost_fn = getattr(self, "_reb_cost_fn", None)
+            setter = getattr(self.rebalancing, "set_cost_function", None)
+            if callable(setter):
+                setter(cost_fn)
+            else:
+                setattr(self.rebalancing, "_reb_cost_fn", cost_fn)
+
         if self.simulator and getattr(self.simulator, "set_event_sink", None):
             try:
                 self.simulator.set_event_sink(self._submodule_event)
@@ -721,6 +737,12 @@ class RiskManager:
         self.last_update = time.time()
         self._last_books: Dict[str, Dict[str, dict]] = {}
         self._paused: Dict[str, bool] = {}
+        self._loop_health: Dict[str, Dict[str, float]] = {
+            name: {"last_success": 0.0, "consecutive_errors": 0}
+            for name in ("orderbooks", "balances", "rebalancing", "volatility", "fee_sync")
+        }
+        self._loop_error_budget = max(1, int(getattr(self.cfg, "loop_error_budget", 5)))
+
 
         # Verrous par (exchange, alias, pair)
         self._pair_locks: Dict[Tuple[str, str, str], asyncio.Lock] = {}
@@ -1975,9 +1997,12 @@ class RiskManager:
                 #self._emit_slippage_to_scanner()
 
                 self.last_update = time.time()
+                self._mark_loop_success("orderbooks")
             except Exception as e:
                 logger.exception(f"[RiskManager] orderbooks loop: {e}")
+                self._mark_loop_error("orderbooks", e)
             await asyncio.sleep(self.t_books)
+
 
     async def _loop_balances(self):
         while self._running:
@@ -2021,9 +2046,12 @@ class RiskManager:
                     self.rebalancing.update_balances(bals)
                     mark_balances_fresh()
                 self.last_update = time.time()
+                self._mark_loop_success("balances")
             except Exception as e:
                 logger.exception(f"[RiskManager] balances loop: {e}")
+                self._mark_loop_error("balances", e)
             await asyncio.sleep(self.t_bal)
+
 
     async def _loop_rebalancing(self):
         while self._running:
@@ -2074,9 +2102,12 @@ class RiskManager:
                         self._rebal_emit_next_allowed = now + self.rebal_emit_cooldown_s
 
                 self.last_update = time.time()
+                self._mark_loop_success("rebalancing")
             except Exception as e:
                 logger.exception(f"[RiskManager] rebalancing loop: {e}")
+                self._mark_loop_error("rebalancing", e)
             await asyncio.sleep(self.t_rebal)
+
 
     async def _loop_volatility(self):
         """
@@ -2142,9 +2173,11 @@ class RiskManager:
 
                 set_rm_paused_count(sum(1 for v in self._paused.values() if v))
                 self.last_update = time.time()
+                self._mark_loop_success("volatility")
 
             except Exception as e:
                 logger.exception(f"[RiskManager] volatility loop: {e}")
+                self._mark_loop_error("volatility", e)
             await asyncio.sleep(self.t_vol)
 
     # ===================== Revalidation & Profitability API =====================
@@ -2777,15 +2810,17 @@ class RiskManager:
                     except Exception:
                         pass
 
+                self._mark_loop_success("fee_sync")
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as exc:
                 if FEESYNC_ERRORS:
                     try:
                         FEESYNC_ERRORS.inc()
                     except Exception:
                         pass
                 log.debug("fee_sync_refresh_once failed", exc_info=False)
+                self._mark_loop_error("fee_sync", exc)
             finally:
                 await asyncio.sleep(_read_interval())
 
@@ -2957,6 +2992,7 @@ class RiskManager:
             await self._forward_rebalancing_trade(op)
         elif t in ("overlay_compensation", "crypto_topup_hint"):
             pass
+
         else:
             legacy = self._legacy_convert(op)
             if legacy:
@@ -2970,6 +3006,26 @@ class RiskManager:
                             await self._exec_internal_subaccount_transfer(legacy)
                     except Exception:
                         logger.exception("[RiskManager] legacy internal transfer failed")
+
+    def _mark_loop_success(self, loop_name: str) -> None:
+        state = self._loop_health.setdefault(loop_name, {"last_success": 0.0, "consecutive_errors": 0})
+        state["last_success"] = time.time()
+        state["consecutive_errors"] = 0
+
+    def _mark_loop_error(self, loop_name: str, exc: Exception) -> None:
+        state = self._loop_health.setdefault(loop_name, {"last_success": 0.0, "consecutive_errors": 0})
+        state["consecutive_errors"] = state.get("consecutive_errors", 0) + 1
+        if state["consecutive_errors"] >= self._loop_error_budget:
+            msg = f"loop {loop_name} failed {self._loop_error_budget}x: {exc}"
+            logger.warning(msg)
+            self._submodule_event({
+                "module": "RM",
+                "level": "WARNING",
+                "event": "loop_stalled",
+                "loop": loop_name,
+                "message": msg,
+            })
+            state["consecutive_errors"] = 0
 
     def _legacy_convert(self, op: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if str(op.get("type")) == "internal_transfer":

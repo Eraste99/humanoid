@@ -505,8 +505,11 @@ class SlippageAndFeesCollector:
         try:
             v = await prov()
             return float(v) if v is not None else None
-        except Exception:
+        except Exception as exc:
+            log.warning("volume provider failed for %s/%s: %s", ex, alias, exc, exc_info=False)
+            self._emit("ERROR", "volume_provider_failed", exchange=ex, alias=alias, error=str(exc))
             return None
+
 
     # --- Event sink (optionnel) ----------------------------------------------
     def set_event_sink(self, sink):
@@ -520,8 +523,9 @@ class SlippageAndFeesCollector:
                 payload = {"module": "SFC", "level": level, "message": message}
                 payload.update(kw)
                 sink(payload)
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("SFC event sink failed: %s", exc, exc_info=False)
+
 
     def _resolve_vip_from_schedule(self, ex: str, maker_base: float, taker_base: float,
                                    vol_30d_usd: Optional[float]) -> Tuple[float,float,int]:
@@ -563,11 +567,12 @@ class SlippageAndFeesCollector:
         if prov:
             try:
                 balances = await prov()  # ex: {"USDC":..., "BNB":..., "EUR":...}
-            except Exception:
+            except Exception as exc:
                 balances = {}
+                log.warning("balance provider failed for %s/%s: %s", ex, alias, exc, exc_info=False)
+                self._emit("ERROR", "balance_provider_failed", exchange=ex, alias=alias, error=str(exc))
         else:
             balances = {}
-
         # Si pas d’info balance → on applique quand même ? Par défaut: non.
         # (évite un "rabais fantôme" si l’exchange n’a pas activé l’option)
         token_bal = _safe_f(balances.get(pol.token_code, 0.0), 0.0)

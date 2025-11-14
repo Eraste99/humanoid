@@ -51,7 +51,7 @@ def _to_f(x) -> float:
     try: return float(x)
     except Exception: return 0.0
 
-def _now() -> float: return time.time()
+
 
 def _norm(s: str) -> str: return (s or "").strip().upper()
 
@@ -136,8 +136,7 @@ class RebalancingManager:
         virtual_parking_wallet_name: str = "PARK",
 
         # --- Orchestration legacy (désormais inactifs, gardés pour compat)
-        rebal_check_interval_s: float = None,
-        edge_min_bps: float = None,
+
         route_switch_margin_bps: float = None,
         route_persistence_s: float = None,
         plankey_cooldown_s: float = None,
@@ -169,13 +168,11 @@ class RebalancingManager:
             ),
             ["BINANCE", "BYBIT", "COINBASE"]
         )
-        self.enabled_exchanges = _norm_list_upper(
-            enabled_exchanges if enabled_exchanges is not None else (
-                    getattr(self.cfg, "enabled_exchanges", None) or (getattr(g, "enabled_exchanges", None))
-            ),
-            ["BINANCE", "BYBIT", "COINBASE"]
-        )
 
+        self.enabled_aliases = _norm_list_upper(
+            enabled_aliases if enabled_aliases is not None else getattr(self.cfg, "enabled_aliases", None),
+            ["TT", "TM"]
+        )
         self.enabled_assets    = [a.upper() for a in (enabled_assets or [
             "ETH","BTC","SOL","ADA","XRP","DOGE","DOT","AVAX","AXS","LTC","SHIB","UNI","LINK",
             "ATOM","XLM","ALGO","FIL","LDO","APE","BNB"
@@ -228,12 +225,19 @@ class RebalancingManager:
         # Event sink (compat)
         self._event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None
 
+        # Coût externe (fourni par le RM)
+        self._reb_cost_fn: Optional[Callable[[Dict[str, Any]], float]] = None
+
         # Dernière mise à jour (utile pour l’âge des snapshots)
         self.last_update: float = 0.0
 
     # -------------------------- Event sink (compat) ---------------------------
     def set_event_sink(self, sink: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
         self._event_sink = sink
+
+    def set_cost_function(self, fn: Optional[Callable[[Dict[str, Any]], float]]) -> None:
+        """Permet au RM d'injecter la fonction de coût utilisée dans les plans."""
+        self._reb_cost_fn = fn
 
     def _emit(self, level: str, message: str, **kw) -> None:
         if not self._event_sink:
@@ -242,25 +246,27 @@ class RebalancingManager:
             evt = {"module": "RebalancingManager", "level": level, "message": message}
             if kw: evt.update(kw)
             self._event_sink(evt)
-        except Exception:
-            pass
-
+        except Exception as exc:
+            log.warning("event sink failed: %s", exc, exc_info=False)
     # ------------------------------- Ingestion --------------------------------
     def ingest_snapshot(self, data: Dict[str, Any]) -> None:
         """data: {exchange, pair_key|symbol, best_bid, best_ask, active=True}."""
         try:
-            ex = _norm(data.get("exchange", ""))
-            if ex not in self.enabled_exchanges: return
-            sym = _norm(data.get("pair_key") or data.get("symbol") or "")
-            if not sym: return
-            bid = _to_f(data.get("best_bid"))
-            ask = _to_f(data.get("best_ask"))
+            ex = _norm((data or {}).get("exchange", ""))
+            if ex not in self.enabled_exchanges:
+                return
+            sym = _norm((data or {}).get("pair_key") or (data or {}).get("symbol") or "")
+            if not sym:
+                return
+            bid = _to_f((data or {}).get("best_bid"))
+            ask = _to_f((data or {}).get("best_ask"))
             if bid <= 0 or ask <= 0 or ask <= bid:  # garde-fous
                 return
             self.latest_orderbooks.setdefault(ex, {})[sym] = {"bid": bid, "ask": ask, "ts": _now()}
             self.last_update = _now()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.exception("ingest_snapshot failed")
+            self._emit("ERROR", "ingest_snapshot_failed", exchange=(data or {}).get("exchange"), error=str(exc))
 
     def update_balances(self, balances: Dict[str, Dict[str, Dict[str, float]]]) -> None:
         """
@@ -280,8 +286,10 @@ class RebalancingManager:
                     norm[exu][al] = {str(a).upper(): _to_f(q) for a, q in (assets or {}).items()}
             self.latest_balances = norm
             self.last_update = _now()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.exception("update_balances failed")
+            self._emit("ERROR", "update_balances_failed", error=str(exc))
+
 
     def update_wallets(self, wallets: Dict[str, Dict[str, Dict[str, Dict[str, float]]]]) -> None:
         """
@@ -306,14 +314,16 @@ class RebalancingManager:
                         norm[exu][al][w] = {str(c).upper(): _to_f(v) for c, v in (ccy_map or {}).items()}
             self.latest_wallets = norm
             self.last_update = _now()
-        except Exception:
-            pass
+        except Exception as exc:
+            log.exception("update_wallets failed")
+            self._emit("ERROR", "update_wallets_failed", error=str(exc))
+
 
     # ------------------------------ Overlay (compat) --------------------------
     @staticmethod
     def _dir_key(self, alias: str, ex_from: str, ex_to: str, ccy: str) -> str:
-        _norm = lambda x: str(x or "").upper()
-        return f"{_norm(alias)}:{_norm(ex_from)}->{_norm(ex_to)}|{_norm(ccy)}"
+        _norm_local = lambda x: str(x or "").upper()
+        return f"{_norm_local(alias)}:{_norm_local(ex_from)}->{_norm_local(ex_to)}|{_norm_local(ccy)}"
 
     @staticmethod
     def _sym_label(alias: str, ex_a: str, ex_b: str, ccy: str) -> str:
@@ -627,12 +637,13 @@ class RebalancingManager:
             "wallet_transfers": sel_wallet,
             "internal_transfers": sel_internal,
             "crypto_topups": sel_crypto,
-            "rebalancing_trade": None,   # compat (désactivé)
-            "bridge_pre": sel_bridge,    # compat (rarement non-None ici)
+            "rebalancing_trade": None,  # compat (désactivé)
+            "bridge_pre": sel_bridge,  # compat (rarement non-None ici)
             "t_ms": (time.perf_counter_ns() - t0) / 1e6,
             "snapshots_age_s": ages,
-            "cost_fn": self._reb_cost_fn,  # <-- fourni par le RM
         }
+        if callable(self._reb_cost_fn):
+            plan["cost_fn"] = self._reb_cost_fn
 
         # Observabilité (compteurs)
         try:

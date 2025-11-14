@@ -88,7 +88,7 @@ VM_LAST_OB_AGE_S                = _NoMetric()
 VM_PRUDENCE_TRANSITIONS_TOTAL   = _NoMetric()
 
 # --- Petites aides -----------------------------------------------------------
-def _now() -> float: return time.time()
+
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         return float(x)
@@ -131,12 +131,18 @@ class VolatilityManager:
         self._ewma: Dict[Tuple[str, str], float] = defaultdict(float)
         # Last top-of-book ts par (pair, exchange)
         self._last_ts: Dict[Tuple[str, str], float] = {}
+        # Volatilité bps (ingestion externe)
+        self._vol_bps: Dict[str, float] = {}
+        self._vol_ema: Dict[str, float] = {}
+        self._vol_ts: Dict[str, float] = {}
+
 
         # Agrégats par pair (tous exchanges confondus)
-        self._pair_last_step_ts: Dict[str, float] = defaultdict(lambda: 0.0)
         self._pair_prudence: Dict[str, str] = defaultdict(lambda: "normal")
         self._pair_prudence_last_change: Dict[str, float] = defaultdict(lambda: 0.0)
         self._pair_metrics_cache: Dict[str, Dict[str, Any]] = {}
+        self._stale_alert_ts: Dict[str, float] = defaultdict(lambda: 0.0)
+        self._event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None
 
         # Seuils par défaut (en bps) + hysteresis
         defaults = {
@@ -156,6 +162,19 @@ class VolatilityManager:
                 pass
 
     # ------------------------------- Ingestion --------------------------------
+    def set_event_sink(self, sink: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
+        self._event_sink = sink
+
+    def _emit(self, level: str, message: str, **details: Any) -> None:
+        if not self._event_sink:
+            return
+        try:
+            payload = {"module": "VolatilityManager", "level": level, "message": message}
+            if details:
+                payload.update(details)
+            self._event_sink(payload)
+        except Exception as exc:
+            log.warning("volatility event sink failed: %s", exc, exc_info=False)
 
     def get_current_metrics(self, pair: str) -> dict:
         """
@@ -229,7 +248,7 @@ class VolatilityManager:
                     p95 = vals_sorted[idx]
 
         age_s = (now - last_ts) if last_ts else float("inf")
-        return {
+        snapshot = {
             "pair": pk,
             "ewma_bps": float(ewma or 0.0),
             "p95_bps": float(p95 or 0.0),
@@ -238,7 +257,12 @@ class VolatilityManager:
             "last_ts": float(last_ts or 0.0),
             "age_s": float(age_s),
             "samples": int(len(hist) if hist is not None else 0),
+            "ewma_vol_bps": float(ewma or 0.0),
+            "p95_vol_bps": float(p95 or 0.0),
+            "last_age_s": float(age_s),
         }
+        return snapshot
+
 
     def ingest_orderbook_top(self, exchange: str, pair: str,
                              best_bid: float, best_ask: float,
@@ -410,37 +434,6 @@ class VolatilityManager:
             "p95_frac": p95 / 10_000.0,
         }
 
-    def get_current_metrics(self, pair: str) -> dict:
-        """
-        Getter consolidé (passif) pour le RM.
-        Retourne un dict minimal et stable : ewma_vol_bps, p95_vol_bps, last_age_s, band.
-        - Aucun état actif ni I/O.
-        - Tolérant si la paire est inconnue (0.0 / "normal").
-        """
-        pk = (pair or "").replace("-", "").upper()
-        st = self._state.get(pk, {})
-        try:
-            ewma = float(st.get("ewma_vol_bps", 0.0))
-            p95 = float(st.get("p95_vol_bps", 0.0))
-            ts = float(st.get("last_ts", 0.0))
-        except Exception:
-            ewma = p95 = ts = 0.0
-
-        now = time.time()
-        age = max(0.0, now - ts) if ts > 0 else 1e9
-
-        try:
-            band = str(self.get_prudence(pk)).lower()  # "normal"|"modere"|"eleve"
-        except Exception:
-            band = "normal"
-
-        return {
-            "pair": pk,
-            "ewma_vol_bps": ewma,
-            "p95_vol_bps": p95,
-            "last_age_s": age,
-            "band": band,
-        }
 
     # ---------------------------- Prudence & Hystérésis -----------------------
 
@@ -530,6 +523,10 @@ class VolatilityManager:
         # (Re)calcule les métriques instantanées
         met = self._aggregate_pair_metrics(pk)
         self._pair_metrics_cache[pk] = dict(met)
+        age = float(met.get("last_age_s", 0.0))
+        if age > self.window_s and (now - self._stale_alert_ts[pk]) >= self.cooloff_s:
+            self._stale_alert_ts[pk] = now
+            self._emit("WARNING", "volatility_metrics_stale", pair=pk, age_s=age)
 
         cur = self._pair_prudence[pk]
         nxt = self._decide_prudence_from_p95(met.get("p95_bps", 0.0), cur)
@@ -541,7 +538,8 @@ class VolatilityManager:
                 VM_PRUDENCE_TRANSITIONS_TOTAL.labels(pk, cur, nxt).inc()
             except Exception:
                 pass
-
+            if nxt == "eleve":
+                self._emit("WARNING", "prudence_escalated", pair=pk, p95_bps=met.get("p95_bps", 0.0))
         # Gauge état
         try:
             VM_PRUDENCE_STATE.labels(pk).set(self._STATE_TO_CODE.get(nxt, 0))
