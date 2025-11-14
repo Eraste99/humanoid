@@ -18,12 +18,11 @@ Rétro-compatible: si buy_ex/sell_ex/route ne sont pas fournis, on retombe
 sur le comportement purement "pair".
 """
 
+import logging
 import time
 from dataclasses import dataclass
 from collections import deque, defaultdict
 from typing import Dict, Any, List, Optional, Tuple, Iterable, Set
-import logger
-import os
 # -------------------- helpers --------------------
 
 def _to_float(x) -> float:
@@ -34,6 +33,9 @@ def _to_float(x) -> float:
 
 def _now() -> float:
     return time.time()
+
+
+logger = logging.getLogger("PairHistoryTracker")
 
 def _norm_pair(p: Optional[str]) -> str:
     return (p or "").replace("-", "").upper()
@@ -204,6 +206,15 @@ class PairHistoryTracker:
 
         self._refresh_mode_bias(pair, entry.get("trade_mode"), ts)
 
+    def ingest_opportunities(self, opps: Iterable[Dict[str, Any]] | None) -> None:
+        if not opps:
+            return
+        for opp in opps:
+            try:
+                self.ingest_opportunity(opp)
+            except Exception:
+                logger.exception("ingest_opportunity failed", exc_info=True)
+
     def ingest_trade(self, trade: Dict[str, Any]) -> None:
         """
         trade attendu (tolère manquants):
@@ -265,6 +276,15 @@ class PairHistoryTracker:
 
         # biais mode
         self._refresh_mode_bias(pair, entry.get("trade_mode"), ts)
+
+    def ingest_trades(self, trades: Iterable[Dict[str, Any]] | None) -> None:
+        if not trades:
+            return
+        for trade in trades:
+            try:
+                self.ingest_trade(trade)
+            except Exception:
+                logger.exception("ingest_trade failed", exc_info=True)
 
     def ingest_volatility(self, pair: str, metrics: Dict[str, Any]) -> None:
         pair = _norm_pair(pair)
@@ -568,14 +588,21 @@ class PairHistoryTracker:
 
     # pair_history_tracker.py — dans class PairHistoryTracker
 
-    def collect_pair_metrics(self, pair_key: str) -> dict:
+    def collect_pair_metrics(self, pair_key: Optional[str] = None):
         """
-        Retourne un snapshot riche pour une paire :
-          - scores (pair + meilleure route)
-          - ema latences (pair + route)
-          - slippage/volatilité instantanés
-          - best_route (clé BUY:EX→SELL:EX) si dispo
+        Retourne soit le snapshot d'une paire, soit une liste complète si pair_key est None.
         """
+        if pair_key is not None:
+            return self._collect_pair_metrics_single(pair_key)
+
+        seen: Set[str] = set(self.pair_scores.keys())
+        seen.update(self.opps_by_pair.keys())
+        seen.update(self.trades_by_pair.keys())
+        if not seen:
+            return []
+        return [self._collect_pair_metrics_single(pk) for pk in sorted(seen)]
+
+    def _collect_pair_metrics_single(self, pair_key: str) -> dict:
         pk = _norm_pair(pair_key)
         out = {
             "pair": pk,
@@ -588,7 +615,6 @@ class PairHistoryTracker:
             "route_latency_ema_ms": None,
             "last_trade_result": self.last_trade_result.get(pk, "unknown"),
         }
-        # meilleure route si connue
         best = None
         best_score = None
         for (p, route), sc in self.route_scores.items():
@@ -601,6 +627,7 @@ class PairHistoryTracker:
             out["route_score"] = float(best_score or 0.0)
             out["route_latency_ema_ms"] = dict(self.lat_ema_by_route.get((pk, best), {}))
         return out
+
 
     def rotate_pairs(self, *, now: float | None = None) -> dict:
         """
@@ -623,86 +650,6 @@ class PairHistoryTracker:
         rep["paused"] = {p: t for p, t in pauses.items() if t > now}
         return rep
 
-    # log_writer.py — dans class LogWriter
-
-    def finalize_day(self, *, sign_priv_pem_path: str | None = None) -> dict:
-        """
-        Fin de journée : checkpoint WAL + VACUUM + hash + (option) signature ECDSA.
-        Retourne un dict {db_path, bytes, sha256, sig_path?}.
-        """
-        path = self.db_path
-        meta = {"db_path": path, "bytes": 0, "sha256": None, "sig_path": None}
-        try:
-            # checkpoint WAL + optimize
-            self.wal_checkpoint("TRUNCATE")
-        except Exception:
-            logger.exception("finalize_day: wal_checkpoint failed")
-        try:
-            self.optimize()
-        except Exception:
-            logger.exception("finalize_day: optimize failed")
-        # tailles & hash
-        try:
-            meta["bytes"] = os.path.getsize(path)
-            h = self._rolling_hash_file(path)
-            meta["sha256"] = h
-        except Exception:
-            logger.exception("finalize_day: rolling hash failed")
-        # signature optionnelle
-        if sign_priv_pem_path:
-            try:
-                sigp = self._ecdsa_sign(path, sign_priv_pem_path)
-                meta["sig_path"] = sigp
-            except Exception:
-                logger.exception("finalize_day: ecdsa sign failed")
-        # petit backup compressé
-        try:
-            self.backup_database()
-        except Exception:
-            logger.exception("finalize_day: backup failed")
-        return meta
-
-    def _rolling_hash_file(self, filepath: str, *, chunk: int = 1 << 20) -> str:
-        """
-        Hash incrémental SHA-256 d’un gros fichier sans épuiser la RAM.
-        """
-        import hashlib
-        h = hashlib.sha256()
-        with open(filepath, "rb") as f:
-            while True:
-                b = f.read(chunk)
-                if not b: break
-                h.update(b)
-        return h.hexdigest()
-
-    def _ecdsa_sign(self, filepath: str, pem_priv_key_path: str) -> str:
-        """
-        Signe le hash du fichier via ECDSA (secp256k1 si dispo, sinon secp256r1).
-        Écrit le .sig à côté du fichier et retourne le chemin de la signature.
-        """
-        try:
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import ec
-            from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
-            from cryptography.hazmat.backends import default_backend
-        except Exception as e:
-            raise RuntimeError("cryptography package required for ECDSA signing") from e
-
-        digest_hex = self._rolling_hash_file(filepath)
-        digest = bytes.fromhex(digest_hex)
-
-        with open(pem_priv_key_path, "rb") as fh:
-            key = serialization.load_pem_private_key(fh.read(), password=None, backend=default_backend())
-        # secp256k1 si possible, sinon r1
-        if not isinstance(key.curve, (ec.SECP256K1, ec.SECP256R1)):
-            key = ec.generate_private_key(ec.SECP256R1(), default_backend())
-
-        sig = key.sign(digest, ec.ECDSA(hashes.SHA256()))
-        r, s = encode_dss_signature(sig)  # DER->(r,s) pour portabilité
-        out = f"{filepath}.sig"
-        with open(out, "wb") as fh:
-            fh.write(sig)
-        return out
 
     # ---------- vues ----------
 
@@ -902,5 +849,4 @@ class PairHistoryTracker:
         try:
             self.active_pairs.remove(p)
         except ValueError:
-            import logging
-            logging.exception("Unhandled exception")
+            logger.debug("reset_pair: %s not in active_pairs", p)

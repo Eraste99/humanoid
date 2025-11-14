@@ -24,6 +24,7 @@ import os, gzip, time, threading
 
 import csv
 import gzip
+import json
 import logging
 import os
 import shutil
@@ -934,6 +935,44 @@ class LogWriter:
                 )
                 conn.commit()
 
+    def insert_alerts_bulk(self, alerts: Iterable[Dict[str, Any]]) -> int:
+        rows = list(alerts or [])
+        if not rows:
+            return 0
+        with self._lock:
+            self._rotate_if_needed()
+            with self._conn() as conn:
+                cur = conn.cursor()
+                payloads: List[Tuple] = []
+                for alert in rows:
+                    module = str(alert.get("module") or alert.get("source") or "LoggerHistorique")
+                    level = str(alert.get("level") or alert.get("severity") or "INFO")
+                    pair_key = alert.get("pair_key")
+                    message = str(alert.get("message") or alert.get("msg") or alert.get("reason") or "alert")
+                    ctx = alert.get("ctx")
+                    if ctx is None:
+                        ctx = json.dumps(alert, default=str)
+                    payloads.append(
+                        (
+                            alert.get("ts") or datetime.utcnow().isoformat(),
+                            module,
+                            level,
+                            pair_key,
+                            message,
+                            ctx,
+                        )
+                    )
+                cur.executemany(
+                    """
+                    INSERT INTO alerts(ts, module, level, pair_key, message, ctx)
+                    VALUES (?,?,?,?,?,?)
+                    """,
+                    payloads,
+                )
+                conn.commit()
+                return len(payloads)
+
+
     # ------------- latency events (tri-CEX pipeline) -------------------
     def insert_latency(self, metrics: Dict[str, Any]) -> None:
         """
@@ -1023,6 +1062,48 @@ class LogWriter:
                 )
                 conn.commit()
                 return len(rows)
+
+    def insert_generic(self, table: str, rows: Iterable[Dict[str, Any]]) -> int:
+        table_name = str(table or "").strip()
+        if not table_name:
+            return 0
+        if not all(c.isalnum() or c == "_" for c in table_name):
+            logger.warning("insert_generic: invalid table %s", table)
+            return 0
+        payloads = list(rows or [])
+        if not payloads:
+            return 0
+        with self._lock:
+            self._rotate_if_needed()
+            with self._conn() as conn:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?;",
+                    (table_name,),
+                )
+                if cur.fetchone() is None:
+                    logger.warning("insert_generic: table %s does not exist", table_name)
+                    return 0
+                cur.execute(f"PRAGMA table_info({table_name});")
+                cols = {row[1] for row in cur.fetchall()}
+                if not cols:
+                    return 0
+                inserted = 0
+                for payload in payloads:
+                    filtered = {k: v for k, v in (payload or {}).items() if k in cols}
+                    if not filtered:
+                        continue
+                    if "ts" in cols and "ts" not in filtered:
+                        filtered["ts"] = datetime.utcnow().isoformat()
+                    keys = ", ".join(filtered.keys())
+                    qmarks = ", ".join(["?"] * len(filtered))
+                    cur.execute(
+                        f"INSERT INTO {table_name} ({keys}) VALUES ({qmarks})",
+                        list(filtered.values()),
+                    )
+                    inserted += 1
+                conn.commit()
+                return inserted
 
     # ------------------------------------------------------------------
     # Exports & backup

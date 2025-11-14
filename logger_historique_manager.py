@@ -97,6 +97,10 @@ class _JsonlRotator:
             self._open_new()
         return need
 
+    def rotate_if_needed(self) -> bool:
+        with self._lock:
+            return self._rotate_if_needed()
+
     # --- API ---
     def write_line(self, b: bytes) -> None:
         if not b:
@@ -389,7 +393,7 @@ class LoggerHistoriqueManager:
 
         # Proxy metrics d’un sous-module vers LHM (si dispo)
         try:
-            self._binlogger._metrics_proxy = self  # noqa: attr-defined
+            self._trade_logger._metrics_proxy = self  # noqa: attr-defined
         except Exception:
             pass
 
@@ -433,7 +437,7 @@ class LoggerHistoriqueManager:
         self._running = True
         self._flush_lock = getattr(self, "_flush_lock", asyncio.Lock())
         # 1) BaseTradeLogger -> event_sink (nous)
-        btl = getattr(self, "_btl", None) or getattr(self, "trade_logger", None)
+        btl = getattr(self, "_trade_logger", None)
         if btl:
             btl.set_event_sink(self._on_event_sink)  # (log_type, entries)
             await btl.start()
@@ -462,7 +466,7 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("flush_now at stop failed")
         # 2) Arrêt du BTL
-        btl = getattr(self, "_btl", None) or getattr(self, "trade_logger", None)
+        btl = getattr(self, "_trade_logger", None)
         if btl:
             try:
                 await btl.stop()
@@ -593,7 +597,7 @@ class LoggerHistoriqueManager:
 
             # Rotation par âge testée à chaque tick (et comptabilisée)
             try:
-                rotated = await asyncio.to_thread(rot._rotate_if_needed)
+                rotated = await asyncio.to_thread(rot.rotate_if_needed)
                 if rotated:
                     try:
                         from modules.obs_metrics import LOGGERH_JSONL_ROTATIONS_TOTAL
@@ -804,20 +808,24 @@ class LoggerHistoriqueManager:
         # Écriture DB (thread → pas de blocage loop)
         try:
             t0 = time.time()
+            record_latency = True
             if log_type == "trades":
-                await asyncio.to_thread(self._writer.insert_trades, enriched)
+                await self._write_trades_async(enriched)
+                record_latency = False  # déjà observé dans _write_trades_async
             elif log_type == "opportunities":
-                await asyncio.to_thread(self._writer.insert_opportunities, enriched)
+                await asyncio.to_thread(self._writer.insert_opportunities_bulk, enriched)
             elif log_type == "alerts":
-                await asyncio.to_thread(self._writer.insert_alerts, enriched)
+                await asyncio.to_thread(self._writer.insert_alerts_bulk, enriched)
             else:
                 # best-effort: on tente une table générique si elle existe
                 await asyncio.to_thread(self._writer.insert_generic, log_type, enriched)
-            try:
-                from modules.obs_metrics import LOGGERH_WRITE_MS
-                LOGGERH_WRITE_MS.observe((time.time() - t0) * 1000.0)
-            except Exception:
-                pass
+            if record_latency:
+                try:
+                    from modules.obs_metrics import LOGGERH_WRITE_MS
+                    LOGGERH_WRITE_MS.observe((time.time() - t0) * 1000.0)
+                except Exception:
+                    pass
+
         except Exception:
             logger.exception("DB write failed for log_type=%s", log_type)
             self._enqueue_jsonl("errors", {"stream": "errors", "log_type": log_type, "payload": enriched,
@@ -1159,7 +1167,7 @@ class LoggerHistoriqueManager:
         """Vide les buffers trades et pousse (optionnel) les métriques paires en DB."""
         try:
             # vidage du buffer BaseTradeLogger
-            self._trade_logger.flush_now()
+            await self._trade_logger.flush_now()
         except Exception:
             logging.exception("Unhandled exception")
 
@@ -1168,11 +1176,10 @@ class LoggerHistoriqueManager:
 
         if rotate:
             try:
-                self._tracker.rotate_pairs(force=True)
+                self._tracker.rotate_pairs()
             except Exception:
-                logger.exception("rotate_pairs(force=True) failed")
+                logger.exception("rotate_pairs failed")
 
-        # export des métriques paires
         # export des métriques paires
         try:
             rows = self._tracker.collect_pair_metrics() or []
@@ -1235,7 +1242,7 @@ class LoggerHistoriqueManager:
         try:
             while True:
                 await asyncio.sleep(self._rotate_interval)
-                self._tracker.rotate_pairs(force=True)
+                self._tracker.rotate_pairs()
                 rows = self._tracker.collect_pair_metrics() or []
                 if rows:
                     # mapping de compat: rt_latency_ema_ms -> latency_ms_avg
@@ -1574,7 +1581,7 @@ class LoggerHistoriqueManager:
 
     def rotate_now(self) -> None:
         """Force une rotation immédiate (le tracker applique ses quotas par branche)."""
-        self._tracker.rotate_pairs(force=True)
+        self._tracker.rotate_pairs()
 
     def set_max_active_by_mode(self, **kw) -> None:
         """

@@ -42,6 +42,7 @@ Usage (via orchestrateur)
 """
 
 import asyncio
+import inspect
 import json
 import logging
 from datetime import datetime
@@ -99,6 +100,10 @@ class BaseTradeLogger:
 
         # proxy métriques (fourni par LHM dynamiquement)
         self._metrics_proxy = _NoopMetricsProxy()
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+        # proxy métriques (fourni par LHM dynamiquement)
+        self._metrics_proxy = _NoopMetricsProxy()
 
     # ----------------------- configuration externe -----------------------
     def set_event_sink(self, sink: Callable[[str, List[Dict[str, Any]]], Any]) -> None:
@@ -134,13 +139,13 @@ class BaseTradeLogger:
 
     async def flush_now(self, *, rotate: bool = False) -> None:
         """Vide immédiatement la file locale (en lots) et cède la main à l’event-loop."""
-        try:
-            # Draine la queue en mémoire
-            items: List[Dict[str, Any]] = []
-            while True:
+        # Draine la queue en mémoire
+        items: List[Dict[str, Any]] = []
+        while True:
+            try:
                 items.append(self._queue.get_nowait())
-        except Exception:
-            pass
+            except QueueEmpty:
+                break
 
         # Émet en batches (taille = self.batch_size)
         if items:
@@ -198,7 +203,13 @@ class BaseTradeLogger:
         t0 = time.perf_counter()
         try:
             # Envoi vers l’orchestrateur (LHM)
-            self._event_sink(self.log_type, batch)
+            result = self._event_sink(self.log_type, batch)
+            if inspect.isawaitable(result):
+                loop = self._loop
+                if not loop:
+                    raise RuntimeError("Async event sink requires an event loop")
+                fut = asyncio.run_coroutine_threadsafe(result, loop)
+                fut.result()
             dur_ms = (time.perf_counter() - t0) * 1000.0
             # Hook métrique (centralisé côté LHM)
             self._metrics_proxy.on_btl_flush_latency(self.log_type, ms=dur_ms)
@@ -208,14 +219,13 @@ class BaseTradeLogger:
 
     def _emit_remaining(self) -> None:
         items: List[Dict[str, Any]] = []
-        try:
-            while True:
+        while True:
+            try:
                 items.append(self._queue.get_nowait())
-        except Exception:
-            pass
+            except QueueEmpty:
+                break
         if items:
             self._emit(items)
-
     # --------------------------- normalisation --------------------------
     @staticmethod
     def _norm_pair(x: Optional[str]) -> Optional[str]:
@@ -470,10 +480,12 @@ class BaseTradeLogger:
         if self._thread and self._thread.is_alive():
             return
         import threading
+        self._loop = asyncio.get_running_loop()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name=f"BTL-{self.log_type}", daemon=True)
         self._thread.start()
         await asyncio.sleep(0)
+
 
     async def stop(self, *, flush: bool = True) -> None:
         self._stop.set()
