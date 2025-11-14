@@ -1032,11 +1032,12 @@ class ExecutionEngine:
         from typing import Optional, Dict, Any, Tuple, List
 
         # --- Wiring de base ---
-        self.cfg = cfg
         self.pws = private_ws
+        self.private_ws_hub = private_ws
         self.rl = rate_limiter
         self.retry = retry_policy
         self.history = history_logger
+
 
         # Sous-config "engine" (si fournie) ; sinon cfg.engine ; sinon cfg
         self.config = config or getattr(self.cfg, "engine", self.cfg)
@@ -1097,7 +1098,16 @@ class ExecutionEngine:
         self._client_symbol_map: Dict[str, Tuple[str, str]] = {}  # client_id -> (EXCHANGE, SYMBOL)
 
         # --- WS privés / hedges ---
+        # --- WS privés / hedges ---
         self._ws_clients: List[Any] = []
+        if self.private_ws_hub:
+            try:
+                self.private_ws_hub.register_callback(self.handle_order_update, role="engine")
+            except TypeError:
+                # anciennes versions sans param role
+                self.private_ws_hub.register_callback(self.handle_order_update)
+            except Exception:
+                logger.exception("[ExecutionEngine] unable to register engine callback on hub")
         self._tm_hedges: Dict[str, Dict[str, Any]] = {}  # maker_client_id -> plan hedge
 
         # --- Pacing / slicing ---

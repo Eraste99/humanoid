@@ -1043,8 +1043,10 @@ class PrivateWSHub:
     ):
         self._callback = on_event
         self._rm_callback: Optional[Callable[[dict], None]] = None
+        self._observers: List[Callable[[dict], Any]] = []
         self._started = False
         self._hb_task: Optional[asyncio.Task] = None
+
 
         # LRU dédup (clé compacte)
         self._seen_events = OrderedDict()
@@ -1371,16 +1373,26 @@ class PrivateWSHub:
         except Exception:
             pass
 
-        # 1) callback RM (async/sync sans bloquer)
-        rm_cb = getattr(self, "_rm_callback", None)
-        if rm_cb:
+            # 1) callback RM (async/sync sans bloquer)
+            self._deliver_callback(getattr(self, "_rm_callback", None), ev, label="RM")
+
+            # 2) callback Engine (sync)
+            self._deliver_callback(getattr(self, "_callback", None), ev, label="Engine")
+
+            # 3) Observateurs additionnels (balance fetcher, watchdogs…)
+            for cb in list(self._observers):
+                self._deliver_callback(cb, ev, label="Observer")
+
+        def _deliver_callback(self, cb: Optional[Callable[[dict], Any]], ev: dict, label: str) -> None:
+            if not cb:
+                return
             try:
-                if inspect.iscoroutinefunction(rm_cb):
-                    asyncio.create_task(rm_cb(ev))
+                if inspect.iscoroutinefunction(cb):
+                    asyncio.create_task(cb(ev))
                 else:
-                    rm_cb(ev)
+                    cb(ev)
             except Exception:
-                logging.getLogger("PrivateWSHub").exception("RM callback a levé une exception")
+                log.exception("[PrivateWSHub] %s callback failed", label)
 
         # 2) callback Engine (sync)
         if getattr(self, "_callback", None):
@@ -1495,16 +1507,28 @@ class PrivateWSHub:
 
         raise TypeError("Invalid _dispatch usage. Use _dispatch(ev_dict) or _dispatch(alias, exchange).")
 
-    def register_callback(self, cb) -> None:
+    def register_callback(self, cb, *, role: str = "engine") -> None:
         """
-        Enregistre un callback consommateur (Engine).
-        Si un callback existait déjà, on le promeut en RM-callback (_rm_callback)
-        pour activer la double émission RM→Engine dans _pws_drain_one().
+        Enregistre un callback consommateur.
+        role="engine" (defaut), "risk" ou "observer" (fan-out additionnel).
         """
-        prev = getattr(self, "_callback", None)
-        if prev and prev is not cb:
-            self._rm_callback = prev
-        self._callback = cb
+        if not cb:
+            return
+        kind = str(role or "engine").lower()
+        if kind == "engine":
+            prev = getattr(self, "_callback", None)
+            if prev and prev is not cb and self._rm_callback is None:
+                self._rm_callback = prev
+            self._callback = cb
+            return
+        if kind in ("risk", "rm", "riskmanager"):
+            self._rm_callback = cb
+            return
+        if kind == "observer":
+            self._observers.append(cb)
+            return
+        raise ValueError(f"unknown callback role={role}")
+
 
     # ------------------------- lifecycle --------------------------------------
 

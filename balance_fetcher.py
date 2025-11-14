@@ -227,10 +227,14 @@ class MultiBalanceFetcher:
         self._cache_lock = asyncio.Lock()
         self._history_lock = asyncio.Lock()
 
-        # Overlay virtuel
         self._virt: Dict[str, Dict[str, Dict[str, float]]] = {}
         self._virt_mode_set_abs: bool = False
         self.latest_balances: Dict[str, Dict[str, Dict[str, float]]] = {"BINANCE": {}, "COINBASE": {}, "BYBIT": {}}
+        self.latest_wallets: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+        self._default_wallet_type = str(
+            getattr(self.cfg, "default_private_wallet", "SPOT") if self.cfg else "SPOT"
+        ).upper()
+
 
         # HTTP
         self._session: Optional[aiohttp.ClientSession] = None
@@ -947,11 +951,21 @@ class MultiBalanceFetcher:
 
     # =========================== Public helpers ===============================
     async def get_all_wallets(self) -> Dict[str, Any]:
-        """Placeholder: structure vide (les wallets détaillés viennent via PrivateWSHub transfer clients)."""
-        return {}
+        """Retourne un snapshot léger des wallets connus via flux privés/REST."""
+        snap: Dict[str, Any] = {}
+        for ex, per_alias in self.latest_wallets.items():
+            snap[ex] = {}
+            for alias, per_wallet in per_alias.items():
+                snap[ex][alias] = {
+                    wallet: dict(ccy_map or {})
+                    for wallet, ccy_map in (per_wallet or {}).items()
+                }
+        return snap
 
     async def get_wallets_snapshot(self) -> Dict[str, Any]:
+        """Alias historique (utilisé par le Hub)."""
         return await self.get_all_wallets()
+
 
     async def get_status(self) -> Dict[str, Any]:
         async with self._cache_lock:
@@ -1010,6 +1024,10 @@ class MultiBalanceFetcher:
                 merged[ccy] = v
         # écriture snapshot en mémoire
         self.latest_balances.setdefault(exu, {})[alu] = merged
+        wallet_type = self._default_wallet_type or "SPOT"
+        per_alias = self.latest_wallets.setdefault(exu, {})
+        per_wallet = per_alias.setdefault(alu, {})
+        per_wallet[wallet_type] = dict(merged)
 
     def prefer_ws_for_keys(self, exchange: str, alias: str, ccys: Tuple[str, ...]) -> None:
         """
@@ -1023,3 +1041,41 @@ class MultiBalanceFetcher:
             if c in cur:
                 pass  # no-op: la simple présence peut guider l'orchestrateur pour prioriser l'update WS
 
+    def ingest_wallet_snapshot(
+            self,
+            exchange: str,
+            alias: str,
+            wallet_type: str,
+            balances: Dict[str, float],
+    ) -> None:
+        """Ingestion explicite d'un snapshot de wallet (via Hub/transfert)."""
+        exu, alu = exchange.upper(), alias.upper()
+        w = (wallet_type or self._default_wallet_type or "SPOT").upper()
+        per_alias = self.latest_wallets.setdefault(exu, {})
+        per_wallet = per_alias.setdefault(alu, {})
+        per_wallet[w] = {str(k).upper(): float(v) for k, v in (balances or {}).items()}
+
+    def observe_fill_fee_reality_check(self, evt: Dict[str, Any]) -> None:
+        """Compare les fees rapportés avec les snapshots connus pour déclencher un refresh léger."""
+        if not evt:
+            return
+        exu = _upper(evt.get("exchange"))
+        alu = _upper(evt.get("alias"))
+        fee_ccy = _upper(evt.get("fee_ccy") or evt.get("fee_currency") or evt.get("fee_asset"))
+        fee_paid = evt.get("fee_paid") or evt.get("fee") or evt.get("fee_qty")
+        if not (exu and alu and fee_ccy):
+            return
+        try:
+            paid = float(fee_paid or 0.0)
+        except Exception:
+            paid = 0.0
+        rec = self.latest_wallets.setdefault(exu, {}).setdefault(alu, {})
+        wallet = rec.get(self._default_wallet_type) or {}
+        known = float(wallet.get(fee_ccy, 0.0))
+        if paid > known:
+            wallet[fee_ccy] = paid
+            rec[self._default_wallet_type] = wallet
+        try:
+            FEE_TOKEN_BALANCE.labels(exu, alu, fee_ccy).set(wallet.get(fee_ccy, 0.0))
+        except Exception:
+            pass

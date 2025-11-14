@@ -662,6 +662,8 @@ class RiskManager:
 
         # Harmonise les alias legacy
         self.slippage_collector = self.slip_collector
+
+
         # Expose aussi "rebal_mgr" (utilisé ailleurs)
         self.rebal_mgr = self.rebalancing
         # --- fin instanciation lazy ---
@@ -894,6 +896,8 @@ class RiskManager:
     # Readiness / Guards
     # ------------------------------------------------------------------
     # === Helpers MM / budgets / réservations (USDC/EUR) ===================
+
+
     def _profile_cap_notional(self, *, profile: str, slip_tail_bps: float = 25.0) -> float:
         # borne “tail-risk” (budget perte € / tail-slip)
         loss_budget = dict(NANO=0.5, MICRO=1.0, SMALL=2.0, MID=4.0, LARGE=8.0).get(profile, 1.0)
@@ -1386,15 +1390,17 @@ class RiskManager:
             self.reconciler = reconciler
             if self.reconciler is None:
                 return
+            if hasattr(self.reconciler, "set_event_sink"):
+                self.reconciler.set_event_sink(self._submodule_event)
             # Lookup inflight côté RM (si disponible)
             if hasattr(self, "lookup_inflight"):
                 self.reconciler._lookup = self.lookup_inflight
-            # Optionnels: helpers is_inflight / metrics, si présents
             if hasattr(self, "is_inflight"):
                 self.reconciler._is_inflight = self.is_inflight
-        except Exception:
-            # best-effort: ne jamais faire tomber le RM si l'injection échoue
-            pass
+            self._wire_reconciler_engine_hooks()
+        except Exception as exc:
+            logger.exception("[RiskManager] bind_reconciler failed")
+            self._emit_private_plane_event("bind_reconciler_failed", error=str(exc))
 
     def set_engine(self, engine) -> None:
         """
@@ -1404,11 +1410,26 @@ class RiskManager:
         """
         try:
             self.engine = engine
-            if getattr(self, "reconciler", None) and self.engine:
-                self.reconciler._resync_order = getattr(self.engine, "resync_order", None)
-                self.reconciler._resync_alias = getattr(self.engine, "resync_alias", None)
-        except Exception:
-            pass
+            self._wire_reconciler_engine_hooks()
+        except Exception as exc:
+            logger.exception("[RiskManager] set_engine failed")
+            self._emit_private_plane_event("set_engine_failed", error=str(exc))
+
+    def _wire_reconciler_engine_hooks(self) -> None:
+        rec = getattr(self, "reconciler", None)
+        eng = getattr(self, "engine", None)
+        if not (rec and eng):
+            return
+        rec._resync_order = getattr(eng, "resync_order", None)
+        rec._resync_alias = getattr(eng, "resync_alias", None)
+        missing = []
+        if not callable(getattr(rec, "_resync_order", None)):
+            missing.append("resync_order")
+        if not callable(getattr(rec, "_resync_alias", None)):
+            missing.append("resync_alias")
+        if missing:
+            self._emit_private_plane_event("reconciler_missing_engine_hooks", missing=missing)
+
 
     def _credit_quote(self, ex: str, quote: str, amount: float) -> None:
         """
@@ -1914,6 +1935,15 @@ class RiskManager:
                 logger.debug("[RiskManager] _submodule_event fallback", exc_info=False)
             except Exception:
                 pass
+
+    def _emit_private_plane_event(self, event: str, **extra: Any) -> None:
+        payload = {"module": "PWS", "event": event}
+        if extra:
+            payload.update(extra)
+        try:
+            self._submodule_event(payload)
+        except Exception:
+            logger.debug("[RiskManager] private plane event drop (%s)", event, exc_info=False)
 
     # ------------------------------------------------------------------
     # Loops
@@ -4719,42 +4749,51 @@ class RiskManager:
           - reconciler : observe + resync async (ordre -> alias),
           - slippage : optionnel.
         """
-        try:
-            status = str((evt or {}).get("status") or (evt or {}).get("type") or "").upper()
-            if status not in ("FILL", "PARTIAL"):
-                return
+        if not evt:
+            return
+        status = str(evt.get("status") or evt.get("type") or "").upper()
+        if status not in ("FILL", "PARTIAL"):
+            return
+        exchange = str(evt.get("exchange") or "NA").upper()
+        alias = str(evt.get("alias") or "NA").upper()
 
-            # reality-check fees (passif)
-            try:
-                bf = getattr(self, "balance_fetcher", None)
-                if bf and hasattr(bf, "observe_fill_fee_reality_check"):
-                    bf.observe_fill_fee_reality_check(evt)
-            except Exception:
-                pass
+        def _handle_error(reason: str, exc: Exception) -> None:
+            logger.exception("[RiskManager] %s", reason)
+            self._emit_private_plane_event(reason, exchange=exchange, alias=alias, error=str(exc))
 
-            # reconciler
+        # reality-check fees (passif)
+        bf = getattr(self, "balance_fetcher", None)
+        if bf and hasattr(bf, "observe_fill_fee_reality_check"):
             try:
-                rec = getattr(self, "reconciler", None)
-                if rec:
-                    rec.observe_fill_event(evt)
+                bf.observe_fill_fee_reality_check(evt)
+            except Exception as exc:
+                _handle_error("bf_reality_check_failed", exc)
+
+        # reconciler fan-out
+        rec = getattr(self, "reconciler", None)
+        if rec:
+            try:
+                rec.observe_fill_event(evt)
+            except Exception as exc:
+                _handle_error("reconciler_observe_failed", exc)
+            else:
+                try:
                     import asyncio
-                    ex = (evt or {}).get("exchange");
-                    al = (evt or {}).get("alias");
-                    oid = (evt or {}).get("order_id")
-                    asyncio.create_task(rec.correlate_and_maybe_resync(ex, al, oid))
-            except Exception:
-                pass
+                    oid = evt.get("order_id") or evt.get("client_id")
+                    task = rec.correlate_and_maybe_resync(exchange, alias, oid)
+                    if asyncio.iscoroutine(task):
+                        asyncio.create_task(task)
+                except Exception as exc:
+                    _handle_error("reconciler_resync_failed", exc)
 
-            # slippage observer (si dispo)
+        # slippage observer (si dispo)
+        sh = getattr(self, "slippage_handler", None)
+        if sh and hasattr(sh, "observe_slippage"):
             try:
-                sh = getattr(self, "slippage_handler", None)
-                if sh and hasattr(sh, "observe_slippage"):
-                    sh.observe_slippage(evt)
-            except Exception:
-                pass
+                sh.observe_slippage(evt)
+            except Exception as exc:
+                _handle_error("slippage_observer_failed", exc)
 
-        except Exception:
-            logger.exception("[RiskManager] on_private_event error")
 
     # risk_manager.py — dans class RiskManager
     def _split_auto_fallback_tick(self) -> None:

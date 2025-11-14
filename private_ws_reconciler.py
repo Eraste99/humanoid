@@ -205,8 +205,9 @@ class PrivateWSReconciler:
         # Appeler ceci à chaque "miss" détecté (en plus du compteur existant)
         try:
             self._miss_win.append(_now())
-        except Exception:
-            pass
+        except Exception as exc:
+            log.exception("[Reconciler] unable to record miss: %s", exc)
+
 
     async def run_miss_alerts(self, threshold_per_minute: int = 30, period_s: float = 5.0) -> None:
         """
@@ -235,12 +236,10 @@ class PrivateWSReconciler:
                         WS_RECO_MISS_BURST_TOTAL.labels(ex, al).inc()
                     except Exception:
                         pass
-                    try:
-                        log.warning("[Reconciler:%s:%s] Burst de miss: %d/min ≥ seuil", ex, al, rate)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                    log.warning("[Reconciler:%s:%s] Burst de miss: %d/min ≥ seuil", ex, al, rate)
+            except Exception as exc:
+                log.exception("[Reconciler] miss_alert loop error: %s", exc)
+                WS_RECO_ERRORS_TOTAL.labels(exchange=ex).inc()
 
             period = max(1.0, float(getattr(cfg, "RECO_ALERT_PERIOD_S", period_s)))
             try:
@@ -308,7 +307,10 @@ class PrivateWSReconciler:
             except asyncio.CancelledError:
                 break
             except Exception:
+                log.exception("[Reconciler] cold_resync_loop error")
                 WS_RECO_ERRORS_TOTAL.labels(exchange=getattr(self,"venue","UNKNOWN")).inc()
+
+
 
     def _pacer_wait(self, kind: str) -> float:
         try:
