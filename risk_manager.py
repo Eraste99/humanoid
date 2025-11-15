@@ -76,7 +76,7 @@ except Exception:
 
 from modules.obs_metrics import (
     mark_books_fresh, mark_balances_fresh, inc_rm_reject,
-    set_rm_paused_count, set_dynamic_min
+    set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL
 )
 
 
@@ -1882,6 +1882,9 @@ class RiskManager:
                 return
 
             imb = self.rebalancing.detect_imbalance()
+            if not imb:
+                return
+
             # Obs: un déséquilibre détecté
             try:
                 from modules.obs_metrics import REBAL_DETECTED_TOTAL
@@ -3076,6 +3079,32 @@ class RiskManager:
             if not (buy_ex and sell_ex and pair):
                 return False
 
+            allow_loss = float(self.rebal_allow_loss_bps)
+            estimator = getattr(self, "rebal_mgr", None)
+            if estimator and hasattr(estimator, "estimate_cross_cex_net_bps"):
+                try:
+                    est_bps = float(estimator.estimate_cross_cex_net_bps(
+                        pair_key=pair,
+                        from_exchange=sell_ex,
+                        to_exchange=buy_ex,
+                    ))
+                except Exception:
+                    est_bps = None
+                else:
+                    if est_bps < -allow_loss:
+                        logger.info(
+                            "[RiskManager] rebal cross %s→%s rejeté (net=%.1f bps < -%.1f)",
+                            sell_ex,
+                            buy_ex,
+                            est_bps,
+                            allow_loss,
+                        )
+                        try:
+                            REBAL_CROSS_TOO_EXPENSIVE_TOTAL.labels("rm_validate").inc()
+                        except Exception:
+                            pass
+                        return False
+
             # Validation "prix": net >= -allow_loss_bps (par défaut 0.0)
             ok = self.revalidate_arbitrage(
                 buy_ex=buy_ex,
@@ -3085,11 +3114,12 @@ class RiskManager:
                 max_drift_bps=10.0,
                 min_required_bps=0.0,  # rebalancing => pas d'exigence de spread minimal
                 is_rebalancing=True,
-                allow_final_loss_bps=self.rebal_allow_loss_bps
+                allow_final_loss_bps=allow_loss
             )
             return bool(ok)
         except Exception:
             return False
+
 
     def set_rebalancing_callback(self, cb: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
         self._rebalancing_cb = cb
@@ -3334,6 +3364,19 @@ class RiskManager:
         if x:
             actions.append(x)
         return actions
+
+    def is_rebalancing_locked(self, pair_key: str, buy_exchange: str, sell_exchange: str) -> bool:
+        if not hasattr(self, "_reb_locks"):
+            self._reb_locks = {}
+        pk = self._norm_pair(pair_key)
+        combo_key = f"{pk}|{str(buy_exchange).upper()}->{str(sell_exchange).upper()}"
+        expiry = float(self._reb_locks.get(combo_key, 0.0) or 0.0)
+        now = time.time()
+        if expiry <= now:
+            if combo_key in self._reb_locks:
+                self._reb_locks.pop(combo_key, None)
+            return False
+        return True
 
     async def _emit_rebalancing_opportunity(self, opp: Dict[str, Any]) -> None:
         cb = self._rebalancing_cb

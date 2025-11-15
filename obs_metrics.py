@@ -395,6 +395,12 @@ FEESYNC_LAST_TS = _metric(Gauge, 'feesync_last_ts_seconds', 'Last fee sync ts (e
 FEESYNC_ERRORS = _metric(Counter, 'feesync_errors_total', 'Fee sync errors', ['exchange', 'alias'])
 REBAL_DETECTED_TOTAL = _metric(Counter, 'rebal_detected_total', 'Rebalancing detected', ['status'])
 REBAL_PLAN_QUANTUM_QUOTE = _metric(Gauge, 'rebal_plan_quantum_quote', 'Rebalancing plan quantum (quote units)', ['quote'])
+REBAL_CROSS_TOO_EXPENSIVE_TOTAL = _metric(
+    Counter,
+    'rebal_cross_too_expensive_total',
+    'Cross-CEX opportunities rejected because estimated net bps is below the allowed loss',
+    ['stage']
+)
 RM_PAUSED_COUNT = _metric(Gauge, 'rm_paused_count', 'Number of paused routes/pairs')
 LAST_BOOKS_FRESH_TS = _metric(Gauge, 'last_books_fresh_ts_seconds', 'Last books fresh ts', ['pair'])
 LAST_BALANCES_FRESH_TS = _metric(Gauge, 'last_balances_fresh_ts_seconds', 'Last balances fresh ts', ['exchange', 'alias'])

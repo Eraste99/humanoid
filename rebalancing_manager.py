@@ -502,6 +502,8 @@ class RebalancingManager:
             "CRYPTO": {},
             "OVERLAY": self.overlay_snapshot(),
         }
+        has_cash_need = False
+        has_crypto_need = False
 
         # 1) CASH par CEX/alias
         for ex, accounts in self.latest_balances.items():
@@ -516,6 +518,7 @@ class RebalancingManager:
                         needed[al] = round(target_min - have, 2)
                 if needed:
                     out["CASH"][q].setdefault(ex, {}).update(needed)
+                    has_cash_need = True
 
         # 2) petites poches CRYPTO (valorisées en USDC)
         for ex, accounts in self.latest_balances.items():
@@ -529,9 +532,14 @@ class RebalancingManager:
                     val = self._value_in_quote(ex, a, _to_f(qty), "USDC")
                     if 0 < val < self.min_crypto_value_usdc:
                         out["CRYPTO"].setdefault(ex, {}).setdefault(alias, {})[a] = round(val, 2)
+                        has_crypto_need = True
 
-        return out
+                has_overlay_need = any(abs(v) > 0.0 for v in (out["OVERLAY"] or {}).values())
 
+                if not (has_cash_need or has_crypto_need or has_overlay_need):
+                    return None
+
+                return out
     # --- 1) Intra-wallet (SPOT/FUNDING vers preferred_wallet) ---
     def _plan_intra_wallet_transfers(self) -> List[Dict[str, Any]]:
         plans: List[Dict[str, Any]] = []
@@ -801,9 +809,69 @@ class RebalancingManager:
         return {"steps": steps, "quantum_quote": q, "status": status}
 
     # -------------------------- Outils & statuts (compat) ---------------------
-    def estimate_cross_cex_net_bps(self) -> float:
-        """Compat: renvoie 0.0 (cross-CEX inactif dans cette version hints-only)."""
-        return 0.0
+    def estimate_cross_cex_net_bps(
+        self,
+        *,
+        pair_key: str,
+        from_exchange: str,
+        to_exchange: str,
+        fee_from_pct: Optional[float] = None,
+        fee_to_pct: Optional[float] = None,
+        slip_from_pct: Optional[float] = None,
+        slip_to_pct: Optional[float] = None,
+    ) -> float:
+        """
+        Estime le net (bps) d'un cross-CEX en tenant compte du spread, fees et slippage.
+
+        Retourne un float (bps). Valeur négative si l'opération est coûteuse.
+        """
+
+        pk = _norm(pair_key)
+        sell_ex = _norm(from_exchange)
+        buy_ex = _norm(to_exchange)
+        if not (pk and sell_ex and buy_ex):
+            return float("-inf")
+
+        sell_bid, _ = self._rm_top_of_book(sell_ex, pk)
+        _, buy_ask = self._rm_top_of_book(buy_ex, pk)
+        if sell_bid <= 0.0 or buy_ask <= 0.0:
+            return float("-inf")
+
+        mid = 0.5 * (sell_bid + buy_ask)
+        if mid <= 0.0:
+            return float("-inf")
+
+        spread_norm = (sell_bid - buy_ask) / mid
+        haircut = float(self.cross_cex_haircut or 1.0)
+        haircut = min(1.0, max(0.0, haircut))
+        spread_norm *= haircut if haircut > 0 else 0.0
+
+        def _fee_pct(ex: str, role: str) -> float:
+            fn = getattr(self.rm, "get_fee_pct", None) if self.rm else None
+            if callable(fn):
+                try:
+                    return max(0.0, float(fn(ex, pk, role)))
+                except Exception:
+                    return 0.0
+            return 0.0
+
+        def _slip_pct(ex: str, side: str) -> float:
+            fn = getattr(self.rm, "get_slippage", None) if self.rm else None
+            if callable(fn):
+                try:
+                    return max(0.0, float(fn(ex, pk, side)))
+                except Exception:
+                    return 0.0
+            return 0.0
+
+        cost_pct = 0.0
+        cost_pct += max(0.0, float(fee_from_pct)) if fee_from_pct is not None else _fee_pct(sell_ex, "taker")
+        cost_pct += max(0.0, float(fee_to_pct)) if fee_to_pct is not None else _fee_pct(buy_ex, "taker")
+        cost_pct += max(0.0, float(slip_from_pct)) if slip_from_pct is not None else _slip_pct(sell_ex, "sell")
+        cost_pct += max(0.0, float(slip_to_pct)) if slip_to_pct is not None else _slip_pct(buy_ex, "buy")
+
+        net_pct = spread_norm - cost_pct
+        return net_pct * 10_000.0
 
     def plan_to_operations(self, plan: Dict[str, Any]) -> List[Dict[str, Any]]:
         """

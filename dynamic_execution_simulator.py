@@ -584,8 +584,19 @@ class DynamicExecutionSimulator:
         Simulation d'une seule branche (TT ou TM).
         """
         symbol = str(opportunity.get("pair", "UNKNOWN")).replace("-", "").upper()
-        buy_ex  = str(opportunity.get("buy_exchange", "")).upper()
+        buy_ex = str(opportunity.get("buy_exchange", "")).upper()
         sell_ex = str(opportunity.get("sell_exchange", "")).upper()
+
+        meta = dict(opportunity.get("meta") or {})
+        opp_type = str(opportunity.get("type") or meta.get("type") or "").lower()
+        is_rebalancing_payload = opp_type in {"rebalancing", "rebalancing_trade"}
+        rebalancing_mode = bool(rebalancing_mode or is_rebalancing_payload)
+
+        strategy = str(
+            (strategy or opportunity.get("strategy") or meta.get("strategy") or "TT")
+        ).upper()
+        if rebalancing_mode:
+            strategy = "TM"
 
         if not self._combo_allowed(buy_ex, sell_ex):
             logger.debug(f"[Sim] Combo non autorisé: {buy_ex}->{sell_ex}")
@@ -648,7 +659,10 @@ class DynamicExecutionSimulator:
 
         # Paramètres TM
         maker_fill_ratio = float(params.get("maker_fill_ratio", getattr(self.config, "maker_fill_ratio", 0.5)))
-        maker_skew_bps   = float(params.get("maker_skew_bps",   getattr(self.config, "maker_skew_bps",   1.0)))
+        maker_skew_bps = float(params.get("maker_skew_bps", getattr(self.config, "maker_skew_bps", 1.0)))
+        if rebalancing_mode:
+            maker_fill_ratio = 1.0  # hedge intégral exigé par les trades de rebalancing
+
 
         # Fees par jambe (fallback sur fee map du simu, sinon fees_total_pct/2, sinon 0)
         fees_buy_pct = float(opportunity.get("fees_buy_pct", params.get("fees_buy_pct", None)) or 0.0)

@@ -704,13 +704,13 @@ try:
         ENGINE_RETRIES_TOTAL,
         ENGINE_SUBMIT_QUEUE_DEPTH,  # <-- gauge {exchange}
         INFLIGHT_GAUGE,  # <-- gauge {exchange}
+        REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
     )
 except Exception:
     # on garde les stubs déclarés plus haut
     # on garde les stubs déclarés plus haut
     pass
-
-    # Garantir présence des gauges, même en NO-OP (si import a échoué)
+# Garantir présence des gauges, même en NO-OP (si import a échoué)
 try:
     ENGINE_SUBMIT_QUEUE_DEPTH
 except NameError:
@@ -719,6 +719,11 @@ try:
     INFLIGHT_GAUGE
 except NameError:
     INFLIGHT_GAUGE = _NoopMetric()
+try:
+    REBAL_CROSS_TOO_EXPENSIVE_TOTAL
+except NameError:
+    REBAL_CROSS_TOO_EXPENSIVE_TOTAL = _NoopMetric()
+
 
 # --- MM metrics ---
 from modules.observability import MM_FILLS_BOTH, MM_SINGLE_FILL_HEDGED, MM_PANIC_HEDGE_TOTAL
@@ -1569,6 +1574,31 @@ class ExecutionEngine:
     def _fmt_pair(self, s: str) -> str:
         return str(s or "").replace("-", "").upper()
 
+    def _bundle_combo_signature(self, payload: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+        legs = payload.get("legs") or (payload.get("payload") or {}).get("legs", []) or []
+        if len(legs) < 2:
+            return None
+        buy_leg = next((l for l in legs if str(l.get("side", "")).upper() == "BUY"), None)
+        sell_leg = next((l for l in legs if str(l.get("side", "")).upper() == "SELL"), None)
+        if not buy_leg or not sell_leg:
+            return None
+        pair = (
+            payload.get("pair_key")
+            or payload.get("pair")
+            or buy_leg.get("symbol")
+            or sell_leg.get("symbol")
+        )
+        if not pair:
+            return None
+        return (
+            self._fmt_pair(pair),
+            self._norm_ex(buy_leg.get("exchange", "")),
+            self._norm_ex(sell_leg.get("exchange", "")),
+        )
+
+    def _fmt_pair(self, s: str) -> str:
+        return str(s or "").replace("-", "").upper()
+
     def _ob_latest(self, exchange: str, pair_key: str) -> dict:
         ex = self._ex_upper(exchange)
         pk = self._fmt_pair(pair_key)
@@ -1853,14 +1883,15 @@ class ExecutionEngine:
         self._rebalancing_cb = rebalancing_callback
 
     def start_rebalancing_loop(self) -> None:
-        if self._rebal_loop_task or not self.rebal_autopilot_enabled:
+        # Désormais, l'autopilot local est neutralisé : la détection + l'envoi
+        # sont gérés par le RiskManager afin d'appliquer caps/priorités via
+        # engine_enqueue_bundle(). On loggue simplement l'état.
+        if self._rebal_loop_task:
             return
-        interval = float(getattr(self.config, "rebal_check_interval_s", 10.0))
-        if interval <= 0:
-            logger.warning("[RebalAutopilot] disabled (interval<=0)")
-            return
-        self._rebal_loop_task = asyncio.create_task(self._rebal_loop())
-        logger.info("[RebalAutopilot] loop started (%.2fs)", interval)
+        logger.info(
+            "[RebalAutopilot] désactivé — RiskManager pilote les rebalancing bundles"
+        )
+        return
 
     def stop_rebalancing_loop(self) -> None:
         t = self._rebal_loop_task
@@ -2128,15 +2159,25 @@ class ExecutionEngine:
         high_wm = int(getattr(self.config, "engine_queue_high_wm", int(queue_max * 0.85)))
         policy = str(getattr(self.config, "engine_enqueue_overflow_policy", "defer")).lower()  # "defer"|"reject"
 
-        if self.order_queue.qsize() >= high_wm and policy == "reject":
-            raise RuntimeError("ENGINE_QUEUE_HIGH_WATERMARK")
-
         if self.order_queue.qsize() >= high_wm and policy == "defer":
             await asyncio.sleep(float(getattr(self.config, "engine_defer_sleep_ms", 8)) / 1000.0)
+
+        combo = self._bundle_combo_signature(bundle)
+        rm = getattr(self, "risk_manager", None)
+        if combo and rm and hasattr(rm, "is_rebalancing_locked"):
+            try:
+                locked = bool(rm.is_rebalancing_locked(combo[0], combo[1], combo[2]))
+            except TypeError:
+                locked = bool(rm.is_rebalancing_locked(combo[0], combo[1], combo[2]))
+            if locked:
+                combo_key = f"{combo[0]}|{combo[1]}->{combo[2]}"
+                logger.info("[ExecutionEngine] combo lock actif (%s) — bundle ignoré", combo_key)
+                return
 
         # 3) Enqueue + obs
         t0 = time.time()
         job = dict(bundle)
+
         job.setdefault("type", "bundle")
         job["cid"] = cid
         await self.order_queue.put(job)
@@ -2441,6 +2482,7 @@ class ExecutionEngine:
                     usdc_amt = max(0.0, delta * px * hedge_ratio)
                     if usdc_amt > 0:
                         _, q = SymbolUtils.split_base_quote(sym)
+                        hedge_alias = plan.get("hedge_alias")
                         hedge_order = {
                             "type": "single",
                             "exchange": hedge_ex,
@@ -2462,9 +2504,11 @@ class ExecutionEngine:
                                 "planned_usdc": usdc_amt,
                                 # hedge = taker → router TT pour l’alias
                                 "strategy": "TT",
-                                "account_alias": self.wallet_router.pick_by_quote(hedge_ex, "TT", q),
+                                "account_alias": hedge_alias
+                                or self.wallet_router.pick_by_quote(hedge_ex, "TT", q),
                             },
                         }
+
                         asyncio.create_task(self._exec_single(hedge_order))
         except Exception:
             logger.debug("[TM Hedge] erreur handle_order_update", exc_info=False)
@@ -2481,118 +2525,22 @@ class ExecutionEngine:
 
     # --------------------------- AUTOPILOT: boucle -------------------------
     async def _rebal_loop(self):
-        interval = float(getattr(self.config, "rebal_check_interval_s", 10.0))
-        persist_s = float(getattr(self.config, "rebal_persist_s", 180.0))
-        min_usdc = float(getattr(self.config, "rebal_min_usdc", 1500.0))
-        allow_loss_bps = float(getattr(self.config, "rebal_allow_loss_bps", 3.0))
-
-        while True:
+        """Boucle neutralisée: tout rebalancing est géré par le RiskManager."""
+        logger.info(
+            "[RebalAutopilot] neutralisé — utiliser RiskManager._loop_rebalancing()"
+        )
+        interval = float(getattr(self.config, "rebal_check_interval_s", 60.0))
+        while self.rebal_autopilot_enabled:
             try:
                 await asyncio.sleep(interval)
-
-                # 1) Détection
-                imb = (
-                    self.risk_manager.rebal_mgr.detect_imbalance()
-                    if hasattr(self.risk_manager, "rebal_mgr")
-                    else self.risk_manager.detect_imbalance()
-                )
-                if not imb:
-                    self._rebal_last_plan_key = None
-                    self._rebal_first_seen_ts = 0.0
-                    continue
-
-                plan_builder = (
-                    self.risk_manager.rebal_mgr
-                    if hasattr(self.risk_manager, "rebal_mgr")
-                    else self.risk_manager
-                )
-                plan = plan_builder.build_plan(imb)
-                try:
-                    plan_builder.push_history(imb, plan)
-                except Exception:
-                    logging.exception("Unhandled exception")
-
-                # 1.a) Overlay + intra-CEX : callback optionnel (non bloquant)
-                self._dispatch_side_ops(plan)
-
-                # 2) Cross-CEX ?
-                cross = plan.get("cross_cex") or None
-                if not cross:
-                    self._rebal_last_plan_key = None
-                    self._rebal_first_seen_ts = 0.0
-                    continue
-
-                # 3) Garde-fous amont
-                amount_quote = float(cross.get("amount_quote") or 0.0)
-                if amount_quote < min_usdc:
-                    continue
-
-                # 4) Persistance du même plan
-                key = self._plan_signature(cross)
-                now = time.time()
-                if key != self._rebal_last_plan_key:
-                    self._rebal_last_plan_key = key
-                    self._rebal_first_seen_ts = now
-
-                if (now - self._rebal_first_seen_ts) < persist_s:
-                    continue
-                if (now - self._rebal_last_fire_ts) < self._rebal_cooldown_s:
-                    continue
-
-                # 5) Check net bps attendu
-                fee_from = self._fee_pct(cross["from_exchange"], "maker")
-                fee_to = self._fee_pct(cross["to_exchange"], "taker")
-
-                slip_from = 0.0
-                slip_to = 0.0
-
-                estimator = getattr(self.risk_manager, "rebal_mgr", self.risk_manager)
-                est_bps = estimator.estimate_cross_cex_net_bps(
-                    pair_key=cross["pair_key"],
-                    from_exchange=cross["from_exchange"],
-                    to_exchange=cross["to_exchange"],
-                    fee_from_pct=fee_from,
-                    fee_to_pct=fee_to,
-                    slip_from_pct=slip_from,
-                    slip_to_pct=slip_to,
-                )
-
-                if est_bps < -allow_loss_bps:
-                    logger.info(
-                        "[RebalAutopilot] skip cross (est_bps=%.1f < -%.1f)",
-                        est_bps,
-                        allow_loss_bps,
-                    )
-                    continue
-
-                # 6) Conversion amount_quote -> qty base (via mid)
-                mid = self._get_mid_for_pair_xcex(
-                    cross["from_exchange"], cross["to_exchange"], cross["pair_key"]
-                )
-                if mid <= 0:
-                    logger.info("[RebalAutopilot] skip cross (mid indisponible)")
-                    continue
-
-                base_qty = round(amount_quote / mid, 6)
-                if base_qty <= 0:
-                    continue
-
-                # 7) Générer et router le bundle (via file engine)
-                payload = self._make_rebal_payload_for_engine(cross, amount_quote, est_bps)
-                await self.submit(payload)
-
-                self._rebal_last_fire_ts = now
-
-
             except asyncio.CancelledError:
-
                 break
-
             except Exception as e:
-
-                report_nonfatal("ExecutionEngine", "rebal_loop_error", e, phase="_rebal_loop")
-
-                logger.exception("[RebalAutopilot] loop error")
+                report_nonfatal(
+                    "ExecutionEngine", "rebal_loop_error", e, phase="_rebal_loop"
+                )
+                logger.exception("[RebalAutopilot] loop error (noop mode)")
+        logger.info("[RebalAutopilot] tâche stoppée (noop mode)")
 
     # -------------------- AUTOPILOT helpers --------------------
     def _dispatch_side_ops(self, plan: Dict[str, Any]) -> None:
@@ -2657,33 +2605,11 @@ class ExecutionEngine:
     def _make_rebal_payload_for_engine(
         self, cross: Dict[str, Any], amount_quote: float, est_bps: float
     ) -> Dict[str, Any]:
-        """Construit un payload rebalancing_trade consommé par le worker → pipeline TM NEUTRAL."""
-        pk = cross["pair_key"].replace("-", "").upper()
-        sell_leg = {
-            "exchange": cross["from_exchange"],
-            "symbol": pk,
-            "side": "SELL",
-            "price": 0.0,  # hydraté par _hydrate_prices_for_legs
-            "volume_usdc": amount_quote,
-            "meta": {"type": "rebalancing"},
-        }
-        buy_leg = {
-            "exchange": cross["to_exchange"],
-            "symbol": pk,
-            "side": "BUY",
-            "price": 0.0,
-            "volume_usdc": amount_quote,
-            "meta": {"type": "rebalancing"},
-        }
-        opp = {
-            "type": "rebalancing_trade",
-            "pair": pk,
-            "net_bps": float(est_bps),
-            "payload": {"legs": [sell_leg, buy_leg]},
-            "timeout_s": float(getattr(self.config, "order_timeout_s", 2.5)),
-        }
-        return opp
-
+        """Compat: les bundles rebalancing doivent provenir du RiskManager."""
+        raise RuntimeError(
+            "Rebalancing autopilot désactivé: RiskManager doit construire les bundles"
+        )
+    
     # --------------------------- PATCH: handlers utils -----------------------
     async def _handle_internal_transfer(self, job: Dict[str, Any]) -> None:
         # READINESS GUARD (utile si on veut bloquer même les side-ops tant que non prêt)
@@ -2792,6 +2718,9 @@ class ExecutionEngine:
         self._hydrate_prices_for_legs(legs)
         for l in legs:
             l.setdefault("meta", {})
+            alias = l.get("account_alias") or l.get("alias")
+            if alias and not l["meta"].get("account_alias"):
+                l["meta"]["account_alias"] = str(alias).upper()
         payload = {
             "type": "bundle",
             "legs": legs,
@@ -2805,7 +2734,15 @@ class ExecutionEngine:
                 "tm": {"mode": "NEUTRAL", "hedge_ratio": 1.0},
             },
         }
-        return payload
+        top_meta = payload["meta"]
+        buy_alias = str(opp.get("buy_alias") or (opp.get("meta") or {}).get("buy_alias") or "").upper() or None
+        sell_alias = str(opp.get("sell_alias") or (opp.get("meta") or {}).get("sell_alias") or "").upper() or None
+        if buy_alias:
+            top_meta["buy_alias"] = buy_alias
+        if sell_alias:
+            top_meta["sell_alias"] = sell_alias
+        return self._normalize_bundle_fields(payload)
+
 
     def _convert_arbitrage_to_bundle(self, opp: Dict[str, Any]) -> Dict[str, Any]:
         if str(opp.get("type")).lower() == "bundle":
@@ -2835,6 +2772,28 @@ class ExecutionEngine:
         if "tm" in payload and "tm" not in meta:
             meta["tm"] = payload.pop("tm")
         payload["meta"] = meta
+        legs = payload.get("legs") or []
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            leg_meta = leg.setdefault("meta", {}) or {}
+            alias = leg.get("account_alias") or leg.get("alias")
+            if alias and not leg_meta.get("account_alias"):
+                leg_meta["account_alias"] = str(alias).upper()
+        buy_leg = next((l for l in legs if str(l.get("side", "")).upper() == "BUY"), None)
+        sell_leg = next((l for l in legs if str(l.get("side", "")).upper() == "SELL"), None)
+        buy_alias = str(
+            payload.get("buy_alias") or meta.get("buy_alias") or ""
+        ).upper() or None
+        sell_alias = str(
+            payload.get("sell_alias") or meta.get("sell_alias") or ""
+        ).upper() or None
+        if buy_alias and buy_leg:
+            meta["buy_alias"] = buy_alias
+            buy_leg.setdefault("meta", {}).setdefault("account_alias", buy_alias)
+        if sell_alias and sell_leg:
+            meta["sell_alias"] = sell_alias
+            sell_leg.setdefault("meta", {}).setdefault("account_alias", sell_alias)
         if "pair_key" not in payload:
             pk = payload.get("pair")
             if pk:
@@ -2946,6 +2905,27 @@ class ExecutionEngine:
         # 3) Fallbacks config
         fb = (getattr(self.config, "fee_fallbacks", {}) or {}).get(ex) or {}
         return float(fb.get(role, 0.0))
+
+    def _slippage_pct(self, exchange: str, pair_key: str, side: str) -> float:
+        ex = self._norm_ex(exchange)
+        pk = self._fmt_pair(pair_key)
+        side_norm = "buy" if str(side).lower().startswith("b") else "sell"
+
+        fn = getattr(self.risk_manager, "get_slippage", None)
+        if callable(fn):
+            try:
+                return float(fn(ex, pk, side_norm))
+            except Exception:
+                pass
+
+        handler = getattr(self, "slippage_handler", None)
+        if handler and hasattr(handler, "get_slippage"):
+            try:
+                return float(handler.get_slippage(ex, pk, side_norm))
+            except Exception:
+                pass
+
+        return 0.0
 
     @staticmethod
     def _norm_ex(ex: str) -> str:
@@ -3824,16 +3804,40 @@ class ExecutionEngine:
             self._reject(pair_key, payload, "bundle sans BUY/SELL")
             return
 
+        is_rebal = (
+                payload.get("type") == "rebalancing"
+                or (payload.get("meta") or {}).get("type") == "rebalancing"
+                or any((l.get("meta") or {}).get("type") == "rebalancing" for l in legs)
+        )
+        strategy = str((payload.get("meta") or {}).get("strategy", "")).upper()
+        if is_rebal:
+            strategy = "TM"
+        if strategy not in {"TM", "TT"}:
+            strategy = "TT"
+        if not self.enable_taker_maker and strategy == "TM":
+            strategy = "TT"
+        if not self.enable_taker_taker and strategy == "TT":
+            strategy = "TM" if self.enable_taker_maker else "TT"
+
         # Alias par défaut si absents (router par quote & stratégie)
         for l in (buy_leg, sell_leg):
             m = l.setdefault("meta", {}) or {}
-            if not m.get("account_alias"):
-                is_maker = bool(m.get("maker", False))
-                strat = "TM" if is_maker else "TT"
-                _, q = SymbolUtils.split_base_quote(l["symbol"])
-                m["account_alias"] = self.wallet_router.pick_by_quote(
-                    self._norm_ex(l["exchange"]), strat, q
-                )
+            alias = m.get("account_alias") or l.get("account_alias") or l.get("alias")
+            if alias:
+                m["account_alias"] = str(alias).upper()
+                continue
+            if is_rebal:
+                self._reject(pair_key, payload, "rebalancing_alias_missing")
+                return
+            is_maker = bool(m.get("maker", False))
+            strat = "TM" if is_maker else "TT"
+            _, q = SymbolUtils.split_base_quote(l["symbol"])
+            m["account_alias"] = self.wallet_router.pick_by_quote(
+                self._norm_ex(l["exchange"]), strat, q
+            )
+
+        buy_alias = (buy_leg.get("meta") or {}).get("account_alias")
+        sell_alias = (sell_leg.get("meta") or {}).get("account_alias")
 
         # Volumes par jambe
         vol_buy = float(buy_leg.get("volume_usdc", 0.0) or 0.0)
@@ -3861,22 +3865,6 @@ class ExecutionEngine:
             self._reject(pair_key, payload, "route CEX non autorisée (tri-CEX)")
             return
 
-        # Rebal → TM forcé
-        is_rebal = (
-                payload.get("type") == "rebalancing"
-                or (payload.get("meta") or {}).get("type") == "rebalancing"
-                or any((l.get("meta") or {}).get("type") == "rebalancing" for l in legs)
-        )
-        strategy = str((payload.get("meta") or {}).get("strategy", "")).upper()
-        if is_rebal:
-            strategy = "TM"
-        if strategy not in {"TM", "TT"}:
-            strategy = "TT"
-        if not self.enable_taker_maker and strategy == "TM":
-            strategy = "TT"
-        if not self.enable_taker_taker and strategy == "TT":
-            strategy = "TM" if self.enable_taker_maker else "TT"
-
         # Inventaire bundle
         if not self.risk_manager.validate_inventory_bundle(
                 buy_ex=buy_leg["exchange"],
@@ -3884,6 +3872,8 @@ class ExecutionEngine:
                 pair_key=pair_key,
                 vol_usdc_buy=vol_buy,
                 vol_usdc_sell=vol_sell,
+                buy_alias=buy_alias,
+                sell_alias=sell_alias,
                 is_rebalancing=is_rebal,
         ):
             self._reject(pair_key, payload, "inventory_cap/skew (bundle)")
@@ -3895,6 +3885,33 @@ class ExecutionEngine:
             float((buy_leg.get("meta") or {}).get("allow_loss_bps", 0) or 0),
             float((sell_leg.get("meta") or {}).get("allow_loss_bps", 0) or 0),
         )
+
+        if is_rebal:
+            estimator = getattr(self.risk_manager, "rebal_mgr", None)
+            if estimator and hasattr(estimator, "estimate_cross_cex_net_bps"):
+                try:
+                    est_bps_bundle = float(estimator.estimate_cross_cex_net_bps(
+                        pair_key=pair_key,
+                        from_exchange=sell_leg["exchange"],
+                        to_exchange=buy_leg["exchange"],
+                    ))
+                except Exception:
+                    est_bps_bundle = None
+                else:
+                    if est_bps_bundle < -allow_loss_bps:
+                        logger.info(
+                            "[ExecutionEngine] rebal bundle %s→%s rejeté (net=%.1f bps < -%.1f)",
+                            sell_leg["exchange"],
+                            buy_leg["exchange"],
+                            est_bps_bundle,
+                            allow_loss_bps,
+                        )
+                        try:
+                            REBAL_CROSS_TOO_EXPENSIVE_TOTAL.labels("engine_bundle").inc()
+                        except Exception:
+                            pass
+                        self._reject(pair_key, payload, "rebalancing_cost")
+                        return
 
         # Revalidation arbitrage
         try:
@@ -4040,6 +4057,8 @@ class ExecutionEngine:
         total_usdc = min(float(buy_leg["volume_usdc"]), float(sell_leg["volume_usdc"]))
         if total_usdc <= 0:
             return
+        buy_alias = (buy_leg.get("meta") or {}).get("account_alias")
+        sell_alias = (sell_leg.get("meta") or {}).get("account_alias")
 
         # ===== Plan fragments (Simulation > RM > fallback front-load) =====
         slices: List[Tuple[float, str, int, float]] = []
@@ -4128,30 +4147,21 @@ class ExecutionEngine:
             ok_s = (not isinstance(res[1], Exception)) and bool(res[1])
             return ok_b, ok_s
 
-        async def _panic_hedge(ex: str, symbol: str, side: str, needed_usdc: float, *, max_loss_bps: float):
+        async def _panic_hedge(
+            ex: str,
+            symbol: str,
+            side: str,
+            needed_usdc: float,
+            *,
+            max_loss_bps: float,
+            account_alias: Optional[str] = None,
+        ):
             bid, ask = (
                 getattr(self.risk_manager, "get_top_of_book", lambda *args: (0, 0))(
                     ex, symbol.replace("-", "").upper()
                 )
             )
-            px = ask if side.upper() == "BUY" else bid
-            if px <= 0:
-                return
-            order = {
-                "type": "single",
-                "exchange": ex,
-                "symbol": symbol,
-                "side": side,
-                "price": px,
-                "volume_usdc": needed_usdc,
-                "meta": {
-                    "tif_override": "IOC",
-                    "fastpath_ok": True,
-                    "skip_inventory": True,
-                    "strategy": "TT",
-                },
-            }
-            await self._exec_single(order)
+
 
         async def _run_one_slice(
                 glabel: str, global_idx: int, usdc_amt: float, weight: float, is_last_of_all: bool
@@ -4232,7 +4242,8 @@ class ExecutionEngine:
                 "meta": {
                     **meta_common,
                     "best_price": best_buy,
-                    "account_alias": self.wallet_router.pick_by_quote(
+                    "account_alias": buy_alias
+                    or self.wallet_router.pick_by_quote(
                         self._norm_ex(buy_leg["exchange"]), "TT", q_buy
                     ),
                 },
@@ -4248,7 +4259,8 @@ class ExecutionEngine:
                 "meta": {
                     **meta_common,
                     "best_price": best_sell,
-                    "account_alias": self.wallet_router.pick_by_quote(
+                    "account_alias": sell_alias
+                    or self.wallet_router.pick_by_quote(
                         self._norm_ex(sell_leg["exchange"]), "TT", q_sell
                     ),
                 },
@@ -4278,11 +4290,21 @@ class ExecutionEngine:
             # Panic-hedge si une jambe échoue
             if (not ok_b) and ok_s:
                 await _panic_hedge(
-                    sell_leg["exchange"], sell_leg["symbol"], "BUY", usdc_amt, max_loss_bps=allow_loss_bps
+                    sell_leg["exchange"],
+                    sell_leg["symbol"],
+                    "BUY",
+                    usdc_amt,
+                    max_loss_bps=allow_loss_bps,
+                    account_alias=sell_alias,
                 )
             elif ok_b and (not ok_s):
                 await _panic_hedge(
-                    buy_leg["exchange"], buy_leg["symbol"], "SELL", usdc_amt, max_loss_bps=allow_loss_bps
+                    buy_leg["exchange"],
+                    buy_leg["symbol"],
+                    "SELL",
+                    usdc_amt,
+                    max_loss_bps=allow_loss_bps,
+                    account_alias=buy_alias,
                 )
 
             await asyncio.sleep(self._pacing_sleep_s(regime))
@@ -4381,6 +4403,8 @@ class ExecutionEngine:
         maker_leg = sell_leg if maker_leg_side == "SELL" else buy_leg
         taker_leg = buy_leg if maker_leg_side == "SELL" else sell_leg
         hedge_side = "BUY" if maker_leg_side == "SELL" else "SELL"
+        maker_alias = (maker_leg.get("meta") or {}).get("account_alias")
+        taker_alias = (taker_leg.get("meta") or {}).get("account_alias")
 
         tm_dec = (payload_meta.get("tm") or {})
         can_nn = bool(getattr(self.risk_manager, "allow_tm_non_neutral", False))
@@ -4528,7 +4552,15 @@ class ExecutionEngine:
             except Exception:
                 return 0.0
 
-        async def _panic_hedge(ex: str, symbol: str, side: str, needed_usdc: float, *, max_loss_bps: float):
+        async def _panic_hedge(
+            ex: str,
+            symbol: str,
+            side: str,
+            needed_usdc: float,
+            *,
+            max_loss_bps: float,
+            account_alias: Optional[str] = None,
+        ):
             bid, ask = (
                 getattr(self.risk_manager, "get_top_of_book", lambda *args: (0, 0))(
                     ex, symbol.replace("-", "").upper()
@@ -4549,6 +4581,7 @@ class ExecutionEngine:
                     "fastpath_ok": True,
                     "skip_inventory": True,
                     "strategy": "TT",
+                    **({"account_alias": account_alias} if account_alias else {}),
                 },
             }
             await self._exec_single(order)
@@ -4680,7 +4713,8 @@ class ExecutionEngine:
                 "slice_weight": float(w),
                 "planned_usdc": float(amt),
                 "strategy": "TM",
-                "account_alias": self.wallet_router.pick_by_quote(
+                "account_alias": maker_alias
+                or self.wallet_router.pick_by_quote(
                     self._norm_ex(maker_leg["exchange"]), "TM", q_maker
                 ),
             }
@@ -4710,6 +4744,7 @@ class ExecutionEngine:
                 "hedge_ratio": hedge_ratio,
                 "maker_exchange": maker_leg["exchange"],
                 "maker_side": maker_leg_side,
+                "hedge_alias": taker_alias,
             }
             buy_ex = taker_leg["exchange"] if maker_leg_side == "SELL" else maker_leg["exchange"]
             sell_ex = maker_leg["exchange"] if maker_leg_side == "SELL" else taker_leg["exchange"]
@@ -4805,7 +4840,12 @@ class ExecutionEngine:
 
             side_now = ("BUY" if hedge_side.upper() == "BUY" else "SELL")
             await _panic_hedge(
-                taker_leg["exchange"], taker_leg["symbol"], side_now, needed_usdc, max_loss_bps=allow_loss_bps
+                taker_leg["exchange"],
+                taker_leg["symbol"],
+                side_now,
+                needed_usdc,
+                max_loss_bps=allow_loss_bps,
+                account_alias=taker_alias,
             )
 
         # Lancer watchdog & TTL

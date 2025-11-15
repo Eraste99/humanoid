@@ -961,28 +961,55 @@ class MultiBalanceFetcher:
         except Exception:
             pass
 
-    def as_rm_snapshot(self, *_, **__) -> Dict[str, Any]:
+    def as_rm_snapshot(self, *, mode: str = "real", cached_only: bool = False) -> Dict[str, Any]:
+        """Retourne un snapshot prêt pour le RiskManager.
+
+        Le paramètre ``mode`` est aligné sur ``get_balances_snapshot`` et permet
+        enfin de distinguer les vues ``real``/``virtual``/``merged``. Le
+        ``cached_only`` ne déclenche aucune I/O supplémentaire : si aucune donnée
+        n’est disponible on renvoie simplement les métadonnées (âges infinis).
+        """
+
+        view = (mode or "real").lower()
+        if view not in ("real", "virtual", "merged"):
+            view = "real"
+
+        balances = self.get_balances_snapshot(view)
         now = time.time()
-        out: Dict[str, Any] = {}
-        meta_age, meta_vip, meta_fee = {}, {}, {}
+        meta_age: Dict[str, float] = {}
+        meta_vip: Dict[str, Any] = {}
+        meta_fee: Dict[str, Dict[str, Any]] = {}
+
+        # Copie des balances (pour éviter toute mutation externe)
+        out: Dict[str, Any] = {ex: {al: dict(ccy_map or {}) for al, ccy_map in (per or {}).items()}
+                               for ex, per in (balances or {}).items()}
 
         for (ex, al), rec in list(self._snap.items()):
-            balances = dict((rec.get("balances") or {}))
-            out.setdefault(ex, {})[al] = balances
-
             ts = float(rec.get("ts", 0.0))
             age = max(0.0, now - ts) if ts > 0.0 else float("inf")
             meta_age[f"{ex}.{al}"] = age
 
             vip = rec.get("vip") or {}
-            if vip: meta_vip[f"{ex}.{al}"] = vip
+            if vip:
+                meta_vip[f"{ex}.{al}"] = vip
 
             ft = rec.get("fee_tokens") or {}
             for tkn, info in ft.items():
                 meta_fee.setdefault(tkn, {})
                 meta_fee[tkn][f"{ex}.{al}"] = info
 
-        out["meta"] = {"age_s": meta_age, "vip": meta_vip, "fee_tokens": meta_fee}
+            # Si la vue choisie n'a pas encore de snapshot pour ce couple,
+            # expose quand même les balances réelles connues pour garder la
+            # rétro-compatibilité (utile en mode cached_only).
+            out.setdefault(ex, {}).setdefault(al, dict(rec.get("balances") or {}))
+
+        out["meta"] = {
+            "age_s": meta_age,
+            "vip": meta_vip,
+            "fee_tokens": meta_fee,
+            "view": view,
+            "cached_only": bool(cached_only),
+        }
         return out
 
     # =========================== Public helpers ===============================
