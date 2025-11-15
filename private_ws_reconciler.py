@@ -45,7 +45,10 @@ try:
         RECONCILE_RESYNC_LATENCY_MS,
         COLD_RESYNC_TOTAL,
         COLD_RESYNC_RUN_MS,  # histogram{exchange,alias,scope}
+        WS_RECO_MISS_PER_MINUTE,
+        WS_RECO_MISS_BURST_TOTAL,
     )
+
 
 
 except Exception:  # pragma: no cover
@@ -59,37 +62,10 @@ except Exception:  # pragma: no cover
     RECONCILE_RESYNC_TOTAL = _NoopMetric()
     RECONCILE_RESYNC_FAILED_TOTAL = _NoopMetric()
     RECONCILE_RESYNC_LATENCY_MS = _NoopMetric()
-    COLD_RESYNC_TOTAL=_NoopMetric()
-    COLD_RESYNC_RUN_MS=_NoopMetric()
-# === Imports métriques (fallback robuste) =====================================
-try:
-    from modules.obs_metrics import Counter, Gauge, Histogram
-except Exception:
-    try:
-        from prometheus_client import Counter, Gauge, Histogram  # fallback direct
-    except Exception:
-        class _NoopMetric:
-            def labels(self, *_, **__): return self
-            def inc(self, *_, **__):  return None
-            def observe(self, *_, **__): return None
-            def set(self, *_, **__):  return None
-        Counter = Gauge = Histogram = _NoopMetric  # no-op si Prometheus absent
-
-# === Metrics Alerting (Reconciler) ============================================
-try:
-    WS_RECO_MISS_PER_MINUTE = Gauge(
-        "ws_reco_miss_per_minute",
-        "Miss détectés par minute (fenêtre glissante ~60s)",
-        ["exchange", "alias"],
-    )
-    WS_RECO_MISS_BURST_TOTAL = Counter(
-        "ws_reco_miss_burst_total",
-        "Bursts de miss > seuil par minute",
-        ["exchange", "alias"],
-    )
-except Exception:
-    pass
-
+    COLD_RESYNC_TOTAL = _NoopMetric()
+    COLD_RESYNC_RUN_MS = _NoopMetric()
+    WS_RECO_MISS_PER_MINUTE = _NoopMetric()
+    WS_RECO_MISS_BURST_TOTAL = _NoopMetric()
 
 # --- LRUSet pour idempotence bornée -----------------------------------------
 class _LRUSet:

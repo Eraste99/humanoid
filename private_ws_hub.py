@@ -84,14 +84,21 @@ try:
         PWS_EVENTS_TOTAL,
         PWS_BACKOFF_SECONDS,
         PWS_HEARTBEAT_GAP_SECONDS,
+        PWS_HEARTBEAT_GAP_BREACH_TOTAL,
         PWS_DROPPED_TOTAL,
         PWS_ACK_LATENCY_MS,
         PWS_FILL_LATENCY_MS,
+        PWS_QUEUE_FILL_RATIO,
+        PWS_QUEUE_SATURATION_TOTAL,
+        PWS_QUEUE_DEPTH,
+        PWS_QUEUE_CAP,
+        PWS_ALERT_TOTAL,
         # AJOUTER dans la liste existante :
         WS_FAILOVER_TOTAL, PWS_POOL_SIZE,
 
     )
 except Exception:  # pragma: no cover
+
     class _NoopMetric:
         def labels(self, *_, **__): return self
         def inc(self, *_, **__): pass
@@ -104,66 +111,15 @@ except Exception:  # pragma: no cover
     PWS_EVENTS_TOTAL = _NoopMetric()
     PWS_BACKOFF_SECONDS = _NoopMetric()
     PWS_HEARTBEAT_GAP_SECONDS = _NoopMetric()
+    PWS_HEARTBEAT_GAP_BREACH_TOTAL = _NoopMetric()
     PWS_DROPPED_TOTAL = _NoopMetric()
     PWS_ACK_LATENCY_MS = _NoopMetric()
     PWS_FILL_LATENCY_MS = _NoopMetric()
-
-# === Imports métriques (fallback robuste) =====================================
-try:
-    from modules.obs_metrics import Counter, Gauge, Histogram
-except Exception:
-    try:
-        from prometheus_client import Counter, Gauge, Histogram  # fallback direct
-    except Exception:
-        class _NoopMetric:
-            def labels(self, *_, **__): return self
-            def inc(self, *_, **__):  return None
-            def observe(self, *_, **__): return None
-            def set(self, *_, **__):  return None
-        Counter = Gauge = Histogram = _NoopMetric  # no-op si Prometheus absent
-
-# --- Import direct des métriques centrales (compat si absentes) ---------------
-try:
-    from modules.obs_metrics import PWS_QUEUE_DEPTH, PWS_QUEUE_CAP, PWS_DEDUP_HITS_TOTAL
-except Exception:
-    # Compat: si obs_metrics indisponible ou métriques non exportées
-    try:
-        PWS_QUEUE_DEPTH = Gauge("pws_queue_depth", "PrivateWS submit queue depth", ["exchange","alias","kind"])
-        PWS_QUEUE_CAP   = Gauge("pws_queue_cap",   "PrivateWS submit queue capacity", ["exchange","alias","kind"])
-    except Exception:
-        class _NoopMetric:
-            def labels(self, *_, **__): return self
-            def set(self, *_, **__):    return None
-        PWS_QUEUE_DEPTH = _NoopMetric()
-        PWS_QUEUE_CAP   = _NoopMetric()
-    # PWS_DEDUP_HITS_TOTAL est déjà initialisé plus haut à _NoopMetric(), il sera utilisé si import KO.
-
-
-# === Metrics Alerting (Hub) ===================================================
-try:
-    PWS_QUEUE_FILL_RATIO = Gauge(
-        "pws_queue_fill_ratio",
-        "Ratio de remplissage des files privées (0..1)",
-        ["exchange", "alias", "kind"],
-    )
-    PWS_QUEUE_SATURATION_TOTAL = Counter(
-        "pws_queue_saturation_total",
-        "Saturation détectée sur une file privée (>= seuil)",
-        ["exchange", "alias", "kind"],
-    )
-    PWS_HEARTBEAT_GAP_BREACH_TOTAL = Counter(
-        "pws_heartbeat_gap_breach_total",
-        "Nombre de fois où le gap heartbeat hub a dépassé le seuil",
-        ["exchange", "alias"],
-    )
-    PWS_ALERT_TOTAL = Counter(
-        "pws_alert_total",
-        "Alertes émises par le PrivateWSHub",
-        ["severity", "reason", "exchange", "alias", "kind"],
-    )
-except Exception:
-    # no-op si déjà enregistrées
-    pass
+    PWS_QUEUE_FILL_RATIO = _NoopMetric()
+    PWS_QUEUE_SATURATION_TOTAL = _NoopMetric()
+    PWS_QUEUE_DEPTH = _NoopMetric()
+    PWS_QUEUE_CAP = _NoopMetric()
+    PWS_ALERT_TOTAL = _NoopMetric()
 
 log = logging.getLogger("PrivateWSHub")
 log.setLevel(logging.INFO)

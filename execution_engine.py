@@ -2609,7 +2609,7 @@ class ExecutionEngine:
         raise RuntimeError(
             "Rebalancing autopilot désactivé: RiskManager doit construire les bundles"
         )
-    
+
     # --------------------------- PATCH: handlers utils -----------------------
     async def _handle_internal_transfer(self, job: Dict[str, Any]) -> None:
         # READINESS GUARD (utile si on veut bloquer même les side-ops tant que non prêt)

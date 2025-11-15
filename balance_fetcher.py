@@ -54,8 +54,15 @@ if not logging.getLogger().handlers:
 # ===== Metrics (fallback no-op si absents) ==================================
 try:
     from modules.obs_metrics import (
-        BF_API_LATENCY_MS, BF_API_ERRORS_TOTAL, BF_CACHE_AGE_SECONDS, BF_LAST_SUCCESS_TS,
+        BF_API_LATENCY_MS,
+        BF_API_ERRORS_TOTAL,
+        BF_CACHE_AGE_SECONDS,
+        BF_LAST_SUCCESS_TS,
         FEE_TOKEN_BALANCE,
+        BF_HTTP_LATENCY_SECONDS,
+        BF_HTTP_ERRORS_TOTAL,
+        BF_FEE_TOKEN_LEVEL,
+        BF_FEE_TOKEN_LOW_TOTAL,
     )
 except Exception:  # pragma: no cover
     class _NoopMetric:
@@ -63,56 +70,10 @@ except Exception:  # pragma: no cover
         def inc(self, *_, **__): pass
         def observe(self, *_, **__): pass
         def set(self, *_, **__): pass
+
     BF_API_LATENCY_MS = BF_API_ERRORS_TOTAL = BF_CACHE_AGE_SECONDS = BF_LAST_SUCCESS_TS = FEE_TOKEN_BALANCE = _NoopMetric()
+    BF_HTTP_LATENCY_SECONDS = BF_HTTP_ERRORS_TOTAL = BF_FEE_TOKEN_LEVEL = BF_FEE_TOKEN_LOW_TOTAL = _NoopMetric()
 
-# === Imports métriques (fallback robuste) =====================================
-try:
-    from modules.obs_metrics import Counter, Gauge, Histogram
-except Exception:
-    try:
-        from prometheus_client import Counter, Gauge, Histogram  # fallback direct
-    except Exception:
-        class _NoopMetric:
-            def labels(self, *_, **__): return self
-            def inc(self, *_, **__):  return None
-            def observe(self, *_, **__): return None
-            def set(self, *_, **__):  return None
-        Counter = Gauge = Histogram = _NoopMetric  # no-op si Prometheus absent
-
-
-# === Metrics Alerting (BalanceFetcher) =======================================
-try:
-    BF_FEE_TOKEN_LEVEL = Gauge(
-        "bf_fee_token_level",
-        "Niveau courant d'un token de frais par (exchange, alias)",
-        ["exchange", "alias", "token"],
-    )
-    BF_FEE_TOKEN_LOW_TOTAL = Counter(
-        "bf_fee_token_low_total",
-        "Compteur d'alertes de niveau bas sur token de frais",
-        ["exchange", "alias", "token"],
-    )
-except Exception:
-    pass
-
-
-# Petits compteurs maison (prometheus_client si dispo, sinon no-op)
-try:
-    from prometheus_client import Histogram, Counter, Gauge  # type: ignore
-    BF_LAT = Histogram("bf_http_latency_seconds", "HTTP latency", ["ex", "alias", "endpoint"])
-    BF_ERR = Counter("bf_http_errors_total", "HTTP errors", ["ex", "alias", "endpoint"])
-    BF_LAST_OK = Gauge("bf_last_success_ts", "Last successful poll ts", ["ex", "alias"])
-except Exception:  # pragma: no cover
-    class _Null:
-        def labels(self, *_, **__): return self
-        def time(self):
-            class _Ctx:
-                def __enter__(self): return None
-                def __exit__(self, *_): return False
-            return _Ctx()
-        def inc(self, *_a, **_k): pass
-        def set(self, *_a, **_k): pass
-    BF_LAT = BF_ERR = BF_LAST_OK = _Null()
 try:
     from modules.observability_pacer import PACER
 except Exception:
@@ -542,7 +503,7 @@ class MultiBalanceFetcher:
                             )
                         return js
 
-                with BF_LAT.labels(ex_label, al_label, endpoint).time():
+                with BF_HTTP_LATENCY_SECONDS.labels(ex_label, al_label, endpoint).time():
                     js = await _do()
 
                 try:
@@ -557,15 +518,14 @@ class MultiBalanceFetcher:
                 if key:
                     self.latency_ms[key] = int((time.time() - t0_wall) * 1000)
                     try:
-                        BF_LAST_OK.labels(ex_label, al_label).set(time.time())
                         BF_LAST_SUCCESS_TS.labels(ex_label, al_label).set(time.time())
                     except Exception:
                         pass
-                return js
+                    return js
 
             except Exception as e:
                 try:
-                    BF_ERR.labels(ex_label, al_label, endpoint).inc()
+                    BF_HTTP_ERRORS_TOTAL.labels(ex_label, al_label, endpoint).inc()
                     BF_API_ERRORS_TOTAL.labels(ex_label, al_label, endpoint, "other").inc()
                 except Exception:
                     pass

@@ -28,32 +28,32 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
-# -----------------------------------------------------------------------------
-# Prometheus (no-op fallback)
-# -----------------------------------------------------------------------------
-try:  # pragma: no cover
-    from prometheus_client import Counter
-    _METRIC_CONVERT = Counter(
-        "contracts_helpers_calls_total",
-        "Number of contract conversion helpers calls",
-        ["func"],
+# -----------------------------------------------------------------------------␊
+# Prometheus (centralisé via modules.obs_metrics)
+# -----------------------------------------------------------------------------␊
+try:  # pragma: no cover␊
+    from modules.obs_metrics import (
+        CONTRACTS_HELPERS_CALLS_TOTAL,
+        CONTRACTS_VALIDATION_ERRORS_TOTAL,
     )
-    _METRIC_ERRORS = Counter(
-        "contracts_validation_errors_total",
-        "Number of contract validation errors",
-        ["model"],
-    )
-    def _inc(counter, *labels):
-        counter.labels(*labels).inc()
 except Exception:  # pragma: no cover
     class _Noop:
         def labels(self, *_, **__):
             return self
+
         def inc(self, *_, **__):
             return None
-    _METRIC_CONVERT = _Noop()
-    _METRIC_ERRORS = _Noop()
-    def _inc(*_a, **_k):  # noqa: D401
+
+    CONTRACTS_HELPERS_CALLS_TOTAL = _Noop()
+    CONTRACTS_VALIDATION_ERRORS_TOTAL = _Noop()
+
+_METRIC_CONVERT = CONTRACTS_HELPERS_CALLS_TOTAL
+_METRIC_ERRORS = CONTRACTS_VALIDATION_ERRORS_TOTAL
+
+def _inc(counter, *labels):
+    try:
+        counter.labels(*labels).inc()
+    except Exception:
         return None
 
 # -----------------------------------------------------------------------------

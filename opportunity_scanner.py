@@ -54,11 +54,8 @@ import asyncio, random, time
 import uuid
 import logging
 from decimal import Decimal, InvalidOperation, getcontext
-from prometheus_client import Histogram
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.errors import DataStaleError
-
-SCANNER_EVAL_MS = Histogram("scanner_evaluate_ms", "Time to evaluate an opportunity", ["pair","route"])
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Set
 getcontext().prec = 28
 
@@ -88,6 +85,7 @@ try:
     # registres communs
     from modules.obs_metrics import (
         SCANNER_DECISION_MS,   # histogramme global (pair, route)
+        SCANNER_EVAL_MS,
         inc_blocked,           # opportunities_blocked_total{module,reason,pair}
         mark_scanner_to_rm,    # (si wrapper plus bas présent)
     )
@@ -95,10 +93,10 @@ except Exception:  # no-op fallbacks en cas d'import partiel
     class _N:
         def labels(self, *a, **k): return self
         def observe(self, *_a, **_k): pass
+    SCANNER_EVAL_MS = _N()
     def inc_blocked(*_a, **_k): pass
     def mark_scanner_to_rm(*_a, **_k): pass
     SCANNER_DECISION_MS = _N()
-
 
 # Helpers observability existants (si présents)
 try:
@@ -115,10 +113,12 @@ except Exception:
 try:
     # registres communs (si dispo dans ton projet)
     from modules.obs_metrics import (
-        SCANNER_DECISION_MS,          # histogramme (optionnel)
-        SC_BANNED,                    # gauge/counter
-        SC_PROMOTED_PRIMARY,          # gauge/counter
-        SC_ROTATION_PRIMARY_SIZE,     # gauge
+        SCANNER_DECISION_MS,  # histogramme (optionnel)
+        SCANNER_EVAL_MS,
+        SC_BANNED,  # gauge/counter
+        SC_PROMOTED_PRIMARY,  # gauge/counter
+        SC_ROTATION_PRIMARY_SIZE,  # gauge
+
         SC_ROTATION_AUDITION_SIZE,    # gauge
         SC_STRATEGY_SCORE,            # gauge
         SC_ELIGIBLE,                  # gauge
@@ -131,7 +131,11 @@ except Exception:
         def observe(self, *a, **k): pass
         def inc(self, *a, **k): pass
         def set(self, *a, **k): pass
+
+
     SCANNER_DECISION_MS = _MetricNoOp()
+    SCANNER_EVAL_MS = _MetricNoOp()
+
     SC_BANNED = _MetricNoOp()
     SC_PROMOTED_PRIMARY = _MetricNoOp()
     SC_ROTATION_PRIMARY_SIZE = _MetricNoOp()
