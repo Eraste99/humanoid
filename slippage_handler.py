@@ -698,8 +698,11 @@ class SlippageHandler:
         Met à jour: self._slip_bps[(ex,pair,side)], self._slip_ts[(ex,pair)]
         """
         try:
-            ex = (msg.get("exchange") or "").upper()
-            pair = (msg.get("pair_key") or "").replace("-", "").upper()
+            ex = self._norm_ex(msg.get("exchange"))
+            pair = self._norm_pair(msg.get("pair_key") or msg.get("symbol") or "")
+            if not ex or not pair:
+                return
+
             ob = (msg.get("orderbook") or {})
             bids = ob.get("bids") or []
             asks = ob.get("asks") or []
@@ -708,18 +711,49 @@ class SlippageHandler:
             top_bid_vol = float(msg.get("top_bid_vol") or 0.0)
             top_ask_vol = float(msg.get("top_ask_vol") or 0.0)
 
-            # Estimation conservative de slip bps côté taker
-            # (tu peux garder ta formule actuelle; ci-dessous: proxy simple)
-            def _bps(px_move_frac: float) -> float:
-                return max(0.0, px_move_frac) * 1e4
+            slip_buy_bps: Optional[float] = None
+            slip_sell_bps: Optional[float] = None
+            slip_metric = msg.get("slip_metric_bps")
+            if isinstance(slip_metric, dict):
+                if slip_metric.get("buy") is not None:
+                    slip_buy_bps = max(0.0, float(slip_metric.get("buy")))
+                if slip_metric.get("sell") is not None:
+                    slip_sell_bps = max(0.0, float(slip_metric.get("sell")))
+            elif isinstance(slip_metric, (int, float)):
+                val = max(0.0, float(slip_metric))
+                slip_buy_bps = slip_sell_bps = val
 
-            slip_buy_bps = _bps((best_ask - best_bid) / max(best_bid, 1e-12))  # acheter -> traverse ask
-            slip_sell_bps = slip_buy_bps  # symétrie simple; remplace par ton calcul si dispo
+            if slip_buy_bps is None or slip_sell_bps is None:
+                self.ingest_snapshot(
+                    exchange=ex,
+                    symbol=pair,
+                    orderbook=ob,
+                    bid_volume=top_bid_vol,
+                    ask_volume=top_ask_vol,
+                )
+                snap = (self.slippage_data.get(ex, {}) or {}).get(pair, {})
+                if slip_buy_bps is None and snap.get("buy") is not None:
+                    slip_buy_bps = max(0.0, float(snap.get("buy"))) * 1e4
+                if slip_sell_bps is None and snap.get("sell") is not None:
+                    slip_sell_bps = max(0.0, float(snap.get("sell"))) * 1e4
+
+            if (slip_buy_bps is None or slip_sell_bps is None) and best_bid > 0 and best_ask > best_bid:
+                approx = (best_ask - best_bid) / max(best_bid, 1e-12) * 1e4
+                if slip_buy_bps is None:
+                    slip_buy_bps = approx
+                if slip_sell_bps is None:
+                    slip_sell_bps = approx
+
+            if slip_buy_bps is None and slip_sell_bps is None:
+                logger.debug("[Slip] missing data for %s/%s", ex, pair)
+                return
 
             self._slip_bps = getattr(self, "_slip_bps", {})
             self._slip_ts = getattr(self, "_slip_ts", {})
-            self._slip_bps[(ex, pair, "buy")] = slip_buy_bps
-            self._slip_bps[(ex, pair, "sell")] = slip_sell_bps
+            if slip_buy_bps is not None:
+                self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
+            if slip_sell_bps is not None:
+                self._slip_bps[(ex, pair, "sell")] = float(slip_sell_bps)
             self._slip_ts[(ex, pair)] = time.time()
 
         except Exception:
@@ -739,12 +773,16 @@ class SlippageHandler:
         tsd = getattr(self, "_slip_ts", {})
 
         now = time.time()
-        ttl = 3.0
-        try:
-            if hasattr(self, "bot_cfg"):
-                ttl = float(getattr(self.bot_cfg, "slip", getattr(self.bot_cfg, "cfg", None)).ttl_s if hasattr(self.bot_cfg, "slip") else self.bot_cfg.slip.ttl_s)
-        except Exception:
-            pass
+        if ttl_s is not None:
+            ttl = float(ttl_s)
+        else:
+            ttl = float(getattr(self, "_ttl_s", 3.0))
+            cfg_slip = getattr(getattr(self, "bot_cfg", None), "slip", None)
+            if cfg_slip is not None and hasattr(cfg_slip, "ttl_s"):
+                try:
+                    ttl = float(getattr(cfg_slip, "ttl_s"))
+                except Exception:
+                    ttl = float(getattr(self, "_ttl_s", 3.0))
 
         if side is None:
             vals = []

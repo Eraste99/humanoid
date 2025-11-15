@@ -878,9 +878,17 @@ class MarketDataRouter:
             # 3) Push vers Scanner (optionnel)
             if self.push_to_scanner and hasattr(self.scanner, "update_orderbook"):
                 for ev in latest_by_ex.values():
-                    res = self.scanner.update_orderbook(ev)
-                    if asyncio.iscoroutine(res):
-                        await res
+                    try:
+                        res = self.scanner.update_orderbook(ev)
+                        if asyncio.iscoroutine(res):
+                            await res
+                    except Exception:
+                        logger.exception("[Router] scanner.update_orderbook failed", extra={"pair": pair_key})
+                        try:
+                            ROUTER_DROPPED_TOTAL.labels(queue="scanner", reason="exception").inc()
+                        except Exception:
+                            pass
+
 
             # 4) reset fenêtre
             self._coalesce_buckets[pair_key] = {

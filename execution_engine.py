@@ -1673,35 +1673,6 @@ class ExecutionEngine:
 
     # execution_engine.py — class ExecutionEngine
 
-    async def _drain_submit_queue(self):
-        """
-        Drain de la file:
-          - route + place chaque bundle
-          - mesure enqueue→submit
-          - micro-respiration configurable
-        """
-        import asyncio, time
-        q = getattr(self, "_q", None)
-        if q is None:
-            return
-        defer_ms = float(getattr(self.config, "engine_worker_idle_sleep_ms", 2.0))
-        while True:
-            item = await q.get()
-            if item is None:
-                q.task_done()
-                break
-            cid = item.get("cid")
-            b = item.get("bundle", {})
-            ts_en = float(item.get("ts", time.time()))
-            try:
-                if hasattr(self, "obs_hist"):
-                    self.obs_hist("engine_enqueue_to_submit_ms", (time.time() - ts_en) * 1000.0)
-                await self._route_and_place(b, cid)
-            except Exception as e:
-                if getattr(self, "log", None): self.log.exception("worker route_and_place failed", exc_info=e)
-            finally:
-                q.task_done()
-            await asyncio.sleep(defer_ms / 1000.0)
 
     # execution_engine.py — class ExecutionEngine
 
@@ -2140,40 +2111,57 @@ class ExecutionEngine:
             if drop_makers or kind in ("MAKER", "MAKER_TM", "MAKER_MM"):
                 raise RuntimeError("ENGINE_NOT_READY")
 
-        # 1) Idempotence
-        if not hasattr(self, "_seen_cids"):
-            self._seen_cids = set()
-        import hashlib, json, time, asyncio
-        h = hashlib.sha256()
-        h.update(json.dumps(bundle, sort_keys=True, default=str).encode("utf-8"))
-        cid = h.hexdigest()[:16]
-        if cid in self._seen_cids:
-            return
+            # 1) Idempotence
+            if not hasattr(self, "_seen_cids"):
+                self._seen_cids = {}
+            import hashlib, json, time, asyncio
+            h = hashlib.sha256()
+            h.update(json.dumps(bundle, sort_keys=True, default=str).encode("utf-8"))
+            cid = h.hexdigest()[:16]
+            now = time.time()
+            self._prune_seen_cids(now)
+            if cid in self._seen_cids:
+                return
 
         # 2) Queue & watermarks
-        if not hasattr(self, "_q"):
-            maxsize = int(getattr(self.config, "engine_queue_max", 2048))
-            import asyncio as _asyncio
-            self._q = _asyncio.Queue(maxsize=max(64, maxsize))
-
-        high_wm = int(getattr(self.config, "engine_queue_high_wm", int(self._q.maxsize * 0.85)))
+        queue_max = getattr(self.order_queue, "maxsize", 0) or int(getattr(self.config, "engine_queue_max", 2048))
+        high_wm = int(getattr(self.config, "engine_queue_high_wm", int(queue_max * 0.85)))
         policy = str(getattr(self.config, "engine_enqueue_overflow_policy", "defer")).lower()  # "defer"|"reject"
 
-        if self._q.qsize() >= high_wm and policy == "reject":
+        if self.order_queue.qsize() >= high_wm and policy == "reject":
             raise RuntimeError("ENGINE_QUEUE_HIGH_WATERMARK")
 
-        if self._q.qsize() >= high_wm and policy == "defer":
+        if self.order_queue.qsize() >= high_wm and policy == "defer":
             await asyncio.sleep(float(getattr(self.config, "engine_defer_sleep_ms", 8)) / 1000.0)
 
         # 3) Enqueue + obs
         t0 = time.time()
-        await self._q.put({"cid": cid, "bundle": bundle, "ts": t0})
-        self._seen_cids.add(cid)
+        job = dict(bundle)
+        job.setdefault("type", "bundle")
+        job["cid"] = cid
+        await self.order_queue.put(job)
+        self._seen_cids[cid] = now
         try:
             if hasattr(self, "obs_hist"):
                 self.obs_hist("engine_enqueue_ms", (time.time() - t0) * 1000.0)
         except Exception:
             pass
+        try:
+            if hasattr(self, "_update_submit_queue_gauge"):
+                self._update_submit_queue_gauge()
+        except Exception:
+            pass
+        self.stats.queue_length = self.order_queue.qsize()
+
+    def _prune_seen_cids(self, now: Optional[float] = None) -> None:
+        if not hasattr(self, "_seen_cids"):
+            self._seen_cids = {}
+            return
+        ttl = float(getattr(self.config, "engine_submit_dedupe_ttl_s", 300.0))
+        now = now or time.time()
+        stale = [cid for cid, ts in list(self._seen_cids.items()) if now - float(ts or 0.0) >= ttl]
+        for cid in stale:
+            self._seen_cids.pop(cid, None)
         try:
             if hasattr(self, "_update_submit_queue_gauge"):
                 self._update_submit_queue_gauge()

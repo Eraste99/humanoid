@@ -692,6 +692,23 @@ class SlippageAndFeesCollector:
             return mk, tk
         return snap.effective_for("maker", pair), snap.effective_for("taker", pair)
 
+    def export_effective_fee_map(self) -> Dict[str, Dict[str, float]]:
+        """Retourne une carte {EX:{maker: frac, taker: frac}} conservatrice (min alias)."""
+        out: Dict[str, Dict[str, float]] = {}
+        for ex, aliases in self._snapshots.items():
+            maker_vals: List[float] = []
+            taker_vals: List[float] = []
+            for snap in aliases.values():
+                if not snap:
+                    continue
+                maker_vals.append(float(snap.maker_effective or snap.maker_base))
+                taker_vals.append(float(snap.taker_effective or snap.taker_base))
+            if maker_vals or taker_vals:
+                out[_norm_ex(ex)] = {
+                    "maker": min(maker_vals) if maker_vals else 0.0,
+                    "taker": min(taker_vals) if taker_vals else 0.0,
+                }
+        return out
     # ---------------------------- Coût total ----------------------------------
 
     def leg_fee_pct(self, ex: str, alias: str, *, pair: Optional[str], role: str) -> float:

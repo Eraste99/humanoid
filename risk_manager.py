@@ -27,6 +27,7 @@ RiskManager — OFFICIEL (V2.1) — Fusion ciblée (part 1/2)
 
 import asyncio, time, inspect
 import time, uuid, random
+import threading
 from typing import Dict, Any, List, Optional
 from modules.obs_metrics import inc_blocked
 import logging
@@ -577,10 +578,16 @@ class RiskManager:
         # ==== [ADD INSIDE __init__ RIGHT AFTER "MM toggles & budgets" BLOCK] =========
         # Kill switch global + budgets (en mémoire, resetés par ton scheduler quotidien)
 
-
         self.global_kill_switch = bool(getattr(self.cfg, "global_kill_switch", False))
-        self.daily_strategy_budget_quote = _cfg_dict(self.bot_cfg, "daily_strategy_budget_quote", {})
+        self.daily_strategy_budget_quote = {
+            str(k).upper(): float(v)
+            for k, v in (_cfg_dict(self.bot_cfg, "daily_strategy_budget_quote", {}) or {}).items()
+        }
         self._spent_today_quote = {"TT": 0.0, "TM": 0.0, "MM": 0.0}
+        for strat in self.daily_strategy_budget_quote.keys():
+            self._spent_today_quote.setdefault(strat, 0.0)
+        self._budget_reset_ts = time.time()
+        self._budget_reset_interval_s = float(getattr(self.cfg, "daily_budget_reset_interval_s", 86400.0))
 
         # Optionnel: fichier JSONL de décision (audit)
 
@@ -728,6 +735,7 @@ class RiskManager:
                 ("BYBIT", "COINBASE"), ("COINBASE", "BYBIT"),
             }
         ))
+        self._sync_simulator_allowed_routes()
         # 1) s'assurer qu'on a un rebal_mgr dispo
         _mk_rebal_mgr_if_missing(self)
 
@@ -742,6 +750,9 @@ class RiskManager:
         self._tasks: List[asyncio.Task] = []
         self.last_update = time.time()
         self._last_books: Dict[str, Dict[str, dict]] = {}
+        self._orderbooks: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._last_sim_fee_sync = 0.0
+
         self._paused: Dict[str, bool] = {}
         self._loop_health: Dict[str, Dict[str, float]] = {
             name: {"last_success": 0.0, "consecutive_errors": 0}
@@ -1127,21 +1138,21 @@ class RiskManager:
 
         # Priorité: hedges non bloqués
         if kind in ("HEDGE", "TAKER") or branch == "TT":
-            return self._enqueue_non_blocking(engine, bundle)
+            return self._dispatch_bundle(bundle)
 
         # Cancels: laissent passer
         if kind == "CANCEL":
-            return self._enqueue_non_blocking(engine, bundle)
+            return self._dispatch_bundle(bundle)
 
         # Makers: appliquer SOFT CAP
         if not (ex and alias):
-            return self._enqueue_non_blocking(engine, bundle)  # fail-open
+            return self._dispatch_bundle(bundle)  # fail-open
 
         sc_key = (ex, alias, branch)
         gate = self._get_sc_bucket(sc_key)
         if gate.try_acquire():
             self._obs_sc_counter("sc_soft_acquired_total", ex, alias, branch)
-            return self._enqueue_non_blocking(engine, bundle)
+            return self._dispatch_bundle(bundle)
 
         # Quota SC atteint → lisser
         self._obs_sc_counter("sc_soft_delayed_total", ex, alias, branch)
@@ -1188,56 +1199,32 @@ class RiskManager:
         return "UNKNOWN"
 
 
-    def _enqueue_non_blocking(self, engine, bundle):
-        submit_coro = getattr(engine, "submit", None)
-        if callable(submit_coro):
-            try:
-                import asyncio, threading
-                try:
-                    asyncio.get_running_loop().create_task(submit_coro(bundle))
-                except RuntimeError:
-                    threading.Thread(target=lambda: asyncio.run(submit_coro(bundle)),
-                                     name="rm-submit-offloop", daemon=True).start()
-                return
-            except Exception:
-                pass
-        enqueue_fn = getattr(engine, "enqueue_bundle", None)
-        place_fn = getattr(engine, "place_bundle", None)
-        if callable(enqueue_fn):
-            try:
-                import inspect, asyncio, threading
-                res = enqueue_fn(bundle)
-                if inspect.iscoroutine(res):
-                    try:
-                        asyncio.get_running_loop().create_task(res)
-                    except RuntimeError:
-                        threading.Thread(target=lambda: asyncio.run(res),
-                                         name="rm-enqueue-offloop", daemon=True).start()
-            except Exception:
-                pass
-            return
-        if callable(place_fn):
-            place_fn(bundle)
-
-    def _schedule_delay(self, engine, bundle, defer_ms: float):
-        import asyncio, threading, time
-        def _task():
-            try:
-                time.sleep(max(0.0, defer_ms / 1000.0))
-                self._enqueue_non_blocking(engine, bundle)
-            except Exception:
-                if getattr(self, "log", None): self.log.exception("RM delay enqueue failed")
+    def _dispatch_bundle(self, bundle: dict) -> None:
+        async def _runner():
+            await self._submit_with_pairlocks(bundle)
 
         try:
-            asyncio.get_running_loop().create_task(self._async_delay_and_enqueue(engine, bundle, defer_ms))
+            asyncio.get_running_loop().create_task(_runner())
         except RuntimeError:
-            threading.Thread(target=_task, name="rm-delay-enqueue", daemon=True).start()
+            threading.Thread(
+                target=lambda: asyncio.run(_runner()),
+                name="rm-submit-offloop",
+                daemon=True,
+            ).start()
 
-    async def _async_delay_and_enqueue(self, engine, bundle, defer_ms: float):
-        import asyncio
-        await asyncio.sleep(max(0.0, defer_ms / 1000.0))
-        self._enqueue_non_blocking(engine, bundle)
+    def _schedule_delay(self, engine, bundle, defer_ms: float):
+        async def _delay_then_submit():
+            await asyncio.sleep(max(0.0, defer_ms / 1000.0))
+            self._dispatch_bundle(bundle)
 
+        try:
+            asyncio.get_running_loop().create_task(_delay_then_submit())
+        except RuntimeError:
+            threading.Thread(
+                target=lambda: asyncio.run(_delay_then_submit()),
+                name="rm-delay-enqueue",
+                daemon=True,
+            ).start()
     def _obs_sc_counter(self, name: str, ex: str, alias: str, branch: str):
         c = getattr(self, "obs_counter", None)
         if callable(c):
@@ -1674,14 +1661,38 @@ class RiskManager:
             pass
         return "NORMAL"
 
+    def _maybe_reset_daily_budget(self) -> None:
+        interval = max(1.0, float(getattr(self, "_budget_reset_interval_s", 86400.0)))
+        now = time.time()
+        if (now - getattr(self, "_budget_reset_ts", 0.0)) < interval:
+            return
+        for strat in list(self._spent_today_quote.keys()):
+            self._spent_today_quote[strat] = 0.0
+        self._budget_reset_ts = now
+
     def _budget_allows(self, strategy: str, notional_quote: float) -> tuple[bool, str]:
-        cap = float(self.daily_strategy_budget_quote.get(strategy, 0.0))
+        self._maybe_reset_daily_budget()
+        strat = str(strategy or "TT").upper()
+        cap = float(self.daily_strategy_budget_quote.get(strat, 0.0))
         if cap <= 0.0:
             return True, ""
-        spent = float(self._spent_today_quote.get(strategy, 0.0))
+        spent = float(self._spent_today_quote.get(strat, 0.0))
         if spent + float(notional_quote) > cap:
             return False, "BUDGET_EXCEEDED"
         return True, ""
+
+    def _record_budget_spend(self, strategy: Optional[str], bundle: Dict[str, Any]) -> None:
+        try:
+            self._maybe_reset_daily_budget()
+            strat = str(strategy or bundle.get("branch") or "TT").upper()
+            notional = bundle.get("notional_quote") or {}
+            amount = float(notional.get("amount") or 0.0)
+            if amount <= 0.0:
+                return
+            self._spent_today_quote[strat] = self._spent_today_quote.get(strat, 0.0) + amount
+        except Exception:
+            logger.debug("[RiskManager] record budget spend failed", exc_info=False)
+
 
     def _preflight_gate(self, opp: dict) -> tuple[bool, str, dict]:
         """
@@ -1717,10 +1728,21 @@ class RiskManager:
                 return (False, "PRUDENCE_ALERT", ctx)
 
             # Budget par stratégie (on lit le choix provisoire si fourni par le scanner sinon on re-choisira plus tard)
-            strat = str((opp.get("expected_net_bps") or {}).get("best", "")).upper() or "TT"
+            exp = opp.get("expected_net_bps")
+            strat_hint = "TT"
+            if isinstance(exp, dict):
+                best_field = exp.get("best")
+                if isinstance(best_field, str):
+                    strat_hint = best_field
+                elif isinstance(best_field, dict):
+                    strat_hint = best_field.get("strategy") or strat_hint
+            elif isinstance(exp, str):
+                strat_hint = exp
+            strat = str(strat_hint).upper() or "TT"
             q, amt = self._normalize_notional_tuple(opp)  # ta fonction déjà existante
             ctx["notional_quote"] = {"quote": q, "amount": float(amt)}
             ok, why = self._budget_allows(strat, amt)
+
             if not ok:
                 return (False, why, ctx)
 
@@ -2025,6 +2047,22 @@ class RiskManager:
                     continue
 
                 self._last_books = books or {}
+                ob_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+                now_s = time.time()
+                for ex, pairs in (self._last_books or {}).items():
+                    exu = str(ex).upper()
+                    for pk, snap in (pairs or {}).items():
+                        norm_pk = self._norm_pair(pk)
+                        bid = float((snap or {}).get("best_bid") or 0.0)
+                        ask = float((snap or {}).get("best_ask") or 0.0)
+                        ts_ms = (snap or {}).get("exchange_ts_ms") or (snap or {}).get("recv_ts_ms") or 0
+                        ts = float(ts_ms) / 1000.0 if ts_ms else now_s
+                        ob_cache[(exu, norm_pk)] = {
+                            "best_bid": bid,
+                            "best_ask": ask,
+                            "ts": ts,
+                        }
+                self._orderbooks = ob_cache
                 mark_books_fresh("ALL")
 
                 # Slippage & fees collector (passif)
@@ -2033,6 +2071,7 @@ class RiskManager:
                         self.slip_collector.collect_from_orderbooks(self._last_books)
                     except Exception:
                         logger.debug("[RiskManager] slippage collector collect failed", exc_info=False)
+                self._sync_simulator_fee_map()
 
                 # Pousser le slippage courant vers le simulateur
                 if self.simulator and hasattr(self.simulator, "update_slippage"):
@@ -2062,6 +2101,10 @@ class RiskManager:
                                     self.simulator.update_slippage(ex, pk, "SELL", ss)
                     except Exception:
                         logger.debug("[RiskManager] push slip to simulator failed", exc_info=False)
+                try:
+                    self._emit_slippage_to_scanner()
+                except Exception:
+                    logger.debug("[RiskManager] emit slippage -> scanner failed", exc_info=False)
 
                 # Rebalancing snapshots
                 if self.rebalancing:
@@ -3590,7 +3633,9 @@ class RiskManager:
         """
         if enforce_fresh is False:
             max_age_s = None
-        ob = self._orderbooks.get((exchange.upper(), pair_key))
+        ex_key = str(exchange).upper()
+        pk = self._norm_pair(pair_key)
+        ob = getattr(self, "_orderbooks", {}).get((ex_key, pk))
         if not ob:
             raise DataStaleError(f"TOB missing: {exchange} {pair_key}")
         ts = float(ob.get("ts", 0.0))
@@ -4073,17 +4118,49 @@ class RiskManager:
     # ------------------------------------------------------------------
     def set_allowed_routes(self, routes):
         self.allowed_routes = {(str(a).upper(), str(b).upper()) for (a, b) in (routes or [])}
+        self._sync_simulator_allowed_routes()
 
     def enable_route(self, a, b):
         self.allowed_routes.add((str(a).upper(), str(b).upper()))
+        self._sync_simulator_allowed_routes()
 
     def disable_route(self, a, b):
         self.allowed_routes.discard((str(a).upper(), str(b).upper()))
+        self._sync_simulator_allowed_routes()
 
     def disable_exchange(self, ex):
         exu = str(ex).upper()
         self.allowed_routes = {(a, b) for (a, b) in self.allowed_routes if a != exu and b != exu}
+        self._sync_simulator_allowed_routes()
 
+    def _sync_simulator_allowed_routes(self) -> None:
+        simulator = getattr(self, "simulator", None)
+        if not simulator or not hasattr(simulator, "update_allowed_routes"):
+            return
+        try:
+            simulator.update_allowed_routes(list(self.allowed_routes))
+        except Exception:
+            logger.debug("[RiskManager] sync allowed routes -> simulator failed", exc_info=False)
+
+    def _sync_simulator_fee_map(self) -> None:
+        simulator = getattr(self, "simulator", None)
+        collector = getattr(self, "slip_collector", None)
+        if not simulator or not hasattr(simulator, "set_fee_map_pct"):
+            return
+        if collector is None or not hasattr(collector, "export_effective_fee_map"):
+            return
+        now = time.time()
+        interval = float(getattr(self, "simulator_fee_sync_interval_s", 30.0))
+        if now - getattr(self, "_last_sim_fee_sync", 0.0) < interval:
+            return
+        fee_map = collector.export_effective_fee_map()
+        if not fee_map:
+            return
+        try:
+            simulator.set_fee_map_pct(fee_map)
+            self._last_sim_fee_sync = now
+        except Exception:
+            logger.debug("[RiskManager] sync fee map -> simulator failed", exc_info=False)
     # ------------------------------------------------------------------
     def pause_all_symbols(self, reason: str = "") -> None:
         for s in self.symbols:
@@ -4651,6 +4728,7 @@ class RiskManager:
     # ---------------------------------------------------------------------
     def _multicast_shadow(self, bundle: Dict[str, Any]) -> None:
         # 1) Envoi Engine (non-bloquant, avec fallbacks gérés)
+        self._record_budget_spend(bundle.get("branch"), bundle)
         self.engine_enqueue_bundle(bundle)
         # 2) Shadow Simu (non-bloquant, sampling interne)
         self.shadow_simulate(bundle, l2_cache=getattr(self, "l2_cache", None))
@@ -4703,11 +4781,6 @@ class RiskManager:
 
         # --- 2) Envoi sérialisé sous verrou -------------------------------------
         async with self._pairlocks[combo_key]:
-            # Shadow non-bloquant pour enrichir les métriques (ne décide pas)
-            try:
-                self.shadow_simulate(order_bundle, l2_cache=getattr(self, "l2_cache", None))
-            except Exception:
-                pass
 
             submit_timeout = float(getattr(self, "engine_submit_timeout_s", 3.0))
             max_retries_net = int(getattr(self, "engine_net_retry", 1))  # une retentative réseau max

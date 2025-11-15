@@ -312,13 +312,14 @@ class OpportunityScanner:
 
         # --- dépendances / config ---
         self.cfg = cfg
-        self.rm = risk_manager
+        self.risk_manager = risk_manager
+        self.rm = risk_manager  # compat legacy
         self.router = market_router
         self.history = history_logger
         self.logger = logging.getLogger("OpportunityScanner")
         if self.router is None:
             raise RuntimeError("Scanner: market_router is required")
-        if self.rm is None:
+        if self.risk_manager is None:
             raise RuntimeError("Scanner: risk_manager is required")
 
         # -------------------------------
@@ -732,43 +733,20 @@ class OpportunityScanner:
         if not callable(g):
             return None
 
-        # Essaye (ex, pair, role) → (ex, role, pair) → (ex, role)
         try:
-            return float(g(ex, _norm_pair(pair), role)) * 1e4
+            return float(g(_norm_ex(ex), _norm_pair(pair), role)) * 1e4
         except TypeError:
-            logging.exception("Unhandled exception")
-        try:
-            return float(g(ex, role, _norm_pair(pair))) * 1e4
-        except TypeError:
-            logging.exception("Unhandled exception")
-        try:
-            return float(g(ex, role)) * 1e4
+            logger.exception("Scanner get_fee_pct signature mismatch for %s/%s", ex, pair)
         except Exception:
-            return None
+            logger.exception("Scanner get_fee_pct error for %s/%s", ex, pair)
+        return None
 
     def _fee_frac(self, ex: str, role: str, pair: str) -> float:
         """Retourne les fees en fraction (ex: 0.001), cache → fallback RM → 0.0."""
         bps = self._fee_bps(ex, role, pair)
         if isinstance(bps, (int, float)):
             return float(bps) / 1e4
-
-        g = getattr(self.risk_manager, "get_fee_pct", None)
-        if not callable(g):
-            return 0.0
-
-        # Essaye (ex, pair, role) → (ex, role, pair) → (ex, role)
-        try:
-            return float(g(ex, _norm_pair(pair), role))* 1e4
-        except TypeError:
-            logging.exception("Unhandled exception")
-        try:
-            return float(g(ex, role, _norm_pair(pair)))* 1e4
-        except TypeError:
-            logging.exception("Unhandled exception")
-        try:
-            return float(g(ex, role))* 1e4
-        except Exception:
-            return None
+        return 0.0
 
     # ---------------- Entrées (push) ----------------
     def update_orderbook(self, data: dict) -> None:

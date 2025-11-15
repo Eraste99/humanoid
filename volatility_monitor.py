@@ -56,6 +56,10 @@ def _norm_pair(s: str) -> str:
     return (s or "").replace("-", "").upper()
 
 
+def _norm_ex(s: str) -> str:
+    return (s or "").upper()
+
+
 class VolatilityMonitor:
     def __init__(
         self,
@@ -120,11 +124,13 @@ class VolatilityMonitor:
         self.historical_window  = timedelta(days=int(historical_days))
         self._log_throttle      = float(log_throttle_secs)
 
-        # --- Structures d'historique
-        self.price_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=int(maxlen_points)))
-        self.spread_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=int(maxlen_points)))
-        self.historical_price_vols: Dict[str, deque] = defaultdict(lambda: deque(maxlen=int(maxlen_points)))
-        self.historical_spread_vols: Dict[str, deque] = defaultdict(lambda: deque(maxlen=int(maxlen_points)))
+        def _hist_deque() -> deque:
+            return deque(maxlen=int(maxlen_points))
+
+        self.price_history: Dict[Tuple[str, str], deque] = defaultdict(_hist_deque)
+        self.spread_history: Dict[Tuple[str, str], deque] = defaultdict(_hist_deque)
+        self.historical_price_vols: Dict[Tuple[str, str], deque] = defaultdict(_hist_deque)
+        self.historical_spread_vols: Dict[Tuple[str, str], deque] = defaultdict(_hist_deque)
 
         # --- Seuils init & statut signal
         self.signal_status: Dict[str, str] = defaultdict(lambda: "normal")
@@ -150,8 +156,13 @@ class VolatilityMonitor:
     def _pair_percentiles(self, pair: str) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
         """Retourne (price_p95, price_p99, spread_p95, spread_p99) sur historiques micro-window."""
         pair = _norm_pair(pair)
-        price_vols = [v for _, v in self.historical_price_vols[pair]]
-        spread_vols = [v for _, v in self.historical_spread_vols[pair]]
+        price_vols: List[float] = []
+        spread_vols: List[float] = []
+        for dq in self._series_for_pair(self.historical_price_vols, pair):
+            price_vols.extend(v for _, v in dq)
+        for dq in self._series_for_pair(self.historical_spread_vols, pair):
+            spread_vols.extend(v for _, v in dq)
+
         if len(price_vols) >= 50:
             price_p95 = float(np.percentile(price_vols, 95))
             price_p99 = float(np.percentile(price_vols, 99))
@@ -168,6 +179,16 @@ class VolatilityMonitor:
     def set_scanner(self, scanner) -> None:
         """Brancher le Scanner pour forward ema_vol_bps -> scanner.ingest_volatility_bps({pair:bps})."""
         self._scanner = scanner
+
+    def _forward_to_scanner(self, exchange: str, pair: str, vol_bps: float) -> None:
+        scanner = getattr(self, "_scanner", None)
+        if not scanner or not hasattr(scanner, "ingest_volatility_bps"):
+            return
+        try:
+            scanner.ingest_volatility_bps(pair, exchange, float(vol_bps), ts=time.time())
+        except Exception:
+            logger.debug("[VolatilityMonitor] scanner forward failed", exc_info=True)
+
 
     # ---- Profils de liquidité (optionnel) ----
     def set_liquidity_profile(self, pair_key: str, level: str) -> None:
@@ -189,9 +210,14 @@ class VolatilityMonitor:
         pair = _norm_pair(data.get("pair_key") or data.get("symbol") or "")
         if not pair:
             return
+        exchange = _norm_ex(data.get("exchange") or data.get("venue"))
+        if not exchange:
+            return
 
         bid = _to_float(data.get("best_bid"))
         ask = _to_float(data.get("best_ask"))
+
+
         if bid <= 0 or ask <= 0 or bid >= ask:
             return
 
@@ -206,11 +232,13 @@ class VolatilityMonitor:
         mid = (bid + ask) / 2.0
         spread = ask - bid
 
-        self.price_history[pair].append((timestamp, mid))
-        self.spread_history[pair].append((timestamp, spread))
+        key = (exchange, pair)
+        self.price_history[key].append((timestamp, mid))
+        self.spread_history[key].append((timestamp, spread))
 
-        self._cleanup_old_data(pair, timestamp)
-        self._evaluate_prudence(pair, now=timestamp)
+        self._cleanup_old_data(exchange, pair, timestamp)
+        self._evaluate_prudence(pair, exchange=exchange, now=timestamp)
+
         self.update_count += 1
         try:
             # Observe les valeurs micro courantes (post _evaluate_prudence qui remplit l'historique)
@@ -224,23 +252,32 @@ class VolatilityMonitor:
             pass
 
     # ---- Maintenance fenêtres ----
-    def _cleanup_old_data(self, pair: str, now: datetime) -> None:
-        self.price_history[pair] = deque(
-            ((t, p) for t, p in self.price_history[pair] if now - t <= self.window_long),
-            maxlen=self.price_history[pair].maxlen,
-        )
-        self.spread_history[pair] = deque(
-            ((t, s) for t, s in self.spread_history[pair] if now - t <= self.window_long),
-            maxlen=self.spread_history[pair].maxlen,
-        )
-        self.historical_price_vols[pair] = deque(
-            ((t, v) for t, v in self.historical_price_vols[pair] if now - t <= self.historical_window),
-            maxlen=self.historical_price_vols[pair].maxlen,
-        )
-        self.historical_spread_vols[pair] = deque(
-            ((t, v) for t, v in self.historical_spread_vols[pair] if now - t <= self.historical_window),
-            maxlen=self.historical_spread_vols[pair].maxlen,
-        )
+    def _cleanup_old_data(self, exchange: str, pair: str, now: datetime) -> None:
+        key = (_norm_ex(exchange), _norm_pair(pair))
+        dq = self.price_history.get(key)
+        if dq is not None:
+            self.price_history[key] = deque(
+                ((t, p) for t, p in dq if now - t <= self.window_long),
+                maxlen=dq.maxlen,
+            )
+        dq = self.spread_history.get(key)
+        if dq is not None:
+            self.spread_history[key] = deque(
+                ((t, s) for t, s in dq if now - t <= self.window_long),
+                maxlen=dq.maxlen,
+            )
+        dq = self.historical_price_vols.get(key)
+        if dq is not None:
+            self.historical_price_vols[key] = deque(
+                ((t, v) for t, v in dq if now - t <= self.historical_window),
+                maxlen=dq.maxlen,
+            )
+        dq = self.historical_spread_vols.get(key)
+        if dq is not None:
+            self.historical_spread_vols[key] = deque(
+                ((t, v) for t, v in dq if now - t <= self.historical_window),
+                maxlen=dq.maxlen,
+            )
 
     # ---- Utils vol ----
     def _clean_values(self, values: List[float]) -> np.ndarray:
@@ -265,15 +302,41 @@ class VolatilityMonitor:
         sd = float(np.std(arr))
         return sd / m
 
-    def _window_values(self, series: deque, duration: timedelta, now: Optional[datetime] = None) -> List[float]:
-        now = now or datetime.utcnow()
-        return [val for (t, val) in series if now - t <= duration]
+    def _series_for_pair(
+        self,
+        store: Dict[Tuple[str, str], deque],
+        pair: str,
+        exchange: Optional[str] = None,
+    ) -> List[deque]:
+        pk = _norm_pair(pair)
+        if exchange:
+            key = (_norm_ex(exchange), pk)
+            dq = store.get(key)
+            return [dq] if dq else []
+        return [dq for (ex_key, pk_key), dq in store.items() if pk_key == pk]
 
-    def get_price_volatility(self, pair: str, window: str = "long", now: Optional[datetime] = None) -> float:
+    def _window_values(self, series_collection, duration: timedelta, now: Optional[datetime] = None) -> List[float]:
+        now = now or datetime.utcnow()
+        if isinstance(series_collection, deque):
+            collections = [series_collection]
+        else:
+            collections = [dq for dq in (series_collection or []) if dq]
+        values: List[float] = []
+        for series in collections:
+            values.extend(val for (t, val) in series if now - t <= duration)
+        return values
+
+    def get_price_volatility(
+        self,
+        pair: str,
+        window: str = "long",
+        now: Optional[datetime] = None,
+        exchange: Optional[str] = None,
+    ) -> float:
         pair = _norm_pair(pair)
         duration = self.window_long if window == "long" else self.window_micro
-        return self._relative_volatility(self._window_values(self.price_history[pair], duration, now))
-
+        series = self._series_for_pair(self.price_history, pair, exchange)
+        return self._relative_volatility(self._window_values(series, duration, now))
 
 
     def get_volatility(self, exchange: str, pair_key: str) -> Optional[float]:
@@ -297,16 +360,28 @@ class VolatilityMonitor:
         vol_rel = rec.get("vol_rel")
         return float(vol_rel) if vol_rel is not None else None
 
-    def get_spread_volatility(self, pair: str, window: str = "long", now: Optional[datetime] = None) -> float:
+    def get_spread_volatility(
+        self,
+        pair: str,
+        window: str = "long",
+        now: Optional[datetime] = None,
+        exchange: Optional[str] = None,
+    ) -> float:
         pair = _norm_pair(pair)
         duration = self.window_long if window == "long" else self.window_micro
-        return self._relative_volatility(self._window_values(self.spread_history[pair], duration, now))
+        series = self._series_for_pair(self.spread_history, pair, exchange)
+        return self._relative_volatility(self._window_values(series, duration, now))
 
     # ---- Seuils dynamiques ----
     def _get_dynamic_thresholds(self, pair: str) -> Tuple[float, float]:
         pair = _norm_pair(pair)
-        price_vols = [v for _, v in self.historical_price_vols[pair]]
-        spread_vols = [v for _, v in self.historical_spread_vols[pair]]
+        price_vols: List[float] = []
+        spread_vols: List[float] = []
+        for dq in self._series_for_pair(self.historical_price_vols, pair):
+            price_vols.extend(v for _, v in dq)
+        for dq in self._series_for_pair(self.historical_spread_vols, pair):
+            spread_vols.extend(v for _, v in dq)
+
         if len(price_vols) >= 100 and len(spread_vols) >= 100:
             price_thresh = float(np.percentile(price_vols, 95))
             spread_thresh = float(np.percentile(spread_vols, 95))
@@ -323,15 +398,23 @@ class VolatilityMonitor:
             return True
         return False
 
-    def _evaluate_prudence(self, pair: str, *, now: Optional[datetime] = None) -> None:
+    def _evaluate_prudence(
+        self,
+        pair: str,
+        *,
+        exchange: Optional[str] = None,
+        now: Optional[datetime] = None,
+    ) -> None:
         pair = _norm_pair(pair)
         now = now or datetime.utcnow()
-        price_vol_micro = self.get_price_volatility(pair, window="micro", now=now)
-        spread_vol_micro = self.get_spread_volatility(pair, window="micro", now=now)
+        price_vol_micro = self.get_price_volatility(pair, window="micro", now=now, exchange=exchange)
+        spread_vol_micro = self.get_spread_volatility(pair, window="micro", now=now, exchange=exchange)
 
         # Alimente l'historique micro
-        self.historical_price_vols[pair].append((now, price_vol_micro))
-        self.historical_spread_vols[pair].append((now, spread_vol_micro))
+        if exchange:
+            key = (_norm_ex(exchange), pair)
+            self.historical_price_vols[key].append((now, price_vol_micro))
+            self.historical_spread_vols[key].append((now, spread_vol_micro))
 
         # Seuils dynamiques (profil par défaut si historique insuffisant)
         price_thr, spread_thr = self._get_dynamic_thresholds(pair)
@@ -425,9 +508,10 @@ class VolatilityMonitor:
         self.last_update = None
 
     def get_status(self) -> Dict[str, Any]:
-        vols = []
+        vols: List[float] = []
         now_dt = datetime.utcnow()
-        for pair in self.price_history:
+        seen_pairs = {pk for (_, pk) in self.price_history.keys()}
+        for pair in seen_pairs:
             v = self.get_price_volatility(pair, window="micro", now=now_dt)
             if v > 0:
                 vols.append(v)
@@ -491,14 +575,16 @@ class VolatilityMonitor:
             self.ingest_snapshot(data)
 
             # Volatilité relative micro (déjà disponible via l’historique interne)
-            vol_rel = float(self.get_price_volatility(pk, window="micro"))
+            vol_rel = float(self.get_price_volatility(pk, window="micro", exchange=ex))
+            vol_bps = self._to_bps(vol_rel)
 
             # TTL cache consommé par get_volatility()
             ts_ms = msg.get("recv_ts_ms") or msg.get("exchange_ts_ms")
             ts_recv_s = (float(ts_ms) / 1000.0) if ts_ms else time.time()
             if not hasattr(self, "_last_vol"):
                 self._last_vol = {}
-            self._last_vol[(ex, pk)] = {"vol_rel": vol_rel, "ts_recv_s": ts_recv_s}
+            self._last_vol[(ex, pk)] = {"vol_rel": vol_rel, "vol_bps": vol_bps, "ts_recv_s": ts_recv_s}
+            self._forward_to_scanner(ex, pk, vol_bps)
 
         except Exception:
             logging.exception("VolatilityMonitor.on_vol error")

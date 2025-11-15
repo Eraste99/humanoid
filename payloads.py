@@ -57,37 +57,44 @@ except Exception:  # pragma: no cover
         return None
 
 # -----------------------------------------------------------------------------
-# Pydantic compat v2/v1
+# Pydantic compat v2/v1 (avec fallback no-op)
 # -----------------------------------------------------------------------------
-try:
-    from pydantic import BaseModel, Field, ValidationError
-    from pydantic import field_validator, model_validator  # v2
-    _PD_V2 = True
-except Exception:  # v1
-    from pydantic import BaseModel, Field, ValidationError  # type: ignore
-    from pydantic import validator as field_validator      # type: ignore
-    from pydantic import root_validator as model_validator  # type: ignore
-    _PD_V2 = False
-
-# -- imports Pydantic --
 try:
     from pydantic import BaseModel, Field, ValidationError
     try:
         from pydantic import field_validator, model_validator  # v2
-    except Exception:
-        field_validator = model_validator = None
-    # ✅ ajouter ceci AU NIVEAU MODULE (pas dans une classe)
+    except Exception:  # pragma: no cover
+        from pydantic import validator as field_validator      # type: ignore
+        from pydantic import root_validator as model_validator  # type: ignore
     try:
         from pydantic import ConfigDict  # v2 only
     except Exception:
-        ConfigDict = None  # v1 fallback
+        ConfigDict = None
 except Exception:
-    BaseModel = object
-    Field = lambda *a, **k: None
-    ValidationError = Exception
-    field_validator = model_validator = None
-    ConfigDict = None
+    class _BaseModel:
+        def __init__(self, **data: Any):
+            for k, v in data.items():
+                setattr(self, k, v)
 
+        def model_dump(self, *_, **__):  # type: ignore[override]
+            return dict(self.__dict__)
+
+    BaseModel = _BaseModel  # type: ignore
+
+    def Field(*args, **kwargs):  # type: ignore
+        return None
+
+    class ValidationError(Exception):
+        pass
+
+    def _noop_validator(*args, **kwargs):
+        def decorator(fn):
+            return fn
+
+        return decorator
+
+    field_validator = model_validator = _noop_validator  # type: ignore
+    ConfigDict = None
 
 
 
@@ -144,6 +151,10 @@ def _norm_symbol(sym: str, keep_dash: bool = True) -> str:
 def _norm_pair_key(sym: str) -> str:
     """Clé de paire compacte 'BTCUSDC' (sans tirets)."""
     return _norm_symbol(sym, keep_dash=False)
+
+
+def _norm_exchange(sym: str) -> str:
+    return (sym or "").strip().upper()
 
 # >>> PATCH #3 — Helpers publics exposés
 def norm_symbol(sym: str, keep_dash: bool = True) -> str:
@@ -398,17 +409,38 @@ class FeesSnapshot(_Cfg, BaseModel):
 
 class SlippageSnapshot(_Cfg, BaseModel):
     exchange: str
-    symbol: Optional[str] = None
+    symbol: str
     side: Optional[Side] = None
-    slip_bps: Optional[float] = None
+    slip_bps: Optional[float] = Field(default=None, ge=0)
+    buy_bps: Optional[float] = Field(default=None, ge=0)
+    sell_bps: Optional[float] = Field(default=None, ge=0)
+    notional_quote: Optional[Dict[str, Any]] = None
     ts: float = Field(default_factory=_now_s)
 
+    @field_validator("exchange", mode="before")
+    def _norm_exchange_field(cls, v: Any) -> str:
+        return _norm_exchange(v)
+
+    @field_validator("symbol", mode="before")
+    def _norm_symbol_field(cls, v: Any) -> str:
+        return _norm_symbol(v)
+
 class VolatilitySnapshot(_Cfg, BaseModel):
+    exchange: str
     symbol: str
     vol_ema_bps: Optional[float] = None
     vol_p95_bps: Optional[float] = None
     vm_band: Optional[str] = None
     ts: float = Field(default_factory=_now_s)
+
+    @field_validator("exchange", mode="before")
+    def _norm_exchange_field(cls, v: Any) -> str:
+        return _norm_exchange(v)
+
+    @field_validator("symbol", mode="before")
+    def _norm_symbol_field(cls, v: Any) -> str:
+        return _norm_symbol(v)
+
 
 class SimResult(_Cfg, BaseModel):
     ok: bool
