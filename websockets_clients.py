@@ -30,23 +30,24 @@ import random
 import socket
 import logging
 import asyncio
-from typing import Dict, List, Optional, Tuple, Set, Any
-from collections import defaultdict
+from typing import Any, Deque, Dict, List, Optional, Tuple
+from collections import defaultdict, OrderedDict, deque
 from dataclasses import dataclass
-from collections import OrderedDict
-from collections import defaultdict as _dd
 import websockets  # pip install websockets
 from modules.retry_policy import with_retry, awith_retry, BackoffPolicy, ErrKind
 # --- imports locaux (pas d'effets globaux) ---
 import asyncio, json, random
-from collections import defaultdict, OrderedDict
-from typing import Optional, Dict, Tuple, List
 
 
 
 # --- Prometheus: WS reconnect/backoff (fallback no-op si absent) ---
 try:
-    from modules.obs_metrics import WS_RECONNECTS_TOTAL, WS_BACKOFF_SECONDS, WS_CONNECTIONS_OPEN
+    from modules.obs_metrics import (
+        WS_RECONNECTS_TOTAL,
+        WS_BACKOFF_SECONDS,
+        WS_CONNECTIONS_OPEN,
+        WS_PUBLIC_DROPPED_TOTAL,
+    )
 except Exception:  # pragma: no cover
     class _Noop:
         def labels(self, *a, **k): return self
@@ -56,6 +57,8 @@ except Exception:  # pragma: no cover
     WS_RECONNECTS_TOTAL = _Noop()
     WS_BACKOFF_SECONDS  = _Noop()
     WS_CONNECTIONS_OPEN = _Noop()
+    WS_PUBLIC_DROPPED_TOTAL = _Noop()
+
 
 logger = logging.getLogger("WebSocketExchangeClient")
 
@@ -254,6 +257,17 @@ class WebSocketExchangeClient:
         self._connected = False
         self._seen_events = OrderedDict()
         self._seen_max = 50_000
+        self._out_queue_put_timeout_s = float(getattr(wscfg, "out_queue_put_timeout_s", 0.05))
+        self._out_queue_drops: Dict[str, int] = defaultdict(int)
+        self._out_queue_last_drop_reason: Dict[str, str] = {}
+        self._out_queue_last_drop_ts: Dict[str, float] = defaultdict(float)
+        self._last_publish_ts: float = 0.0
+        self._last_publish_by_exchange: Dict[str, float] = defaultdict(float)
+        self._bp_last_log_ts: Dict[str, float] = defaultdict(float)
+        self._control_events_pending: Deque[Dict[str, Any]] = deque(maxlen=64)
+        self._snapshot_runs = 0
+        self._snapshot_pairs = 0
+        self._snapshot_last_ts = 0.0
 
         # mapping inverse exchange_symbol -> pair_key
         try:
@@ -389,6 +403,50 @@ class WebSocketExchangeClient:
             loop.create_task(self.aschedule_snapshots_in_waves(pairs, per_minute))
         except RuntimeError:
             asyncio.run(self.aschedule_snapshots_in_waves(pairs, per_minute))
+
+    async def _take_snapshot(self, batch: List[str]) -> None:
+        if not batch:
+            return
+        emitted = 0
+        missing: List[str] = []
+        for pair_key in batch:
+            mapping = self.pair_mapping.get(pair_key) or {}
+            for ex, symbol in mapping.items():
+                if not symbol:
+                    continue
+                sym = str(symbol).upper()
+                exu = str(ex).upper()
+                l1 = self._l1.get(exu, {}).get(sym)
+                l2 = self._l2.get(exu, {}).get(sym)
+                if not l1 or not l2:
+                    missing.append(f"{exu}:{pair_key}")
+                    continue
+                try:
+                    await self._emit_if_ready(exu, sym)
+                    emitted += 1
+                except Exception:
+                    logger.exception("[WS] snapshot emit failed", extra={"exchange": exu, "pair": pair_key})
+        self._snapshot_runs += 1
+        self._snapshot_pairs += len(batch)
+        self._snapshot_last_ts = time.time()
+        if missing and self.verbose:
+            logger.debug("[WS] snapshot missing feeds: %s", ",".join(missing[:10]))
+
+    async def _do_close(self) -> None:
+        for task in list(self.tasks):
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+        self.tasks.clear()
+        self._open_connections = 0
+        self._connected = False
+
+    async def _do_open(self) -> None:
+        self._reload_event.set()
+
     # --- métriques internes par exchange ---
     def _metrics_conn_open(self, exchange: str) -> None:
         try:
@@ -409,8 +467,10 @@ class WebSocketExchangeClient:
     def _metrics_reconnect(self, exchange: str, delay_s: float, *, reason: str) -> None:
         try:
             ex = exchange.upper()
-            WS_RECONNECTS_TOTAL.labels(exchange=ex).inc()
-            # Gauge, pas histogram → on utilise .set()
+            try:
+                WS_RECONNECTS_TOTAL.labels(exchange=ex, reason=reason).inc()
+            except Exception:
+                WS_RECONNECTS_TOTAL.labels(exchange=ex).inc()
             WS_BACKOFF_SECONDS.labels(exchange=ex).set(max(0.0, float(delay_s)))
         except Exception:
             pass
@@ -469,7 +529,7 @@ class WebSocketExchangeClient:
             self._send_sub(_t)
 
     # ------------------- Hooks WS (expo tests) -------------------
-    def on_open(self, *a, **k) -> None:
+    def on_open(self, exchange: Optional[str] = None, *a, **k) -> None:
         # 1 socket de plus
         self._open_connections += 1
         self._connected = self._open_connections > 0
@@ -493,6 +553,15 @@ class WebSocketExchangeClient:
             self._mark_ready()
 
         self._resubscribe_all()
+        if exchange:
+            payload = {
+                "__ws_reconnect__": True,
+                "exchange": str(exchange).upper(),
+                "reason": "listener_open",
+                "ts_ms": int(time.time() * 1000),
+            }
+            self._queue_control_event(payload)
+
 
     def on_close(self, *a, **k) -> None:
         # 1 socket de moins
@@ -554,7 +623,75 @@ class WebSocketExchangeClient:
         if len(self._seen_events) > self._seen_max:
             self._seen_events.popitem(last=False)
 
-        await self.out_queue.put(event)
+        ok = await self._publish_event(event, exchange=ex, reason="emit")
+        if not ok:
+            now = time.time()
+            if (now - self._bp_last_log_ts[ex]) >= 1.0:
+                logger.warning(
+                    '[WS] out_queue saturated (exchange=%s, symbol=%s) — event dropped',
+                    ex,
+                    ex_symbol,
+                )
+                self._bp_last_log_ts[ex] = now
+
+    async def _publish_event(self, payload: Dict[str, Any], *, exchange: str, reason: str) -> bool:
+        try:
+            self.out_queue.put_nowait(payload)
+            self._note_out_success(exchange)
+            return True
+        except asyncio.QueueFull:
+            pass
+
+        timeout = max(0.0, float(self._out_queue_put_timeout_s))
+        if timeout == 0.0:
+            self._note_backpressure(exchange, reason=reason)
+            return False
+        try:
+            await asyncio.wait_for(self.out_queue.put(payload), timeout=timeout)
+            self._note_out_success(exchange)
+            return True
+        except asyncio.TimeoutError:
+            self._note_backpressure(exchange, reason=reason)
+            return False
+
+    def _note_out_success(self, exchange: str) -> None:
+        now = time.time()
+        self._last_publish_ts = now
+        self._last_publish_by_exchange[exchange] = now
+        self._flush_control_events()
+
+    def _note_backpressure(self, exchange: str, *, reason: str) -> None:
+        ex = exchange.upper()
+        self._out_queue_drops[ex] += 1
+        self._out_queue_last_drop_reason[ex] = reason
+        self._out_queue_last_drop_ts[ex] = time.time()
+        try:
+            WS_PUBLIC_DROPPED_TOTAL.labels(exchange=ex, reason=reason).inc()
+        except Exception:
+            pass
+        payload = {
+            "__ws_backpressure__": True,
+            "exchange": ex,
+            "reason": reason,
+            "drops": self._out_queue_drops[ex],
+            "ts_ms": int(time.time() * 1000),
+        }
+        self._queue_control_event(payload)
+
+    def _queue_control_event(self, payload: Dict[str, Any]) -> None:
+        self._control_events_pending.append(payload)
+        self._flush_control_events()
+
+    def _flush_control_events(self) -> None:
+        while self._control_events_pending:
+            try:
+                self.out_queue.put_nowait(self._control_events_pending[0])
+                self._control_events_pending.popleft()
+            except asyncio.QueueFull:
+                break
+
+
+
 
     # ======================= BINANCE listener =======================
     async def _binance_listener_chunk(self, pairs_subset: List[str]):
@@ -570,7 +707,7 @@ class WebSocketExchangeClient:
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
                     _set_tcp_nodelay(ws)
-                    self.on_open()  # reset backoff + resub
+                    self.on_open(exchange="BINANCE")  # reset backoff + resub
                     self._metrics_conn_open("BINANCE")
 
                     async for raw in ws:
@@ -602,10 +739,10 @@ class WebSocketExchangeClient:
                             await self._emit_if_ready("BINANCE", ex_symbol)
                             continue
             except Exception as e:
-                await self.out_queue.put({
+                await self._publish_event({
                     "exchange": "BINANCE", "pair_key": None, "active": False,
                     "error": str(e), "recv_ts_ms": int(time.time() * 1000),
-                })
+                }, exchange="BINANCE", reason="listener_error")
                 # backoff unifié (une seule fois)
                 self.on_close();
                 did_close = True
@@ -639,7 +776,7 @@ class WebSocketExchangeClient:
                 async with websockets.connect(self.COINBASE_WS, ping_interval=20, ping_timeout=20,
                                               close_timeout=5) as ws:
                     _set_tcp_nodelay(ws)
-                    self.on_open()
+                    self.on_open(exchange="COINBASE")
                     self._metrics_conn_open("COINBASE")
 
                     await ws.send(json.dumps(sub))
@@ -695,10 +832,10 @@ class WebSocketExchangeClient:
                             await self._emit_if_ready("COINBASE", pid)
                             continue
             except Exception as e:
-                await self.out_queue.put({
+                await self._publish_event({
                     "exchange": "COINBASE", "pair_key": None, "active": False,
                     "error": str(e), "recv_ts_ms": int(time.time() * 1000),
-                })
+                }, exchange="COINBASE", reason="listener_error")
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("COINBASE")
@@ -724,7 +861,7 @@ class WebSocketExchangeClient:
                 async with websockets.connect(self.BYBIT_WS_SPOT, ping_interval=20, ping_timeout=20,
                                               close_timeout=5) as ws:
                     _set_tcp_nodelay(ws)
-                    self.on_open()
+                    self.on_open(exchange="BYBIT")
                     self._metrics_conn_open("BYBIT")
 
                     await ws.send(self._json_dumps(sub))
@@ -757,10 +894,10 @@ class WebSocketExchangeClient:
                             await self._emit_if_ready("BYBIT", sym)
                             continue
             except Exception as e:
-                await self.out_queue.put({
+                await self._publish_event({
                     "exchange": "BYBIT", "pair_key": None, "active": False,
                     "error": str(e), "recv_ts_ms": int(time.time() * 1000),
-                })
+                }, exchange="BYBIT", reason="listener_error")
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("BYBIT")
@@ -950,6 +1087,20 @@ class WebSocketExchangeClient:
             "module": "WebSocketExchangeClient",
             "healthy": self._running and (self._supervisor_task is not None) and (not self._supervisor_task.done()),
             "last_update": self.last_update,
-            "metrics": {"latency_ms": self.latency},
+            "metrics": {
+                "latency_ms": self.latency,
+                "out_queue_drops": dict(self._out_queue_drops),
+                "last_publish_ts": self._last_publish_ts,
+                "last_publish_by_exchange": dict(self._last_publish_by_exchange),
+                "snapshots": {
+                    "runs": self._snapshot_runs,
+                    "pairs_processed": self._snapshot_pairs,
+                    "last_ts": self._snapshot_last_ts,
+                },
+            },
             "details": "WS actifs (tri-CEX: Binance/Coinbase/Bybit)",
+            "backpressure": {
+                "last_drop_reason": dict(self._out_queue_last_drop_reason),
+                "last_drop_ts": dict(self._out_queue_last_drop_ts),
+            },
         }

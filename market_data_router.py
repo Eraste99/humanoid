@@ -172,7 +172,7 @@ class MarketDataRouter:
             # Coalescing (par paire)
             coalesce_window_ms: int = 15,
             coalesce_maxlen: int = 3,
-
+            ws_source_backpressure_cooldown_s: float = 5.0,
     ) -> None:
         if in_queue is None:
             raise ValueError("MarketDataRouter: in_queue requis")
@@ -291,6 +291,9 @@ class MarketDataRouter:
         self.drop_window_s: float = 3.0
         self.drop_alert_threshold: int = 64
         self._bp_drops: Dict[str, deque] = {}
+        self.ws_source_backpressure_cooldown_s = float(max(0.5, ws_source_backpressure_cooldown_s))
+        self._ws_backpressure_until: float = 0.0
+        self._ws_backpressure_state: Dict[str, Dict[str, Any]] = {}
 
     # ----------------------- Keys / Queues builders -----------------------
     @staticmethod
@@ -551,12 +554,32 @@ class MarketDataRouter:
         return out
 
     # Hook optionnel, callable depuis les clients WS
-    def note_ws_reconnect(self, exchange: str) -> None:
+    def note_ws_reconnect(self, exchange: str, *, reason: str = "listener_reconnect") -> None:
+        ex = str(exchange).upper()
         try:
-            WS_RECONNECTS_TOTAL.labels(exchange=str(exchange).upper()).inc()
+            WS_RECONNECTS_TOTAL.labels(exchange=ex, reason=str(reason)).inc()
+            return
+        except Exception:
+            pass
+        try:
+            WS_RECONNECTS_TOTAL.labels(exchange=ex).inc()
         except Exception:
             pass
 
+    def note_ws_backpressure(self, exchange: str, *, reason: str, drops: int = 1, last_error: Optional[str] = None) -> None:
+        ex = str(exchange).upper()
+        self._ws_backpressure_state[ex] = {
+            "ts": time.time(),
+            "reason": reason,
+            "drops": int(drops),
+            "last_error": last_error,
+        }
+        self._ws_backpressure_until = time.time() + self.ws_source_backpressure_cooldown_s
+        try:
+            ROUTER_DROPPED_TOTAL.labels(queue=f"ws_source:{ex}", reason=reason).inc(max(1, int(drops)))
+        except Exception:
+            pass
+        self._bp_note_drop(f"ws_source:{ex}", reason=reason)
     # ----------------------------- Purge -----------------------------
     def _purge_old_snapshots(self) -> None:
         now = _now_dt()
@@ -630,18 +653,20 @@ class MarketDataRouter:
                             break
                 if high: break
 
-            if high:
+            ws_bp_active = bool(self._ws_backpressure_until and time.time() < self._ws_backpressure_until)
+            if high or ws_bp_active:
                 self.coalesce_window_ms = base_coalesce_ms + bump_ms
                 self.coalesce_maxlen = base_maxlen + grow
-                bp_until = time.time() + cooldown
+                bp_until = max(time.time() + cooldown, self._ws_backpressure_until or 0.0)
             elif bp_until and time.time() > bp_until:
                 # retour normal
                 self.coalesce_window_ms = base_coalesce_ms
                 self.coalesce_maxlen = base_maxlen
                 bp_until = 0.0
+                if self._ws_backpressure_until and time.time() >= self._ws_backpressure_until:
+                    self._ws_backpressure_until = 0.0
 
             await asyncio.sleep(0.001)
-
     # ------------------------ Legacy internal feeds (compat) ------------------------
     def _maybe_feed_volatility_legacy(self, pair: str, ex: str, data: Dict[str, Any]) -> None:
         if not self.volatility_monitor:
@@ -1254,6 +1279,21 @@ class MarketDataRouter:
                 try:
                     if isinstance(item, dict) and item.get("__stop__"):
                         break
+                    if isinstance(item, dict) and item.get("__ws_reconnect__"):
+                        payload = item
+                        ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
+                        self.note_ws_reconnect(ex, reason=str(payload.get("reason", "listener_reconnect")))
+                        continue
+                    if isinstance(item, dict) and item.get("__ws_backpressure__"):
+                        payload = item
+                        ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
+                        self.note_ws_backpressure(
+                            ex,
+                            reason=str(payload.get("reason", "ws_source")),
+                            drops=int(payload.get("drops") or 1),
+                            last_error=payload.get("error"),
+                        )
+                        continue
 
                     ev = self._validate_and_enrich(item)
                     if not ev:
@@ -1390,8 +1430,8 @@ class MarketDataRouter:
                 "restart_count": self.restart_count,
             },
             "submodules": {},
+            "ws_source_backpressure": self._ws_backpressure_state,
         }
-
 
 # === BEGIN LATENCY INSTRUMENTATION (Router) ===
 try:
@@ -1455,9 +1495,9 @@ class WSFanInMux:
 
     async def start(self, note_reconnect: Optional[Callable[[str], None]] = None) -> None:
         self._running = True
-        keys = list(self._sources.keys())
         idx = 0
         while self._running:
+            keys = list(self._sources.keys())
             if not keys:
                 await asyncio.sleep(self.poll_s); continue
             ex, sh = keys[idx % len(keys)]
@@ -1471,13 +1511,11 @@ class WSFanInMux:
                 await asyncio.sleep(self.poll_s)
                 continue
             try:
-                if isinstance(item, dict) and item.get("__ws_reconnect__"):
-                    if callable(note_reconnect):
-                        note_reconnect(ex)
-                    continue
+                if isinstance(item, dict) and item.get("__ws_reconnect__") and callable(note_reconnect):
+                    note_reconnect(item.get("exchange") or ex)
                 self.router_in_queue.put_nowait(item)
             except asyncio.QueueFull:
-                # backpressure jusqu’au Router: on laisse l’item en tête du shard (pas de lose)
+        # backpressure jusqu’au Router: on laisse l’item en tête du shard (pas de lose)
                 try:
                     q.put_nowait(item)  # requeue best effort
                 except Exception:

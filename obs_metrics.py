@@ -544,6 +544,10 @@ if "WS_CONNECTIONS_OPEN" not in globals():
     WS_CONNECTIONS_OPEN = Gauge(
         "ws_connections_open", "Connexions WS publiques ouvertes", ["exchange"]
     )
+if "WS_PUBLIC_DROPPED_TOTAL" not in globals():
+    WS_PUBLIC_DROPPED_TOTAL = Counter(
+        "ws_public_dropped_total", "Evénements WS publics rejetés", ["exchange", "reason"]
+    )
 
 # === Hub WS privés (PWS) ===
 if "PWS_DROPPED_TOTAL" not in globals():
@@ -616,8 +620,6 @@ def inc_engine_pacing_backpressure(reason: str) -> None:
         ENGINE_PACING_BACKPRESSURE_TOTAL.labels(_norm(reason)).inc()
     except Exception:
         pass
-WS_RECONNECTS_TOTAL = _metric(Counter, 'ws_reconnects_total', 'Public WS reconnects count', ['exchange'])
-WS_BACKOFF_SECONDS = _metric(Histogram, 'ws_backoff_seconds', 'Applied reconnect backoff (seconds)', ['exchange'])
 WS_CONNECTIONS_OPEN = _metric(Gauge, 'ws_connections_open', 'Active WS public connections', ['exchange'])
 PACER_STATE = _metric(Gauge, 'pacer_state', 'Pacer state (0=NORMAL,1=CONSTRAINED,2=SEVERE)')
 PACER_CLAMP_SECONDS = _metric(Gauge, 'pacer_clamp_seconds', 'Seconds under clamp by kind', ['kind'])
