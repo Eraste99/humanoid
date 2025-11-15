@@ -265,7 +265,7 @@ class SlippageAndFeesCollector:
         prev = self._ewma[key]; a = 0.22
         self._ewma[key] = (a * v) + ((1 - a) * prev if prev > 0.0 else a * v)
 
-    def get_slippage(self, ex: str, pair: str, side: str, *, kind: str="ewma", default: float=0.0) -> float:
+    def get_slippage(self, ex: str, pair: str, side: str, *, kind: str = "ewma", default: float = 0.0) -> float:
         exu, pk, sd = _norm_ex(ex), _norm_pair(pair), ("buy" if (side or "").lower().startswith("b") else "sell")
         dq = self._hist.get((exu, pk, sd))
         if not dq: return float(default)
@@ -274,9 +274,88 @@ class SlippageAndFeesCollector:
             cutoff = time.time() - self.lookback_s
             arr = [v for (ts, v) in dq if ts >= cutoff]
             if not arr: return float(default)
-            arr.sort(); idx = max(0, int(0.95*(len(arr)-1)))
+            arr.sort();
+            idx = max(0, int(0.95 * (len(arr) - 1)))
             return float(arr[idx])
         return float(self._ewma.get((exu, pk, sd), default))
+
+    def get_recent_slippage(self,
+                            pair: Optional[str] = None,
+                            *,
+                            exchange: Optional[str] = None,
+                            alias: Optional[str] = None,
+                            side: Optional[str] = None,
+                            default: float = 0.0) -> Any:
+        """
+        Retourne les slippages récents agrégés sous forme {pair -> exchange -> alias -> {buy,sell}}.
+
+        - Sans argument : snapshot complet (copie) pour instrumentation / debug.
+        - pair=... : agrégat (max buy/sell) cross-exchanges.
+        - pair+exchange : agrégat sur les alias de l'exchange.
+        - pair+exchange+alias : valeur directe pour l'alias (buy/sell si side fourni, sinon max).
+
+        default est utilisé si aucune donnée n'est disponible.
+        """
+
+        def _entry_value(entry: Optional[Dict[str, float]], side_hint: Optional[str]) -> float:
+            if not entry:
+                return float(default)
+            sd = str(side_hint or "").lower()
+            if sd in ("buy", "sell"):
+                return float(entry.get(sd, float(default)))
+            return float(max(entry.get("buy", float(default)), entry.get("sell", float(default))))
+
+        def _aggregate_aliases(bucket: Dict[str, Dict[str, float]]) -> float:
+            if not bucket:
+                return float(default)
+            vals = [_entry_value(entry, side) for entry in bucket.values()]
+            return float(max(vals) if vals else float(default))
+
+        def _aggregate_exchanges(bucket: Dict[str, Dict[str, Dict[str, float]]]) -> float:
+            if not bucket:
+                return float(default)
+            vals = [_aggregate_aliases(per_alias) for per_alias in bucket.values()]
+            return float(max(vals) if vals else float(default))
+
+        def _aliases_for_exchange(exu: str) -> List[str]:
+            aliases = list(self._snapshots.get(exu, {}).keys())
+            if not aliases:
+                aliases = list(self._fee_clients.get(exu, {}).keys())
+            return [str(a).upper() for a in aliases] or ["GLOBAL"]
+
+        view: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+        for (exu, pk, sd), val in list(self._ewma.items()):
+            if val is None:
+                continue
+            pair_key = pk
+            ex_bucket = view.setdefault(pair_key, {})
+            alias_bucket = ex_bucket.setdefault(exu, {})
+            targets = _aliases_for_exchange(exu)
+            for alias_name in targets:
+                entry = alias_bucket.setdefault(alias_name, {"buy": float(default), "sell": float(default)})
+                entry[sd] = float(max(0.0, val))
+
+        if pair is None:
+            return view
+
+        pk = _norm_pair(pair)
+        per_pair = view.get(pk)
+        if not per_pair:
+            return float(default)
+
+        if exchange:
+            exu = _norm_ex(exchange)
+            per_ex = per_pair.get(exu)
+            if not per_ex:
+                return float(default)
+            if alias:
+                alias_u = str(alias).upper()
+                entry = per_ex.get(alias_u)
+                if entry:
+                    return _entry_value(entry, side)
+            return _aggregate_aliases(per_ex)
+
+        return _aggregate_exchanges(per_pair)
 
     # ------------------------------ Fee policies -----------------------------
 

@@ -35,6 +35,11 @@ Clients attendus (sync ou async) :
         "ts": 1700000000.0
       }
 
+register_callback(cb, role="engine") supporte plusieurs rôles :
+    • role="engine"  → callback principal Engine
+    • role="risk"    → RiskManager (fan-out avant Engine)
+    • role="observer"→ observateurs additionnels (watchdogs…)
+    
 API
 ---
   hub = PrivateWSHub(..., transfer_clients=..., config=BotConfigOrNone)
@@ -275,15 +280,22 @@ class _BaseWSClient:
         if self.cfg.g.mode == "DRY_RUN" and self.cfg.g.feature_switches.get("private_ws", False):
             raise RuntimeError("DRY_RUN: private_ws must be OFF")
 
-    def register_callback(self, cb):
-        """
-        Enregistre le callback principal (Engine) et conserve le précédent
-        comme callback RM si non déjà fixé. Permet double émission RM→Engine.
-        """
-        prev = getattr(self, "_callback", None)
-        if self._rm_callback is None and prev is not None and prev is not cb:
-            self._rm_callback = prev
-        self._callback = cb
+    def register_callback(self, cb, *, role: str = "engine") -> None:
+        """API uniforme: role="engine" (défaut) ou role="risk"."""
+        if not cb:
+            return
+        kind = str(role or "engine").lower()
+        if kind == "engine":
+            prev = getattr(self, "_callback", None)
+            if self._rm_callback is None and prev is not None and prev is not cb:
+                self._rm_callback = prev
+            self._callback = cb
+            return
+        if kind in ("risk", "rm", "riskmanager"):
+            self._rm_callback = cb
+            return
+        raise ValueError(f"unknown callback role={role}")
+
 
     async def start(self):
         import aiohttp, asyncio
@@ -788,11 +800,21 @@ class CoinbaseATPoller:
         self._last_event_ts: float = 0.0
         self._errors: int = 0
 
-    def register_callback(self, cb):
-        prev = getattr(self, "_callback", None)
-        if self._rm_callback is None and prev is not None and prev is not cb:
-            self._rm_callback = prev
-        self._callback = cb
+    def register_callback(self, cb, *, role: str = "engine") -> None:
+        if not cb:
+            return
+        kind = str(role or "engine").lower()
+        if kind == "engine":
+            prev = getattr(self, "_callback", None)
+            if self._rm_callback is None and prev is not None and prev is not cb:
+                self._rm_callback = prev
+            self._callback = cb
+            return
+        if kind in ("risk", "rm", "riskmanager"):
+            self._rm_callback = cb
+            return
+        raise ValueError(f"unknown callback role={role}")
+
 
     def _emit(self, ev: dict) -> None:
         self._last_event_ts = _now()
@@ -1372,34 +1394,31 @@ class PrivateWSHub:
             PWS_QUEUE_CAP.labels(ex, al, kind).set(float(cap))
         except Exception:
             pass
-
-            # 1) callback RM (async/sync sans bloquer)
-            self._deliver_callback(getattr(self, "_rm_callback", None), ev, label="RM")
-
-            # 2) callback Engine (sync)
-            self._deliver_callback(getattr(self, "_callback", None), ev, label="Engine")
-
-            # 3) Observateurs additionnels (balance fetcher, watchdogs…)
-            for cb in list(self._observers):
-                self._deliver_callback(cb, ev, label="Observer")
-
-        def _deliver_callback(self, cb: Optional[Callable[[dict], Any]], ev: dict, label: str) -> None:
-            if not cb:
-                return
-            try:
-                if inspect.iscoroutinefunction(cb):
-                    asyncio.create_task(cb(ev))
-                else:
-                    cb(ev)
-            except Exception:
-                log.exception("[PrivateWSHub] %s callback failed", label)
+        # 1) callback RM (async/sync sans bloquer)
+        self._deliver_callback(getattr(self, "_rm_callback", None), ev, label="RM")
 
         # 2) callback Engine (sync)
-        if getattr(self, "_callback", None):
-            try:
-                self._callback(ev)
-            except Exception:
-                logging.getLogger("PrivateWSHub").exception("Engine callback a levé une exception")
+        self._deliver_callback(getattr(self, "_callback", None), ev, label="Engine")
+
+        # 3) Observateurs additionnels (balance fetcher, watchdogs…)
+        for cb in list(self._observers):
+            self._deliver_callback(cb, ev, label="Observer")
+
+    def _deliver_callback(self, cb: Optional[Callable[[dict], Any]], ev: dict, label: str) -> None:
+        if not cb:
+            return
+        try:
+            result = cb(ev)
+            if inspect.isawaitable(result):
+                try:
+                    asyncio.create_task(result)
+                except RuntimeError:
+                    log.warning(
+                        "[PrivateWSHub] %s callback coroutine sans boucle active", label
+                    )
+        except Exception:
+            log.exception("[PrivateWSHub] %s callback failed", label)
+
 
     def _pws_observe_latency(self, exchange: str, status: str, ev: dict) -> None:
         """Observe la latence entre ts_exchange et ts_local pour ACK/FILL/PARTIAL."""

@@ -132,6 +132,8 @@ class Boot:
         self.boot_complete = asyncio.Event()
         self.ctx = BootContext(cfg)
         self._started = False
+        self._private_health_task: Optional[asyncio.Task] = None
+
 
     # ------------------------------- Public API ----------------------------
     async def start(self) -> BootContext:
@@ -201,6 +203,14 @@ class Boot:
                     await asyncio.wait_for(t, timeout=timeout_s)
                 except asyncio.TimeoutError:
                     pass
+        # Moniteur santé private WS
+        with contextlib.suppress(Exception):
+            t = getattr(self, "_private_health_task", None)
+            if t:
+                t.cancel()
+                await asyncio.wait_for(t, timeout=timeout_s)
+            self._private_health_task = None
+
 
         # 1) RPC
         with contextlib.suppress(Exception):
@@ -561,7 +571,9 @@ class Boot:
         except Exception:
             pass
 
+        self._wire_private_hub_callbacks()
         self._send_status("rm", "ready")
+
 
     async def _start_scanner(self) -> None:
 
@@ -623,36 +635,73 @@ class Boot:
             self._send_status("private", "skipped", {"reason": "feature_flag_off"})
             return
 
-        # 1) Hub privé
+            # 1) Hub privé
         if not getattr(self.ctx, "pws_hub", None):
+            cfg = getattr(self, "cfg", None)
+            binance_accounts = getattr(cfg, "binance_accounts", None) or None
+            bybit_accounts = getattr(cfg, "bybit_accounts", None) or None
+            coinbase_accounts = getattr(cfg, "coinbase_at_accounts", None) or None
+            transfer_clients = None
+            rm = getattr(self.ctx, "rm", None)
+            if rm:
+                tc = getattr(rm, "transfer_clients", None)
+                if tc:
+                    transfer_clients = dict(tc)
 
+            hub_kwargs = {
+                "config": cfg,
+                "binance_accounts": binance_accounts,
+                "bybit_accounts": bybit_accounts,
+                "coinbase_at_accounts": coinbase_accounts,
+                "transfer_clients": transfer_clients,
+            }
+            hub_kwargs = {k: v for k, v in hub_kwargs.items() if v}
 
-
-            self.ctx.pws_hub = PrivateWSHub(getattr(self, "cfg", None))
+            self.ctx.pws_hub = PrivateWSHub(**hub_kwargs)
+            setattr(self.ctx, "priv", self.ctx.pws_hub)
         if hasattr(self.ctx.pws_hub, "start"):
             await self.ctx.pws_hub.start()
+        self.ready_private.set()
         self._send_status("private", "ready")
+
 
         # 2) Reconciler (unique)
         if not getattr(self.ctx, "reconciler", None):
+          self.ctx.reconciler = PrivateWSReconciler(venue_name="TRI-CEX")
 
-
-            self.ctx.reconciler = PrivateWSReconciler(venue_name="TRI-CEX")
-
-        # Attacher au Hub s'il expose un hook
+          # Attacher au Hub s'il expose un hook
         try:
             if hasattr(self.ctx.pws_hub, "attach_reconciler"):
                 self.ctx.pws_hub.attach_reconciler(self.ctx.reconciler)
         except Exception:
             pass
 
-        # Si RM déjà lancé, lier maintenant
         rm = getattr(self.ctx, "rm", None)
+        if rm and hasattr(self.ctx.pws_hub, "register_callback"):
+            cb = getattr(rm, "on_private_event", None)
+            if callable(cb):
+                try:
+                    self.ctx.pws_hub.register_callback(cb, role="rm")
+                except TypeError:
+                    self.ctx.pws_hub.register_callback(cb)
+            setattr(rm, "private_ws_hub", self.ctx.pws_hub)
+
+        # Si RM déjà lancé, lier maintenant
         if rm and hasattr(rm, "bind_reconciler"):
             try:
                 rm.bind_reconciler(self.ctx.reconciler)
             except Exception:
                 pass
+
+        if rm and hasattr(rm, "bind_private_ws_hub"):
+            try:
+                rm.bind_private_ws_hub(self.ctx.pws_hub)
+            except Exception:
+                self.log.exception("[Boot] rm.bind_private_ws_hub failed")
+
+        self._propagate_private_ws_health()
+        self._ensure_private_health_task()
+
 
     async def _sync_scanner_cohorts_loop(self) -> None:
         """
@@ -723,7 +772,9 @@ class Boot:
 
         if hasattr(self.ctx.engine, "start"):
             await self.ctx.engine.start()
+        self._wire_private_hub_callbacks()
         self._send_status("engine", "ready")
+
 
         # 2) RPC
         if not getattr(self.ctx, "rpc", None):
@@ -758,6 +809,8 @@ class Boot:
                     rm.bind_reconciler(reconciler)
             except Exception:
                 pass
+        self._wire_private_hub_callbacks()
+
 
     # ------------------------------- Arrêts ---------------------------------
 
@@ -801,7 +854,7 @@ class Boot:
         with contextlib.suppress(Exception):
             if self.ctx.balances:
                 await self.ctx.balances.stop()
-
+        self._publish_private_hub_status(reason="stopped")
 
 
     async def _stop_scanner(self) -> None:
@@ -822,6 +875,44 @@ class Boot:
         with contextlib.suppress(Exception):
             if self.ctx.lhm:
                 await self.ctx.lhm.stop()
+
+    def _propagate_private_ws_health(self) -> None:
+        hub = getattr(self.ctx, "pws_hub", None)
+        rm = getattr(self.ctx, "rm", None)
+        if not (hub and rm and hasattr(rm, "set_private_ws_health")):
+            return
+        status = None
+        try:
+            if hasattr(hub, "get_status"):
+                status = hub.get_status()
+        except Exception:
+            self.log.exception("[Boot] private WS hub status read failed")
+        try:
+            rm.set_private_ws_health(status)
+        except Exception:
+            self.log.exception("[Boot] propagate private WS health failed")
+
+    def _ensure_private_health_task(self) -> None:
+        if self._private_health_task or not self._running:
+            return
+        interval = float(getattr(getattr(self.cfg, "boot", object()), "private_ws_health_interval_s", 5.0))
+        if interval <= 0:
+            return
+        try:
+            self._private_health_task = asyncio.create_task(
+                self._monitor_private_ws_health(interval), name="boot-private-health"
+            )
+        except Exception:
+            self.log.exception("[Boot] unable to start private WS health monitor")
+
+    async def _monitor_private_ws_health(self, interval: float) -> None:
+        try:
+            while self._running:
+                self._propagate_private_ws_health()
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+
 
     # ------------------------------- Gates ----------------------------------
     def _get_router_ready_pairs_count(self) -> Optional[int]:
@@ -890,6 +981,58 @@ class Boot:
         self._mark_stage("ready")
 
     # ----------------------------- Utilitaires ------------------------------
+    def _wire_private_hub_callbacks(self) -> None:
+        """Brancher hub↔Engine/RM dès qu'ils sont disponibles."""
+        hub = getattr(self.ctx, "pws_hub", None)
+        if not hub or not hasattr(hub, "register_callback"):
+            return
+
+        rm = getattr(self.ctx, "rm", None)
+        rm_cb = getattr(rm, "on_private_event", None)
+        if rm_cb:
+            try:
+                hub.register_callback(rm_cb, role="risk")
+            except TypeError:
+                hub.register_callback(rm_cb)
+            except Exception:
+                self.log.exception("[Boot] unable to register RM callback on hub")
+
+        engine = getattr(self.ctx, "engine", None)
+        eng_cb = getattr(engine, "handle_order_update", None)
+        if eng_cb:
+            try:
+                hub.register_callback(eng_cb, role="engine")
+            except TypeError:
+                hub.register_callback(eng_cb)
+            except Exception:
+                self.log.exception("[Boot] unable to register Engine callback on hub")
+
+    def _publish_private_hub_status(self, *, reason: str = "update") -> Optional[Dict[str, Any]]:
+        """Expose l'état du hub vers Boot.status_sink et RiskManager."""
+        hub = getattr(self.ctx, "pws_hub", None)
+        if not hub or not hasattr(hub, "get_status"):
+            return None
+        try:
+            status = hub.get_status()
+        except Exception:
+            self.log.exception("[Boot] unable to fetch PrivateWSHub status")
+            return None
+
+        payload = {"reason": reason, "status": status}
+        try:
+            self._send_status("private_hub", "state", payload)
+        except Exception:
+            pass
+
+        rm = getattr(self.ctx, "rm", None)
+        emitter = getattr(rm, "_emit_private_plane_event", None)
+        if callable(emitter):
+            try:
+                emitter("hub_status", reason=reason, status=status)
+            except Exception:
+                self.log.exception("[Boot] unable to publish hub status to RM")
+        return status
+
     def _mark_stage(self, stage: str) -> None:
         self.state["stage"] = stage
         self.state.setdefault("timestamps", {})[stage] = time.time()

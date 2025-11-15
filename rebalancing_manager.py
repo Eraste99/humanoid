@@ -213,14 +213,27 @@ class RebalancingManager:
         # balances: latest_balances[EX][ALIAS] = {"USDC":..., "EUR":..., "ETH":...}
         self.latest_balances:   Dict[str, Dict[str, Dict[str, float]]] = {}
         # wallets: latest_wallets[EX][ALIAS][WALLET] = {"USDC":..., "EUR":...}
-        self.latest_wallets:    Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+        self.latest_wallets: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
 
         # Overlay (virtuel) par devise — clé: "ALIAS:EX_A->EX_B|CCY" → montant
         self._overlay_flow: Dict[str, float] = defaultdict(float)
 
+        # Garde-fous snapshots
+        self._snapshots_missing_since: Optional[float] = None
+        self._snapshots_last_error_ts: float = 0.0
+        self._snapshots_missing_error_s: float = max(
+            5.0,
+            float(getattr(self.cfg, "rebal_snapshots_missing_error_s", 45.0)),
+        )
+        self._snapshots_error_cooldown_s: float = max(
+            5.0,
+            float(getattr(self.cfg, "rebal_snapshots_error_cooldown_s", 60.0)),
+        )
+
         # Historique (debug) & rate-limit
         self.history: deque = deque(maxlen=256)
         self._emit_ts = deque(maxlen=512)
+
 
         # Event sink (compat)
         self._event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None
@@ -248,6 +261,60 @@ class RebalancingManager:
             self._event_sink(evt)
         except Exception as exc:
             log.warning("event sink failed: %s", exc, exc_info=False)
+
+        # -------------------------- Snapshots guards ----------------------------
+
+    def _has_balances_snapshot(self) -> bool:
+        for per_alias in (self.latest_balances or {}).values():
+            for assets in (per_alias or {}).values():
+                if assets:
+                    return True
+        return False
+
+    def _has_wallet_snapshot(self) -> bool:
+        for per_alias in (self.latest_wallets or {}).values():
+            for per_wallet in (per_alias or {}).values():
+                for ccy_map in (per_wallet or {}).values():
+                    if ccy_map:
+                        return True
+        return False
+
+    def _has_orderbook_snapshot(self) -> bool:
+        for per in (self.latest_orderbooks or {}).values():
+            for ob in (per or {}).values():
+                if ob.get("bid") or ob.get("ask"):
+                    return True
+        return False
+
+    def _snapshots_ready(self) -> bool:
+        """Vérifie la présence de snapshots avant traitement et déclenche un event si absent."""
+        if self._has_balances_snapshot():
+            self._snapshots_missing_since = None
+            return True
+
+        now = _now()
+        if self._snapshots_missing_since is None:
+            self._snapshots_missing_since = now
+            return False
+
+        missing_for = now - self._snapshots_missing_since
+        if missing_for >= self._snapshots_missing_error_s:
+            if (now - self._snapshots_last_error_ts) >= self._snapshots_error_cooldown_s:
+                states = {
+                    "balances": self._has_balances_snapshot(),
+                    "wallets": self._has_wallet_snapshot(),
+                    "orderbooks": self._has_orderbook_snapshot(),
+                }
+                missing = [k for k, ok in states.items() if not ok]
+                self._snapshots_last_error_ts = now
+                self._emit(
+                    "ERROR",
+                    "snapshots_missing",
+                    missing_since_s=round(missing_for, 1),
+                    missing_components=missing,
+                )
+        return False
+
     # ------------------------------- Ingestion --------------------------------
     def ingest_snapshot(self, data: Dict[str, Any]) -> None:
         """data: {exchange, pair_key|symbol, best_bid, best_ask, active=True}."""
@@ -427,7 +494,7 @@ class RebalancingManager:
 
     def detect_imbalance(self) -> Optional[Dict[str, Any]]:
         """Retourne un snapshot d'imbalance ou None si RAS (hors overlay)."""
-        if not self.latest_balances:
+        if not self._snapshots_ready():
             return None
 
         out = {
@@ -546,8 +613,27 @@ class RebalancingManager:
     def build_plan_raw(self, imbalance: Dict[str, Any], constraints: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         t0 = time.perf_counter_ns()
 
+        if not self._snapshots_ready():
+            qmap = getattr(self.cfg, "rebal_quantum_quote_map", None) or {"USDC": 250.0, "EUR": 250.0}
+            ages = self._freshness_ages()
+            return {
+                "overlay_comp": [],
+                "wallet_transfers": [],
+                "internal_transfers": [],
+                "crypto_topups": [],
+                "rebalancing_trade": None,
+                "bridge_pre": None,
+                "t_ms": 0.0,
+                "snapshots_age_s": ages,
+                "steps": [],
+                "quantum_quote": qmap,
+                "status": "SKIP",
+                "reason": "snapshots_missing",
+            }
+
         # Observabilité : âges
         ages = self._freshness_ages()
+
         try:
             for k, v in ages.items(): REBAL_SNAPSHOTS_AGE_S.labels(k).set(float(v))
         except Exception:

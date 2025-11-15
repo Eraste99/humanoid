@@ -627,10 +627,14 @@ class RiskManager:
         self.bot_cfg = bot_cfg
 
         self.engine = execution_engine
+        self.private_ws_hub = None
+        self.private_ws_healthy: bool = True
+        self._private_ws_status: Dict[str, Any] = {}
         self.reconciler = PrivateWSReconciler()
         self.reconciler._lookup = getattr(self, "lookup_inflight", None)
         self.reconciler._resync_order = getattr(self.engine, "resync_order", None)
         self.reconciler._resync_alias = getattr(self.engine, "resync_alias", None)
+
 
         # --- Instanciation lazy des sous-modules internes (si non injectés) ---
 
@@ -1402,6 +1406,57 @@ class RiskManager:
             logger.exception("[RiskManager] bind_reconciler failed")
             self._emit_private_plane_event("bind_reconciler_failed", error=str(exc))
 
+    def bind_private_ws_hub(self, hub) -> None:
+        """Injection tardive du Hub privé (registre les callbacks RM)."""
+        self.private_ws_hub = hub
+        if hub is None:
+            self.set_private_ws_health(None)
+            return
+        if hasattr(hub, "register_callback") and hasattr(self, "on_private_event"):
+            try:
+                hub.register_callback(self.on_private_event, role="risk")
+            except Exception as exc:
+                logger.exception("[RiskManager] unable to register RM callback on hub")
+                self._emit_private_plane_event("pws_register_failed", error=str(exc))
+        status = None
+        if hasattr(hub, "get_status"):
+            try:
+                status = hub.get_status()
+            except Exception as exc:
+                logger.exception("[RiskManager] private WS status fetch failed")
+                self._emit_private_plane_event("pws_status_failed", error=str(exc))
+        self.set_private_ws_health(status)
+
+    @staticmethod
+    def _derive_private_ws_health(status: Optional[Dict[str, Any]]) -> bool:
+        if not status:
+            return False
+        healthy = bool(status.get("healthy", False))
+        subs = status.get("submodules")
+        if subs and isinstance(subs, dict):
+            any_client = False
+            any_ok = False
+            for per_exchange in subs.values():
+                if not isinstance(per_exchange, dict):
+                    continue
+                for sub_status in per_exchange.values():
+                    any_client = True
+                    if bool((sub_status or {}).get("healthy", False)):
+                        any_ok = True
+            if any_client:
+                return any_ok
+        return healthy
+
+    def set_private_ws_health(self, status: Optional[Dict[str, Any]]) -> None:
+        healthy = self._derive_private_ws_health(status)
+        prev = getattr(self, "private_ws_healthy", None)
+        self.private_ws_healthy = healthy
+        self._private_ws_status = dict(status or {})
+        if prev is None or bool(prev) != bool(healthy):
+            event = "private_ws_recovered" if healthy else "private_ws_degraded"
+            self._emit_private_plane_event(event, healthy=bool(healthy))
+
+
     def set_engine(self, engine) -> None:
         """
         Injection tardive de l'Engine (après création réelle dans le Boot).
@@ -1995,6 +2050,7 @@ class RiskManager:
                                     try:
                                         recent = float(self.slip_collector.get_recent_slippage(pk))
                                         if sb is None:
+
                                             sb = recent
                                         if ss is None:
                                             ss = recent
@@ -5014,6 +5070,7 @@ class RiskManager:
             "module": "RiskManager",
             "healthy": self._running,
             "last_update": self.last_update,
+            "private_ws_healthy": bool(getattr(self, "private_ws_healthy", True)),
             "details": "Orchestrateur central actif (multi-comptes) — quote-agnostic USDC/EUR",
             "metrics": {
                 "vol_interval_s": self.t_vol,

@@ -36,7 +36,7 @@ import base64
 import logging
 import json
 import random
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, Tuple, List,Set
 
 logger = logging.getLogger("MultiBalanceFetcher")
 logger.setLevel(logging.INFO)
@@ -234,6 +234,12 @@ class MultiBalanceFetcher:
         self._default_wallet_type = str(
             getattr(self.cfg, "default_private_wallet", "SPOT") if self.cfg else "SPOT"
         ).upper()
+        self._expected_wallet_types = self._build_expected_wallet_types()
+        self._wallet_missing_log: Dict[Tuple[str, str, str], float] = {}
+        self._wallet_missing_log_interval_s = float(
+            getattr(self.cfg, "wallet_missing_log_interval_s", 60.0)
+            if self.cfg else 60.0
+        )
 
 
         # HTTP
@@ -435,6 +441,36 @@ class MultiBalanceFetcher:
         virt_aliases = set((self._virt.get(ex) or {}).keys())
         canon = set(self.canonical_aliases)
         return sorted(cfg_aliases | virt_aliases | canon)
+
+    def _build_expected_wallet_types(self) -> Set[str]:
+        base: List[str] = [self._default_wallet_type or "SPOT"]
+        cfg_wallets = None
+        cfg_rm = getattr(self.cfg, "rm", None) if self.cfg else None
+        if cfg_rm and getattr(cfg_rm, "wallet_types", None):
+            cfg_wallets = getattr(cfg_rm, "wallet_types")
+        elif self.cfg and getattr(self.cfg, "wallet_types", None):
+            cfg_wallets = getattr(self.cfg, "wallet_types")
+        if not cfg_wallets:
+            base.append("FUNDING")
+        else:
+            base.extend(str(w or "").upper() for w in cfg_wallets)
+        return {str(w or "").upper() for w in base if str(w or "").strip()}
+
+    def _maybe_log_missing_wallet_snapshot(self, exchange: str, alias: str, wallet: str) -> None:
+        interval = max(5.0, float(getattr(self, "_wallet_missing_log_interval_s", 60.0)))
+        key = (str(exchange).upper(), str(alias).upper(), str(wallet).upper())
+        now = time.time()
+        last = float(self._wallet_missing_log.get(key, 0.0))
+        if now - last < interval:
+            return
+        self._wallet_missing_log[key] = now
+        try:
+            logger.warning(
+                "[BalanceFetcher] wallet snapshot missing via PWS deltas for %s[%s] wallet=%s",
+                key[0], key[1], key[2],
+            )
+        except Exception:
+            pass
 
     def _apply_ccy_filter(self, balances: Dict[str, float]) -> Dict[str, float]:
         if not self.ccy_filter:
@@ -952,14 +988,22 @@ class MultiBalanceFetcher:
     # =========================== Public helpers ===============================
     async def get_all_wallets(self) -> Dict[str, Any]:
         """Retourne un snapshot léger des wallets connus via flux privés/REST."""
-        snap: Dict[str, Any] = {}
-        for ex, per_alias in self.latest_wallets.items():
-            snap[ex] = {}
-            for alias, per_wallet in per_alias.items():
-                snap[ex][alias] = {
+        snap: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+        expected = sorted(self._expected_wallet_types)
+        for ex in ("BINANCE", "COINBASE", "BYBIT"):
+            snap.setdefault(ex, {})
+            known_aliases = self._known_aliases(ex)
+            per_alias = (self.latest_wallets.get(ex) or {})
+            for alias in known_aliases:
+                per_wallet = {
                     wallet: dict(ccy_map or {})
-                    for wallet, ccy_map in (per_wallet or {}).items()
+                    for wallet, ccy_map in ((per_alias.get(alias) or {}).items())
                 }
+                for wallet in expected:
+                    data = per_wallet.setdefault(wallet, {})
+                    if not data:
+                        self._maybe_log_missing_wallet_snapshot(ex, alias, wallet)
+                snap[ex][alias] = per_wallet
         return snap
 
     async def get_wallets_snapshot(self) -> Dict[str, Any]:
@@ -998,36 +1042,63 @@ class MultiBalanceFetcher:
             }
 
     # Alias public (nommage canonique) — facilite le branchement depuis le Hub
-    def ingest_account_update(self, exchange: str, alias: str, delta: Dict[str, float]) -> None:
+    def ingest_account_update(
+            self,
+            exchange: str,
+            alias: str,
+            delta: Dict[str, float],
+            wallet_type: Optional[str] = None,
+    ) -> None:
         """
         Compatibilité: même effet que ingest_account_ws_delta (delta par devise).
         """
-        return self.ingest_account_ws_delta(exchange, alias, delta)
+        return self.ingest_account_ws_delta(exchange, alias, delta, wallet_type=wallet_type)
 
-
-    def ingest_account_ws_delta(self, exchange: str, alias: str, partial_balances: Dict[str, float]) -> None:
+    def ingest_account_ws_delta(
+            self,
+            exchange: str,
+            alias: str,
+            partial_balances: Dict[str, float],
+            wallet_type: Optional[str] = None,
+    ) -> None:
         """
         Ingestion opportuniste de snapshots venant d'un feed 'account WS'.
         Conserve l'hypothèse conservatrice: on ne décrémente jamais un solde réel
         sans confirmation REST (on ne fait que relever des hausses, et on écrase sur ccy absent).
         """
         exu, alu = exchange.upper(), alias.upper()
+        if not partial_balances:
+            return
+
+        if any(isinstance(v, dict) for v in partial_balances.values()):
+            for wallet, balances in partial_balances.items():
+                if isinstance(balances, dict):
+                    self.ingest_account_ws_delta(exchange, alias, balances, wallet_type=wallet)
+            return
+
         cur = ((self.latest_balances.get(exu) or {}).get(alu) or {})
         merged = dict(cur)
+        filtered: Dict[str, float] = {}
         for ccy, val in (partial_balances or {}).items():
             try:
-                v = float(val)
+                filtered[str(ccy).upper()] = float(val)
             except Exception:
                 continue
-            # merge conservateur: si WS > cur → prend WS, sinon garde cur
+        filtered = self._apply_ccy_filter(filtered)
+        for ccy, v in filtered.items():
             if v >= float(cur.get(ccy, 0.0)):
                 merged[ccy] = v
-        # écriture snapshot en mémoire
-        self.latest_balances.setdefault(exu, {})[alu] = merged
-        wallet_type = self._default_wallet_type or "SPOT"
+
+        default_wallet = self._default_wallet_type or "SPOT"
+        if (wallet_type or default_wallet).upper() == default_wallet:
+            self.latest_balances.setdefault(exu, {})[alu] = merged
+
         per_alias = self.latest_wallets.setdefault(exu, {})
         per_wallet = per_alias.setdefault(alu, {})
-        per_wallet[wallet_type] = dict(merged)
+        w = (wallet_type or default_wallet).upper()
+        per_wallet[w] = dict(filtered)
+        self._wallet_missing_log.pop((exu, alu, w), None)
+
 
     def prefer_ws_for_keys(self, exchange: str, alias: str, ccys: Tuple[str, ...]) -> None:
         """
@@ -1054,6 +1125,8 @@ class MultiBalanceFetcher:
         per_alias = self.latest_wallets.setdefault(exu, {})
         per_wallet = per_alias.setdefault(alu, {})
         per_wallet[w] = {str(k).upper(): float(v) for k, v in (balances or {}).items()}
+        self._wallet_missing_log.pop((exu, alu, w), None)
+
 
     def observe_fill_fee_reality_check(self, evt: Dict[str, Any]) -> None:
         """Compare les fees rapportés avec les snapshots connus pour déclencher un refresh léger."""

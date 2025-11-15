@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Callable, Awaitable, Optional, Tuple, List, Dict, Any
+from typing import Callable, Awaitable, Optional, Tuple, List, Dict, Any,Set
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 try:
@@ -41,8 +41,13 @@ try:
         WS_RECO_RUN_MS,  # histogram{exchange}
         WS_RECO_ERRORS_TOTAL,  # counter{exchange}
         RECONCILE_RESYNC_TOTAL,  # counter{exchange,alias,scope}
-        RECONCILE_RESYNC_LATENCY_MS, COLD_RESYNC_TOTAL, COLD_RESYNC_RUN_MS  # histogram{exchange,alias,scope}
-)
+        RECONCILE_RESYNC_FAILED_TOTAL,  # counter{exchange,alias,scope}
+        RECONCILE_RESYNC_LATENCY_MS,
+        COLD_RESYNC_TOTAL,
+        COLD_RESYNC_RUN_MS,  # histogram{exchange,alias,scope}
+    )
+
+
 except Exception:  # pragma: no cover
     class _NoopMetric:
         def labels(self, *_, **__): return self
@@ -52,6 +57,7 @@ except Exception:  # pragma: no cover
     WS_RECO_RUN_MS = _NoopMetric()
     WS_RECO_ERRORS_TOTAL = _NoopMetric()
     RECONCILE_RESYNC_TOTAL = _NoopMetric()
+    RECONCILE_RESYNC_FAILED_TOTAL = _NoopMetric()
     RECONCILE_RESYNC_LATENCY_MS = _NoopMetric()
     COLD_RESYNC_TOTAL=_NoopMetric()
     COLD_RESYNC_RUN_MS=_NoopMetric()
@@ -194,7 +200,7 @@ class PrivateWSReconciler:
         self._cold_every_h = float(getattr(self, "cold_resync_interval_h", 6.0))
         self._cold_task = None
         self._event_sink = None  # optionnel: injecte ton LHM/Watchdog
-
+        self._missing_hook_warned: Set[Tuple[str, str, str]] = set()
 
         # Fenêtre glissante pour le taux de miss (~60s)
         self._miss_win: Deque[float] = collections.deque(maxlen=512)
@@ -252,6 +258,78 @@ class PrivateWSReconciler:
 
     def set_event_sink(self, sink: Callable[[dict], None] | None) -> None:
         self._event_sink = sink
+
+    # ----------------------------- Alerts/Events -----------------------------
+
+    def _emit_event(self, event: str, **payload: Any) -> None:
+        if not self._event_sink:
+            return
+        body = {"module": "PWS", "event": event, "ts": time.time()}
+        if payload:
+            body.update(payload)
+        try:
+            self._event_sink(body)
+        except Exception:
+            log.debug("[Reconciler] event_sink emit failed", exc_info=False)
+
+    def _notify_hook_missing(self, hook: str, exchange: str, alias: str) -> None:
+        key = (hook, exchange, alias)
+        if key in self._missing_hook_warned:
+            return
+        self._missing_hook_warned.add(key)
+        log.warning("[Reconciler:%s:%s] hook %s missing", exchange, alias, hook)
+        self._emit_event(
+            "reco_hook_missing",
+            hook=hook,
+            exchange=exchange,
+            alias=alias,
+        )
+
+    def _record_resync_metric(self, exchange: str, alias: str, scope: str) -> None:
+        try:
+            RECONCILE_RESYNC_TOTAL.labels(exchange, alias, scope).inc()
+        except Exception:
+            pass
+
+    def _observe_resync_latency(self, exchange: str, alias: str, scope: str, start_ts: float) -> None:
+        try:
+            RECONCILE_RESYNC_LATENCY_MS.labels(exchange, alias, scope).observe(
+                max(0.0, (time.time() - start_ts) * 1000.0)
+            )
+        except Exception:
+            pass
+
+    def _on_resync_failure(
+        self,
+        exchange: str,
+        alias: str,
+        scope: str,
+        reason: str,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        try:
+            RECONCILE_RESYNC_FAILED_TOTAL.labels(exchange, alias, scope).inc()
+        except Exception:
+            pass
+        try:
+            WS_RECO_ERRORS_TOTAL.labels(exchange).inc()
+        except Exception:
+            pass
+        msg = f"[Reconciler:{exchange}:{alias}] resync {scope} failed ({reason})"
+        if error is not None:
+            log.exception(msg)
+        else:
+            log.warning(msg)
+        payload = {
+            "exchange": exchange,
+            "alias": alias,
+            "scope": scope,
+            "reason": reason,
+        }
+        if error is not None:
+            payload["error"] = str(error)
+        self._emit_event("reco_resync_failed", **payload)
+
 
     async def _cold_resync_loop(self) -> None:
         """
@@ -426,45 +504,64 @@ class PrivateWSReconciler:
         t0 = time.time()
         scope = None
         ok = False
+        attempted = False
         try:
             # 1) resync order
-            if client_id and callable(self._resync_order):
-                scope = "order"
-                ok = await self._resync_order(exchange, alias, client_id)
-                try:
-                    RECONCILE_RESYNC_TOTAL.labels(exchange, alias, scope).inc()
-                except Exception:
+            if client_id:
+                if callable(self._resync_order):
+                    scope = "order"
+                    attempted = True
+                    order_ok = False
+                    order_exc: Optional[BaseException] = None
                     try:
-                        WS_RECO_ERRORS_TOTAL.labels(exchange).inc()
-                    except Exception:
-                        pass
-
-                    pass
+                        order_ok = bool(await self._resync_order(exchange, alias, client_id))
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        order_exc = exc
+                        self._on_resync_failure(exchange, alias, scope, "exception", error=exc)
+                    finally:
+                        self._record_resync_metric(exchange, alias, scope)
+                    if order_exc is None and not order_ok:
+                        self._on_resync_failure(exchange, alias, scope, "returned_false")
+                    ok = order_ok
+                else:
+                    self._notify_hook_missing("resync_order", exchange, alias)
+                    self._on_resync_failure(exchange, alias, "order", "hook_missing")
 
             # 2) resync alias si besoin
-            if (not ok) and misses >= 2 and callable(self._resync_alias):
-                last = float(self._last_alias_resync.get(key, 0.0))
-                if (time.time() - last) >= self._cooldown_s:
-                    scope = "alias"
-                    ok = await self._resync_alias(exchange, alias)
-                    self._last_alias_resync[key] = time.time()
-                    try:
-                        RECONCILE_RESYNC_TOTAL.labels(exchange, alias, scope).inc()
-                    except Exception:
-                        pass
+            if (not ok) and misses >= 2:
+                if callable(self._resync_alias):
+                    last = float(self._last_alias_resync.get(key, 0.0))
+                    if (time.time() - last) >= self._cooldown_s:
+                        scope = "alias"
+                        attempted = True
+                        alias_ok = False
+                        alias_exc: Optional[BaseException] = None
+                        try:
+                            alias_ok = bool(await self._resync_alias(exchange, alias))
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            alias_exc = exc
+                            self._on_resync_failure(exchange, alias, scope, "exception", error=exc)
+                        finally:
+                            self._record_resync_metric(exchange, alias, scope)
+                        if alias_exc is None:
+                            self._last_alias_resync[key] = time.time()
+                            if not alias_ok:
+                                self._on_resync_failure(exchange, alias, scope, "returned_false")
+                        ok = alias_ok
+                else:
+                    self._notify_hook_missing("resync_alias", exchange, alias)
+                    self._on_resync_failure(exchange, alias, "alias", "hook_missing")
         except asyncio.CancelledError:
             raise
-        except Exception:
-            # volontairement silencieux côté logs: le run boucle se charge d'obs les erreurs
-            pass
+        except Exception as exc:
+            self._on_resync_failure(exchange, alias, scope or "unknown", "exception", error=exc)
         finally:
-            if scope:
-                try:
-                    RECONCILE_RESYNC_LATENCY_MS.labels(exchange, alias, scope).observe(
-                        max(0.0, (time.time() - t0) * 1000.0)
-                    )
-                except Exception:
-                    pass
+            if attempted and scope:
+                self._observe_resync_latency(exchange, alias, scope, t0)
             if ok:
                 self._alias_miss_counter[key] = 0  # reset indulgent
 

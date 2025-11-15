@@ -642,6 +642,12 @@ WS_RECO_RUN_MS = _metric(Histogram, 'ws_reco_run_ms', 'Private WS reconciler run
 WS_RECO_ERRORS_TOTAL = _metric(Counter, 'ws_reco_errors_total', 'Errors in private WS reconciler', ['exchange'])
 RECONCILE_MISS_TOTAL = _metric(Counter, 'reconcile_miss_total', 'Reconciler misses', ['exchange', 'kind'])
 RECONCILE_RESYNC_TOTAL = _metric(Counter, 'reconcile_resync_total', 'Resyncs requested by reconciler', ['exchange', 'reason'])
+RECONCILE_RESYNC_FAILED_TOTAL = _metric(
+    Counter,
+    'reconcile_resync_failed_total',
+    'Failed resync attempts triggered by reconciler',
+    ['exchange', 'reason'],
+)
 RECONCILE_RESYNC_LATENCY_MS = _metric(Histogram, 'reconcile_resync_latency_ms', 'Resync rebuild latency (ms)', ['exchange'], buckets=BUCKETS_MS)
 COLD_RESYNC_TOTAL = _metric(Counter, 'cold_resync_total', 'Cold resyncs', ['exchange'])
 COLD_RESYNC_RUN_MS = _metric(Histogram, 'cold_resync_run_ms', 'Cold resync duration (ms)', ['exchange'], buckets=BUCKETS_MS)
