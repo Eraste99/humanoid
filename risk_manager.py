@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 """
-RiskManager — OFFICIEL (V2.1) — Fusion ciblée (part 1/2)
+RiskManager — OFFICIEL (V2.1) 
 =========================================================
 - Quote-agnostic **USDC/EUR** (détection automatique de la devise de cotation).
 - Multi-comptes TT/TM par CEX, routes autorisées, verrous par (exchange, alias, pair).
@@ -21,8 +21,6 @@ RiskManager — OFFICIEL (V2.1) — Fusion ciblée (part 1/2)
     • _ensure_ready() (RM prêt + Engine prêt)
     • handle_opportunity() / rebalance_tick() protègent les appels externes
 
-⚠️ Ce fichier est la **partie 1/2** du module complet. La **partie 2/2** contient le reste de la classe
-   (validations inventaire, stratégie TM, hooks Scanner/Engine, fragmentation, status, etc.).
 """
 
 import asyncio, time, inspect
@@ -193,12 +191,7 @@ class DecisionRecord:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
 # =============================================================================
 
-# -----------------------------
-# Readiness / erreurs
-# -----------------------------
-class NotReadyError(RuntimeError):
-    """Levée quand le RiskManager (ou son Engine) n’est pas prêt."""
-    pass
+
 
 
 # -----------------------------

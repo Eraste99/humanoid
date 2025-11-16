@@ -17,9 +17,6 @@ Patches intégrés (sélection sécurité/perf):
 - TTL en NN: hedge partial auto à l'échéance (panic_hedge avec ratio configurable).
 - _with_retry pour HTTP CEX.
 
-Ce fichier contient: utilitaires, data, FSM, et la moitié haute de ExecutionEngine
-(jusqu'à la fin du pipeline TT). La seconde moitié (TM + HTTP + callbacks utilitaires)
-se trouve dans PART 2.
 """
 
 import asyncio, time, collections, hashlib, json
@@ -684,33 +681,31 @@ logger = logging.getLogger("ExecutionEngine")
 logger.setLevel(logging.INFO)
 
 try:
-    from modules.observability import (
-        set_engine_running,
-        observe_engine_latency,
-        inc_engine_trade,
-        set_engine_queue,
-        inc_ack_timeout,
-        mark_engine_ack,
-        report_nonfatal,
-        MM_FILLS_BOTH,
-        MM_SINGLE_FILL_HEDGED,
-        MM_PANIC_HEDGE_TOTAL,
-    )
     from modules.obs_metrics import (
         ENGINE_SUBMIT_TO_ACK_MS,
         ENGINE_ACK_TO_FILL_MS,
         ENGINE_CANCELLATIONS_TOTAL,
         ENGINE_QUEUEPOS_BLOCKED_TOTAL,
         ENGINE_RETRIES_TOTAL,
-        ENGINE_SUBMIT_QUEUE_DEPTH,  # <-- gauge {exchange}
-        INFLIGHT_GAUGE,  # <-- gauge {exchange}
+        ENGINE_SUBMIT_QUEUE_DEPTH,
+        INFLIGHT_GAUGE,
         REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
+        MM_FILLS_BOTH,
+        MM_SINGLE_FILL_HEDGED,
+        MM_PANIC_HEDGE_TOTAL,
+        inc_ack_timeout,
+        inc_engine_trade,
+        mark_engine_ack,
+        observe_engine_latency,
+        report_nonfatal,
+        set_engine_queue,
+        set_engine_running,
     )
 except Exception:
     # on garde les stubs déclarés plus haut
-    # on garde les stubs déclarés plus haut
     pass
-# Garantir présence des gauges, même en NO-OP (si import a échoué)
+
+    # Garantir présence des gauges, même en NO-OP (si import a échoué)
 try:
     ENGINE_SUBMIT_QUEUE_DEPTH
 except NameError:
@@ -724,10 +719,6 @@ try:
 except NameError:
     REBAL_CROSS_TOO_EXPENSIVE_TOTAL = _NoopMetric()
 
-
-# --- MM metrics ---
-from modules.observability import MM_FILLS_BOTH, MM_SINGLE_FILL_HEDGED, MM_PANIC_HEDGE_TOTAL
-from modules.obs_metrics import ENGINE_SUBMIT_TO_ACK_MS, ENGINE_ACK_TO_FILL_MS
 
 logger = logging.getLogger("ExecutionEngine")
 

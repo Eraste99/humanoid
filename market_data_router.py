@@ -37,10 +37,12 @@ logger = logging.getLogger("MarketDataRouter")
 
 # Observabilité (no-op fallback)
 try:
-    from modules.observability import router_on_combo_event, report_nonfatal  # type: ignore
+    from modules.obs_metrics import router_on_combo_event, report_nonfatal  # type: ignore
 except Exception:  # pragma: no cover
     router_on_combo_event = None  # type: ignore
-    def report_nonfatal(*a, **k): return None
+
+    def report_nonfatal(*a, **k):
+        return None
 
 # --- Observability (canonique) ----------------------------------------------
 # On importe TOUT depuis modules.obs_metrics ; si non dispo, on no-op.

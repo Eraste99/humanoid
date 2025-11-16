@@ -59,21 +59,25 @@ from contracts.errors import DataStaleError
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Set
 getcontext().prec = 28
 
-# Observabilité (tolérant : no-op si modules/observability absent)
+# Observabilité (tolérant : no-op si modules/obs_metrics absent)
 try:
-    from modules.observability import (
-        bump_scanner,               # métriques historiques déjà utilisées
-        inc_scanner_rejection,      # nouveau
-        inc_scanner_emitted,        # nouveau
-        observe_scanner_latency,    # nouveau
+    from modules.obs_metrics import (
+        bump_scanner,
+        inc_scanner_rejection,
+        inc_scanner_emitted,
+        observe_scanner_latency,
     )
 except Exception:  # pragma: no cover
+
     def bump_scanner(*args, **kwargs):  # type: ignore
         return
+
     def inc_scanner_rejection(*args, **kwargs):  # type: ignore
         return
+
     def inc_scanner_emitted(*args, **kwargs):  # type: ignore
         return
+
     def observe_scanner_latency(*args, **kwargs):  # type: ignore
         return
 
@@ -98,16 +102,6 @@ except Exception:  # no-op fallbacks en cas d'import partiel
     def mark_scanner_to_rm(*_a, **_k): pass
     SCANNER_DECISION_MS = _N()
 
-# Helpers observability existants (si présents)
-try:
-    from modules.observability import (
-        bump_scanner, inc_scanner_rejection, inc_scanner_emitted, observe_scanner_latency
-    )
-except Exception:
-    def bump_scanner(*_a, **_k): pass
-    def inc_scanner_rejection(*_a, **_k): pass
-    def inc_scanner_emitted(*_a, **_k): pass
-    def observe_scanner_latency(*_a, **_k): pass
 
 # --- OBS/METRICS Fallbacks & imports manquants ---
 try:

@@ -54,15 +54,17 @@ except Exception:  # pragma: no cover
     SIMULATED_VWAP_DEVIATION_BPS = _NoopHist()
 
 try:
-    from modules.observability import sim_on_run
+    from modules.obs_metrics import sim_on_run
 except Exception:  # pragma: no cover
+
     def sim_on_run(mode: str, vwap_dev: Optional[float] = None, fragments: int = 0, blocked: bool = False) -> None:
         return
 
 # Signaux non-fatals (facultatif, no-op si absent)
 try:
-    from modules.observability import report_nonfatal
+    from modules.obs_metrics import report_nonfatal
 except Exception:  # pragma: no cover
+
     def report_nonfatal(module: str, kind: str, err: Optional[BaseException] = None, **labels) -> None:
         return
 

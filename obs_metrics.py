@@ -5,9 +5,11 @@ import logging
 import threading
 import time
 import os as _os
-from typing import Any, Dict, Optional
+from typing import Any, Dict,List, Optional
 from dataclasses import dataclass, asdict
 log = logging.getLogger('obs_metrics')
+_obs_shim_log = logging.getLogger('observability_shim')
+
 from prometheus_client import Counter, Gauge, Histogram, REGISTRY
 
 # --- BEGIN OM-0: STRICT + PROM READY + Noop ---
@@ -510,6 +512,8 @@ ENGINE_PACER_INFLIGHT_MAX = _metric(Gauge, 'engine_pacer_inflight_max', 'Engine 
 ENGINE_PACER_MODE = _metric(Gauge, 'engine_pacer_mode', 'Engine pacer mode (0=NORMAL,1=CONSTRAINED,2=SEVERE)')
 ENGINE_DRAIN_LATENCY_MS = _metric(Histogram, 'engine_drain_latency_ms', 'Engine drain latency (ms)', buckets=BUCKETS_MS)
 ENGINE_PACING_BACKPRESSURE_TOTAL = _metric(Counter, 'engine_pacing_backpressure_total', 'Engine pacing backpressure', ['reason'])
+ENGINE_ACK_TIMEOUT_TOTAL = _metric(Counter, 'engine_ack_timeout_total', 'Engine ack timeouts')
+
 
 # === OBS READINESS (Lot B) — strict + stubs + métriques Lot B ===
 import os, logging
@@ -917,30 +921,201 @@ def sim_on_run(mode: str, vwap_dev: Optional[float]=None, fragments: int=0, bloc
 PAYLOAD_REJECTED_TOTAL = _metric(Counter, 'payload_rejected_total', 'Payloads rejected by validation', ['field'])
 _metrics_http_started = False
 
-class ObsServer:
-    """Mini serveur /metrics (Prometheus). Démarre sur `port` (9108 par défaut).
-    S'assure de ne pas lancer deux fois le serveur process-wide.
-    """
 
-    def __init__(self, host: str='0.0.0.0', port: int=9108):
+class ObsServer:
+    """HTTP helper exposing /metrics plus optional JSON endpoints."""
+
+    def __init__(self, *, host: str = '0.0.0.0', port: int = 9108) -> None:
         self.host = host
         self.port = int(port)
-        self._started = False
+        self._runner: Optional['web.AppRunner'] = None
+        self._site: Optional['web.TCPSite'] = None
+        self._modules: Dict[str, Any] = {}
+        self._started_prometheus_only = False
+
+    def register_modules(self, **modules: Any) -> None:
+        self._modules.update({k: v for k, v in modules.items() if v is not None})
 
     async def start(self) -> None:
         global _metrics_http_started
-        if self._started or _metrics_http_started:
-            return
-        try:
+        if web is None:
+            if self._started_prometheus_only or _metrics_http_started:
+                return
             start_http_server(self.port)
-            log.info('ObsServer started on :%d (/metrics)', self.port)
-            self._started = True
+            self._started_prometheus_only = True
             _metrics_http_started = True
-        except Exception:
-            log.exception('ObsServer.start failed')
+            _obs_shim_log.info('ObsServer: prometheus_client /metrics on :%d (aiohttp absent)', self.port)
+            return
+
+        if self._runner or self._site:
+            return
+        if _metrics_http_started:
+            _obs_shim_log.info('ObsServer already started globally; skipping second instance')
+            return
+
+        app = web.Application()
+
+        @web.middleware
+        async def _cors_mw(request, handler):
+            resp = await handler(request)
+            resp.headers['Access-Control-Allow-Origin'] = '*'
+            return resp
+
+        app.middlewares.append(_cors_mw)
+        app.add_routes([
+            web.get('/health', self._health),
+            web.get('/metrics', self._metrics),
+            web.get('/api/engine/status', self._engine_status),
+            web.get('/engine/status', self._engine_status),
+            web.get('/api/risk/snapshot', self._risk_snapshot),
+            web.get('/risk/snapshot', self._risk_snapshot),
+            web.get('/api/scanner/snapshot', self._scanner_snapshot),
+            web.get('/scanner/snapshot', self._scanner_snapshot),
+            web.get('/api/router/health', self._router_health),
+            web.get('/router/health', self._router_health),
+            web.get('/central/last_event', self._central_last_event),
+            web.get('/central/status', self._central_status),
+        ])
+        self._runner = web.AppRunner(app, access_log=None)
+        await self._runner.setup()
+        self._site = web.TCPSite(self._runner, self.host, self.port)
+        await self._site.start()
+        self._started_prometheus_only = True
+        _metrics_http_started = True
+        _obs_shim_log.info('ObsServer started on %s:%d (aiohttp)', self.host, self.port)
 
     async def stop(self) -> None:
-        self._started = False
+        global _metrics_http_started
+        if self._site:
+            await self._site.stop()
+        if self._runner:
+            await self._runner.cleanup()
+        self._site = None
+        self._runner = None
+        if self._started_prometheus_only:
+            _metrics_http_started = False
+            self._started_prometheus_only = False
+
+    async def _health(self, request):
+        statuses: Dict[str, Any] = {}
+        healthy = True
+        for name, mod in self._modules.items():
+            try:
+                st = mod.get_status() if hasattr(mod, 'get_status') else {'healthy': True}
+            except Exception:
+                st = {'healthy': False, 'details': 'get_status failed'}
+            statuses[name] = st
+            healthy = healthy and bool(st.get('healthy', True))
+        return web.json_response({'healthy': healthy, 'modules': statuses})
+
+    async def _metrics(self, request):
+        data = generate_latest(REGISTRY)
+        return web.Response(body=data, content_type=CONTENT_TYPE_LATEST)
+
+    async def _engine_status(self, request):
+        eng = self._modules.get('engine')
+        out: Dict[str, Any] = {}
+        if eng:
+            snap = None
+            for name in ('export_status', 'snapshot', 'status', 'to_dict', 'export'):
+                if hasattr(eng, name):
+                    res = getattr(eng, name)()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    snap = res
+                    break
+            if isinstance(snap, dict):
+                out = snap
+            else:
+                out = {
+                    'status': getattr(eng, 'state', 'running'),
+                    'latency_ms': getattr(eng, 'latency_ms', {'ack_p50': None, 'fill_p50': None}),
+                }
+        return web.json_response(out or {'status': 'unknown'})
+
+    async def _risk_snapshot(self, request):
+        rm = self._modules.get('risk')
+        out: Dict[str, Any] = {}
+        if rm:
+            snap = None
+            for name in ('export_snapshot', 'snapshot', 'to_dict', 'export'):
+                if hasattr(rm, name):
+                    res = getattr(rm, name)()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    snap = res
+                    break
+            if isinstance(snap, dict):
+                out = snap
+            else:
+                fees = None
+                for n in ('export_fees_snapshot', 'get_all_fees'):
+                    if hasattr(rm, n):
+                        fees = getattr(rm, n)()
+                        break
+                prud = 'unknown'
+                vm = getattr(rm, 'volatility_monitor', None)
+                if vm is not None:
+                    prud = getattr(vm, 'prudence', None) or getattr(vm, 'get_prudence_signal', lambda *_: 'unknown')('ALL')
+                out = {
+                    'fees': fees or {},
+                    'slippage': getattr(rm, '_ext_slip', {}),
+                    'volatility_bps': getattr(rm, '_ext_vol_bps', {}),
+                    'prudence': prud,
+                }
+        return web.json_response(out or {})
+
+    async def _scanner_snapshot(self, request):
+        sc = self._modules.get('scanner')
+        out: Dict[str, Any] = {}
+        if sc:
+            snap = None
+            for name in ('export_snapshot', 'snapshot', 'to_dict', 'export'):
+                if hasattr(sc, name):
+                    res = getattr(sc, name)()
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    snap = res
+                    break
+            if isinstance(snap, dict):
+                out = snap
+            else:
+                opps = []
+                for name in ('get_recent_opportunities', 'recent_opportunities', 'opportunities'):
+                    if hasattr(sc, name):
+                        data = getattr(sc, name)
+                        data = data() if callable(data) else data
+                        if isinstance(data, list):
+                            opps = data
+                            break
+                out = {'opportunities': opps, 'summary': {'count': len(opps)}}
+        return web.json_response(out or {})
+
+    async def _router_health(self, request):
+        try:
+            return web.json_response({'exchanges': _ROUTER_HEALTH_CACHE})
+        except Exception:
+            return web.json_response({'error': 'failed to read router health'}, status=500)
+
+    async def _central_last_event(self, request):
+        cw = self._modules.get('central_watchdog')
+        if not cw or not hasattr(cw, 'get_status'):
+            return web.json_response({'error': 'central_watchdog not registered'}, status=404)
+        try:
+            st = cw.get_status() or {}
+            return web.json_response({'last_event': st.get('last_event')})
+        except Exception:
+            return web.json_response({'error': 'failed to read central last event'}, status=500)
+
+    async def _central_status(self, request):
+        cw = self._modules.get('central_watchdog')
+        if not cw or not hasattr(cw, 'get_status'):
+            return web.json_response({'error': 'central_watchdog not registered'}, status=404)
+        try:
+            return web.json_response(cw.get_status())
+        except Exception:
+            return web.json_response({'error': 'failed to read central status'}, status=500)
+
 try:
     from aiohttp import web
 except Exception:
@@ -1182,11 +1357,227 @@ def obs_is_ready() -> bool:
     """Indique si l'empilement Prometheus est opérationnel (client importable)."""
     return bool(_OBS_PROM_AVAILABLE)
 
-# Initialisation du flag (no-op si get_gauge retourne un stub)
 try:
     OBS_READY.set(1.0 if _OBS_PROM_AVAILABLE else 0.0)
 except Exception:
     pass
+
+# --- Legacy observability helpers (migrated from observability.py) ---
+try:
+    from aiohttp import web  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    web = None  # type: ignore
+
+_ROUTER_HEALTH_CACHE: Dict[str, Dict[str, Any]] = {}
+
+def router_health_on_beat(
+    exchange: str,
+    *,
+    last_ex_ts_ms: int,
+    last_recv_ts_ms: int,
+    age_ms: float,
+    pairs_seen: int | List[str] | None = None,
+) -> None:
+    """Backfills the /api/router/health cache used by the HTTP shim."""
+
+    try:
+        exu = str(exchange).upper()
+        n_pairs = len(pairs_seen) if isinstance(pairs_seen, (list, tuple)) else int(pairs_seen or 0)
+        _ROUTER_HEALTH_CACHE[exu] = {
+            'exchange': exu,
+            'last_ex_ts_ms': int(last_ex_ts_ms),
+            'last_recv_ts_ms': int(last_recv_ts_ms),
+            'age_ms': float(age_ms),
+            'pairs_seen': n_pairs,
+            'updated_ts': time.time(),
+        }
+    except Exception:  # pragma: no cover - defensive
+        _obs_shim_log.exception('router_health_on_beat failed')
+
+
+def ws_public_on_frame(exchange: str) -> None:
+    _obs_shim_log.debug('ws_public_on_frame(%s) [legacy no-op]', exchange)
+
+
+def ws_public_set_staleness(exchange: str, seconds: float) -> None:
+    _obs_shim_log.debug('ws_public_set_staleness(%s, %.3f) [legacy no-op]', exchange, seconds)
+
+
+def mark_books_fresh_by_exchange(exchange: str) -> None:
+    """Marks the synthetic pair "{EX}:ALL" as fresh to retain per-exchange granularity."""
+
+    try:
+        ex = (exchange or 'ALL').upper()
+        mark_books_fresh(f'{ex}:ALL')
+    except Exception:
+        _obs_shim_log.exception('mark_books_fresh_by_exchange failed')
+
+
+def router_on_combo_event(
+    combo: str,
+    skew_ms: float | None = None,
+    ages_ms_by_exchange: dict[str, float] | None = None,
+) -> None:
+    try:
+        if isinstance(skew_ms, (int, float)):
+            ROUTER_COMBO_SKEW_MS.labels(str(combo)).observe(max(0.0, float(skew_ms)))
+    except Exception:  # pragma: no cover - metrics optional
+        _obs_shim_log.exception('router_on_combo_event failed')
+
+
+def feesync_on_refresh(ok: bool) -> None:
+    _obs_shim_log.debug('feesync_on_refresh(%s) [legacy no-op]', ok)
+
+
+def feesync_on_apply(exchange: str, alias: str) -> None:
+    _obs_shim_log.debug('feesync_on_apply(%s,%s) [legacy no-op]', exchange, alias)
+
+
+def feesync_on_error() -> None:
+    _obs_shim_log.debug('feesync_on_error() [legacy no-op]')
+
+
+def discovery_on_run(enabled_exchanges: list[str], pairs_per_exchange: dict[str, int]) -> None:
+    _obs_shim_log.debug('discovery_on_run(%d exchanges) [legacy no-op]', len(enabled_exchanges or []))
+
+
+def private_on_poller_tick(exchange: str) -> None:
+    _obs_shim_log.debug('private_on_poller_tick(%s) [legacy no-op]', exchange)
+
+
+def private_on_event(exchange: str, typ: str) -> None:
+    _obs_shim_log.debug('private_on_event(%s,%s) [legacy no-op]', exchange, typ)
+
+
+def snapshot_inventory(balances: dict[str, dict[str, float]], mids: dict[str, float]) -> None:
+    _obs_shim_log.debug('snapshot_inventory(...) [legacy no-op]')
+
+
+def bump_scanner(spread_pct: float | None, active_pairs: int | None) -> None:
+    _obs_shim_log.debug('bump_scanner(spread=%s, active=%s) [legacy no-op]', spread_pct, active_pairs)
+
+
+def set_tm_open_makers(n: int) -> None:
+    _obs_shim_log.debug('set_tm_open_makers(%d) [legacy no-op]', n)
+
+
+def tm_on_maker_placed(exchange: str, symbol: str, side: str) -> None:
+    _obs_shim_log.debug('tm_on_maker_placed(%s,%s,%s) [legacy no-op]', exchange, symbol, side)
+
+
+def tm_on_maker_canceled(exchange: str, symbol: str) -> None:
+    _obs_shim_log.debug('tm_on_maker_canceled(%s,%s) [legacy no-op]', exchange, symbol)
+
+
+def tm_on_hedge_sent(exchange: str, symbol: str, side: str, lag_seconds: float | None = None) -> None:
+    _obs_shim_log.debug('tm_on_hedge_sent(%s,%s,%s,lag=%s) [legacy no-op]', exchange, symbol, side, lag_seconds)
+
+
+def tm_on_maker_fill_ratio(ratio: float) -> None:
+    _obs_shim_log.debug('tm_on_maker_fill_ratio(%.3f) [legacy no-op]', ratio)
+
+
+def mm_on_opp(pair: str) -> None:
+    _obs_shim_log.debug('mm_on_opp(%s) [legacy no-op]', pair)
+
+
+def mm_on_both_filled(pair: str) -> None:
+    _obs_shim_log.debug('mm_on_both_filled(%s) [legacy no-op]', pair)
+
+
+def mm_on_single_fill_hedged(pair: str) -> None:
+    _obs_shim_log.debug('mm_on_single_fill_hedged(%s) [legacy no-op]', pair)
+
+
+def mm_on_panic_hedge(pair: str) -> None:
+    _obs_shim_log.debug('mm_on_panic_hedge(%s) [legacy no-op]', pair)
+
+
+def set_engine_queue(n: int) -> None:
+    try:
+        ENGINE_SUBMIT_QUEUE_DEPTH.set(max(0, int(n)))
+    except Exception:
+        _obs_shim_log.exception('set_engine_queue failed')
+
+
+def inc_ack_timeout() -> None:
+    try:
+        ENGINE_ACK_TIMEOUT_TOTAL.inc()
+    except Exception:
+        _obs_shim_log.exception('inc_ack_timeout failed')
+
+
+def _norm_shim(v: Any) -> str:
+    if v is None:
+        return 'none'
+    s = str(v)
+    return s if s else 'empty'
+
+
+def inc_engine_trade(result: str, kind: str, mode: str = 'standard') -> None:
+    try:
+        TRADES_LIVE_DAY_TOTAL.labels(_norm_shim(result)).inc()
+    except Exception:
+        _obs_shim_log.exception('inc_engine_trade failed')
+
+
+def observe_engine_latency(seconds: float) -> None:
+    try:
+        ENGINE_DRAIN_LATENCY_MS.observe(max(0.0, float(seconds) * 1000.0))
+    except Exception:
+        _obs_shim_log.exception('observe_engine_latency failed')
+
+
+def mark_engine_ack(submit_ts_ns: int) -> None:
+    """Legacy shim mapping Engine submit→ack timings to Prometheus."""
+
+    try:
+        dt_ms = max(0.0, (time.perf_counter_ns() - int(submit_ts_ns)) / 1_000_000.0)
+        ENGINE_SUBMIT_TO_ACK_MS.observe(dt_ms)
+    except Exception:
+        _obs_shim_log.exception('mark_engine_ack failed')
+
+
+def record_pipeline_timings(trace: Dict[str, Any]) -> None:
+    """Best-effort mapper for legacy dict payloads into Engine histograms."""
+
+    try:
+        t_sub = trace.get('t_engine_submit_ms')
+        t_ack = trace.get('t_engine_ack_ms')
+        t_ff = trace.get('t_first_fill_ms')
+        if isinstance(t_sub, (int, float)) and isinstance(t_ack, (int, float)) and (t_ack >= t_sub):
+            ENGINE_SUBMIT_TO_ACK_MS.observe(float(t_ack - t_sub))
+        if isinstance(t_sub, (int, float)) and isinstance(t_ff, (int, float)) and (t_ff >= t_sub):
+            ENGINE_ACK_TO_FILL_MS.observe(float(t_ff - t_sub))
+    except Exception:
+        _obs_shim_log.exception('record_pipeline_timings failed')
+
+
+def inc_scanner_rejection(reason: str, route: str = 'n/a', pair: str = 'n/a') -> None:
+    try:
+        SCANNER_REJECTIONS_TOTAL.labels(str(reason)).inc()
+    except Exception:
+        _obs_shim_log.exception('inc_scanner_rejection failed')
+
+
+def inc_scanner_emitted(route: str = 'n/a', pair: str = 'n/a') -> None:
+    try:
+        SCANNER_EMITTED_TOTAL.inc()
+    except Exception:
+        _obs_shim_log.exception('inc_scanner_emitted failed')
+
+
+def observe_scanner_latency(route: str, seconds: float) -> None:
+    try:
+        ROUTER_TO_SCANNER_MS.labels(str(route)).observe(max(0.0, float(seconds) * 1000.0))
+    except Exception:
+        _obs_shim_log.exception('observe_scanner_latency failed')
+
+
+def set_engine_running(flag: bool) -> None:
+    _obs_shim_log.debug('set_engine_running(%s) [legacy no-op]', flag)
+
+
 
 __all__ = ['BUCKETS_MS',"LAT_ACK_MS", "LAT_FILL_FIRST_MS", "LAT_FILL_ALL_MS", "LAT_E2E_MS","LOGGERH_FILE_ROTATIONS_TOTAL",
     "LAT_EVENTS_TOTAL", "LAT_PIPELINE_EVENTS_TOTAL","OBS_READY", "obs_is_ready",
@@ -1205,4 +1596,20 @@ __all__ += [
     'PWS_ALERT_TOTAL',
     'WS_RECO_MISS_PER_MINUTE',
     'WS_RECO_MISS_BURST_TOTAL',
+]
+__all__ += [
+    'ObsServer',
+    'router_health_on_beat',
+    'router_on_combo_event',
+    'mark_books_fresh_by_exchange',
+    'set_engine_queue',
+    'inc_ack_timeout',
+    'inc_engine_trade',
+    'observe_engine_latency',
+    'mark_engine_ack',
+    'record_pipeline_timings',
+    'inc_scanner_rejection',
+    'inc_scanner_emitted',
+    'observe_scanner_latency',
+    'set_engine_running',
 ]
