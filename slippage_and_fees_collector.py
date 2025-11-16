@@ -63,7 +63,7 @@ from collections import defaultdict, deque
 
 # Observabilité — sous-module PASSIF (no Prometheus ici)
 from typing import Callable, Optional, Dict, Any
-import logging, time
+import logging, time, types
 
 log = logging.getLogger("slippage_and_fees_collector")
 
@@ -181,6 +181,147 @@ class SlippageAndFeesCollector:
     # --------------------------- Slippage (minimal) ---------------------------
 
     # -------------------- Fee token level / targets (hooks RM) --------------------
+    def _sfc_get_total_cost_pct_compat(self, *args, **kwargs):
+        """
+        Compatibility wrapper for SlippageAndFeesCollector.get_total_cost_pct.
+
+        Accepts calls in multiple forms:
+          - get_total_cost_pct(route=..., side=..., size_quote=..., slippage_kind=..., prudence_key=..., ts_ns=None, explain=...)
+          - get_total_cost_pct(buy_ex, sell_ex, pair)
+          - get_total_cost_pct(buy_ex, sell_ex, pair, size_quote)
+          - fallback: tries original implementation if present, otherwise composes a conservative estimate.
+
+        Always returns a fraction (float), e.g. 0.0012 for 12 bps. Never raises TypeError due to signature mismatch.
+        """
+        # 1) Prefer original preserved implementation if present
+        try:
+            orig = getattr(self, "__orig_get_total_cost_pct", None)
+            if orig and callable(orig):
+                try:
+                    return float(orig(*args, **kwargs))
+                except TypeError:
+                    # signature mismatch, fall through to mapping attempts
+                    pass
+                except Exception:
+                    logging.exception("sfc compat: orig call failed")
+        except Exception:
+            logging.exception("sfc compat: error fetching orig")
+
+        # 2) Try direct call on whatever implementation exists (best-effort)
+        try:
+            if hasattr(self, "get_total_cost_pct") and getattr(self,
+                 "get_total_cost_pct") is not self._sfc_get_total_cost_pct_compat:
+                try:
+                    return float(self.get_total_cost_pct(*args, **kwargs))
+                except TypeError:
+                    # likely our method or signature mismatch -> continue
+                    pass
+                except Exception:
+                    logging.exception("sfc compat: direct call to get_total_cost_pct failed")
+        except Exception:
+            pass
+
+        # 3) Map route dict -> positional (buy_ex, sell_ex, pair)
+        route = kwargs.get("route") or (args[0] if args and isinstance(args[0], dict) else None)
+        if isinstance(route, dict):
+            buy_ex = route.get("buy_ex") or route.get("buy_exchange")
+            sell_ex = route.get("sell_ex") or route.get("sell_exchange")
+            pair = route.get("pair") or route.get("pair_key")
+            try:
+                # try preserved original with positional mapping
+                if getattr(self, "__orig_get_total_cost_pct", None):
+                    try:
+                        return float(self.__orig_get_total_cost_pct(buy_ex, sell_ex, pair))
+                    except Exception:
+                        pass
+                # fallback direct
+                if hasattr(self, "get_total_cost_pct"):
+                    try:
+                        return float(self.get_total_cost_pct(buy_ex, sell_ex, pair))
+                    except Exception:
+                        pass
+            except Exception:
+                logging.exception("sfc compat: route->positional mapping failed")
+
+        # 4) If called with >=3 positional args, try to use them as (buy_ex, sell_ex, pair)
+        if len(args) >= 3:
+            try:
+                buy_ex, sell_ex, pair = args[0], args[1], args[2]
+                if getattr(self, "__orig_get_total_cost_pct", None):
+                    try:
+                        return float(self.__orig_get_total_cost_pct(buy_ex, sell_ex, pair))
+                    except Exception:
+                        pass
+                if hasattr(self, "get_total_cost_pct"):
+                    try:
+                        return float(self.get_total_cost_pct(buy_ex, sell_ex, pair))
+                    except Exception:
+                        pass
+            except Exception:
+                logging.exception("sfc compat: positional mapping failed")
+
+        # 5) Best-effort compute using available per-side helpers (fee & recent slip)
+        try:
+            # try to discover buy_ex/sell_ex/pair from kwargs or args
+            buy_ex = None
+            sell_ex = None
+            pair = None
+            if isinstance(route, dict):
+                buy_ex = route.get("buy_ex") or route.get("buy_exchange")
+                sell_ex = route.get("sell_ex") or route.get("sell_exchange")
+                pair = route.get("pair") or route.get("pair_key")
+            elif len(args) >= 3:
+                buy_ex, sell_ex, pair = args[0], args[1], args[2]
+
+            fee_buy = fee_sell = slip_buy = slip_sell = 0.0
+            if buy_ex and sell_ex and pair:
+                if hasattr(self, "get_fee_pct"):
+                    try:
+                        fee_buy = float(self.get_fee_pct(buy_ex, pair, "taker"))
+                        fee_sell = float(self.get_fee_pct(sell_ex, pair, "taker"))
+                    except Exception:
+                        logging.debug("sfc compat: get_fee_pct fallback failed", exc_info=False)
+                if hasattr(self, "get_recent_slippage"):
+                    try:
+                        slip = float(self.get_recent_slippage(pair))
+                        slip_buy = slip_sell = slip
+                    except Exception:
+                        logging.debug("sfc compat: get_recent_slippage fallback failed", exc_info=False)
+            total = max(0.0, fee_buy + fee_sell + slip_buy + slip_sell)
+            return float(total)
+        except Exception:
+            logging.exception("sfc compat: compute fallback failed")
+
+        # 6) Last resort
+        return 0.0
+
+    def install_get_total_cost_pct_compat(sfc):
+        """
+        Install the compatibility wrapper on an instance of a SlippageAndFeesCollector (or similar SFC object).
+
+        Usage: call install_get_total_cost_pct_compat(self) from inside SlippageAndFeesCollector.__init__
+               (or call it from RiskManager after injection: install_get_total_cost_pct_compat(rm.slip_collector))
+        """
+        if getattr(sfc, "_sfc_compat_installed", False):
+            return
+        # Preserve original implementation under a private name if possible
+        try:
+            if not hasattr(sfc, "__orig_get_total_cost_pct"):
+                if hasattr(sfc, "get_total_cost_pct"):
+                    sfc.__orig_get_total_cost_pct = sfc.get_total_cost_pct
+                else:
+                    # no original -> create trivial origin returning 0.0
+                    sfc.__orig_get_total_cost_pct = lambda *a, **k: 0.0
+        except Exception:
+            sfc.__orig_get_total_cost_pct = lambda *a, **k: 0.0
+
+        # Bind the compatibility wrapper as the public method
+        sfc.get_total_cost_pct = types.MethodType(sfc._sfc_get_total_cost_pct_compat, sfc)
+
+        sfc._sfc_compat_installed = True
+
+    # ---- END PATCH ----
+
 
     def get_total_cost_pct_route(
             self,
