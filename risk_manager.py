@@ -191,9 +191,6 @@ class DecisionRecord:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
 # =============================================================================
 
-
-
-
 # -----------------------------
 # Quote handling (USDC & EUR)
 # -----------------------------
@@ -546,21 +543,20 @@ class RiskManager:
 
     ) -> None:
 
-        self.config = config  # alias explicite conservé
-        self.bot_cfg = config  # cohérence avec le reste du code
-        self.cfg = config
+        base_cfg = bot_cfg or config
+        self.bot_cfg = base_cfg
+        self.config = base_cfg  # alias explicite conservé
+        self.cfg = base_cfg
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
 
         self.inventory_cap_quote = _cfg_float(
             self.cfg, "inventory_cap_quote",
             _cfg_float(self.cfg, "inventory_cap_usd", 1500.0)
         )
-        self.inventory_cap_quote = _cfg_float(
-            self.cfg, "inventory_cap_quote",
-            _cfg_float(self.cfg, "inventory_cap_usd", 1500.0)
-        )
+
         # conservez les attributs existants pour limiter le diff interne
         self.inventory_cap_usd = self.inventory_cap_quote  # compat interne
+        self.min_buffer_quote = _cfg_float(self.cfg, "min_buffer_quote", 0.0)
 
 
 
@@ -800,8 +796,8 @@ class RiskManager:
 
         # Readiness
         self.ready_event: asyncio.Event = ready_event or asyncio.Event()
-        self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.fee_buyer = FeeTokenBuyer(self.config, logger=getattr(self, "logger", None))
+
         # --- RM Mode Overlay (FSM P0) ---
         self.rm_mode = "NORMAL"  # NORMAL | OPP_VOLUME | OPP_VOL | SEVERE
         self._mode_since = 0.0
@@ -1063,7 +1059,7 @@ class RiskManager:
                 break
 
     # === RM: capital net & profil ===
-    @staticmethod
+
     def compute_capital_net_per_subaccount(self, gross_equity: float, fee_reserve_total: float) -> float:
         """
         Capital net exploitable = equity - réserves tokens fees (BNB/MNT...).
@@ -1071,7 +1067,7 @@ class RiskManager:
         """
         return max(0.0, float(gross_equity) - float(fee_reserve_total))
 
-    @staticmethod
+
     def decide_capital_profile(self, net_per_sc: float) -> str:
         if net_per_sc < 2000: return "NANO"
         if net_per_sc < 5000: return "MICRO"
@@ -1639,7 +1635,7 @@ class RiskManager:
     # ------------------------------------------------------------------
 
     # ==== [ADD THESE METHODS INSIDE class RiskManager (helpers section)] =========
-    @staticmethod
+
     def _hash_decision_id(self, pair: str, buy: str, sell: str, ts_ns: int) -> str:
         base = f"{pair}|{buy}|{sell}|{ts_ns // 1_000_000}"  # tranche à la ms
         return str(abs(hash(base)))
@@ -1875,9 +1871,6 @@ class RiskManager:
                 return
 
             imb = self.rebalancing.detect_imbalance()
-            if not imb:
-                return
-
             # Obs: un déséquilibre détecté
             try:
                 from modules.obs_metrics import REBAL_DETECTED_TOTAL
@@ -1894,8 +1887,14 @@ class RiskManager:
                 try:
                     if plan and isinstance(plan, dict):
                         from modules.obs_metrics import REBAL_PLAN_QUANTUM_QUOTE
-                        q = str(plan.get("quantum_quote") or "NA").upper()
-                        REBAL_PLAN_QUANTUM_QUOTE.labels(q).set(float(plan.get("quantum") or 0.0))
+                        qmap = plan.get("quantum_quote") or {}
+                        if isinstance(qmap, dict) and qmap:
+                            for quote, qval in qmap.items():
+                                try:
+                                    REBAL_PLAN_QUANTUM_QUOTE.labels(str(quote).upper()).set(float(qval or 0.0))
+                                except Exception:
+                                    # On ne casse jamais le tick pour une simple métrique.
+                                    pass
                 except Exception:
                     pass
 
@@ -2627,120 +2626,6 @@ class RiskManager:
             return 0.0
         return filled_quote / filled_base
 
-    def revalidate_arbitrage(
-
-            self,
-            *,
-            buy_ex: str,
-            sell_ex: str,
-            pair_key: str,
-            expected_net: float | None,  # ratio (ex: 0.0015 = 15 bps)
-            max_drift_bps: float = 7.0,
-            min_required_bps: float | None = None,
-            is_rebalancing: bool = False,
-            allow_final_loss_bps: float = 0.0,
-            # nouveaux overrides explicites (optionnels, sans casser l’existant)
-            buy_px_override: float | None = None,
-            sell_px_override: float | None = None,
-            # compat avec l’existant
-            price_overrides: dict | None = None,
-    ) -> bool:
-        """
-        Revalidation last-mile :
-        - lit TOB (Router) avec overrides éventuels,
-        - applique frais + slippage,
-        - vérifie bps nets vs seuils/tolérances.
-        """
-        try:
-            pk = (pair_key or "").replace("-", "").upper()
-            bo = price_overrides or {}
-
-            # --- 1) TOB live (Engine doit être branché au Router) ---
-            b_bid, b_ask = self.get_top_of_book(buy_ex, pk)
-            s_bid, s_ask = self.get_top_of_book(sell_ex, pk)
-
-            # BUY = on paie l'ASK ; SELL = on frappe le BID
-            buy_ask = float(
-                buy_px_override
-                if buy_px_override is not None else
-                (bo.get("buy_ask") if bo else b_ask)
-            )
-            sell_bid = float(
-                sell_px_override
-                if sell_px_override is not None else
-                (bo.get("sell_bid") if bo else s_bid)
-            )
-
-            # Garde-fous prix
-            if buy_ask <= 0 or sell_bid <= 0 or sell_bid <= buy_ask:
-                return False
-
-            # --- 2) Frais & slippage (fallbacks tolérants) ---
-            def _fee(ex: str, role: str) -> float:
-                # essaie _fee_pct(ex, role) → get_fee_pct(ex, role) → variantes tolérantes
-                for sig in (
-                        lambda: self._fee_pct(ex, role),
-                        lambda: self.get_fee_pct(ex, role),
-                        lambda: self.get_fee_pct(ex, None, role),
-                        lambda: self.get_fee_pct(ex, role, None),
-                ):
-                    try:
-                        return float(sig())
-                    except Exception:
-                        logging.exception("Unhandled exception")
-                return 0.0
-
-            def _slip(ex: str, pair: str, side: str) -> float:
-                # essaie _slip_pct(ex, pair, "buy"/"sell") → get_slippage_pct(ex, pair, "BUY"/"SELL")
-                for (fn, sd) in (
-                        (getattr(self, "_slip_pct", None), side.lower()),
-                        (getattr(self, "get_slippage_pct", None), side.upper()),
-                ):
-                    if callable(fn):
-                        try:
-                            return float(fn(ex, pair, sd))
-                        except Exception:
-                            logging.exception("Unhandled exception")
-                return 0.0
-
-            fee_buy = max(0.0, _fee(buy_ex, "taker"))
-            fee_sell = max(0.0, _fee(sell_ex, "taker"))
-            slip_buy = max(0.0, _slip(buy_ex, pk, "buy"))
-            slip_sell = max(0.0, _slip(sell_ex, pk, "sell"))
-
-            # Net sur 1$ de base: on paie buy_ask*(1+fee+slip); on reçoit sell_bid*(1-fee-slip)
-            buy_cost = buy_ask * (1.0 + fee_buy + slip_buy)
-            sell_take = sell_bid * (1.0 - fee_sell - slip_sell)
-            net_ratio = (sell_take - buy_cost) / buy_cost
-            net_bps = 1e4 * net_ratio
-
-            # --- 3) Seuils / tolérances ---
-            base_min_bps = float(getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0)))
-
-            min_req = 0.0 if is_rebalancing else float(
-                min_required_bps if min_required_bps is not None else base_min_bps)
-
-
-
-            # Tolérance de perte finale (toujours appliquée)
-            if net_bps < -float(allow_final_loss_bps or 0.0):
-                return False
-
-            # Cohérence avec l’attendu (on tolère “mieux que prévu”)
-            if expected_net is not None:
-                exp_bps = 1e4 * float(expected_net)
-                if (exp_bps - net_bps) > float(max_drift_bps or 0.0):
-                    return False
-
-            return net_bps >= min_req
-
-        except Exception:
-            # durcir: on refuse proprement + compteur
-            try:
-                self.metrics_refusals = getattr(self, "metrics_refusals", 0) + 1
-            except Exception:
-                logging.exception("Unhandled exception")
-            return False
 
     async def is_fragment_profitable(
             self,
@@ -3138,26 +3023,28 @@ class RiskManager:
 
         if t == "internal_wallet_transfer":
             await self._exec_internal_wallet_transfer(op)
-        elif t == "internal_subaccount_transfer":
+        elif t in ("internal_subaccount_transfer", "internal_alias_transfer"):
             await self._exec_internal_subaccount_transfer(op)
         elif t == "rebalancing_trade":
             await self._forward_rebalancing_trade(op)
-        elif t in ("overlay_compensation", "crypto_topup_hint"):
-            pass
-
+        elif t in ("overlay_compensation", "crypto_topup_hint", "bridge_pre_hint"):
+            # Hints purement informatifs pour l’instant (obs + décision hors RM).
+            return
         else:
             legacy = self._legacy_convert(op)
             if legacy:
-                if legacy["type"] == "rebalancing_trade":
+                lt = str(legacy.get("type") or "").lower()
+                if lt == "rebalancing_trade":
                     await self._forward_rebalancing_trade(legacy)
-                elif legacy["type"].startswith("internal_"):
+                elif lt.startswith("internal_"):
                     try:
-                        if legacy["type"] == "internal_wallet_transfer":
+                        if lt == "internal_wallet_transfer":
                             await self._exec_internal_wallet_transfer(legacy)
-                        elif legacy["type"] == "internal_subaccount_transfer":
+                        elif lt == "internal_subaccount_transfer":
                             await self._exec_internal_subaccount_transfer(legacy)
                     except Exception:
                         logger.exception("[RiskManager] legacy internal transfer failed")
+
 
     def _mark_loop_success(self, loop_name: str) -> None:
         state = self._loop_health.setdefault(loop_name, {"last_success": 0.0, "consecutive_errors": 0})
@@ -3180,16 +3067,33 @@ class RiskManager:
             state["consecutive_errors"] = 0
 
     def _legacy_convert(self, op: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        if str(op.get("type")) == "internal_transfer":
+        """Conversion des anciens formats d'opérations de rebalancing.
+
+        Objectif : mapper les schémas historiques vers les types normalisés
+        *internal_wallet_transfer* / *internal_subaccount_transfer* / *rebalancing_trade*.
+        """
+        t = str(op.get("type") or "").lower()
+
+        # Ancien format pour transferts internes entre alias (USDC only)
+        if t in ("internal_transfer", "internal_alias_transfer", "transfer"):
+            src = op.get("from") or {}
+            dst = op.get("to") or {}
             return {
                 "type": "internal_subaccount_transfer",
                 "exchange": op.get("exchange"),
-                "from_alias": op.get("from_alias"),
-                "to_alias": op.get("to_alias"),
-                "ccy": "USDC",
-                "amount": float(op.get("amount_usdc", 0.0) or 0.0),
+                "from_alias": op.get("from_alias") or (src.get("alias") if isinstance(src, dict) else None),
+                "to_alias": op.get("to_alias") or (dst.get("alias") if isinstance(dst, dict) else None),
+                "ccy": str(op.get("ccy") or "USDC").upper(),
+                "amount": float(
+                    op.get("amount_usdc")
+                    or op.get("amount")
+                    or 0.0
+                ),
             }
+
+        # Par défaut : pas de conversion
         return None
+
 
     async def _forward_rebalancing_trade(self, op: Dict[str, Any]) -> None:
         cross = op.get("cross") or op  # accepte soit l'op brut Engine, soit le champ "cross"
@@ -3386,7 +3290,7 @@ class RiskManager:
     # Inventaire / skew / temps (helpers) — **multi-comptes**
     # ------------------------------------------------------------------
 
-    def _norm_pair(s: str) -> str:
+    def _norm_pair(self, s: str) -> str:
         return (s or "").replace("-", "").upper()
 
     @staticmethod
@@ -3822,68 +3726,230 @@ class RiskManager:
         return boost_bps, size_factor, hedge_ratio
 
     def revalidate_arbitrage(
-        self,
-        *,
-        buy_ex: str,
-        sell_ex: str,
-        pair_key: str,
-        expected_net: Optional[float] = None,
-        max_drift_bps: float = 10.0,
-        min_required_bps: Optional[float] = None,
-        is_rebalancing: bool = False,
-        allow_final_loss_bps: float = 0.0,
+            self,
+            *,
+            buy_ex: str,
+            sell_ex: str,
+            pair_key: str,
+            expected_net: Optional[float] = None,
+            max_drift_bps: float = 10.0,
+            min_required_bps: Optional[float] = None,
+            is_rebalancing: bool = False,
+            allow_final_loss_bps: float = 0.0,
+            # overrides optionnels (compat)
+            buy_px_override: Optional[float] = None,
+            sell_px_override: Optional[float] = None,
+            price_overrides: Optional[dict] = None,
     ) -> bool:
-        pk = self._norm_pair(pair_key)
+        """
+        Revalidation "last-mile" unifiée et robuste.
 
-        if min_required_bps is None:
-            if self.dynamic_min_required and not is_rebalancing:
-                min_required_bps = self._dynamic_min_required_bps(pk)
-            else:
-                min_required_bps = 0.0 if is_rebalancing else self.base_min_bps
-
-        # ---- VM : prudence -> boost du seuil (en bps) -------------------------------
+        - Essaie d'utiliser TOB strict via get_top_of_book (raise DataStaleError/InconsistentStateError si stale/invalide).
+        - Fallback tolérant sur snapshot _last_books si le TOB strict n'est pas disponible.
+        - Supporte overrides explicites (buy_px_override / sell_px_override / price_overrides).
+        - Calcul du coût net en préférant :
+            1) l'API SFC.get_total_cost_pct si disponible (renvoie fraction, ex. 0.0012)
+            2) sinon, composition fees + slippage via get_fee_pct / get_slippage / _slip_pct fallback.
+        - Applique boost VM (prudence) sur min_required_bps si applicable.
+        - Vérifie expected_net drift, tolérance de perte finale et retourne True si net_bps >= min_required_bps.
+        - Penalise la paire (penalize_pair) si incohérences / dérives observées.
+        """
         try:
-            vm_boost_bps, _, _ = self._vm_adjustments(pk)
-            if vm_boost_bps > 0.0 and not is_rebalancing:
-                min_required_bps = float(min_required_bps) + float(vm_boost_bps)
-        except Exception:
-            pass
+            pk = self._norm_pair(pair_key)
+            bo = price_overrides or {}
 
-        books = self._last_books or {}
-        try:
-            buy_book = books.get(buy_ex, {}).get(pk, {}) or {}
-            sell_book = books.get(sell_ex, {}).get(pk, {}) or {}
+            # ===== min_required_bps resolution (param -> dynamic -> base) =====
+            if min_required_bps is None:
+                if getattr(self, "dynamic_min_required", False) and not is_rebalancing:
+                    try:
+                        min_required_bps = self._dynamic_min_required_bps(pk)
+                    except Exception:
+                        min_required_bps = float(getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0)))
+                else:
+                    min_required_bps = 0.0 if is_rebalancing else float(
+                        getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0)))
 
-            if not (self._fresh_enough(buy_book) and self._fresh_enough(sell_book)):
-                self.penalize_pair(pk, reason="revalidate_drift")
-                return False
+            # VM adjustments (boost threshold)
+            try:
+                vm_boost_bps, _, _ = self._vm_adjustments(pk)
+                if vm_boost_bps > 0.0 and not is_rebalancing:
+                    min_required_bps = float(min_required_bps) + float(vm_boost_bps)
+            except Exception:
+                # best-effort: ignore VM failure
+                pass
 
-            buy_ask = float(buy_book.get("best_ask", 0) or 0)
-            sell_bid = float(sell_book.get("best_bid", 0) or 0)
-            if buy_ask <= 0 or sell_bid <= 0 or sell_bid <= buy_ask:
-                self.penalize_pair(pk, reason="revalidate_drift")
-                return False
-
-            mid = (buy_ask + sell_bid) / 2.0
-            spread_norm = (sell_bid - buy_ask) / mid
-
-            total_cost = self.get_total_cost_pct(buy_ex, sell_ex, pk)
-            net_now = spread_norm - total_cost
-
-            if (net_now * 1e4) < float(min_required_bps):
-                if is_rebalancing and allow_final_loss_bps > 0:
-                    return net_now >= -(allow_final_loss_bps / 1e4)
-                self.penalize_pair(pk, reason="revalidate_drift")
-                return False
-
-            if expected_net is not None:
-                drift_bps = (expected_net - net_now) * 1e4
-                if drift_bps > float(max_drift_bps):
-                    self.penalize_pair(pk, reason="revalidate_drift")
+            # ===== 1) read TOP-OF-BOOK (strict preferred) with graceful fallback =====
+            buy_ask = None
+            sell_bid = None
+            try:
+                # prefer strict TOB (may raise DataStaleError / InconsistentStateError)
+                b_bid, b_ask = self.get_top_of_book(buy_ex, pk)
+                s_bid, s_ask = self.get_top_of_book(sell_ex, pk)
+                buy_ask = float(
+                    buy_px_override if buy_px_override is not None else (bo.get("buy_ask") if bo else b_ask))
+                sell_bid = float(
+                    sell_px_override if sell_px_override is not None else (bo.get("sell_bid") if bo else s_bid))
+            except (DataStaleError, InconsistentStateError):
+                # Fallback: use last snapshot _last_books if available, but require freshness check
+                books = self._last_books or {}
+                buy_book = books.get(buy_ex, {}).get(pk, {}) or {}
+                sell_book = books.get(sell_ex, {}).get(pk, {}) or {}
+                if not (self._fresh_enough(buy_book) and self._fresh_enough(sell_book)):
+                    # trop vieux -> penaliser et rejeter
+                    try:
+                        self.penalize_pair(pk, reason="revalidate_stale")
+                    except Exception:
+                        pass
                     return False
+                buy_ask = float(buy_px_override if buy_px_override is not None else (
+                    bo.get("buy_ask") if bo else buy_book.get("best_ask", 0)))
+                sell_bid = float(sell_px_override if sell_px_override is not None else (
+                    bo.get("sell_bid") if bo else sell_book.get("best_bid", 0)))
 
+            except Exception:
+                # lecture TOB totalement ratée -> safer reject (increment metric)
+                try:
+                    self.penalize_pair(pk, reason="revalidate_tob_err")
+                except Exception:
+                    pass
+                return False
+
+            # Price sanity
+            if buy_ask <= 0 or sell_bid <= 0 or sell_bid <= buy_ask:
+                try:
+                    self.penalize_pair(pk, reason="revalidate_price_invalid")
+                except Exception:
+                    pass
+                return False
+
+            # ===== 2) compute costs: prefer SFC total_cost_pct else compose from fees+slip =====
+            total_cost_frac = None  # fraction (ex: 0.0012)
+            # Prefer slip_collector.get_total_cost_pct if exposed (SFC)
+            sfc = getattr(self, "slip_collector", None) or getattr(self, "sfc", None)
+            if sfc and hasattr(sfc, "get_total_cost_pct"):
+                try:
+                    # try to call with flexible signature; some implementations accept route+kwargs, others simpler
+                    try:
+                        total_cost_frac = float(
+                            sfc.get_total_cost_pct(route={"buy_ex": buy_ex, "sell_ex": sell_ex, "pair": pk},
+                                                   side="TM" if is_rebalancing else "TT",
+                                                   size_quote=None,
+                                                   slippage_kind=getattr(self, "slippage_source", "ewma"),
+                                                   prudence_key=self._current_prudence(pk)))
+                    except TypeError:
+                        # fallback simple signature
+                        total_cost_frac = float(sfc.get_total_cost_pct(buy_ex, sell_ex, pk))
+                except Exception:
+                    total_cost_frac = None
+
+            # If SFC not available or failed, compute per-side fees+slip
+            if total_cost_frac is None:
+                # helper: robust fee getter (fraction)
+                def _fee(ex: str, role: str) -> float:
+                    try:
+                        # try rm helpers / public API
+                        return float(self._fee_pct(ex, role))
+                    except Exception:
+                        try:
+                            return float(self.get_fee_pct(ex, pk, role))
+                        except Exception:
+                            # best-effort fallback 0.0
+                            return 0.0
+
+                def _slip(ex: str, pair: str, side: str) -> float:
+                    try:
+                        # prefer consolidated SFC API
+                        return float(self._slip_pct(ex, pair, side))
+                    except Exception:
+                        try:
+                            return float(self.get_slippage(ex, pair, side))
+                        except Exception:
+                            return 0.0
+
+                fee_buy = max(0.0, _fee(buy_ex, "taker"))
+                fee_sell = max(0.0, _fee(sell_ex, "taker"))
+                slip_buy = max(0.0, _slip(buy_ex, pk, "buy"))
+                slip_sell = max(0.0, _slip(sell_ex, pk, "sell"))
+
+                # total cost as fraction sum of per-side contributions (conservative)
+                total_cost_frac = max(0.0, fee_buy + fee_sell + slip_buy + slip_sell)
+
+            # Defensive clamp
+            try:
+                total_cost_frac = float(total_cost_frac)
+                if math.isnan(total_cost_frac) or total_cost_frac < 0:
+                    total_cost_frac = 0.0
+            except Exception:
+                total_cost_frac = 0.0
+
+            # ===== 3) compute net (fraction) and net_bps =====
+            # Use multiplicative exact formulation when we have per-side fee/slip info; otherwise approximate via spread-mid minus total_cost_frac
+            net_frac = None
+            # if we have per-side components available in locals, use multiplicative formula
+            try:
+                # If we earlier computed fee_buy/fee_sell/slip_buy/slip_sell then use multiplicative formula
+                if "fee_buy" in locals() and "fee_sell" in locals() and "slip_buy" in locals() and "slip_sell" in locals():
+                    buy_cost = buy_ask * (1.0 + fee_buy + slip_buy)
+                    sell_take = sell_bid * (1.0 - fee_sell - slip_sell)
+                    net_frac = (sell_take - buy_cost) / max(buy_cost, 1e-12)
+                else:
+                    # fallback to spread-mid minus total_cost_frac
+                    mid = (buy_ask + sell_bid) / 2.0
+                    spread_norm = (sell_bid - buy_ask) / max(mid, 1e-12)
+                    net_frac = spread_norm - total_cost_frac
+            except Exception:
+                # worst-case: compute via spread-mid - total_cost_frac
+                mid = (buy_ask + sell_bid) / 2.0
+                spread_norm = (sell_bid - buy_ask) / max(mid, 1e-12)
+                net_frac = spread_norm - total_cost_frac
+
+            net_bps = 1e4 * float(net_frac)
+
+            # ===== 4) final checks: allow_final_loss, expected_net drift, threshold compare =====
+            # final loss guard (absolute)
+            if net_bps < -float(allow_final_loss_bps or 0.0):
+                # allow_final_loss violated
+                return False
+
+            # expected_net coherence (expected_net is ratio)
+            if expected_net is not None:
+                try:
+                    exp_bps = 1e4 * float(expected_net)
+                    if (exp_bps - net_bps) > float(max_drift_bps or 0.0):
+                        # drift too large
+                        try:
+                            self.penalize_pair(pk, reason="revalidate_drift")
+                        except Exception:
+                            pass
+                        return False
+                except Exception:
+                    # if expected_net parsing fail -> treat as non-fatal
+
+                    pass
+
+            # compare to minimum required (both are in bps)
+            if net_bps < float(min_required_bps):
+                # special-case rebalancing allow_final_loss path already handled above
+                try:
+                    if is_rebalancing and float(allow_final_loss_bps or 0.0) > 0.0:
+                        # allow a loss up to allow_final_loss_bps
+                        if net_bps >= -(float(allow_final_loss_bps) or 0.0):
+                            return True
+                    # otherwise penalize and reject
+                    self.penalize_pair(pk, reason="revalidate_below_min")
+                except Exception:
+                    pass
+                return False
+
+            # OK
             return True
+
         except Exception:
+            # Harden: count refusals and return False
+            try:
+                self.metrics_refusals = getattr(self, "metrics_refusals", 0) + 1
+            except Exception:
+                logging.exception("Unhandled exception")
             return False
 
 
@@ -3925,12 +3991,24 @@ class RiskManager:
     def get_fees(self, exchange: str, pair_key: str) -> float:
         return self.get_fee_pct(exchange, pair_key, "taker")
 
-
+    # --- Remplacer l'implémentation actuelle de _mm_cost_bps par :
     def _mm_cost_bps(self, route: dict, *, size_quote: float, prudence_key: str = "NORMAL") -> float:
         """
-        Raccourci: coût MM (maker/maker) en bps, publié avec le label side="MM".
+        Coût MM (maker/maker) en bps, en utilisant l'API get_total_cost_pct(buy_ex, sell_ex, pair_key).
+        route peut être un dict {'buy_ex':..,'sell_ex':..,'pair':..} ou similaire.
         """
-        return self._total_cost_bps(route, side="MM", size_quote=size_quote, prudence_key=prudence_key)
+        try:
+            if isinstance(route, dict):
+                buy_ex = (route.get("buy_ex") or route.get("buy_exchange") or "").upper()
+                sell_ex = (route.get("sell_ex") or route.get("sell_exchange") or "").upper()
+                pair = (route.get("pair") or route.get("pair_key") or "")
+            else:
+                # fallback safe
+                return 0.0
+            pct = float(self.get_total_cost_pct(buy_ex, sell_ex, pair) or 0.0)
+            return pct * 1e4
+        except Exception:
+            return 0.0
 
     def get_fee_pct(self, exchange: str, pair_key: str, mode: str = "taker") -> float:
         if self.slip_collector is None or not hasattr(self.slip_collector, "get_fee_pct"):
@@ -4046,22 +4124,34 @@ class RiskManager:
 
     def _tm_edge_bps(self, *, maker_side: str, maker_ex: str, taker_ex: str, pair_key: str) -> float:
         maker_side = str(maker_side).upper()
-        mbid, mask = self.get_top_of_book(maker_ex, pair_key)
-        tbid, task = self.get_top_of_book(taker_ex, pair_key)
+        try:
+            # lire TOB (attention: get_top_of_book lève si stale)
+            mbid, mask = self.get_top_of_book(maker_ex, pair_key)
+            tbid, task = self.get_top_of_book(taker_ex, pair_key)
+        except Exception:
+            return -1e9
         if min(mbid, mask, tbid, task) <= 0:
             return -1e9
+
+        # calcul brut dépendant du côté maker
         if maker_side == "SELL":
             brut = (mask - task) / max(task, 1e-12)
-            total_cost = self.get_total_cost_pct(
-                buy_ex=taker_ex, sell_ex=maker_ex, pair_key=pair_key,
-                maker_on_sell=True, maker_on_buy=False,
+            # coûts : taker fee @ taker_ex (taker), maker fee @ maker_ex (maker)
+            total_cost = (
+                    self.get_fee_pct(taker_ex, pair_key, "taker")
+                    + self.get_fee_pct(maker_ex, pair_key, "maker")
+                    + self.get_slippage(taker_ex, pair_key, "buy")
+                    + self.get_slippage(maker_ex, pair_key, "sell")
             )
         else:
             brut = (tbid - mbid) / max(mbid, 1e-12)
-            total_cost = self.get_total_cost_pct(
-                buy_ex=maker_ex, sell_ex=taker_ex, pair_key=pair_key,
-                maker_on_buy=True, maker_on_sell=False,
+            total_cost = (
+                    self.get_fee_pct(maker_ex, pair_key, "maker")
+                    + self.get_fee_pct(taker_ex, pair_key, "taker")
+                    + self.get_slippage(maker_ex, pair_key, "buy")
+                    + self.get_slippage(taker_ex, pair_key, "sell")
             )
+
         return (brut - total_cost) * 1e4
 
     def _depth_ratio_ok(self, ex: str, pair_key: str, usdc_amt: float, min_ratio: float) -> bool:
@@ -5086,7 +5176,11 @@ class RiskManager:
             avg = total / cnt
             auto = False
 
-        weights = list(self.frontload_weights or [0.5, 0.35, 0.15])
+        try:
+            raw_weights = self.frontload_weights or [0.5, 0.35, 0.15]
+            weights = [float(w) for w in raw_weights]
+        except Exception:
+            weights = [0.5, 0.35, 0.15]
         if sum(weights) <= 0:
             weights = [1.0, 0.0, 0.0]
         s = sum(weights)

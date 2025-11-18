@@ -757,18 +757,19 @@ class RebalancingManager:
         - Aucun I/O : coûts/px viennent du RM (ex: cost_fn) si besoin, fournis via 'constraints'.
         - Rétro-compat : on fusionne les champs legacy du plan 'raw' dans le retour final.
         """
-        # 1) Obtenir un plan "raw" depuis l'implémentation existante, sans I/O
+        # 1) Obtenir un plan "raw" depuis l'implémentation existante, sans I/O.
+        # On privilégie d'abord build_plan_raw (nouvelle API), puis les variantes legacy.
         raw = None
-        for name in ("_build_plan_raw", "build_plan_core", "_legacy_build_plan"):
+        for name in ("build_plan_raw", "_build_plan_raw", "build_plan_core", "_legacy_build_plan"):
             fn = getattr(self, name, None)
             if callable(fn):
                 raw = fn(target_alloc, constraints)
                 break
         if raw is None:
-            # fallback ultra conservateur : plan vide (SKIP)
+            # Fallback ultra conservateur : plan vide (SKIP)
             raw = {}
 
-        # 2) Deriver les steps (liste d’opérations abstraites)
+        # 2) Dériver les steps (liste d’opérations abstraites)
         steps = raw.get("steps")
         if not isinstance(steps, list):
             try:
@@ -785,7 +786,7 @@ class RebalancingManager:
         status = "READY" if steps else "SKIP"
 
         # 5) Fusion: on renvoie le triplet normalisé + les champs legacy inchangés
-        plan = {"steps": steps, "quantum_quote": qmap, "status": status}
+        plan: Dict[str, Any] = {"steps": steps, "quantum_quote": qmap, "status": status}
         try:
             plan.update(raw)  # compat: on garde le détail historique si présent
         except Exception:
@@ -879,16 +880,52 @@ class RebalancingManager:
         Ici ça reste des hints ; le RM choisit quoi exécuter et comment.
         """
         ops: List[Dict[str, Any]] = []
+
+        # Overlay: purement indicatif, laissé au RM
         for op in plan.get("overlay_comp") or []:
-            ops.append({"type": "overlay_compensation", **op})
+            base = dict(op or {})
+            ops.append({**base, "type": "overlay_compensation"})
+
+        # Transferts entre wallets (SPOT/FUNDING/DERIV ...)
         for w in plan.get("wallet_transfers") or []:
-            ops.append({"type": "internal_wallet_transfer", **w})
+            base = dict(w or {})
+            # On force le type attendu par le RM
+            ops.append({**base, "type": "internal_wallet_transfer"})
+
+        # Transferts intra-CEX entre alias (TT/TM/MM...)
         for it in plan.get("internal_transfers") or []:
-            ops.append({"type": "internal_alias_transfer", **it})
+            base = dict(it or {})
+
+            # Normalisation des alias
+            from_alias = base.pop("from_alias", None)
+            to_alias = base.pop("to_alias", None)
+
+            src = base.get("from") or {}
+            dst = base.get("to") or {}
+
+            if not from_alias and isinstance(src, dict):
+                from_alias = src.get("alias")
+            if not to_alias and isinstance(dst, dict):
+                to_alias = dst.get("alias")
+
+            if from_alias:
+                base["from_alias"] = from_alias
+            if to_alias:
+                base["to_alias"] = to_alias
+
+            # Type aligné sur l'API du RM
+            ops.append({**base, "type": "internal_subaccount_transfer"})
+
+        # Top-ups crypto indicatifs
         for t in plan.get("crypto_topups") or []:
-            ops.append({"type": "crypto_topup_hint", **t})
+            base = dict(t or {})
+            ops.append({**base, "type": "crypto_topup_hint"})
+
+        # Pré-bridge éventuel (hint purement informatif)
         if plan.get("bridge_pre"):
-            ops.append({"type": "bridge_pre_hint", **plan["bridge_pre"]})
+            base = dict(plan.get("bridge_pre") or {})
+            ops.append({**base, "type": "bridge_pre_hint"})
+
         return ops
 
     def push_history(self, imbalance: Dict[str, Any], plan: Dict[str, Any]) -> None:
