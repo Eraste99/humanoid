@@ -44,6 +44,26 @@ from typing import Any, Dict, List, Optional, Callable, Tuple, Set,Iterable
 import math, random
 
 
+# RM_* : décisions métier / risque prises par le RiskManager.
+# ENGINE_* : rejets techniques ou incapacité du moteur / CEX (backpressure, erreurs réseau, etc.).
+RM_STALE_VOL = "RM_STALE_VOL"
+RM_SFC_UNAVAILABLE = "RM_SFC_UNAVAILABLE"
+RM_COST_COMPUTE_ERROR = "RM_COST_COMPUTE_ERROR"
+RM_BELOW_MIN_BPS = "RM_BELOW_MIN_BPS"
+RM_BELOW_MIN_NOTIONAL = "RM_BELOW_MIN_NOTIONAL"
+RM_BALANCE_TTL_BLOCK = "RM_BALANCE_TTL_BLOCK"
+RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
+
+ENGINE_BACKPRESSURE_QUEUE_FULL = "ENGINE_BACKPRESSURE_QUEUE_FULL"
+ENGINE_BACKPRESSURE_CAP_BRANCH = "ENGINE_BACKPRESSURE_CAP_BRANCH"
+ENGINE_BACKPRESSURE_HIGH_WM = "ENGINE_BACKPRESSURE_HIGH_WM"
+ENGINE_PRICE_GUARD = "ENGINE_PRICE_GUARD"
+ENGINE_SHALLOW_BOOK = "ENGINE_SHALLOW_BOOK"
+ENGINE_SUBMIT_TIMEOUT = "ENGINE_SUBMIT_TIMEOUT"
+ENGINE_NACK_429 = "ENGINE_NACK_429"
+ENGINE_NACK_5XX = "ENGINE_NACK_5XX"
+
+
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from modules.risk_manager.rebalancing_manager import RebalancingManager
 from modules.risk_manager.volatility_manager import VolatilityManager
@@ -6164,8 +6184,8 @@ class RiskManager:
             q = float(leg.get("qty") or 0.0)
             px = float(leg.get("px_limit") or 0.0)
             if q <= 0.0 or px <= 0.0:
-                inc_rm_reject(reason="BUNDLE_EMPTY_PARAMS", pair=pair, route=f"{buy_ex}->{sell_ex}")
                 raise RMError(f"BUNDLE_EMPTY_PARAMS leg={i} qty={q} px={px}")
+            
 
         bundle = make_submit_bundle(
             legs=legs,
@@ -6238,7 +6258,7 @@ class RiskManager:
         if not is_ready:
             # Skip soft: on ne casse pas le lock mais on n’envoie pas tant que l’Engine n’est pas ready
             if getattr(self, "log", None): self.log.warning("RM.REJECT_READY: engine not ready")
-            if hasattr(self, "obs_inc"): self.obs_inc("rm_reject_total", reason="REJECT_ENGINE_NOT_READY")
+            if hasattr(self, "obs_inc"): self.obs_inc("rm_reject_total", reason=RM_ENGINE_NOT_READY)
             return
 
         # --- 2) Envoi sérialisé sous verrou -------------------------------------
@@ -6269,22 +6289,30 @@ class RiskManager:
                     return
                 except asyncio.TimeoutError as e:
                     last_exc = e
-                    if getattr(self, "log", None): self.log.warning(f"RM.NACK_TIMEOUT combo={combo_key}")
-                    if hasattr(self, "obs_inc"): self.obs_inc("rm_reject_total", reason="NACK_TIMEOUT")
+                    reason = ENGINE_SUBMIT_TIMEOUT
+                    if getattr(self, "log", None):
+                        self.log.warning(f"RM.{reason} combo={combo_key}")
+                    try:
+                        if hasattr(self, "obs_inc"):
+                            self.obs_inc("engine_reject_total", reason=reason)
+                    except Exception:
+                        pass
                     # P1: on ne boucle pas indéfiniment -> on tente une seule fois de plus si autorisé
                 except Exception as e:
                     last_exc = e
-                    msg = str(e).lower()
-                    reason = "NACK_REJECT"
+                    reason = getattr(e, "reason", None) or str(e)
                     degrade = False
-                    if any(x in msg for x in ("429", "too many", "rate limit")):
-                        reason = "NACK_429";
+                    if isinstance(e, Exception) and not isinstance(reason, str):
+                        reason = str(reason)
+                    if str(reason).upper() in {ENGINE_NACK_429, ENGINE_NACK_5XX}:
                         degrade = True
-                    elif any(x in msg for x in ("5xx", "internal", "temporarily")):
-                        reason = "NACK_5XX";
-                        degrade = True
-                    if getattr(self, "log", None): self.log.exception(f"RM.{reason} combo={combo_key}")
-                    if hasattr(self, "obs_inc"): self.obs_inc("rm_reject_total", reason=reason)
+                    if getattr(self, "log", None):
+                        self.log.exception(f"RM.ENGINE_REJECT combo={combo_key} reason={reason}")
+                    try:
+                        if hasattr(self, "obs_inc"):
+                            self.obs_inc("engine_reject_total", reason=str(reason))
+                    except Exception:
+                        pass
 
                     # Dégrader le pacer et/ou muter temporairement la route si itérations
                     if degrade:
@@ -6293,6 +6321,7 @@ class RiskManager:
                                 self.pacer.degrade(source="engine_error")
                         except Exception:
                             pass
+
 
                 # Retentative si possible
                 if attempt <= max_retries_net:
@@ -6659,9 +6688,9 @@ class RiskManager:
         met = vm.get_current_metrics(pair) if vm and hasattr(vm, "get_current_metrics") else None
         last_age_s = float((met or {}).get("last_age_s", float("inf")))
         if not met or not (last_age_s < float("inf")):
-            inc_rm_reject(reason="STALE_VOL", pair=pair,
+            inc_rm_reject(reason="RM_STALE_VOL", pair=pair,
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
-            raise RMError("STALE_VOL")
+            raise RMError("RM_STALE_VOL")
 
         # 2) Prudence et source de slippage
         prudence = vm.get_prudence(pair).upper() if hasattr(vm, "get_prudence") else "UNKNOWN"
@@ -6670,9 +6699,9 @@ class RiskManager:
         # 3) Coût total via collecteur unique (SFC)
         sfc = getattr(self, "slip_collector", None) or getattr(self, "sfc", None)
         if not sfc or not hasattr(sfc, "get_total_cost_pct"):
-            inc_rm_reject(reason="SFC_UNAVAILABLE", pair=pair,
+            inc_rm_reject(reason="RM_SFC_UNAVAILABLE", pair=pair,
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
-            raise RMError("SFC_UNAVAILABLE")
+            raise RMError("RM_SFC_UNAVAILABLE")
 
         cost_frac = float(sfc.get_total_cost_pct(
             route=route,
@@ -6685,9 +6714,9 @@ class RiskManager:
         ))
         # cost_frac doit être numérique et >= 0
         if not (cost_frac >= 0.0):
-            inc_rm_reject(reason="COST_COMPUTE_ERROR", pair=pair,
+            inc_rm_reject(reason="RM_COST_COMPUTE_ERROR", pair=pair,
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
-            raise RMError("COST_COMPUTE_ERROR")
+            raise RMError("RM_COST_COMPUTE_ERROR")
         return cost_frac
 
     # ------------------------------------------------------------------

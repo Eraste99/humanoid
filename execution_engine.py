@@ -75,6 +75,25 @@ except Exception:
 
 _REGION_TZ = {"EU": "Europe/Rome", "US": "America/New_York"}
 
+# RM_* : décisions métier / risque prises par le RiskManager.
+# ENGINE_* : rejets techniques ou incapacité du moteur / CEX (backpressure, erreurs réseau, etc.).
+RM_STALE_VOL = "RM_STALE_VOL"
+RM_SFC_UNAVAILABLE = "RM_SFC_UNAVAILABLE"
+RM_COST_COMPUTE_ERROR = "RM_COST_COMPUTE_ERROR"
+RM_BELOW_MIN_BPS = "RM_BELOW_MIN_BPS"
+RM_BELOW_MIN_NOTIONAL = "RM_BELOW_MIN_NOTIONAL"
+RM_BALANCE_TTL_BLOCK = "RM_BALANCE_TTL_BLOCK"
+RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
+
+ENGINE_BACKPRESSURE_QUEUE_FULL = "ENGINE_BACKPRESSURE_QUEUE_FULL"
+ENGINE_BACKPRESSURE_CAP_BRANCH = "ENGINE_BACKPRESSURE_CAP_BRANCH"
+ENGINE_BACKPRESSURE_HIGH_WM = "ENGINE_BACKPRESSURE_HIGH_WM"
+ENGINE_PRICE_GUARD = "ENGINE_PRICE_GUARD"
+ENGINE_SHALLOW_BOOK = "ENGINE_SHALLOW_BOOK"
+ENGINE_SUBMIT_TIMEOUT = "ENGINE_SUBMIT_TIMEOUT"
+ENGINE_NACK_429 = "ENGINE_NACK_429"
+ENGINE_NACK_5XX = "ENGINE_NACK_5XX"
+
 class PnLAggregator:
     def __init__(self):
         self._last_local_day = {"EU": None, "US": None, "UTC": None}
@@ -2366,10 +2385,26 @@ class ExecutionEngine:
                 # 4) Cancel makers restants
                 await self._mm_cancel_open_makers([sell_cid, buy_cid])
 
-    # === execution_engine.py ===
-    # Dans class ExecutionEngine
+        # === execution_engine.py ===
+        # Dans class ExecutionEngine
 
-    # modules/execution_engine.py — class ExecutionEngine
+        # modules/execution_engine.py — class ExecutionEngine
+
+    def _engine_reject_metric(self, reason: str, *, branch: str | None = None, profile: str | None = None) -> None:
+        try:
+            if hasattr(self, "obs_inc"):
+                self.obs_inc("engine_reject_total", reason=reason, branch=branch, profile=profile)
+        except Exception:
+            pass
+
+    def _raise_engine_submit_error(self, reason: str, *, branch: str | None = None, profile: str | None = None):
+        self._engine_reject_metric(reason, branch=branch, profile=profile)
+        err = EngineSubmitError(reason)
+        try:
+            err.reason = reason
+        except Exception:
+            pass
+        raise err
 
     async def submit(self, bundle: dict):
         """
@@ -2515,7 +2550,7 @@ class ExecutionEngine:
                 )
             except Exception:
                 pass
-            raise EngineSubmitError("ENGINE_BACKPRESSURE_QUEUE_FULL")
+            self._raise_engine_submit_error(ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile)
 
         # 2-b) Hard backpressure: caps_local par branche (optionnel)
         if bundle_concurrency is not None and branch_depth is not None:
@@ -2531,7 +2566,7 @@ class ExecutionEngine:
                     )
                 except Exception:
                     pass
-                raise EngineSubmitError("ENGINE_BACKPRESSURE_CAP_BRANCH")
+                self._raise_engine_submit_error(ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile)
 
         # 2-c) Soft backpressure: high watermark
         if queue_max and high_wm and depth >= high_wm and overflow_policy == "defer":
@@ -2546,7 +2581,8 @@ class ExecutionEngine:
                 )
             except Exception:
                 pass
-            raise EngineSubmitError("ENGINE_BACKPRESSURE_HIGH_WM")
+            self._raise_engine_submit_error(ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile)
+
 
         # 3) Lock REB éventuel (on garde le comportement existant)
         combo = self._bundle_combo_signature(bundle)
@@ -2816,12 +2852,12 @@ class ExecutionEngine:
                         if ts_ns is None:
                             return  # pas de timestamp → pas de latence à tracer
 
-                        now_ns = time.perf_counter_ns()
-                        latency_ms = max(0, int((now_ns - ts_ns) / 1_000_000))
+                    now_ns = time.perf_counter_ns()
+                    latency_ms = max(0, int((now_ns - ts_ns) / 1_000_000))
 
-                        ex_lab = (self._client_symbol_map.get(clid, ("?", "?"))[0] or "?")
-                        ENGINE_SUBMIT_TO_ACK_MS.labels(exchange=str(ex_lab)).observe(latency_ms)
-                        mark_engine_ack(latency_ms)  # wrapper tolérant: reçoit un delta en ms
+                    ex_lab = (self._client_symbol_map.get(clid, ("?", "?"))[0] or "?")
+                    ENGINE_SUBMIT_TO_ACK_MS.labels(exchange=str(ex_lab)).observe(latency_ms)
+                    mark_engine_ack(latency_ms)  # wrapper tolérant: reçoit un delta en ms
                 except Exception:
                     logging.exception("Unhandled exception")
 
@@ -2944,7 +2980,7 @@ class ExecutionEngine:
         for op in plan.get("overlay_comp", []) or []:
             if cb:
                 try:
-                    cb({"type": "overlay_compensation", **op})
+                    cb({"type": "overlay_comp", **op})
                 except Exception:
                     report_nonfatal("ExecutionEngine", "overlay_callback_failed", None,
                                                          phase="rebal_side_ops")
@@ -3404,10 +3440,32 @@ class ExecutionEngine:
         try:
             return self._exchange_submit(order)  # tua chiamata SDK/signed REST
         except (TimeoutError, ConnectionError) as e:
-            raise ExternalServiceError(f"Submit timeout: {order.get('id')}") from e
+            try:
+                self._engine_reject_metric(ENGINE_SUBMIT_TIMEOUT)
+            except Exception:
+                pass
+            err = EngineSubmitError(ENGINE_SUBMIT_TIMEOUT)
+            try:
+                err.reason = ENGINE_SUBMIT_TIMEOUT
+            except Exception:
+                pass
+            raise err from e
         except Exception as e:
-            # Niente pass o default: errore tipizzato
-            raise EngineSubmitError(f"Submit failed: {order.get('id')}") from e
+            msg = str(e).lower()
+            reason = ENGINE_NACK_5XX
+            if any(tok in msg for tok in ("429", "too many", "rate limit")):
+                reason = ENGINE_NACK_429
+            try:
+                self._engine_reject_metric(reason)
+            except Exception:
+                pass
+            err = EngineSubmitError(reason)
+            try:
+                err.reason = reason
+            except Exception:
+                pass
+            raise err from e
+
 
     def _cancel_or_raise(self, order_id: str) -> None:
         try:
