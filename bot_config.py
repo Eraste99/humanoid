@@ -244,62 +244,124 @@ class WsPublicCfg:
 # --- Discovery ---
 @dataclass
 class DiscoveryCfg:
+    """
+    Configuration de la découverte d'univers (marché public).
+    Toutes les constantes métier (volumes, quotes, listes) transitent par cette structure.
+    """
+    # Paramètres techniques d'appel API
     http_timeout_s: int = 10
-    retry_policy: Dict[str,int] = field(default_factory=lambda: {"base_ms":500, "max_ms":20_000, "max_attempts":5, "jitter":1})
+    retry_policy: Dict[str, int] = field(default_factory=lambda: {"retries": 3, "backoff_s": 1})
     max_inflight_requests: int = 8
-    quotes_allowed: List[str] = field(default_factory=lambda: ["USDC","EUR"])
+
+    # Quotes autorisées pour l'univers (USDC / EUR par défaut)
+    quotes_allowed: List[str] = field(default_factory=lambda: ["USDC", "EUR"])
+
+    # Seuils de volume globaux
     min_24h_volume_usd: float = 100_000.0
-    # NEW: seuils par quote (optionnels)
+
+    # Seuils de volume par quote (overrides explicites)
     min_quote_volume_usdc: Optional[float] = None
-    min_quote_volume_eur: Optional[float]  = None
+    min_quote_volume_eur: Optional[float] = None
+    # Map générique par quote (e.g. {"USDC": 5e6, "EUR": 2e6})
+    min_quote_volume_by_quote: Dict[str, float] = field(default_factory=dict)
+
+    # Listes explicites pilotant l'univers
     whitelist: List[str] = field(default_factory=list)
     blacklist: List[str] = field(default_factory=list)
     enabled: bool = True
-    # opzionale: soglie per-quote
-    min_quote_volume_by_quote: Dict[str, float] = field(default_factory=dict)
+
+    # Paramètres P0 Marché Public
+    # - top_n : cap global du nombre de paires actives en sortie Discovery
+    top_n: int = 120
+
+    # Meta-informations de mode / exchanges actifs
+    # (recopiées depuis Globals pour éviter les relectures d'ENV partout)
+    deployment_mode: str = "EU_ONLY"
+    enabled_exchanges: List[str] = field(default_factory=list)
+
+    # Ratios pour les quotes spécifiques
+    # - eur_quote_volume_factor : fraction du seuil global appliquée à EUR si pas d'override
+    # - min_quote_volume_floor : plancher absolu (anti-valeurs ridicules)
+    eur_quote_volume_factor: float = 0.30
+    min_quote_volume_floor: float = 1.0
+
 
 # --- Scanner ---
+# ---------------------------------------------------------------------------
+# Router / Scanner & RiskManager configs
+# ---------------------------------------------------------------------------
+
+
+# --- Scanner ---
+# ---------------------------------------------------------------------------
+# Router / Scanner & RiskManager configs
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RouterCfg:
+    coalesce_window_ms: int = 20
+    stale_ms: int = 1200
+    shards_per_exchange: Tuple[int, int, int] = (2, 1, 1)
+    out_queues_maxlen: int = 20000
+    # P0: quotas stream-centrics optionnels par kind (combo/vol/slip/health)
+    # ex: {"combo": 5000, "vol": 2000, "slip": 2000, "health": 2000}
+    out_queues_maxlen_by_kind: Dict[str, int] = field(default_factory=dict)
+    # P0: cadence cible ≈ 5 ms
+    mux_poll_ms: int = 5
+    require_l2_first: bool = True
+    # P0: matrix de comportement par tier, pilotée par env (ROUTER_DROP_POLICY)
+    drop_policy: Dict[str, Any] = field(default_factory=dict)
+    # P0: taille des deques internes par exchange (ROUTER_DEQUE_MAXLEN_PER_EX)
+    deque_maxlen_per_ex: Dict[str, int] = field(default_factory=dict)
+    # P0: paramètres de backpressure Router (ROUTER_BACKPRESSURE)
+    backpressure: Dict[str, Any] = field(default_factory=dict)
+    # P0: bump spécifique Coinbase en SPLIT (ROUTER_CB_COALESCE_BUMP_MS)
+    cb_coalesce_bump_ms: int = 10
+    # P0: plafond Hz par topic (ROUTER_TOPIC_MAX_HZ)
+    topic_max_hz: Dict[str, float] = field(default_factory=dict)
+
+
 @dataclass
 class ScannerCfg:
+    # Workers et backpressure de base
     workers: int = 1
-    dedup_window_s: float = 0.5
-    ttl_hints_s: float = 1.0
-    audition_ttl_min: int = 5
-    ban_ttl_min: int = 3
-    hysteresis_min: int = 2
-    enable_mm_hints: bool = False
-    binance_depth_level: int = 10
-    min_spread_net: float = 0.002
-    min_required_bps: float = 15.0
-    drift_guard_bps: float = 10.0
-    max_pairs_per_tick: int = 40
-    max_time_skew_s: float = 0.20
-    scan_interval: float = 0.5
-    dedup_cooldown_s: float = 0.35
-    backpressure_log_every: int = 100
-    max_opportunities: int = 5000
-    audition_ttl_s: float = 300.0
-    autopause_duration_s: float = 600.0
-    tm_depth_levels: int = 5
-    tm_depth_weight_exponent: float = 1.0
-    max_notional_quote: float = 0.0
-    default_timeout_s: float = 2.0
-    allow_loss_bps_rebal: float = 10.0
-    vol_ema_lambda: float = 0.7
-    priority_weight_logger: float = 0.7
-    priority_weight_scanner: float = 0.3
-    scanner_eval_hz_primary: float = 25.0
-    scanner_eval_hz_core: float = 25.0
+    backpressure_log_every: int = 1000
+    max_opportunities: int = 1000
+
+    # P0: dedup & fenêtres de scan
+    dedup_window_s: float = 0.18  # cible P0 ≈ 0.12–0.20 s
+    dedup_cooldown_s: float = 0.16
+    max_pairs_per_tick: int = 150
+    scan_interval: float = 0.02
+    max_time_skew_s: float = 0.3
+
+    # P0: dimensionnement des deques par tier
+    deque_max_core: int = 1800
+    deque_max_primary: int = 1800
+    deque_max_audition: int = 600
+    deque_max_sandbox: int = 300
+
+    # P0: fréquences d’évaluation par tier
+    scanner_eval_hz_primary: float = 30.0
+    scanner_eval_hz_core: float = 32.0
     scanner_eval_hz_audition: float = 5.0
-    scanner_eval_hz_sandbox: float = 5.0
+    scanner_eval_hz_sandbox: float = 2.0
     scanner_global_eval_hz: float = 200.0
-    mm_seed_pairs: List[str] = field(default_factory=list)
+
+    # MM / hints publics
+    enable_mm_hints: bool = True
+    binance_depth_level: int = 50
     mm_rotation_enabled: bool = False
-    mm_depth_min_quote: float = 7500.0
+    mm_seed_pairs: Tuple[str, ...] = ()
+    mm_depth_min_quote: float = 200.0
     mm_qpos_max_ahead_quote: float = 5000.0
-    mm_min_net_bps: float = 0.0005
-    mm_hedge_cost_bps: float = 5.0
-    mm_vol_bps_max: float = 6.0
+    mm_min_net_bps: float = 0.6
+    mm_hedge_cost_bps: float = 3.0
+    mm_vol_bps_max: float = 40.0
+
+    # Rebalancing
+    allow_loss_bps_rebal: float = 0.0
 
 
 # --- Risk Manager ---
@@ -315,6 +377,45 @@ class RiskManagerCfg:
         "USDC": {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
         "EUR":  {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
     })
+
+    # Ticket 10 — Caps d'inflight business par profil / branche
+    # Profil = NANO/MICRO/SMALL/MID/LARGE (source: g.capital_profile)
+    # Ces caps sont la "vérité business" que le RM appliquera, et que l'Engine devra respecter.
+
+    # Inflight globaux "trading" (TT + TM + MM), par profil de capital.
+    inflight_trading_by_profile: Dict[str, int] = field(default_factory=lambda: {
+        "NANO": 2,
+        "MICRO": 4,
+        "SMALL": 8,
+        "MID": 16,
+        "LARGE": 32,
+    })
+
+    # Répartition des caps par branche TRADING (TT/TM/MM) pour chaque profil.
+    # Invariant attendu côté RM plus tard:
+    #   TT_cap + TM_cap + MM_cap <= inflight_trading_by_profile[profile]
+    caps_trading_by_profile: Dict[str, Dict[str, int]] = field(default_factory=lambda: {
+        # NANO : 2 inflights globaux => TT=1, TM=1, MM=0 (MM désactivé en bootstrap)
+        "NANO":  {"TT": 1, "TM": 1, "MM": 0},
+        # MICRO : 4 inflights globaux => TT=2, TM=1, MM=1
+        "MICRO": {"TT": 2, "TM": 1, "MM": 1},
+        # SMALL : 8 inflights globaux => TT=3, TM=3, MM=1
+        "SMALL": {"TT": 3, "TM": 3, "MM": 1},
+        # MID : 16 inflights globaux => TT=6, TM=5, MM=3
+        "MID":   {"TT": 6, "TM": 5, "MM": 3},
+        # LARGE : 32 inflights globaux => TT=12, TM=10, MM=6
+        "LARGE": {"TT": 12, "TM": 10, "MM": 6},
+    })
+
+    # Budget séparé pour REB (mode exclusif par SC, pas dans le pool TRADING).
+    inflight_rebal_by_profile: Dict[str, int] = field(default_factory=lambda: {
+        "NANO": 1,
+        "MICRO": 1,
+        "SMALL": 2,
+        "MID": 3,
+        "LARGE": 4,
+    })
+
 
     default_notional: float = 500.0
     min_fragment_quote: Dict[str, float] = field(default_factory=lambda: {"USDC":200.0, "EUR":200.0})
@@ -374,6 +475,49 @@ class EngineCfg:
     pacer_max_ms: int = 25
     pacer_jitter_ms: int = 2
     pacer_targets: Dict[str,int] = field(default_factory=lambda: {"EU": 8, "EU_CB": 12, "US": 12})
+
+    # Ticket 10 — capacités techniques Engine (workers / inflight par CEX)
+
+    # Nombre de workers (tâches ordre) par profil de capital.
+    workers_by_profile: Dict[str, int] = field(default_factory=lambda: {
+        "NANO": 4,
+        "MICRO": 8,
+        "SMALL": 16,
+        "MID": 24,
+        "LARGE": 40,
+    })
+
+    # Capacité max d'ordres "inflight" par exchange ET par profil.
+    # Par défaut, chaque CEX peut encaisser à lui seul le budget global du profil.
+    # Plus tard, tu pourras brider un CEX en baissant ses valeurs via .env.
+    inflight_max_by_exchange_by_profile: Dict[str, Dict[str, int]] = field(default_factory=lambda: {
+        "NANO": {
+            "BINANCE": 2,
+            "BYBIT": 2,
+            "COINBASE": 2,
+        },
+        "MICRO": {
+            "BINANCE": 4,
+            "BYBIT": 4,
+            "COINBASE": 4,
+        },
+        "SMALL": {
+            "BINANCE": 8,
+            "BYBIT": 8,
+            "COINBASE": 8,
+        },
+        "MID": {
+            "BINANCE": 16,
+            "BYBIT": 16,
+            "COINBASE": 16,
+        },
+        "LARGE": {
+            "BINANCE": 32,
+            "BYBIT": 32,
+            "COINBASE": 32,
+        },
+    })
+
 
     tt_max_skew_ms: int = 35
     order_timeout_s: int = 3
@@ -649,6 +793,35 @@ class BotConfig:
     # dans la dataclass BotConfig (ou équivalent)
     scanner_global_eval_hz: float | None = None
 
+    # --- Aliases pratiques pour les modules WS / Router -------------------
+
+    @property
+    def POD_REGION(self) -> str:
+        """
+        Alias utilisé par websockets_clients / Router pour la région du pod.
+
+        Source unique : self.g.pod_region (env: POD_REGION).
+        Valeurs typiques : "EU", "US", "EU_CB", ...
+        """
+        val = getattr(self.g, "pod_region", "EU")
+        if not val:
+            return "EU"
+        return str(val).upper()
+
+    @property
+    def DEPLOYMENT_MODE(self) -> str:
+        """
+        Alias utilisé par websockets_clients / Router pour le mode de déploiement.
+
+        Source unique : self.g.deployment_mode (env: DEPLOYMENT_MODE).
+        Valeurs typiques : "EU_ONLY", "SPLIT", ...
+        """
+        val = getattr(self.g, "deployment_mode", "EU_ONLY")
+        if not val:
+            return "EU_ONLY"
+        return str(val).upper()
+
+
     # ------------- Construction -------------
     @staticmethod
     def from_env() -> "BotConfig":
@@ -688,15 +861,29 @@ class BotConfig:
             g.mode = "DRY_RUN"
         g.feature_switches = _Env.get_dict("FEATURE_SWITCHES", g.feature_switches)
 
-        # --- Sections (exemples de surcharges d'env simples) ---
+        # --- Router cfg ---------------------------------------------------
         cfg.router.coalesce_window_ms = _Env.get_int("ROUTER_COALESCE_WINDOW_MS", cfg.router.coalesce_window_ms)
-        cfg.router.shards_per_exchange = _Env.get_int("ROUTER_SHARDS_PER_EXCHANGE", cfg.router.shards_per_exchange)
+        cfg.router.stale_ms = _Env.get_int("ROUTER_STALE_MS", cfg.router.stale_ms)
+        # P0: shards_per_exchange = (BINANCE, BYBIT, COINBASE)
+        cfg.router.shards_per_exchange = tuple(
+            _Env.get_int("ROUTER_SHARDS_PER_EXCHANGE", cfg.router.shards_per_exchange) for _ in range(3)
+        )
+        # Quota global (fallback) + quotas stream-centrics optionnels
         cfg.router.out_queues_maxlen = _Env.get_int("ROUTER_OUT_QUEUES_MAXLEN", cfg.router.out_queues_maxlen)
+        cfg.router.out_queues_maxlen_by_kind = _Env.get_dict(
+            "ROUTER_OUT_QUEUES_MAXLEN_BY_KIND", cfg.router.out_queues_maxlen_by_kind
+        )
+        cfg.router.mux_poll_ms = _Env.get_int("ROUTER_MUX_POLL_MS", cfg.router.mux_poll_ms)
         cfg.router.require_l2_first = _Env.get_bool("ROUTER_REQUIRE_L2_FIRST", cfg.router.require_l2_first)
+        cfg.router.drop_policy = _Env.get_dict("ROUTER_DROP_POLICY", cfg.router.drop_policy)
         cfg.router.deque_maxlen_per_ex = _Env.get_dict("ROUTER_DEQUE_MAXLEN_PER_EX", cfg.router.deque_maxlen_per_ex)
         cfg.router.backpressure = _Env.get_dict("ROUTER_BACKPRESSURE", cfg.router.backpressure)
-        cfg.router.cb_coalesce_bump_ms = _Env.get_int("ROUTER_CB_COALESCE_BUMP_MS", cfg.router.cb_coalesce_bump_ms)
+        cfg.router.cb_coalesce_bump_ms = _Env.get_int(
+            "ROUTER_CB_COALESCE_BUMP_MS", cfg.router.cb_coalesce_bump_ms
+        )
         cfg.router.topic_max_hz = _Env.get_dict("ROUTER_TOPIC_MAX_HZ", cfg.router.topic_max_hz)
+
+
         cfg.ws_public.ws_backoff = _Env.get_dict("WS_BACKOFF", cfg.ws_public.ws_backoff)
         cfg.ws_public.connect_timeout_s = _Env.get_int("WS_CONNECT_TIMEOUT_S", cfg.ws_public.connect_timeout_s)
         cfg.ws_public.read_timeout_s = _Env.get_int("WS_READ_TIMEOUT_S", cfg.ws_public.read_timeout_s)
@@ -767,42 +954,173 @@ class BotConfig:
             buf = 0.0
         setattr(cfg, "min_buffer_quote", float(buf))
 
-        # NEW: allow/deny lists pilotées par env
+        # --- Discovery : configuration centrale de l'univers -----------------
+        # Volumes minimaux 24h (USD) et par quote
+        cfg.discovery.min_24h_volume_usd = float(
+            _Env.get("DISCOVERY_MIN_24H_VOLUME_USD", cfg.discovery.min_24h_volume_usd)
+        )
+        cfg.discovery.min_quote_volume_usdc = float(
+            _Env.get(
+                "DISCOVERY_MIN_QUOTE_VOLUME_USDC",
+                cfg.discovery.min_quote_volume_usdc or cfg.discovery.min_24h_volume_usd,
+            )
+        )
+        cfg.discovery.min_quote_volume_eur = float(
+            _Env.get(
+                "DISCOVERY_MIN_QUOTE_VOLUME_EUR",
+                cfg.discovery.min_quote_volume_eur or cfg.discovery.min_24h_volume_usd,
+            )
+        )
+
+        # Facteur EUR vs USD et plancher absolu pour la quote EUR
+        # (évitons un EUR ridiculement bas même si base_min est petit)
+        cfg.discovery.eur_quote_volume_factor = float(
+            _Env.get(
+                "DISCOVERY_EUR_QUOTE_VOLUME_FACTOR",
+                getattr(cfg.discovery, "eur_quote_volume_factor", 0.30),
+            )
+        )
+        cfg.discovery.min_quote_volume_floor = float(
+            _Env.get(
+                "DISCOVERY_MIN_QUOTE_VOLUME_FLOOR",
+                getattr(cfg.discovery, "min_quote_volume_floor", 1.0),
+            )
+        )
+
+        # Filtrage par quotes et exchanges actifs
+        q_allowed = _Env.get_list("DISCOVERY_QUOTES_ALLOWED", cfg.discovery.quotes_allowed or [])
+        if q_allowed:
+            cfg.discovery.quotes_allowed = [q.upper() for q in q_allowed]
+
+        ex_enabled = _Env.get_list(
+            "DISCOVERY_ENABLED_EXCHANGES",
+            cfg.discovery.enabled_exchanges or cfg.g.enabled_exchanges,
+        )
+        if ex_enabled:
+            cfg.discovery.enabled_exchanges = [e.upper() for e in ex_enabled]
+
+        # Whitelists / blacklists paires
         cfg.discovery.whitelist = _Env.get_list("DISCOVERY_WHITELIST", cfg.discovery.whitelist)
         cfg.discovery.blacklist = _Env.get_list("DISCOVERY_BLACKLIST", cfg.discovery.blacklist)
 
+        # --- Scanner cfg ------------------------------------------------------
         cfg.scanner.workers = _Env.get_int("SCANNER_WORKERS", cfg.scanner.workers)
         cfg.scanner.enable_mm_hints = _Env.get_bool("SCANNER_ENABLE_MM_HINTS", cfg.scanner.enable_mm_hints)
-        cfg.scanner.binance_depth_level = _Env.get_int("BINANCE_DEPTH_LEVEL", cfg.scanner.binance_depth_level)
-        cfg.scanner.mm_rotation_enabled = _Env.get_bool("SCANNER_MM_ROTATION_ENABLED", cfg.scanner.mm_rotation_enabled)
-        cfg.scanner.mm_seed_pairs = _Env.get_list("SCANNER_MM_SEED_PAIRS", cfg.scanner.mm_seed_pairs)
-        cfg.scanner.mm_depth_min_quote = _Env.get_float("SCANNER_MM_DEPTH_MIN_QUOTE", cfg.scanner.mm_depth_min_quote)
-        cfg.scanner.mm_qpos_max_ahead_quote = _Env.get_float("SCANNER_MM_QPOS_MAX_AHEAD_QUOTE",
-                                                             cfg.scanner.mm_qpos_max_ahead_quote)
+        cfg.scanner.binance_depth_level = _Env.get_int(
+            "SCANNER_BINANCE_DEPTH_LEVEL", cfg.scanner.binance_depth_level
+        )
+        cfg.scanner.mm_rotation_enabled = _Env.get_bool(
+            "SCANNER_MM_ROTATION_ENABLED", cfg.scanner.mm_rotation_enabled
+        )
+        cfg.scanner.mm_seed_pairs = tuple(
+            _Env.get_list("SCANNER_MM_SEED_PAIRS", cfg.scanner.mm_seed_pairs, sep=",")
+        )
+        cfg.scanner.mm_depth_min_quote = _Env.get_float(
+            "SCANNER_MM_DEPTH_MIN_QUOTE", cfg.scanner.mm_depth_min_quote
+        )
+        cfg.scanner.mm_qpos_max_ahead_quote = _Env.get_float(
+            "SCANNER_MM_QPOS_MAX_AHEAD_QUOTE", cfg.scanner.mm_qpos_max_ahead_quote
+        )
         cfg.scanner.mm_min_net_bps = _Env.get_float("SCANNER_MM_MIN_NET_BPS", cfg.scanner.mm_min_net_bps)
         cfg.scanner.mm_hedge_cost_bps = _Env.get_float("SCANNER_MM_HEDGE_COST_BPS", cfg.scanner.mm_hedge_cost_bps)
         cfg.scanner.mm_vol_bps_max = _Env.get_float("SCANNER_MM_VOL_BPS_MAX", cfg.scanner.mm_vol_bps_max)
-        cfg.scanner.scanner_eval_hz_primary = _Env.get_float("SCANNER_EVAL_HZ_PRIMARY",
-                                                             cfg.scanner.scanner_eval_hz_primary)
-        cfg.scanner.scanner_eval_hz_core = _Env.get_float("SCANNER_EVAL_HZ_CORE", cfg.scanner.scanner_eval_hz_core)
-        cfg.scanner.scanner_eval_hz_audition = _Env.get_float("SCANNER_EVAL_HZ_AUDITION",
-                                                              cfg.scanner.scanner_eval_hz_audition)
-        cfg.scanner.scanner_eval_hz_sandbox = _Env.get_float("SCANNER_EVAL_HZ_SANDBOX",
-                                                             cfg.scanner.scanner_eval_hz_sandbox)
-        cfg.scanner.allow_loss_bps_rebal = _Env.get_float("SCANNER_ALLOW_LOSS_BPS_REBAL",
-                                                          cfg.scanner.allow_loss_bps_rebal)
+
+        # P0: fenêtres & budgets de scan
+        cfg.scanner.dedup_window_s = _Env.get_float("SCANNER_DEDUP_WINDOW_S", cfg.scanner.dedup_window_s)
+        cfg.scanner.max_pairs_per_tick = _Env.get_int(
+            "SCANNER_MAX_PAIRS_PER_TICK", cfg.scanner.max_pairs_per_tick
+        )
+        cfg.scanner.scan_interval = _Env.get_float("SCANNER_SCAN_INTERVAL_S", cfg.scanner.scan_interval)
+        cfg.scanner.backpressure_log_every = _Env.get_int(
+            "SCANNER_BACKPRESSURE_LOG_EVERY", cfg.scanner.backpressure_log_every
+        )
+        cfg.scanner.max_opportunities = _Env.get_int(
+            "SCANNER_MAX_OPPORTUNITIES", cfg.scanner.max_opportunities
+        )
+        cfg.scanner.max_time_skew_s = _Env.get_float(
+            "SCANNER_MAX_TIME_SKEW_S", cfg.scanner.max_time_skew_s
+        )
+
+        # P0: fréquences d'évaluation par tier
+        cfg.scanner.scanner_eval_hz_primary = _Env.get_float(
+            "SCANNER_EVAL_HZ_PRIMARY", cfg.scanner.scanner_eval_hz_primary
+        )
+        cfg.scanner.scanner_eval_hz_core = _Env.get_float(
+            "SCANNER_EVAL_HZ_CORE", cfg.scanner.scanner_eval_hz_core
+        )
+        cfg.scanner.scanner_eval_hz_audition = _Env.get_float(
+            "SCANNER_EVAL_HZ_AUDITION", cfg.scanner.scanner_eval_hz_audition
+        )
+        cfg.scanner.scanner_eval_hz_sandbox = _Env.get_float(
+            "SCANNER_EVAL_HZ_SANDBOX", cfg.scanner.scanner_eval_hz_sandbox
+        )
+        cfg.scanner.allow_loss_bps_rebal = _Env.get_float(
+            "SCANNER_ALLOW_LOSS_BPS_REBAL", cfg.scanner.allow_loss_bps_rebal
+        )
+
+        # Support legacy SCANNER_* keys pour du tuning runtime,
+        # mais en propageant vers ScannerCfg pour garder une source unique.
+
+        # --- Scanner / agrégateurs P0 (Ticket 6.A) ----------------------------
         cfg.SCANNER_HZ = _Env.get_dict("SCANNER_HZ", getattr(cfg, "SCANNER_HZ", {}))
         cfg.SCANNER_DEQUE_MAX = _Env.get_dict("SCANNER_DEQUE_MAX", getattr(cfg, "SCANNER_DEQUE_MAX", {}))
-        cfg.SCANNER_DEDUP_COOLDOWN_S = _Env.get_float("SCANNER_DEDUP_COOLDOWN_S",
-                                                      getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", 0.16))
+        cfg.SCANNER_DEDUP_COOLDOWN_S = _Env.get_float(
+            "SCANNER_DEDUP_COOLDOWN_S",
+            getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", getattr(cfg.scanner, "dedup_cooldown_s", 0.16)),
+        )
+        cfg.SCANNER_GLOBAL_EVAL_HZ = _Env.get_float(
+            "SCANNER_GLOBAL_EVAL_HZ",
+            getattr(cfg, "SCANNER_GLOBAL_EVAL_HZ", getattr(cfg.scanner, "scanner_global_eval_hz", 200.0)),
+        )
 
-        # --- Scanner (cap global optionnel) ---
-        val = os.getenv("SCANNER_GLOBAL_EVAL_HZ")
-        if val is not None and str(val).strip() != "":
-            try:
-                cfg.scanner_global_eval_hz = float(val)
-            except Exception:
-                pass  # fallback: laisser les defaults du Scanner
+        sc = cfg.scanner
+
+        # Exposer le cooldown de dedup aussi dans ScannerCfg
+        try:
+            sc.dedup_cooldown_s = float(cfg.SCANNER_DEDUP_COOLDOWN_S)
+        except Exception:
+            pass
+
+        # Garder BotConfig.scanner_global_eval_hz, cfg.SCANNER_GLOBAL_EVAL_HZ
+        # et ScannerCfg.scanner_global_eval_hz alignés
+        try:
+            v = float(cfg.SCANNER_GLOBAL_EVAL_HZ)
+        except Exception:
+            v = float(getattr(sc, "scanner_global_eval_hz", 200.0))
+        sc.scanner_global_eval_hz = v
+        cfg.scanner_global_eval_hz = v
+
+        # Refléter SCANNER_HZ (legacy) dans ScannerCfg (P0 Marché Public)
+        hz = cfg.SCANNER_HZ or {}
+        if isinstance(hz, dict):
+            v = hz.get("CORE") or hz.get("core")
+            if v is not None:
+                try:
+                    sc.scanner_eval_hz_core = float(v)
+                except Exception:
+                    pass
+
+            v = hz.get("PRIMARY") or hz.get("primary")
+            if v is not None:
+                try:
+                    sc.scanner_eval_hz_primary = float(v)
+                except Exception:
+                    pass
+
+            v = hz.get("AUDITION") or hz.get("audition")
+            if v is not None:
+                try:
+                    sc.scanner_eval_hz_audition = float(v)
+                except Exception:
+                    pass
+
+            v = hz.get("SANDBOX") or hz.get("sandbox")
+            if v is not None:
+                try:
+                    sc.scanner_eval_hz_sandbox = float(v)
+                except Exception:
+                    pass
+
 
         cfg.rm.enable_tt = _Env.get_bool("ENABLE_TT", cfg.rm.enable_tt)
         cfg.rm.enable_tm = _Env.get_bool("ENABLE_TM", cfg.rm.enable_tm)
@@ -830,8 +1148,34 @@ class BotConfig:
         cfg.rm.rebal_volume_haircut = _Env.get_float("REBAL_VOLUME_HAIRCUT", cfg.rm.rebal_volume_haircut)
         cfg.rm.tm_neutral_hedge_ratio = _Env.get_float("TM_NEUTRAL_HEDGE_RATIO", cfg.rm.tm_neutral_hedge_ratio)
 
+        # Ticket 10 — caps inflight business par profil / branche
+        cfg.rm.inflight_trading_by_profile = _Env.get_dict(
+            "RM_INFLIGHT_TRADING_BY_PROFILE",
+            cfg.rm.inflight_trading_by_profile,
+        )
+        cfg.rm.caps_trading_by_profile = _Env.get_dict(
+            "RM_CAPS_TRADING_BY_PROFILE",
+            cfg.rm.caps_trading_by_profile,
+        )
+        cfg.rm.inflight_rebal_by_profile = _Env.get_dict(
+            "RM_INFLIGHT_REBAL_BY_PROFILE",
+            cfg.rm.inflight_rebal_by_profile,
+        )
+
+
         cfg.sim.max_fragments = _Env.get_int("SIM_MAX_FRAGMENTS", cfg.sim.max_fragments)
         cfg.sim.min_fragment_usdc = _Env.get_float("SIM_MIN_FRAGMENT_USDC", cfg.sim.min_fragment_usdc)
+
+        # Ticket 10 — capacités techniques Engine (workers / inflight CEX par profil)
+        cfg.engine.workers_by_profile = _Env.get_dict(
+            "ENGINE_WORKERS_BY_PROFILE",
+            cfg.engine.workers_by_profile,
+        )
+        cfg.engine.inflight_max_by_exchange_by_profile = _Env.get_dict(
+            "ENGINE_INFLIGHT_MAX_BY_EXCHANGE_BY_PROFILE",
+            cfg.engine.inflight_max_by_exchange_by_profile,
+        )
+
 
         cfg.engine.tt_max_skew_ms = _Env.get_int("ENGINE_TT_MAX_SKEW_MS", cfg.engine.tt_max_skew_ms)
         cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
@@ -855,6 +1199,17 @@ class BotConfig:
         cfg.engine.circuit_mute_max_s = _Env.get_float("ENGINE_CIRCUIT_MUTE_MAX_S", cfg.engine.circuit_mute_max_s)
         cfg.engine.circuit_mute_s_tm = _Env.get_float("ENGINE_CIRCUIT_MUTE_S_TM", cfg.engine.circuit_mute_s_tm)
         cfg.engine.circuit_mute_s_mm = _Env.get_float("ENGINE_CIRCUIT_MUTE_S_MM", cfg.engine.circuit_mute_s_mm)
+
+        # Ticket 10 — capacité technique Engine (workers / inflight par CEX)
+        cfg.engine.workers_by_profile = _Env.get_dict(
+            "ENGINE_WORKERS_BY_PROFILE",
+            cfg.engine.workers_by_profile,
+        )
+        cfg.engine.inflight_max_by_exchange = _Env.get_dict(
+            "ENGINE_INFLIGHT_MAX_BY_EXCHANGE",
+            cfg.engine.inflight_max_by_exchange,
+        )
+
 
         cfg.pws.PWS_POOL_SIZE_EU = _Env.get_int("PWS_POOL_SIZE_EU", cfg.pws.PWS_POOL_SIZE_EU)
         cfg.pws.PWS_POOL_SIZE_US = _Env.get_int("PWS_POOL_SIZE_US", cfg.pws.PWS_POOL_SIZE_US)

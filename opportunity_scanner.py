@@ -85,24 +85,6 @@ logger = logging.getLogger("OpportunityScanner")
 
 
 # --- PATCH A AJOUTER (tout en haut, après imports/observability) ---
-try:
-    # registres communs
-    from modules.obs_metrics import (
-        SCANNER_DECISION_MS,   # histogramme global (pair, route)
-        SCANNER_EVAL_MS,
-        inc_blocked,           # opportunities_blocked_total{module,reason,pair}
-        mark_scanner_to_rm,    # (si wrapper plus bas présent)
-    )
-except Exception:  # no-op fallbacks en cas d'import partiel
-    class _N:
-        def labels(self, *a, **k): return self
-        def observe(self, *_a, **_k): pass
-    SCANNER_EVAL_MS = _N()
-    def inc_blocked(*_a, **_k): pass
-    def mark_scanner_to_rm(*_a, **_k): pass
-    SCANNER_DECISION_MS = _N()
-
-
 # --- OBS/METRICS Fallbacks & imports manquants ---
 try:
     # registres communs (si dispo dans ton projet)
@@ -117,7 +99,7 @@ try:
         SC_STRATEGY_SCORE,            # gauge
         SC_ELIGIBLE,                  # gauge
         inc_blocked,                  # function(module, reason, pair)
-        mark_scanner_to_rm,           # latence Scanner→RM
+        mark_scanner_to_rm_ts,        # latence Scanner→RM (wrapper ts_ns)
     )
 except Exception:
     class _MetricNoOp:
@@ -126,18 +108,20 @@ except Exception:
         def inc(self, *a, **k): pass
         def set(self, *a, **k): pass
 
-
     SCANNER_DECISION_MS = _MetricNoOp()
     SCANNER_EVAL_MS = _MetricNoOp()
 
     SC_BANNED = _MetricNoOp()
     SC_PROMOTED_PRIMARY = _MetricNoOp()
     SC_ROTATION_PRIMARY_SIZE = _MetricNoOp()
+
     SC_ROTATION_AUDITION_SIZE = _MetricNoOp()
     SC_STRATEGY_SCORE = _MetricNoOp()
     SC_ELIGIBLE = _MetricNoOp()
+
     def inc_blocked(*_a, **_k): pass
-    def mark_scanner_to_rm(*_a, **_k): pass
+
+    def mark_scanner_to_rm_ts(*_a, **_k): pass
 
 # --- Canonique B6: RM_DECISION_MS{cohort} (PRIMARY|AUDITION) ---
 try:
@@ -325,7 +309,20 @@ class OpportunityScanner:
         # -------------------------------
         r = self.cfg.router
         self._shards = int(r.shards_per_exchange)
-        self._pair_queue_max = int(r.out_queues_maxlen)
+
+        # pair_queue_max : valeur initiale conservatrice, recalée ensuite via apply_runtime_config
+        try:
+            self._pair_queue_max = int(getattr(r, "out_queues_maxlen", 0) or 0)
+        except Exception:
+            self._pair_queue_max = 0
+
+        if self._pair_queue_max <= 0:
+            # fallback sur SCANNER_DEQUE_MAX + max_pairs_per_tick si déjà présent
+            try:
+                self._pair_queue_max = int(self._compute_pair_queue_max_from_cfg(self.cfg))
+            except Exception:
+                self._pair_queue_max = 1000
+
         self._coalesce_window_ms = int(r.coalesce_window_ms)
         self._require_l2_first = bool(r.require_l2_first)
 
@@ -1211,37 +1208,290 @@ class OpportunityScanner:
         return "AUDITION"
 
     # À mettre dans opportunity_scanner.py (dans la classe)
-    def apply_runtime_config(self, cfg) -> None:
+    def apply_runtime_config(self, cfg: Any) -> None:
         """
-        P0/P1: Hz par tier + cap global + dedup + deques (+ workers + MM hints).
-        Compatible avec:
-          - SCANNER_HZ={"PRIMARY":..,"AUDITION":..,"CORE":..,"SANDBOX":..}
-          - anciens scanner_eval_hz_* déjà lus dans __init__
-        """
-        # --- Hz par tier (fallback rétro-compat si CORE/SANDBOX absents) ---
-        hz = dict(getattr(cfg, "SCANNER_HZ", {}))
-        self.eval_hz_core = float(hz.get("CORE", getattr(self, "eval_hz_core", getattr(self, "eval_hz_primary", 25.0))))
-        self.eval_hz_primary = float(hz.get("PRIMARY", getattr(self, "eval_hz_primary", 25.0)))
-        self.eval_hz_audition = float(hz.get("AUDITION", getattr(self, "eval_hz_audition", 5.0)))
-        self.eval_hz_sandbox = float(
-            hz.get("SANDBOX", getattr(self, "eval_hz_sandbox", getattr(self, "eval_hz_audition", 5.0))))
-        self.global_eval_hz = float(getattr(cfg, "scanner_global_eval_hz", getattr(self, "global_eval_hz", 200.0)))
+        Applique une mise à jour "live" de la configuration Scanner à partir
+        d'un BotConfig (ou équivalent).
 
-        # --- token-buckets ---
-        self._tb_global = _TokenBucket(rate_per_s=self.global_eval_hz, capacity=self.global_eval_hz * 2.0)
+        Invariants business (Ticket 5 / P0 Marché Public) :
+        - Source principale des paramètres : cfg.scanner (ScannerCfg).
+        - Compat sur les anciens champs agrégés :
+          cfg.SCANNER_HZ / cfg.SCANNER_DEQUE_MAX / cfg.SCANNER_DEDUP_COOLDOWN_S.
+        - Pas de lecture directe de SCANNER_* pour des paramètres déjà
+          exposés dans ScannerCfg.
+        """
+        # --- Point d'entrée principal : ScannerCfg ---------------------------
+        scanner_cfg = getattr(cfg, "scanner", None)
+        if scanner_cfg is None:
+            # fallback : utiliser la cfg attachée à l'instance si disponible
+            scanner_cfg = getattr(getattr(self, "cfg", None), "scanner", None)
+
+        # --- Merge éventuel des clés legacy dans ScannerCfg -----------------
+        # SCANNER_DEDUP_COOLDOWN_S : cadence de cooldown dedup (legacy)
+        legacy_dedup = getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", None)
+        if scanner_cfg is not None and legacy_dedup is not None:
+            try:
+                scanner_cfg.dedup_cooldown_s = float(legacy_dedup)
+            except Exception:
+                pass
+
+        # SCANNER_HZ : override agrégé des fréquences par tier (legacy)
+        legacy_hz = getattr(cfg, "SCANNER_HZ", None)
+        if scanner_cfg is not None and isinstance(legacy_hz, dict):
+            def _pick(d: Dict[str, Any], *keys: str) -> Optional[float]:
+                for k in keys:
+                    if k in d and d[k] is not None:
+                        try:
+                            return float(d[k])
+                        except Exception:
+                            return None
+                return None
+
+            v = _pick(legacy_hz, "CORE", "core")
+            if v is not None:
+                scanner_cfg.scanner_eval_hz_core = v
+            v = _pick(legacy_hz, "PRIMARY", "primary")
+            if v is not None:
+                scanner_cfg.scanner_eval_hz_primary = v
+            v = _pick(legacy_hz, "AUDITION", "audition")
+            if v is not None:
+                scanner_cfg.scanner_eval_hz_audition = v
+            v = _pick(legacy_hz, "SANDBOX", "sandbox")
+            if v is not None:
+                scanner_cfg.scanner_eval_hz_sandbox = v
+
+        # --- Global Hz, workers & fréquences par tier -----------------------
+        if scanner_cfg is not None:
+            self.global_eval_hz = float(
+                getattr(scanner_cfg, "scanner_global_eval_hz", getattr(self, "global_eval_hz", 200.0)) or 200.0
+            )
+            self.eval_hz_core = float(
+                getattr(scanner_cfg, "scanner_eval_hz_core", getattr(self, "eval_hz_core", self.global_eval_hz))
+            )
+            self.eval_hz_primary = float(
+                getattr(scanner_cfg, "scanner_eval_hz_primary", getattr(self, "eval_hz_primary", self.global_eval_hz))
+            )
+            self.eval_hz_audition = float(
+                getattr(
+                    scanner_cfg,
+                    "scanner_eval_hz_audition",
+                    getattr(self, "eval_hz_audition", max(1.0, self.global_eval_hz * 0.25)),
+                )
+            )
+            self.eval_hz_sandbox = float(
+                getattr(
+                    scanner_cfg,
+                    "scanner_eval_hz_sandbox",
+                    getattr(self, "eval_hz_sandbox", max(0.5, self.global_eval_hz * 0.15)),
+                )
+            )
+            self._workers = int(max(1, getattr(scanner_cfg, "workers", getattr(self, "_workers", 1))))
+        else:
+            # compat très ancien cfg sans ScannerCfg
+            self.global_eval_hz = float(
+                getattr(cfg, "scanner_global_eval_hz", getattr(self, "global_eval_hz", 200.0)) or 200.0
+            )
+            self.eval_hz_core = float(
+                getattr(cfg, "scanner_eval_hz_core", getattr(self, "eval_hz_core", self.global_eval_hz))
+            )
+            self.eval_hz_primary = float(
+                getattr(cfg, "scanner_eval_hz_primary", getattr(self, "eval_hz_primary", self.global_eval_hz))
+            )
+            self.eval_hz_audition = float(
+                getattr(
+                    cfg,
+                    "scanner_eval_hz_audition",
+                    getattr(self, "eval_hz_audition", max(1.0, self.global_eval_hz * 0.25)),
+                )
+            )
+            self.eval_hz_sandbox = float(
+                getattr(
+                    cfg,
+                    "scanner_eval_hz_sandbox",
+                    getattr(self, "eval_hz_sandbox", max(0.5, self.global_eval_hz * 0.15)),
+                )
+            )
+            self._workers = int(max(1, getattr(cfg, "SCANNER_WORKERS", getattr(self, "_workers", 1))))
+
+        # --- Dedup window & cooldown ----------------------------------------
+        if scanner_cfg is not None:
+            # fenêtre de dedup & cooldown pilotées par ScannerCfg (P0)
+            self._dedup_window_s = float(
+                max(0.01, getattr(scanner_cfg, "dedup_window_s", getattr(self, "_dedup_window_s", 0.16)))
+            )
+            self.dedup_cooldown_s = float(
+                max(0.01, getattr(scanner_cfg, "dedup_cooldown_s", getattr(self, "dedup_cooldown_s", 0.16)))
+            )
+        else:
+            # compat legacy : on se rabat sur l'ancien champ global si présent
+            self.dedup_cooldown_s = float(
+                max(0.01, getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", getattr(self, "dedup_cooldown_s", 0.16)))
+            )
+
+        # --- Deques input / backlog (SCANNER_DEQUE_MAX = agrégateur P0) ----
+        dq_cfg = getattr(cfg, "SCANNER_DEQUE_MAX", None)
+
+        if isinstance(dq_cfg, dict):
+            base_core = int(dq_cfg.get("CORE", dq_cfg.get("core", getattr(self, "_deque_max_core", 1500))))
+            base_primary = int(
+                dq_cfg.get("PRIMARY", dq_cfg.get("primary", getattr(self, "_deque_max_primary", base_core)))
+            )
+            base_audition = int(
+                dq_cfg.get(
+                    "AUDITION",
+                    dq_cfg.get(
+                        "audition",
+                        getattr(self, "_deque_max_audition", max(300, base_primary // 3)),
+                    ),
+                )
+            )
+            base_sandbox = int(
+                dq_cfg.get(
+                    "SANDBOX",
+                    dq_cfg.get(
+                        "sandbox",
+                        getattr(self, "_deque_max_sandbox", max(200, base_primary // 4)),
+                    ),
+                )
+            )
+        elif isinstance(dq_cfg, (int, float)):
+            base_core = int(dq_cfg)
+            base_primary = int(dq_cfg)
+            base_audition = max(300, base_primary // 3)
+            base_sandbox = max(200, base_primary // 4)
+        else:
+            base_core = int(getattr(self, "_deque_max_core", 1500))
+            base_primary = int(getattr(self, "_deque_max_primary", base_core))
+            base_audition = int(getattr(self, "_deque_max_audition", max(300, base_primary // 3)))
+            base_sandbox = int(getattr(self, "_deque_max_sandbox", max(200, base_primary // 4)))
+
+        self._deque_max_core = base_core
+        self._deque_max_primary = base_primary
+        self._deque_max_audition = base_audition
+        self._deque_max_sandbox = base_sandbox
+        # pour le logging backpressure existant
+        self.deque_max = self._deque_max_core
+
+        # --- Token buckets : recalage sur la nouvelle global_eval_hz --------
+        try:
+            # _tb_global : limiter nb de paires / seconde
+            if hasattr(self, "_tb_global") and self._tb_global is not None:
+                self._tb_global.update_rate(self.global_eval_hz)
+            else:
+                self._tb_global = _TokenBucket(
+                    rate_per_s=self.global_eval_hz,
+                    capacity=self.global_eval_hz * 2.0,
+                )
+        except Exception:
+            # en cas de problème, on garde l'ancien bucket
+            pass
+
+        # reset du cache per-pair : il sera repopulé progressivement
         self._tb_pair = {}
 
-        # --- dedup & deques (déjà présents) ---
-        self.dedup_cooldown_s = float(getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", getattr(self, "dedup_cooldown_s", 0.16)))
-        dq = dict(getattr(cfg, "SCANNER_DEQUE_MAX", {}))
-        self._deque_max_core = int(dq.get("CORE", getattr(self, "_deque_max_core", 1500)))
-        self._deque_max_primary = int(dq.get("PRIMARY", getattr(self, "_deque_max_primary", 1500)))
-        self._deque_max_audition = int(dq.get("AUDITION", getattr(self, "_deque_max_audition", 500)))
-        self._deque_max_sandbox = int(dq.get("SANDBOX", getattr(self, "_deque_max_sandbox", 300)))
+        # --- Pair-level queues : alignement SCANNER_DEQUE_MAX + max_pairs_per_tick ---
+        try:
+            new_pair_max = int(self._compute_pair_queue_max_from_cfg(cfg))
+        except Exception:
+            new_pair_max = int(getattr(self, "_pair_queue_max", 1000) or 1000)
 
-        # --- (inchangé) workers & MM hints: on les CONSERVE ---
-        self._workers_target = int(getattr(cfg, "SCANNER_WORKERS", getattr(self, "_workers_target", 4)))
-        self._enable_mm_hints = bool(getattr(cfg, "ENABLE_MM_HINTS", getattr(self, "_enable_mm_hints", True)))
+        old_pair_max = int(getattr(self, "_pair_queue_max", 0) or 0)
+        if new_pair_max != old_pair_max and new_pair_max > 0:
+            from collections import deque, defaultdict
+
+            self._pair_queue_max = new_pair_max
+
+            # reconstruire les deques existants avec le nouveau maxlen
+            old_queues = getattr(self, "_queues", {}) or {}
+            new_queues = {}
+            for pk, dq in old_queues.items():
+                try:
+                    new_queues[pk] = deque(dq, maxlen=self._pair_queue_max)
+                except Exception:
+                    # fallback: réinitialise la file si problème
+                    new_queues[pk] = deque(maxlen=self._pair_queue_max)
+
+            self._queues = defaultdict(lambda: deque(maxlen=self._pair_queue_max))
+            self._queues.update(new_queues)
+
+            try:
+                self.logger.info(
+                    "[Scanner] pair_queue_max recalé via SCANNER_DEQUE_MAX/max_pairs_per_tick: %s -> %s",
+                    old_pair_max,
+                    self._pair_queue_max,
+                )
+            except Exception:
+                pass
+
+    def _compute_pair_queue_max_from_cfg(self, cfg) -> int:
+        """
+        Calcule une capacité cohérente pour les deques par paire, en alignant :
+        - SCANNER_DEQUE_MAX (cap globale par tier, en pratique PRIMARY),
+        - max_pairs_per_tick,
+        - le plafond éventuel Router.out_queues_maxlen.
+
+        Retourne une valeur bornée (16..10_000).
+        """
+        # max_pairs_per_tick depuis ScannerCfg ou instance
+        try:
+            sc = getattr(cfg, "scanner", None)
+        except Exception:
+            sc = None
+
+        mpt = None
+        if sc is not None:
+            try:
+                mpt = int(getattr(sc, "max_pairs_per_tick", getattr(self, "max_pairs_per_tick", 40)))
+            except Exception:
+                mpt = None
+        if not mpt or mpt <= 0:
+            mpt = int(getattr(self, "max_pairs_per_tick", 40) or 40)
+
+        # agrégateur SCANNER_DEQUE_MAX : on part de PRIMARY
+        dq_cfg = getattr(cfg, "SCANNER_DEQUE_MAX", None)
+        base_primary = None
+        if isinstance(dq_cfg, dict):
+            try:
+                base_primary = int(
+                    dq_cfg.get(
+                        "PRIMARY",
+                        dq_cfg.get(
+                            "primary",
+                            dq_cfg.get("CORE", dq_cfg.get("core", getattr(self, "_deque_max_primary", 1500))),
+                        ),
+                    )
+                )
+            except Exception:
+                base_primary = None
+        elif isinstance(dq_cfg, (int, float)):
+            base_primary = int(dq_cfg)
+
+        if base_primary is None:
+            try:
+                base_primary = int(getattr(self, "_deque_max_primary", getattr(self, "_deque_max_core", 1500)))
+            except Exception:
+                base_primary = 1500
+
+        # cap globale → capacité par paire approximative
+        per_pair_cap = max(16, base_primary // max(mpt, 1))
+
+        # borne haute éventuelle via Router
+        router_cfg = getattr(cfg, "router", None)
+        router_cap = None
+        try:
+            if router_cfg is not None:
+                router_cap = int(getattr(router_cfg, "out_queues_maxlen", 0) or 0)
+        except Exception:
+            router_cap = None
+
+        if router_cap and router_cap > 0:
+            pair_max = min(per_pair_cap, router_cap)
+        else:
+            pair_max = per_pair_cap
+
+        pair_max = int(max(16, min(pair_max, 10_000)))
+        return pair_max
+
 
     def _cohort_of(self, pair: str) -> str:
         pk = _norm_pair(pair)
@@ -1918,14 +2168,43 @@ class OpportunityScanner:
         except Exception:
             logging.exception("Unhandled exception")
 
+        # --- Scanner → RM : latence et statut appel RM ---------------------------
+        ts_rm_ns = time.perf_counter_ns()
+        ok_rm = False
+        reason_rm = "no_callback"
+
         try:
-            if self.on_opportunity:
-                if asyncio.iscoroutinefunction(self.on_opportunity):
-                    asyncio.create_task(self.on_opportunity(opp))
+            cb = self.on_opportunity
+            if cb:
+                if asyncio.iscoroutinefunction(cb):
+                    # On ne bloque pas sur le RM : tâche async
+                    asyncio.create_task(cb(opp))
+                    ok_rm = True
+                    reason_rm = "async_task"
                 else:
-                    self.on_opportunity(opp)
+                    cb(opp)
+                    ok_rm = True
+                    reason_rm = "ok"
+            else:
+                # Pas de callback configuré → on logge et on marque en NOK
+                reason_rm = "no_callback"
         except Exception as e:
+            ok_rm = False
+            reason_rm = "exception"
             self.logger.exception("on_opportunity callback error: %s", e)
+        finally:
+            try:
+                # Mesure Scanner → RM avec labels minimaux (pair, route)
+                mark_scanner_to_rm_ts(
+                    ts_rm_ns,
+                    ok=ok_rm,
+                    reason=reason_rm,
+                    pair=pair,
+                    route=route_combo,
+                )
+            except Exception:
+                # Observabilité best-effort
+                pass
 
         dt_ms = (time.perf_counter() - _t0) * 1000.0
         dt_ms = (time.perf_counter() - _t0) * 1000.0
@@ -2186,40 +2465,4 @@ class OpportunityScanner:
                 self.logger.exception("[Scanner] worker error")
                 await asyncio.sleep(0.005)
 
-
-# === BEGIN LATENCY INSTRUMENTATION (Scanner→RM) ===
-try:
-    import time, inspect
-    from modules.obs_metrics import mark_scanner_to_rm
-    ScannerClass = None
-    for _n, _o in list(globals().items()):
-        if _n in ("OpportunityScanner", "Scanner", "OpportunityScannerV2") and isinstance(_o, type):
-            ScannerClass = _o
-            break
-
-    # Cherche une méthode qui appelle le RM (noms fréquents)
-    for meth_name in ("_emit_to_rm", "emit_to_rm", "push_to_rm", "submit_to_rm"):
-        if ScannerClass and hasattr(ScannerClass, meth_name):
-            _orig = getattr(ScannerClass, meth_name)
-            if inspect.iscoroutinefunction(_orig):
-                async def _wrapped(self, *args, __orig=_orig, **kwargs):
-                    ts = time.perf_counter_ns()
-                    res = await __orig(self, *args, **kwargs)
-                    try: mark_scanner_to_rm(ts)
-                    except Exception:
-                        logging.exception("Unhandled exception")
-                    return res
-            else:
-                def _wrapped(self, *args, __orig=_orig, **kwargs):
-                    ts = time.perf_counter_ns()
-                    res = __orig(self, *args, **kwargs)
-                    try: mark_scanner_to_rm(ts)
-                    except Exception:
-                        logging.exception("Unhandled exception")
-                    return res
-            setattr(ScannerClass, meth_name, _wrapped)
-            break
-except Exception:
-    logging.exception("Unhandled exception")
-# === END LATENCY INSTRUMENTATION (Scanner→RM) ===
 

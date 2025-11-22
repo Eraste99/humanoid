@@ -34,6 +34,36 @@ from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_b
 
 logger = logging.getLogger("SlippageHandler")
 
+try:
+    from modules.obs_metrics import (
+        SLIP_SAMPLE_TOTAL,
+        SLIP_DECISION_TOTAL,
+        SLIP_P95_BPS,
+        SLIP_P99_BPS,
+        set_slip_age_seconds,
+    )
+except Exception:  # pragma: no cover
+    class _Noop:
+        def labels(self, *_, **__):
+            return self
+
+        def set(self, *_, **__):
+            return None
+
+        def inc(self, *_, **__):
+            return None
+
+        def observe(self, *_, **__):
+            return None
+
+    SLIP_SAMPLE_TOTAL = _Noop()
+    SLIP_DECISION_TOTAL = _Noop()
+    SLIP_P95_BPS = _Noop()
+    SLIP_P99_BPS = _Noop()
+
+    def set_slip_age_seconds(*_, **__):
+        return None
+
 
 # ----------------------------- Frais dynamiques -----------------------------
 class _FeeSchedule:
@@ -744,28 +774,52 @@ class SlippageHandler:
                 if slip_sell_bps is None:
                     slip_sell_bps = approx
 
-            if slip_buy_bps is None and slip_sell_bps is None:
-                logger.debug("[Slip] missing data for %s/%s", ex, pair)
-                return
+                if slip_buy_bps is None and slip_sell_bps is None:
+                    logger.debug("[Slip] missing data for %s/%s", ex, pair)
+                    return
 
-            self._slip_bps = getattr(self, "_slip_bps", {})
-            self._slip_ts = getattr(self, "_slip_ts", {})
-            if slip_buy_bps is not None:
-                self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
-            if slip_sell_bps is not None:
-                self._slip_bps[(ex, pair, "sell")] = float(slip_sell_bps)
-            self._slip_ts[(ex, pair)] = time.time()
+                # Mise à jour du cache TTL (source unique pour get_slippage_bps)
+                self._slip_bps = getattr(self, "_slip_bps", {})
+                self._slip_ts = getattr(self, "_slip_ts", {})
+                now_s = time.time()
+                if slip_buy_bps is not None:
+                    self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
+                if slip_sell_bps is not None:
+                    self._slip_bps[(ex, pair, "sell")] = float(slip_sell_bps)
+                self._slip_ts[(ex, pair)] = now_s
+
+                # Observabilité P0 : âge du dernier point de slippage par pair/exchange/side
+                try:
+                    age_s = 0.0  # âge "au moment de l’ingestion" (référence pour les SLO P0)
+                    if slip_buy_bps is not None:
+                        set_slip_age_seconds(pair, ex, "buy", age_s)
+                    if slip_sell_bps is not None:
+                        set_slip_age_seconds(pair, ex, "sell", age_s)
+                except Exception:
+                    # best-effort, ne doit jamais casser le flux marché public
+                    pass
 
         except Exception:
             logging.exception("[Slip] on_slip error")
 
     # slippage_handler.py
-    def get_slippage_bps(self, exchange: str, pair_key: str, side: str | None = None, *,
-                         ttl_s: float | None = None) -> float | None:
+    def get_slippage_bps(
+            self,
+            exchange: str,
+            pair_key: str,
+            side: str | None = None,
+            *,
+            ttl_s: float | None = None,
+    ) -> float | None:
         """
         Retourne le slippage estimé (en bps) si frais (TTL), sinon None.
-        TTL: SLIP_TTL_S (bot_cfg) ou 3.0s par défaut.
-        side: "buy" | "sell" | None (None => max des deux si dispos)
+
+        TTL:
+          - si `ttl_s` est fourni à l'appel, on l'utilise directement,
+          - sinon on s'appuie sur `self._ttl_s` (configurée depuis cfg.slip.ttl_s,
+            donc pilotée par BotConfig / SLIP_TTL_S, défaut 2.0s).
+
+        side: "buy" | "sell" | None (None => max des deux si disponibles).
         """
         ex = (exchange or "").upper()
         pk = (pair_key or "").replace("-", "").upper()
@@ -776,28 +830,30 @@ class SlippageHandler:
         if ttl_s is not None:
             ttl = float(ttl_s)
         else:
-            ttl = float(getattr(self, "_ttl_s", 3.0))
-            cfg_slip = getattr(getattr(self, "bot_cfg", None), "slip", None)
-            if cfg_slip is not None and hasattr(cfg_slip, "ttl_s"):
-                try:
-                    ttl = float(getattr(cfg_slip, "ttl_s"))
-                except Exception:
-                    ttl = float(getattr(self, "_ttl_s", 3.0))
+            # Source unique: cfg.slip.ttl_s injecté dans self._ttl_s au __init__
+            ttl = float(getattr(self, "_ttl_s", 2.0))
 
         if side is None:
             vals = []
             for s in ("buy", "sell"):
                 v = bps.get((ex, pk, s))
                 t = tsd.get((ex, pk))
-                if v is not None and t is not None and (now - float(t)) <= ttl:
-                    vals.append(float(v))
-            return max(vals) if vals else None
+                if v is not None and t is not None:
+                    age = now - float(t)
+                    if age <= ttl:
+                        vals.append(float(v))
+                        # Optionnel: on pourrait pousser ici un age réel via set_slip_age_seconds
+                return max(vals) if vals else None
 
         v = bps.get((ex, pk, str(side).lower()))
         t = tsd.get((ex, pk))
         if v is None or t is None:
             return None
-        return float(v) if (now - float(t)) <= ttl else None
+
+        age = now - float(t)
+        # (On ne met pas set_slip_age_seconds ici pour ne pas surcharger de calls ; on reste P0.)
+        return float(v) if age <= ttl else None
+
 
     def detach_bus_consumers(self) -> None:
         for ex, t in list(self._bus_tasks.items()):

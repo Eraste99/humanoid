@@ -24,14 +24,23 @@ Clients attendus (sync ou async) :
 Événements émis via callback (register_callback) :
   - "order"   : mise à jour d’ordre
   - "fill"    : exécutions (patch: `quote`, `quote_qty`, `usdc_qty` ajoutés)
-  - "transfer": résultat d’un transfert (OK/ERROR)
+  - "transfer": résultat d’un transfert interne (OK/ERROR), consommé par le RM.
+      # Contrat minimal (Ticket 8 — capital en mouvement) :
       {
         "type": "transfer",
         "subtype": "wallet" | "subaccount",
         "exchange": "BINANCE"|"BYBIT"|"COINBASE",
-        "alias": "TT"|"TM"|None,
+        "alias": "TT"|"TM"|None,      # alias focus (dest alias pour subtype="subaccount")
         "status": "OK"|"ERROR",
-        "payload": {...}, "result": {...}|None, "error": "...",
+        "ccy": "USDC",
+        "amount": 100.0,              # en ccy
+        "from_alias": "TT"|None,      # pour subtype="subaccount"
+        "to_alias": "TM"|None,        # pour subtype="subaccount"
+        "from_wallet": "SPOT"|None,   # pour subtype="wallet"
+        "to_wallet": "FUNDING"|None,  # pour subtype="wallet"
+        "payload": {...},             # payload brut, toujours présent
+        "result": {...}|None,
+        "error": "...",
         "ts": 1700000000.0
       }
 
@@ -51,12 +60,28 @@ API
   await hub.transfer_subaccount(ex, from_alias, to_alias, ccy, amount)
 
   # Snapshots optionnels de wallets (si clients les exposent)
+   # Snapshots optionnels de wallets (si clients les exposent)
   await hub.get_wallets_snapshot()
+
+Contrat événements FILL/PARTIAL
+-------------------------------
+  Event transmis vers RM/Reconciler si et seulement si :
+    • status in {"FILL", "PARTIAL"} (après normalisation),
+    • payload contient au minimum :
+        - exchange, alias, symbol, side,
+        - fill_px, base_qty, quote, quote_qty,
+        - au moins un identifiant: client_id ou exchange_order_id,
+        - timestamp ts_local (toujours) + ts_exchange (ou dérivé de ts_ms).
+
+  Les événements "order" (type="order") avec status FILLED/CANCELED restent de
+  type "order" et sont traités côté Engine, mais ne passent plus le filtre
+  FILL/PARTIAL s'ils ne respectent pas ce contrat.
 
 Statut
 ------
   hub.get_status()
 """
+
 
 from dataclasses import dataclass
 from collections import OrderedDict, defaultdict, deque
@@ -1019,9 +1044,14 @@ class PrivateWSHub:
         coinbase_ws_ack_clients: Dict[str, Any] | None = None,
         **_  # future-proof
     ):
+        # Callbacks wiring (RM / Engine / observers)
         self._callback = on_event
         self._rm_callback: Optional[Callable[[dict], None]] = None
         self._observers: List[Callable[[dict], Any]] = []
+        # Indicateur compat: True si _rm_callback a été déduit automatiquement
+        # à partir d'un précédent callback "engine" (mode test uniquement).
+        self._wiring_auto_rm_from_engine: bool = False
+
         self._started = False
         self._hb_task: Optional[asyncio.Task] = None
 
@@ -1245,7 +1275,6 @@ class PrivateWSHub:
             return str(self._region_map[exu]).upper()
         return "EU"
 
-
     def on_event(self, event: dict) -> None:
         """
         Entrée unique: QoS, métriques (ACK/FILL + lag + heartbeats), drain minimal.
@@ -1264,6 +1293,44 @@ class PrivateWSHub:
         if status == "OTHER" and str(ev.get("type")).lower() == "fill":
             status = "FILL"
             ev["status"] = "FILL"
+
+        etype = str(ev.get("type") or "").lower()
+
+        # Normalise exchange/alias dans l'événement
+        ev.setdefault("exchange", exu)
+        ev.setdefault("alias", alu)
+
+        # Validation minimale du contrat FILL/PARTIAL pour les événements type="fill"
+        if etype == "fill" and status in ("FILL", "PARTIAL"):
+            required = ("symbol", "side", "fill_px", "base_qty", "quote", "quote_qty")
+            missing = [name for name in required if ev.get(name) in (None, "")]
+            has_id = bool(ev.get("client_id") or ev.get("exchange_order_id"))
+            if missing or not has_id:
+                reason = "invalid_fill_contract"
+                try:
+                    PWS_DROPPED_TOTAL.labels(exu, alu, reason).inc()
+                except Exception:
+                    pass
+                try:
+                    log.warning(
+                        "[PrivateWSHub] évènement FILL/PARTIAL invalide, drop: "
+                        "missing=%s has_id=%s ev_head=%s",
+                        missing,
+                        has_id,
+                        {
+                            "exchange": ev.get("exchange"),
+                            "alias": ev.get("alias"),
+                            "symbol": ev.get("symbol"),
+                            "side": ev.get("side"),
+                            "status": ev.get("status"),
+                            "type": ev.get("type"),
+                            "client_id": ev.get("client_id"),
+                            "exchange_order_id": ev.get("exchange_order_id"),
+                        },
+                    )
+                except Exception:
+                    pass
+                return
 
         ev.setdefault("ts_local", _t.time())
         key = (exu, alu)
@@ -1335,6 +1402,8 @@ class PrivateWSHub:
     def _pws_drain_one(self, key: tuple) -> None:
         """
         Émet 1 événement (le plus prioritaire dispo) vers RM (si présent) puis Engine.
+        En mode PROD, on s'attend à ce que RM ET Engine soient câblés ; un manque
+        de callback est traité comme wiring incomplet (métriques + log).
         """
         q = self._queues.get(key)
         if not q or not q:
@@ -1349,16 +1418,46 @@ class PrivateWSHub:
             PWS_QUEUE_DEPTH.labels(ex, al, kind).set(float(depth))
             PWS_QUEUE_CAP.labels(ex, al, kind).set(float(cap))
         except Exception:
+            ex = ex if "ex" in locals() else "-"
+            al = al if "al" in locals() else "-"
+            kind = kind if "kind" in locals() else "-"
+
+        # 1) callback RM / Engine (wiring check)
+        rm_cb = getattr(self, "_rm_callback", None)
+        eng_cb = getattr(self, "_callback", None)
+
+        # Wiring incomplet → alerte explicite (prod / test visibles)
+        try:
+            if rm_cb is None:
+                self._notify_alert(
+                    severity="ERROR",
+                    reason="missing_rm_callback",
+                    exchange=ex,
+                    alias=al,
+                    kind=kind,
+                    message="PrivateWSHub: événement privé sans callback RiskManager",
+                )
+            if eng_cb is None:
+                self._notify_alert(
+                    severity="ERROR",
+                    reason="missing_engine_callback",
+                    exchange=ex,
+                    alias=al,
+                    kind=kind,
+                    message="PrivateWSHub: événement privé sans callback ExecutionEngine",
+                )
+        except Exception:
             pass
-        # 1) callback RM (async/sync sans bloquer)
-        self._deliver_callback(getattr(self, "_rm_callback", None), ev, label="RM")
+
+        self._deliver_callback(rm_cb, ev, label="RM")
 
         # 2) callback Engine (sync)
-        self._deliver_callback(getattr(self, "_callback", None), ev, label="Engine")
+        self._deliver_callback(eng_cb, ev, label="Engine")
 
         # 3) Observateurs additionnels (balance fetcher, watchdogs…)
         for cb in list(self._observers):
             self._deliver_callback(cb, ev, label="Observer")
+
 
     def _deliver_callback(self, cb: Optional[Callable[[dict], Any]], ev: dict, label: str) -> None:
         if not cb:
@@ -1485,25 +1584,63 @@ class PrivateWSHub:
     def register_callback(self, cb, *, role: str = "engine") -> None:
         """
         Enregistre un callback consommateur.
-        role="engine" (defaut), "risk" ou "observer" (fan-out additionnel).
+
+        Contrat wiring:
+          - role="engine": callback unique pour l'ExecutionEngine
+            (on_private_order_update).
+          - role="risk"|"rm"|"riskmanager": callback unique pour le RiskManager
+            (on_private_event).
+          - role="observer": callbacks additionnels (fan-out lecture seule).
+
+        En PROD, on s'attend à avoir AU MOINS un callback "engine" ET un
+        callback "risk". Le fallback qui réutilise un ancien callback "engine"
+        comme "_rm_callback" est conservé pour compatibilité/tests uniquement
+        et marqué via self._wiring_auto_rm_from_engine.
         """
         if not cb:
             return
+
         kind = str(role or "engine").lower()
+
         if kind == "engine":
             prev = getattr(self, "_callback", None)
-            if prev and prev is not cb and self._rm_callback is None:
+            if prev is not None and prev is not cb and getattr(self, "_rm_callback", None) is None:
+                # Mode compat: on promeut l'ancien callback "engine" en RM si aucun
+                # callback RM n'est encore enregistré. Marqué comme auto-wiring.
                 self._rm_callback = prev
+                self._wiring_auto_rm_from_engine = True
+                try:
+                    log.warning(
+                        "[PrivateWSHub] auto-wiring précédent callback engine en RM "
+                        "(mode compat/test uniquement)"
+                    )
+                except Exception:
+                    pass
+                try:
+                    # Alerte observable pour les dashboards (wiring incomplet).
+                    self._notify_alert(
+                        severity="WARNING",
+                        reason="auto_rm_from_engine",
+                        exchange="-",
+                        alias="-",
+                        kind="wiring",
+                        message="RM callback déduit automatiquement depuis engine (compat/test)",
+                    )
+                except Exception:
+                    pass
             self._callback = cb
             return
+
         if kind in ("risk", "rm", "riskmanager"):
             self._rm_callback = cb
+            self._wiring_auto_rm_from_engine = False
             return
+
         if kind == "observer":
             self._observers.append(cb)
             return
-        raise ValueError(f"unknown callback role={role}")
 
+        raise ValueError(f"unknown callback role={role!r}")
 
     # ------------------------- lifecycle --------------------------------------
 
@@ -1820,19 +1957,98 @@ class PrivateWSHub:
         except Exception as e:
             return False, None, f"{type(e).__name__}: {e}"
 
-    def _emit_transfer_event(self, *, subtype: str, exchange: str, alias: Optional[str], status: str,
-                             payload: Dict[str, Any], result: Any = None, error: Optional[str] = None) -> None:
+    def _emit_transfer_event(
+            self,
+            *,
+            subtype: str,
+            exchange: str,
+            alias: Optional[str],
+            status: str,
+            payload: Dict[str, Any],
+            result: Any = None,
+            error: Optional[str] = None,
+    ) -> None:
+        """Émet un évènement de transfert interne (wallet ou subaccount).
+
+        Contrat (cf. docstring module & Ticket 8) :
+          - type="transfer"
+          - subtype="wallet"|"subaccount"
+          - exchange="BINANCE"/"BYBIT"/"COINBASE"
+          - alias: alias focus (dest alias pour subtype="subaccount")
+          - ccy, amount: devise & montant en ccy
+          - from_alias / to_alias: pour subtype="subaccount"
+          - from_wallet / to_wallet: pour subtype="wallet"
+          - payload: copie brute du payload passé au client
+        """
+        subtype_norm = str(subtype).lower()
+        exu = _upper(exchange)
+        alias_u = _upper(alias) if alias else None
+
+        base_payload = dict(payload or {})
+        try:
+            ccy = _upper(base_payload.get("ccy")) if base_payload.get("ccy") else None
+        except Exception:
+            ccy = None
+        try:
+            amount = float(base_payload.get("amount") or 0.0)
+        except Exception:
+            amount = 0.0
+
+        from_alias: Optional[str] = None
+        to_alias: Optional[str] = None
+        from_wallet: Optional[str] = None
+        to_wallet: Optional[str] = None
+
+        if subtype_norm == "wallet":
+            # Transfert intra-wallet pour un alias logique (TT/TM/MM).
+            try:
+                from_wallet = _upper(base_payload.get("from_wallet")) if base_payload.get("from_wallet") else None
+            except Exception:
+                from_wallet = None
+            try:
+                to_wallet = _upper(base_payload.get("to_wallet")) if base_payload.get("to_wallet") else None
+            except Exception:
+                to_wallet = None
+
+            if alias_u is None:
+                try:
+                    alias_u = _upper(base_payload.get("alias")) if base_payload.get("alias") else None
+                except Exception:
+                    alias_u = None
+            from_alias = alias_u
+            to_alias = alias_u
+
+        elif subtype_norm == "subaccount":
+            # Transfert entre alias (TT ↔ TM) sur un même exchange.
+            try:
+                from_alias = _upper(base_payload.get("from_alias")) if base_payload.get("from_alias") else None
+            except Exception:
+                from_alias = None
+            try:
+                to_alias = _upper(base_payload.get("to_alias")) if base_payload.get("to_alias") else None
+            except Exception:
+                to_alias = None
+            if alias_u is None:
+                alias_u = to_alias or from_alias
+
         ev = {
             "type": "transfer",
-            "subtype": str(subtype).lower(),  # "wallet" | "subaccount"
-            "exchange": _upper(exchange),
-            "alias": _upper(alias) if alias else None,
+            "subtype": subtype_norm,  # "wallet" | "subaccount"
+            "exchange": exu,
+            "alias": alias_u,
             "status": _upper(status),
-            "payload": dict(payload),
+            "ccy": ccy,
+            "amount": amount,
+            "from_alias": from_alias,
+            "to_alias": to_alias,
+            "from_wallet": from_wallet,
+            "to_wallet": to_wallet,
+            "payload": base_payload,
             "result": result,
             "error": error,
             "ts": _now(),
         }
+
         try:
             PWS_TRANSFERS_TOTAL.labels(
                 exchange=ev["exchange"],
@@ -1841,15 +2057,27 @@ class PrivateWSHub:
             ).inc()
         except Exception:
             pass
+
         try:
-            log.info("[PrivateWSHub] %s", json.dumps({
-                "pws_transfer": True,
-                "exchange": ev["exchange"],
-                "alias": ev["alias"],
-                "subtype": ev["subtype"],
-                "status": ev["status"],
-                "error": ev.get("error"),
-            }))
+            log.info(
+                "[PrivateWSHub] %s",
+                json.dumps(
+                    {
+                        "pws_transfer": True,
+                        "exchange": ev["exchange"],
+                        "alias": ev["alias"],
+                        "subtype": ev["subtype"],
+                        "status": ev["status"],
+                        "ccy": ev.get("ccy"),
+                        "amount": ev.get("amount"),
+                        "from_alias": ev.get("from_alias"),
+                        "to_alias": ev.get("to_alias"),
+                        "from_wallet": ev.get("from_wallet"),
+                        "to_wallet": ev.get("to_wallet"),
+                        "error": ev.get("error"),
+                    }
+                ),
+            )
         except Exception:
             pass
 
@@ -1859,8 +2087,24 @@ class PrivateWSHub:
             except Exception:
                 log.exception("[PrivateWSHub] transfer callback error")
 
+
     async def transfer_wallet(self, *, ex: str, alias: str, from_wallet: str, to_wallet: str,
                               ccy: str, amount: float) -> Dict[str, Any]:
+        """
+               Transfert intra-wallet (ex: FUNDING ↔ SPOT) pour un alias logique (TT/TM/MM).
+
+               Contrat:
+                 - ex: "BINANCE" | "BYBIT" | "COINBASE"
+                 - alias: alias logique (TT/TM/MM...) côté bot
+                 - from_wallet / to_wallet: noms de wallet CEX (SPOT/FUNDING...), uppercased
+                 - ccy, amount: devise et montant transféré (en ccy)
+
+               Évènement émis vers RM (cf. _emit_transfer_event):
+                 - subtype="wallet"
+                 - exchange=ex, alias=alias
+                 - payload={"ex","alias","from_wallet","to_wallet","ccy","amount"}
+                 - champs dérivés: from_alias=alias, to_alias=alias
+               """
         exu, alu = _upper(ex), _upper(alias)
         payload = {
             "ex": exu, "alias": alu,
@@ -1887,6 +2131,21 @@ class PrivateWSHub:
 
     async def transfer_subaccount(self, *, ex: str, from_alias: str, to_alias: str,
                                   ccy: str, amount: float) -> Dict[str, Any]:
+        """
+                Transfert entre sous-comptes / alias (TT ↔ TM) pour un même exchange.
+
+                Contrat:
+                  - ex: "BINANCE" | "BYBIT" | "COINBASE"
+                  - from_alias / to_alias: alias logiques TT/TM/MM..., uppercased
+                  - ccy, amount: devise et montant transféré (en ccy)
+
+                Évènement émis vers RM (cf. _emit_transfer_event):
+                  - subtype="subaccount"
+                  - exchange=ex
+                  - alias = to_alias (alias focus = destination)
+                  - payload={"ex","from_alias","to_alias","ccy","amount"}
+                  - champs dérivés: from_alias / to_alias remplis au top-level de l'event
+                """
         exu = _upper(ex)
         payload = {
             "ex": exu, "from_alias": _upper(from_alias), "to_alias": _upper(to_alias),
@@ -1936,17 +2195,219 @@ class PrivateWSHub:
                 log.exception("[PrivateWSHub] get_wallets_snapshot from %s failed", ex)
         return out if had_any else None
 
+    # --------------------- WS health par alias ---------------------------
+
+    def _collect_ws_client_status_for_alias(self, exchange: str, alias: str) -> Dict[str, Dict[str, Any]]:
+        """
+        Regroupe les statuts bruts des clients WS/poller pour un (exchange, alias).
+
+        Retourne un dict par type de client, ex:
+          {
+            "orders_ws": {...},     # Binance / Bybit / Coinbase-ACK
+            "rest_poller": {...},   # CoinbaseATPoller
+          }
+        Les valeurs sont directement celles de client.get_status().
+        """
+        exu = str(exchange).upper()
+        alu = _upper(alias)
+        clients: Dict[str, Dict[str, Any]] = {}
+
+        # BINANCE: un seul user-stream privé par alias
+        if exu == "BINANCE":
+            c = self.binance_by_alias.get(alu)
+            if c is not None:
+                try:
+                    clients["orders_ws"] = c.get_status()
+                except Exception:
+                    log.exception("[PrivateWSHub] get_status BINANCE %s failed", alu)
+
+        # BYBIT: un client privé multi-endpoints par alias
+        elif exu == "BYBIT":
+            c = self.bybit_by_alias.get(alu)
+            if c is not None:
+                try:
+                    clients["orders_ws"] = c.get_status()
+                except Exception:
+                    log.exception("[PrivateWSHub] get_status BYBIT %s failed", alu)
+
+        # COINBASE: REST poller (source principale) + WS ACK optionnel
+        elif exu in ("COINBASE", "COINBASE_AT"):
+            p = self.cb_poller_by_alias.get(alu)
+            if p is not None:
+                try:
+                    clients["rest_poller"] = p.get_status()
+                except Exception:
+                    log.exception("[PrivateWSHub] get_status Coinbase poller %s failed", alu)
+            w = self.cb_ack_ws_by_alias.get(alu)
+            if w is not None:
+                try:
+                    clients["orders_ws"] = w.get_status()
+                except Exception:
+                    log.exception("[PrivateWSHub] get_status Coinbase ACK %s failed", alu)
+        else:
+            # Exchange inconnu côté Hub
+            pass
+
+        return clients
+
+    def get_alias_ws_status_snapshot(self, exchange: str, alias: str) -> Dict[str, Any]:
+        """
+        Snapshot de santé WS "alias-centré" pour (exchange, alias).
+
+        Utilisé par:
+          - RiskManager / Boot (vue alias),
+          - MultiBalanceFetcher (marquer un alias 'capital_at_risk'),
+          - Observabilité (hub.get_status).
+
+        Statut agrégé:
+          - status: "WS_OK" | "WS_DEGRADED" | "WS_DOWN" | "WS_UNKNOWN"
+          - healthy: bool global (au moins un client 'healthy')
+        """
+        exu = str(exchange).upper()
+        alu = _upper(alias)
+        clients = self._collect_ws_client_status_for_alias(exu, alu)
+
+        # Aucune source pour cet alias
+        if not clients:
+            return {
+                "exchange": exu,
+                "alias": alu,
+                "status": "WS_UNKNOWN",
+                "healthy": False,
+                "heartbeat_gap_s": None,
+                "last_event_ts": None,
+                "errors_total": 0,
+                "reconnects_total": 0,
+                "clients": {},
+            }
+
+        now = _now()
+        last_ts_vals = []
+        errors_total = 0
+        reconnects_total = 0
+        any_healthy = False
+
+        for _kind, st in clients.items():
+            if not isinstance(st, dict):
+                continue
+            ts = _safe_float(st.get("last_event_ts"), 0.0)
+            if ts > 0.0:
+                last_ts_vals.append(ts)
+            err = st.get("errors", 0) or 0
+            rec = st.get("reconnects", 0) or 0
+            try:
+                errors_total += int(err)
+            except Exception:
+                pass
+            try:
+                reconnects_total += int(rec)
+            except Exception:
+                pass
+            if st.get("healthy"):
+                any_healthy = True
+
+        last_ts = max(last_ts_vals) if last_ts_vals else None
+        heartbeat_gap_s = (now - last_ts) if last_ts is not None else None
+
+        # Heuristiques simples (ajustables plus tard via la config si besoin)
+        DEFAULT_SOFT_GAP_S = 60.0   # au-delà, on considère l'alias dégradé
+        DEFAULT_HARD_GAP_S = 180.0  # au-delà, on considère l'alias DOWN
+        ERROR_THRESHOLD = 10
+        RECONNECT_THRESHOLD = 20
+
+        gap = heartbeat_gap_s if heartbeat_gap_s is not None else None
+
+        if gap is None:
+            # Pas encore d'events; on considère l'alias comme dégradé tant qu'on n'a pas vu de trafic
+            if any_healthy:
+                status = "WS_DEGRADED"
+                healthy = True
+            else:
+                status = "WS_DEGRADED"
+                healthy = False
+        else:
+            if (not any_healthy) or (gap >= DEFAULT_HARD_GAP_S):
+                status = "WS_DOWN"
+                healthy = False
+            elif (gap >= DEFAULT_SOFT_GAP_S) or (errors_total >= ERROR_THRESHOLD) or (reconnects_total >= RECONNECT_THRESHOLD):
+                status = "WS_DEGRADED"
+                healthy = True
+            else:
+                status = "WS_OK"
+                healthy = True
+
+        return {
+            "exchange": exu,
+            "alias": alu,
+            "status": status,
+            "healthy": healthy,
+            "heartbeat_gap_s": heartbeat_gap_s,
+            "last_event_ts": last_ts,
+            "errors_total": errors_total,
+            "reconnects_total": reconnects_total,
+            "clients": clients,
+        }
+
+    def get_all_alias_ws_status(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """
+        Snapshot complet par alias:
+
+        {
+          "BINANCE": { "TT": {...}, "TM": {...}, ... },
+          "BYBIT": { ... },
+          "COINBASE": { ... },
+        }
+
+        Utilisable par:
+          - RiskManager (vue globale alias),
+          - watchdog / observabilité,
+          - scripts de debug.
+        """
+        out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+        # BINANCE
+        for al in self.binance_by_alias.keys():
+            alu = _upper(al)
+            out.setdefault("BINANCE", {})[alu] = self.get_alias_ws_status_snapshot("BINANCE", alu)
+
+        # BYBIT
+        for al in self.bybit_by_alias.keys():
+            alu = _upper(al)
+            out.setdefault("BYBIT", {})[alu] = self.get_alias_ws_status_snapshot("BYBIT", alu)
+
+        # COINBASE (union poller + ACK)
+        cb_aliases = set(list(self.cb_poller_by_alias.keys()) + list(self.cb_ack_ws_by_alias.keys()))
+        for al in cb_aliases:
+            alu = _upper(al)
+            out.setdefault("COINBASE", {})[alu] = self.get_alias_ws_status_snapshot("COINBASE", alu)
+
+        return out
+
+
     # ------------------------- status -----------------------------------------
 
     def get_status(self) -> Dict[str, Any]:
+        """
+        Statut synthétique du Hub, y compris wiring callbacks.
+        Utilisé par le RiskManager / Boot pour décider du READY global.
+        """
+        wiring = {
+            "has_engine_callback": bool(getattr(self, "_callback", None)),
+            "has_rm_callback": bool(getattr(self, "_rm_callback", None)),
+            "observer_count": len(getattr(self, "_observers", []) or []),
+            "auto_rm_from_engine": bool(getattr(self, "_wiring_auto_rm_from_engine", False)),
+        }
+        accounts_ws = self.get_all_alias_ws_status()
         return {
             "module": "PrivateWSHub",
             "healthy": self._started,
+            "wiring": wiring,
             "submodules": {
                 "binance": {al: c.get_status() for al, c in self.binance_by_alias.items()},
-                "bybit":   {al: c.get_status() for al, c in self.bybit_by_alias.items()},
-                "coinbase":{al: c.get_status() for al, c in self.cb_poller_by_alias.items()},
+                "bybit": {al: c.get_status() for al, c in self.bybit_by_alias.items()},
+                "coinbase": {al: c.get_status() for al, c in self.cb_poller_by_alias.items()},
             },
+            "accounts_ws": accounts_ws,
             "transfers": {
                 "available": sorted(self._transfer_clients.keys()),
                 "has_binance": "BINANCE" in self._transfer_clients,

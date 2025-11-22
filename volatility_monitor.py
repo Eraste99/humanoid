@@ -30,19 +30,37 @@ logger = logging.getLogger("VolatilityMonitor")
 # Observabilité (fallback no-op si obs_metrics absent)
 try:
     from modules.obs_metrics import (
-        VOL_PRICE_VOL_MICRO, VOL_SPREAD_VOL_MICRO,
-        VOL_PRICE_PCTL, VOL_SPREAD_PCTL,
-        VOL_ANOMALY_TOTAL, VOL_SIGNAL_STATE,
+        VOL_PRICE_VOL_MICRO,
+        VOL_SPREAD_VOL_MICRO,
+        VOL_PRICE_PCTL,
+        VOL_SPREAD_PCTL,
+        VOL_ANOMALY_TOTAL,
+        VOL_SIGNAL_STATE,
+        set_vol_age_seconds,
     )
 except Exception:  # pragma: no cover
     class _Noop:
-        def labels(self, *a, **k): return self
-        def observe(self, *a, **k): return
-        def inc(self, *a, **k): return
-        def set(self, *a, **k): return
-    VOL_PRICE_VOL_MICRO = VOL_SPREAD_VOL_MICRO = _Noop()
-    VOL_PRICE_PCTL = VOL_SPREAD_PCTL = _Noop()
-    VOL_ANOMALY_TOTAL = VOL_SIGNAL_STATE = _Noop()
+        def labels(self, *_, **__):
+            return self
+
+        def set(self, *_, **__):
+            return None
+
+        def inc(self, *_, **__):
+            return None
+
+        def observe(self, *_, **__):
+            return None
+
+    VOL_PRICE_VOL_MICRO = _Noop()
+    VOL_SPREAD_VOL_MICRO = _Noop()
+    VOL_PRICE_PCTL = _Noop()
+    VOL_SPREAD_PCTL = _Noop()
+    VOL_ANOMALY_TOTAL = _Noop()
+    VOL_SIGNAL_STATE = _Noop()
+
+    def set_vol_age_seconds(*_, **__):
+        return None
 
 
 def _to_float(x) -> float:
@@ -351,9 +369,7 @@ class VolatilityMonitor:
             return None
 
         age_s = max(0.0, time.time() - float(rec.get("ts_recv_s", 0.0)))
-        ttl = 5.0
-        if hasattr(self, "bot_cfg"):
-            ttl = float(self.bot_cfg.vol.ttl_s)
+        ttl = float(getattr(self, "_ttl_s", 5.0))
         if age_s > ttl:
             return None
 
@@ -581,9 +597,23 @@ class VolatilityMonitor:
             # TTL cache consommé par get_volatility()
             ts_ms = msg.get("recv_ts_ms") or msg.get("exchange_ts_ms")
             ts_recv_s = (float(ts_ms) / 1000.0) if ts_ms else time.time()
+
             if not hasattr(self, "_last_vol"):
                 self._last_vol = {}
-            self._last_vol[(ex, pk)] = {"vol_rel": vol_rel, "vol_bps": vol_bps, "ts_recv_s": ts_recv_s}
+            self._last_vol[(ex, pk)] = {
+                "vol_rel": vol_rel,
+                "vol_bps": vol_bps,
+                "ts_recv_s": ts_recv_s,
+            }
+
+            # Observabilité : âge du dernier snapshot vol pour cette paire
+            try:
+                age_s = max(0.0, time.time() - ts_recv_s)
+                set_vol_age_seconds(pk, age_s)
+            except Exception:
+                # best-effort, ne casse jamais le flux
+                pass
+
             self._forward_to_scanner(ex, pk, vol_bps)
 
         except Exception:

@@ -297,8 +297,6 @@ class Boot:
         except asyncio.TimeoutError:
             return False
 
-
-
     def get_status(self) -> Dict[str, Any]:
         s = dict(self.state)
         s.update({
@@ -318,7 +316,75 @@ class Boot:
         rc = self._get_router_ready_pairs_count()
         if rc is not None:
             s["router_l2_ready_pairs"] = rc
+
+        # Vue consolidée du marché privé (Ticket 6)
+        rm = getattr(self.ctx, "rm", None)
+        engine = getattr(self.ctx, "engine", None)
+        rm_private: Dict[str, Any] = {}
+        engine_private: Dict[str, Any] = {}
+
+        try:
+            if rm and hasattr(rm, "get_status"):
+                rm_status = rm.get_status() or {}
+                rm_private = rm_status.get("private_ws") or {}
+        except Exception:
+            rm_private = {}
+
+        try:
+            if engine and hasattr(engine, "get_status"):
+                eng_status = engine.get_status() or {}
+                engine_private = eng_status.get("private_ws") or {}
+        except Exception:
+            engine_private = {}
+
+        s["private_ws"] = {
+            "ready_flag": self.ready_private.is_set(),
+            "rm": rm_private,
+            "engine": engine_private,
+        }
         return s
+
+    def set_status_callback(self, callback) -> None:
+        """
+        Configure ou remplace le callback de statut externe.
+
+        Le callback reçoit un dict du type:
+            {
+                "component": str,
+                "status": str,
+                "payload": dict,
+                "ts": float,  # epoch seconds
+            }
+        Si aucun callback n'est configuré, les appels à _send_status sont des no-op.
+        """
+        self._status_sink = callback
+
+    def _send_status(self, component: str, status: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        """
+        Helper interne: publie un statut vers le status_sink s'il est configuré.
+
+        - Ne lève jamais d'exception côté Boot (robustesse).
+        - Si aucun status_sink n'est configuré, no-op silencieux.
+        """
+        sink = getattr(self, "_status_sink", None)
+        if not callable(sink):
+            return
+
+        try:
+            msg = {
+                "component": component,
+                "status": status,
+                "payload": payload or {},
+                "ts": time.time(),
+            }
+            sink(msg)
+        except Exception:
+            # On loggue mais on ne casse jamais le Boot à cause du sink.
+            self.log.exception(
+                "[Boot] status_sink a échoué pour component=%s status=%s",
+                component,
+                status,
+            )
 
     # ------------------------------- Étapes ---------------------------------
     # boot.py
@@ -488,9 +554,16 @@ class Boot:
             slippage_handler=self.ctx.slippage,
             publish_combo_to_bus=True,
             push_to_scanner=True,
-            require_l2_first=bool(getattr(getattr(self.cfg, "router", object()), "require_l2_first", True)),
+            require_l2_first=bool(
+                getattr(getattr(self.cfg, "router", object()), "require_l2_first", True)
+            ),
             combos=combos,
         )
+
+        # --- Brancher la BotConfig sur le Router pour les quotas stream-centrics ---
+        # Permet au MarketDataRouter d'utiliser cfg.router.out_queues_maxlen[_by_kind]
+        # pour dimensionner les deques combo/vol/slip/health.
+        self.ctx.router.bot_cfg = self.cfg
 
         # Lance Router en tâche non-bloquante
         self._router_task = asyncio.create_task(self.ctx.router.start(), name="boot-router-start")
@@ -572,8 +645,20 @@ class Boot:
             pass
 
         self._wire_private_hub_callbacks()
-        self._send_status("rm", "ready")
 
+        # Brancher MBF sur Hub/Reconciler si déjà disponibles (Ticket 7)
+        try:
+            self._wire_mbf_ws_status_providers()
+        except Exception:
+            self.log.exception("[Boot] wiring MBF ws_status_providers depuis _start_rm a échoué")
+
+        # Brancher l'event_sink MBF vers le RM (Ticket 8)
+        try:
+            self._wire_mbf_event_sink()
+        except Exception:
+            self.log.exception("[Boot] wiring MBF event_sink depuis _start_rm a échoué")
+
+        self._send_status("rm", "ready")
 
     async def _start_scanner(self) -> None:
 
@@ -609,7 +694,7 @@ class Boot:
                     primary=list(self.ctx.active_pairs),
                     audition=[],
                 )
-
+        self.ctx.scanner.apply_runtime_config(self.cfg)
         await self.ctx.scanner.start()
 
         # (4) Démarre la mini-loop de sync périodique (voir méthode plus bas)
@@ -624,7 +709,7 @@ class Boot:
     async def _start_private_plane(self) -> None:
         """
         Démarre le Hub privé et attache un unique PrivateWSReconciler.
-        Idempotent, DRY_RUN-gated si tu utilises des feature flags.
+        Idempotent, DRY_RUN-gated via feature_switches.private_ws.
         """
         # DRY_RUN / feature flags: on peut skipper si nécessaire
         g = getattr(self.cfg, "g", None)
@@ -635,7 +720,7 @@ class Boot:
             self._send_status("private", "skipped", {"reason": "feature_flag_off"})
             return
 
-            # 1) Hub privé
+        # 1) Hub privé
         if not getattr(self.ctx, "pws_hub", None):
             cfg = getattr(self, "cfg", None)
             binance_accounts = getattr(cfg, "binance_accounts", None) or None
@@ -659,48 +744,56 @@ class Boot:
 
             self.ctx.pws_hub = PrivateWSHub(**hub_kwargs)
             setattr(self.ctx, "priv", self.ctx.pws_hub)
+
         if hasattr(self.ctx.pws_hub, "start"):
             await self.ctx.pws_hub.start()
+
+        # Hub up = ready_private, mais wiring validé plus tard via RM/Engine
         self.ready_private.set()
         self._send_status("private", "ready")
 
-
         # 2) Reconciler (unique)
         if not getattr(self.ctx, "reconciler", None):
-          self.ctx.reconciler = PrivateWSReconciler(venue_name="TRI-CEX")
+            self.ctx.reconciler = PrivateWSReconciler(venue_name="TRI-CEX")
 
-          # Attacher au Hub s'il expose un hook
+        # Attacher au Hub s'il expose un hook
         try:
             if hasattr(self.ctx.pws_hub, "attach_reconciler"):
                 self.ctx.pws_hub.attach_reconciler(self.ctx.reconciler)
         except Exception:
             pass
 
+        # 3) Wiring via RiskManager (source de vérité du privé)
         rm = getattr(self.ctx, "rm", None)
-        if rm and hasattr(self.ctx.pws_hub, "register_callback"):
-            cb = getattr(rm, "on_private_event", None)
-            if callable(cb):
+        if rm:
+            # Si RM déjà lancé, lier maintenant le Reconciler
+            if hasattr(rm, "bind_reconciler"):
                 try:
-                    self.ctx.pws_hub.register_callback(cb, role="rm")
-                except TypeError:
-                    self.ctx.pws_hub.register_callback(cb)
-            setattr(rm, "private_ws_hub", self.ctx.pws_hub)
+                    rm.bind_reconciler(self.ctx.reconciler)
+                except Exception:
+                    self.log.exception("[Boot] rm.bind_reconciler failed")
 
-        # Si RM déjà lancé, lier maintenant
-        if rm and hasattr(rm, "bind_reconciler"):
-            try:
-                rm.bind_reconciler(self.ctx.reconciler)
-            except Exception:
-                pass
+            # Confier au RM le binding du Hub (callbacks + health + flags wiring)
+            if hasattr(rm, "bind_private_ws_hub"):
+                try:
+                    rm.bind_private_ws_hub(self.ctx.pws_hub)
+                except Exception:
+                    self.log.exception("[Boot] rm.bind_private_ws_hub failed")
 
-        if rm and hasattr(rm, "bind_private_ws_hub"):
-            try:
-                rm.bind_private_ws_hub(self.ctx.pws_hub)
-            except Exception:
-                self.log.exception("[Boot] rm.bind_private_ws_hub failed")
-
+        # 4) Tâche de santé privée (Hub→RM)
         self._propagate_private_ws_health()
         self._ensure_private_health_task()
+        # 3bis) Brancher MBF sur les statuts Hub/Reconciler si présent (Ticket 7)
+        try:
+            self._wire_mbf_ws_status_providers()
+        except Exception:
+            self.log.exception("[Boot] wiring MBF ws_status_providers depuis _start_private_plane a échoué")
+            # 3ter) Brancher l'event_sink MBF vers le RM (Ticket 8)
+        try:
+            self._wire_mbf_event_sink()
+        except Exception:
+            self.log.exception("[Boot] wiring MBF event_sink depuis _start_private_plane a échoué")
+
 
 
     async def _sync_scanner_cohorts_loop(self) -> None:
@@ -765,25 +858,22 @@ class Boot:
         """
         # 1) Engine
         if not getattr(self.ctx, "engine", None):
-
-
-
             self.ctx.engine = ExecutionEngine(getattr(self, "cfg", None))
 
-        if hasattr(self.ctx.engine, "start"):
-            await self.ctx.engine.start()
+        engine = self.ctx.engine
+
+        if hasattr(engine, "start"):
+            await engine.start()
+
+        # Wiring initial Engine ↔ Hub (callback "engine" + set_private_ws_hub)
         self._wire_private_hub_callbacks()
         self._send_status("engine", "ready")
 
-
         # 2) RPC
         if not getattr(self.ctx, "rpc", None):
-
-
-
             self.ctx.rpc = RPCServer(getattr(self, "cfg", None))
 
-        # (P2) tenter de monter /status via RPC existant AVANT start
+        # Tenter de monter /status via RPC existant AVANT start
         try:
             if hasattr(self.ctx.rpc, "register_status_endpoint"):
                 self.ctx.rpc.register_status_endpoint(self)  # passe le Boot
@@ -793,7 +883,7 @@ class Boot:
         except Exception:
             pass
 
-        # lancer le RPC
+        # Lancer le RPC
         if hasattr(self.ctx.rpc, "start"):
             await self.ctx.rpc.start()
         self._send_status("rpc", "ready")
@@ -803,14 +893,15 @@ class Boot:
         if rm:
             try:
                 if hasattr(rm, "set_engine"):
-                    rm.set_engine(self.ctx.engine)
+                    rm.set_engine(engine)
                 reconciler = getattr(self.ctx, "reconciler", None)
                 if reconciler and hasattr(rm, "bind_reconciler"):
                     rm.bind_reconciler(reconciler)
             except Exception:
                 pass
-        self._wire_private_hub_callbacks()
 
+        # Dernier wiring Engine ↔ Hub (idempotent)
+        self._wire_private_hub_callbacks()
 
     # ------------------------------- Arrêts ---------------------------------
 
@@ -932,21 +1023,30 @@ class Boot:
     async def _evaluate_ready(self) -> None:
         self._mark_stage("evaluating_ready")
         reasons: List[str] = []
+
         # Warmup config
-        warmup_n = int(getattr(getattr(self.cfg, "boot", object()), "warmup_pairs", 0) or 0)
-        warmup_timeout = float(getattr(getattr(self.cfg, "boot", object()), "warmup_timeout_s", 0.0) or 0.0)
+        boot_cfg = getattr(self.cfg, "boot", object())
+        warmup_n = int(getattr(boot_cfg, "warmup_pairs", 0) or 0)
+        warmup_timeout = float(getattr(boot_cfg, "warmup_timeout_s", 0.0) or 0.0)
 
         req = [self.ready_ws, self.ready_router, self.ready_scanner, self.ready_rm]
-        live = (str(getattr(self.cfg, "mode", "DRY_RUN")).upper() == "PROD") or bool(
-            getattr(getattr(self.cfg, "g", object()), "feature_switches", {}).get("engine_real", False)
-        )
+
+        g = getattr(self.cfg, "g", None)
+        fs = getattr(g, "feature_switches", {}) if g else {}
+        live = (str(getattr(self.cfg, "mode", "DRY_RUN")).upper() == "PROD") or bool(fs.get("engine_real", False))
+        private_ws_enabled = bool(fs.get("private_ws", False))
+
         if live:
             req.append(self.ready_engine)
-            if bool(getattr(getattr(self.cfg, "g", object()), "feature_switches", {}).get("private_ws", False)):
+            if private_ws_enabled:
                 req.append(self.ready_private)
-        if bool(getattr(getattr(self.cfg, "rpc", object()), "enabled", False)):
+
+        rpc_cfg = getattr(self.cfg, "rpc", object())
+        rpc_enabled = bool(getattr(rpc_cfg, "enabled", False))
+        if rpc_enabled:
             req.append(self.ready_rpc)
 
+        # Attente des flags READY avec timeout optionnel
         try:
             if warmup_timeout > 0:
                 await asyncio.wait_for(asyncio.gather(*(ev.wait() for ev in req)), timeout=warmup_timeout)
@@ -955,57 +1055,200 @@ class Boot:
         except asyncio.TimeoutError:
             reasons.append("warmup_timeout")
 
+        # Vérif warmup L2
         if warmup_n > 0:
             rc = self._get_router_ready_pairs_count()
             if rc is not None and rc < warmup_n:
                 reasons.append("warmup_pairs_missing")
 
-        if bool(getattr(getattr(self.cfg, "g", object()), "feature_switches", {}).get("balance_fetcher", False)):
+        # TTL balances
+        if bool(fs.get("balance_fetcher", False)):
             if not self.ready_balances.is_set():
                 reasons.append("balances_stale")
 
-        if bool(getattr(getattr(self.cfg, "rpc", object()), "enabled", False)) and not self.ready_rpc.is_set():
+        # RPC obligatoire si activé
+        if rpc_enabled and not self.ready_rpc.is_set():
             reasons.append("rpc_unavailable")
 
+        # Ticket 6 – wiring privé obligatoire en live + private_ws ON
+        if live and private_ws_enabled:
+            rm = getattr(self.ctx, "rm", None)
+            engine = getattr(self.ctx, "engine", None)
+
+            rm_status: Dict[str, Any] = {}
+            engine_status: Dict[str, Any] = {}
+
+            if rm and hasattr(rm, "get_status"):
+                try:
+                    rm_status = rm.get_status() or {}
+                except Exception:
+                    reasons.append("rm_status_unavailable")
+
+            if engine and hasattr(engine, "get_status"):
+                try:
+                    engine_status = engine.get_status() or {}
+                except Exception:
+                    reasons.append("engine_status_unavailable")
+
+            rm_private = rm_status.get("private_ws") or {}
+            eng_private = engine_status.get("private_ws") or {}
+
+            if rm_private:
+                if not rm_private.get("hub_wiring_ok", False):
+                    reasons.append("private_hub_wiring_incomplete")
+                if not rm_private.get("reconciler_wiring_ok", False):
+                    reasons.append("reconciler_wiring_incomplete")
+                if not rm_private.get("engine_attached", False):
+                    reasons.append("rm_engine_not_attached_private")
+
+            if eng_private:
+                if not eng_private.get("hub_present", False):
+                    reasons.append("engine_private_hub_missing")
+                elif not eng_private.get("hub_wiring_ok", False):
+                    reasons.append("engine_private_hub_wiring_incomplete")
+
+        # Décision READY / DEGRADED
         if reasons:
             self.state["degraded"] = True
             self.state["reasons"] = reasons
             base_ready = all(
-                ev.is_set() for ev in [self.ready_ws, self.ready_router, self.ready_scanner, self.ready_rm])
+                ev.is_set() for ev in [self.ready_ws, self.ready_router, self.ready_scanner, self.ready_rm]
+            )
             if live:
                 base_ready = base_ready and self.ready_engine.is_set()
             if base_ready:
                 self.ready_all.set()
         else:
             self.ready_all.set()
+
         self._mark_stage("ready")
+
 
     # ----------------------------- Utilitaires ------------------------------
     def _wire_private_hub_callbacks(self) -> None:
-        """Brancher hub↔Engine/RM dès qu'ils sont disponibles."""
+        """
+        Brancher hub ↔ Engine dès qu'ils sont disponibles.
+
+        Le callback RM est désormais câblé par RiskManager.bind_private_ws_hub().
+        Ici on ne traite que:
+          - le callback Engine vers le Hub,
+          - l'injection du Hub dans l'Engine (set_private_ws_hub).
+        """
         hub = getattr(self.ctx, "pws_hub", None)
         if not hub or not hasattr(hub, "register_callback"):
             return
 
-        rm = getattr(self.ctx, "rm", None)
-        rm_cb = getattr(rm, "on_private_event", None)
-        if rm_cb:
-            try:
-                hub.register_callback(rm_cb, role="risk")
-            except TypeError:
-                hub.register_callback(rm_cb)
-            except Exception:
-                self.log.exception("[Boot] unable to register RM callback on hub")
-
         engine = getattr(self.ctx, "engine", None)
-        eng_cb = getattr(engine, "handle_order_update", None)
-        if eng_cb:
+        if not engine:
+            return
+
+        # Callback Engine principal
+        eng_cb = getattr(engine, "on_private_order_update", None)
+        # Compat: fallback sur handle_order_update si ancien nom
+        if not callable(eng_cb):
+            eng_cb = getattr(engine, "handle_order_update", None)
+
+        if callable(eng_cb):
             try:
                 hub.register_callback(eng_cb, role="engine")
             except TypeError:
                 hub.register_callback(eng_cb)
             except Exception:
                 self.log.exception("[Boot] unable to register Engine callback on hub")
+
+        # Informer l'Engine du Hub pour qu'il puisse vérifier son wiring
+        if hasattr(engine, "set_private_ws_hub"):
+            try:
+                engine.set_private_ws_hub(hub)
+            except Exception:
+                self.log.exception("[Boot] engine.set_private_ws_hub failed")
+
+    def _wire_mbf_ws_status_providers(self) -> None:
+        """
+        Brancher le statut comptes WS (Hub + Reconciler) dans le MultiBalanceFetcher, si présent.
+
+        Hypothèses d'API côté MBF :
+          - self.ctx.balances est une instance de MultiBalanceFetcher (ou équivalent),
+          - expose une méthode set_ws_status_providers(hub=..., reconciler=...).
+
+        Effet :
+          - permet à MBF de construire meta["ws_accounts"][alias] avec les statuts Hub/Reconciler
+            et un flag capital_at_risk exploité par le RM.
+        """
+        mbf = getattr(self.ctx, "balances", None)
+        if not mbf:
+            return
+        if not hasattr(mbf, "set_ws_status_providers"):
+            # MBF pas encore migré Ticket 7 : on sort silencieusement.
+            return
+
+        hub = getattr(self.ctx, "pws_hub", None)
+        reco = getattr(self.ctx, "reconciler", None)
+        if not (hub or reco):
+            # Rien à brancher tant qu'on n'a pas au moins Hub ou Reconciler.
+            return
+
+        try:
+            # API recommandée: set_ws_status_providers(hub=..., reconciler=...)
+            mbf.set_ws_status_providers(hub=hub, reconciler=reco)
+            self.log.info(
+                "[Boot] MBF ws_status_providers branchés (hub=%s, reco=%s)",
+                type(hub).__name__ if hub else "None",
+                type(reco).__name__ if reco else "None",
+            )
+        except TypeError:
+            # Compat si MBF a gardé une signature positionnelle (ancien patch).
+            try:
+                mbf.set_ws_status_providers(hub, reco)
+                self.log.info(
+                    "[Boot] MBF ws_status_providers branchés (positional, hub=%s, reco=%s)",
+                    type(hub).__name__ if hub else "None",
+                    type(reco).__name__ if reco else "None",
+                )
+            except Exception:
+                self.log.exception("[Boot] set_ws_status_providers positional a échoué")
+        except Exception:
+            self.log.exception("[Boot] set_ws_status_providers a échoué")
+
+    def _wire_mbf_event_sink(self) -> None:
+        """
+        Brancher l'event_sink du MultiBalanceFetcher vers le hub d'évènements du RM (Ticket 8).
+
+        Hypothèses d'API :
+          - self.ctx.balances expose set_event_sink(callable),
+          - le RM expose en priorité on_mbf_event(event: dict),
+            sinon un hub générique _submodule_event(event: dict).
+        """
+        mbf = getattr(self.ctx, "balances", None)
+        if not mbf or not hasattr(mbf, "set_event_sink"):
+            # Pas de MBF ou pas encore migré avec event_sink : no-op.
+            return
+
+        rm = getattr(self.ctx, "rm", None)
+        if not rm:
+            # RM pas encore démarré : on sort silencieusement.
+            return
+
+        # Priorité à un handler dédié si présent
+        handler = getattr(rm, "on_mbf_event", None)
+        if not callable(handler):
+            # Fallback sur le hub générique des sous-modules
+            handler = getattr(rm, "_submodule_event", None)
+
+        if not callable(handler):
+            # RM pas encore équipé pour consommer les évènements MBF : no-op.
+            return
+
+        try:
+            mbf.set_event_sink(handler)
+            self.log.info(
+                "[Boot] MBF event_sink branché vers %s.%s",
+                type(rm).__name__,
+                getattr(handler, "__name__", "handler"),
+            )
+        except Exception:
+            self.log.exception("[Boot] MBF.set_event_sink a échoué")
+
 
     def _publish_private_hub_status(self, *, reason: str = "update") -> Optional[Dict[str, Any]]:
         """Expose l'état du hub vers Boot.status_sink et RiskManager."""

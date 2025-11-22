@@ -64,15 +64,6 @@ except Exception:  # pragma: no cover
     ENGINE_PACER_INFLIGHT_MAX        = _NoOp()
     ENGINE_PACER_MODE                = _NoOp()
 
-# --------- Capital profiles (clamps) ---------
-# Les bornes ci-dessous contraignent la FSM (inflight & pacing). La FSM ajuste à l’intérieur.
-_CAPITAL_PROFILES: Dict[str, Dict[str, Any]] = {
-    "NANO":  dict(inflight_min=1, inflight_max=1, per_ex=1, per_pair=1, pacing_min=10,  pacing_max=250, base_pacing=150, mm_allowed=False),
-    "MICRO": dict(inflight_min=2, inflight_max=4, per_ex=2, per_pair=1, pacing_min=5,   pacing_max=200, base_pacing=100, mm_allowed=False),
-    "SMALL": dict(inflight_min=4, inflight_max=8, per_ex=4, per_pair=2, pacing_min=2,   pacing_max=160, base_pacing=60,  mm_allowed=True),
-    "MID":   dict(inflight_min=8, inflight_max=16, per_ex=8, per_pair=3, pacing_min=0,  pacing_max=120, base_pacing=30,  mm_allowed=True),
-    "LARGE": dict(inflight_min=16, inflight_max=32, per_ex=16, per_pair=4, pacing_min=0, pacing_max=90, base_pacing=20,  mm_allowed=True),
-}
 
 # --------- Default regional targets ---------
 # Cibles (hautes/sévères) utilisées pour normaliser les gaps → score de sévérité S∈[0,1].
@@ -166,6 +157,17 @@ class EnginePacer:
         self._init_ms = int(init_ms)
         self._jitter_ms = int(jitter_ms)
 
+        # Clamps profil → dérivés uniquement de la config Engine (Ticket 10)
+        # Ici on ne redéfinit AUCUNE grille NANO/MICRO/… : c’est déjà décidé par BotConfig/RM.
+        self._pacing_min_profile = int(self._min_ms)
+        self._pacing_max_profile = int(self._max_ms)
+
+        # Plancher technique global sur l’inflight (>=1), plafond optionnel
+        # qui pourra être fixé depuis l’Engine à partir des caps RM/BotConfig.
+        self._inflight_min_profile = 1
+        self._inflight_ceiling: Optional[int] = None
+
+
         # mapping exchange -> region (hint pour l’Engine si besoin)
         self._region_map = dict(region_map) if region_map else {}
 
@@ -187,17 +189,22 @@ class EnginePacer:
 
     @staticmethod
     def _norm_profile(p: Optional[str]) -> str:
-        p = str(p or "NANO").upper()
-        return p if p in _CAPITAL_PROFILES else "NANO"
+        """
+        Normalise le libellé de profil en simple tag (NANO/MICRO/…).
+        Aucune logique de caps ici : tout est piloté par BotConfig/RM.
+        """
+        return str(p or "NANO").upper()
 
     def _ensure_region(self, region: str, cold_start: bool = False) -> RegionState:
         region = self._norm_region(region)
         st = self._regions.get(region)
         if st is None:
             st = RegionState()
-            prof = _CAPITAL_PROFILES[self._profile]
-            st.pacing_ms   = max(self._min_ms, min(self._max_ms, max(self._init_ms, prof["base_pacing"])))
-            st.inflight_max= prof["inflight_min"]
+            # Pacing initial piloté par la config Engine (pacer_min/max_ms, pacer_init_ms).
+            base = self._init_ms if self._init_ms > 0 else self._min_ms
+            st.pacing_ms = max(self._min_ms, min(self._max_ms, base))
+            # Cap inflight purement technique : >=1. Les caps métier restent côté RM/Engine.
+            st.inflight_max = 1
             st.state = _STATE_WARMUP if cold_start else _STATE_NORMAL
             self._regions[region] = st
         return st
@@ -218,6 +225,25 @@ class EnginePacer:
             # clamp immédiatement les régions en cours
             for rg, st in self._regions.items():
                 self._apply_clamps(rg, st)
+
+    def set_inflight_ceiling(self, cap: Optional[int]) -> None:
+        """
+        Fixe un plafond global d'inflight recommandé (optionnel),
+        typiquement dérivé des caps RM/BotConfig (Ticket 10).
+
+        cap=None => pas de plafond spécifique côté pacer (seuls RM/Engine bornent).
+        """
+        with self._lock:
+            if cap is None:
+                self._inflight_ceiling = None
+            else:
+                try:
+                    self._inflight_ceiling = max(1, int(cap))
+                except Exception:
+                    self._inflight_ceiling = 1
+            for rg, st in self._regions.items():
+                self._apply_clamps(rg, st)
+
 
     def set_region_targets(self, region: str, overrides: Dict[str, float]) -> None:
         """Surcharger les cibles d'une région (EU/US/EU-CB)."""
@@ -383,48 +409,56 @@ class EnginePacer:
                 st.flags["ioc_only"]  = False
 
     def _apply_clamps(self, rg: str, st: RegionState) -> None:
-        prof = _CAPITAL_PROFILES[self._profile]
-        # pacing
-        st.pacing_ms = max(
-            max(self._min_ms, prof["pacing_min"]),
-            min(st.pacing_ms, min(self._max_ms, prof["pacing_max"]))
-        )
-        # inflight
-        st.inflight_max = max(prof["inflight_min"], min(st.inflight_max, prof["inflight_max"]))
+        # Pacing : uniquement borné par la config Engine (min/max globaux).
+        pacing_min = int(self._pacing_min_profile)
+        pacing_max = int(self._pacing_max_profile)
+        st.pacing_ms = max(pacing_min, min(st.pacing_ms, pacing_max))
+
+        # Inflight : plancher technique = 1 ; plafond optionnel dérivé de BotConfig/RM.
+        ceiling = self._inflight_ceiling
+        if ceiling is not None:
+            try:
+                cap = max(1, int(ceiling))
+            except Exception:
+                cap = 1
+            st.inflight_max = max(1, min(st.inflight_max, cap))
+        else:
+            st.inflight_max = max(1, st.inflight_max)
 
     def _compute_policy(self, rg: str, st: RegionState, S: float) -> None:
-        prof = _CAPITAL_PROFILES[self._profile]
-        # base pacing vers le bas en NORMAL (AIMD) ; sinon multiplicatif
+        pacing_min = int(self._pacing_min_profile)
+        pacing_max = int(self._pacing_max_profile)
+        inflight_floor = int(self._inflight_min_profile)
+        ceiling = self._inflight_ceiling
+
         if st.state == _STATE_NORMAL:
             st.mode = _MODE_NORMAL
-            st.pacing_ms = max(prof["pacing_min"], st.pacing_ms - 5)  # AIMD step
-            st.inflight_max = min(prof["inflight_max"], max(prof["inflight_min"], st.inflight_max + 1))
+            # AIMD vers le bas sur la latence : on relaxe doucement
+            st.pacing_ms = max(pacing_min, st.pacing_ms - 5)
+            st.inflight_max = max(inflight_floor, st.inflight_max + 1)
+
         elif st.state == _STATE_CONSTR:
             st.mode = _MODE_CONSTRAIN
             mul = (1.0 + 0.5 * S)
-            st.pacing_ms = int(max(prof["pacing_min"], min(prof["pacing_max"], st.pacing_ms * mul)))
-            st.inflight_max = max(prof["inflight_min"], int(st.inflight_max / mul))
+            st.pacing_ms = int(max(pacing_min, min(pacing_max, st.pacing_ms * mul)))
+            st.inflight_max = max(inflight_floor, int(st.inflight_max / mul))
+
         elif st.state == _STATE_SEVERE:
             st.mode = _MODE_SEVERE
             mul = (1.0 + 1.5 * S)
-            st.pacing_ms = int(max(prof["pacing_min"], min(prof["pacing_max"], st.pacing_ms * mul)))
-            st.inflight_max = max(1, int(max(prof["inflight_min"], st.inflight_max / mul)))
-            # flags déjà set via FSM ; on les laisse actifs jusqu’au hold-time
+            st.pacing_ms = int(max(pacing_min, min(pacing_max, st.pacing_ms * mul)))
+            st.inflight_max = max(1, int(max(inflight_floor, st.inflight_max / mul)))
+
         elif st.state == _STATE_RECOV:
             st.mode = _MODE_CONSTRAIN
-            # recovery douce : on réduit modérément pacing, on remonte inflight prudemment
-            st.pacing_ms = max(prof["pacing_min"], int(st.pacing_ms * 0.9))
-            st.inflight_max = min(prof["inflight_max"], max(prof["inflight_min"], st.inflight_max + 1))
+            # Recovery douce : on réduit modérément pacing, on remonte inflight prudemment
+            st.pacing_ms = max(pacing_min, int(st.pacing_ms * 0.9))
+            st.inflight_max = max(inflight_floor, st.inflight_max + 1)
 
-        # clamps globaux + jitter léger
+        # Clamps globaux + jitter léger
         self._apply_clamps(rg, st)
         j = random.randint(0, max(0, self._jitter_ms))
         st.pacing_ms = int(max(self._min_ms, min(self._max_ms, st.pacing_ms + j)))
-
-        # NANO : sécurité forte (inflight=1, MM non autorisée)
-        if self._profile == "NANO":
-            st.inflight_max = 1
-            # la MM est gérée au niveau Engine via flags mm_frozen/maker gating
 
     def _policy_dict(self, rg: str, st: RegionState) -> Dict[str, Any]:
         return {

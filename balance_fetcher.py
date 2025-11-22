@@ -25,6 +25,11 @@ Alignement P0:
 - Bybit v5 Unified: signature X-BAPI-*.
 - Snapshots enrichis (age, fee-tokens, VIP hook facultatif).
 - Métriques tolérantes (no-op fallback, try/except sur .labels()).
+- Intégration Ticket 8 (transferts internes & capital en mouvement) :
+    • ne consomme pas directement les events de transfert, mais fournit :
+      - resync_balances_for_alias(ex, alias) pour un refresh agressif post-transfert,
+      - as_rm_snapshot(...).meta["age_s"] comme base unique de TTL balances,
+      - set_event_sink(...) pour publier des events "capital_refresh" facultatifs.
 """
 
 import asyncio
@@ -36,7 +41,7 @@ import base64
 import logging
 import json
 import random
-from typing import Dict, Any, Optional, Tuple, List,Set
+from typing import Dict, Any, Optional, Tuple, List,Set, Iterable
 
 logger = logging.getLogger("MultiBalanceFetcher")
 logger.setLevel(logging.INFO)
@@ -111,6 +116,19 @@ def _upper(x: Optional[str]) -> str:
 
 
 class MultiBalanceFetcher:
+    """
+        Source de vérité « data-plane » pour les soldes par exchange / alias / asset.
+
+        - Maintient les vues `real`, `virtual` et `merged` via `get_balances_snapshot(mode=...)`.
+        - Expose une vue normalisée pour le desk de risque via `as_rm_snapshot(...)`
+          (RM + Rebalancing = trading-plane).
+        - Toutes les décisions de caps / réservations / REB doivent partir d’un snapshot MBF
+          (directement ou via `_RM_MBFGlue`), pas de structures locales parallèles.
+
+        Cette classe ne porte aucune logique de caps métier : elle expose seulement l’état
+        des soldes réels + overlay virtuel (dry-run, simulations), avec métadonnées d’âge
+        et d’état des tokens de fees.
+        """
     # Bases par défaut (overridables via self.cfg.*)
     BINANCE_API_DEFAULT = "https://api.binance.com"
     COINBASE_API_DEFAULT = "https://api.coinbase.com"
@@ -224,11 +242,20 @@ class MultiBalanceFetcher:
         # Snap enrichi (fee tokens, vip…)
         self._snap: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._event_sink = None  # callback optionnel (alerts)
+
         # Source WS (optionnelle): si un flux "account WS" alimente ces snapshots, on merge conservateur
-        self._ws_balances: Dict[Tuple[str,str], Dict[str, Any]] = {}
+        self._ws_balances: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._ws_lock = asyncio.Lock()
         # TTL pour considérer la source WS
         self._ws_ttl_s = getattr_float(self, "WS_BAL_TTL_SECONDS", 10.0)
+
+        # Statut WS / Reconciler (optionnel) pour marquer le capital « à risque »
+        # Ces providers sont injectés par le Boot / orchestrateur:
+        #  - Hub: get_alias_ws_status_snapshot(ex, alias) -> dict
+        #  - Reconciler: get_alias_status_snapshot(ex, alias) -> dict
+        self._ws_hub_status_provider = None
+        self._ws_reco_status_provider = None
+
         # P0: alias de compat pour lecture uniforme des paramètres éventuels
         if not hasattr(self, "cfg"):
             self.cfg = None
@@ -286,6 +313,32 @@ class MultiBalanceFetcher:
             return {str(k).upper(): float(v) for k, v in m.items()}
         except Exception:
             return {"BNB": 40.0, "MNT": 15.0}
+
+    @staticmethod
+    def _compute_fee_level(balance, low_thr):
+        """
+        Helper interne pour normaliser les niveaux de tokens de fees.
+
+        Retourne (level, high_watermark) avec:
+        - level ∈ {"low", "ok", "high"}
+        - high_watermark = 2 × low_thr (ou 0 si low_thr=0)
+        """
+        balance = float(balance or 0.0)
+        low_thr = float(low_thr or 0.0)
+
+        if low_thr <= 0.0:
+            # Pas de seuil configuré : on considère tout solde > 0 comme "ok"
+            if balance <= 0.0:
+                return "low", 0.0
+            return "ok", 0.0
+
+        if balance < low_thr:
+            return "low", 2.0 * low_thr
+        if balance >= 2.0 * low_thr:
+            return "high", 2.0 * low_thr
+
+        return "ok", 2.0 * low_thr
+
 
     async def run_alerts(self) -> None:
         """
@@ -789,7 +842,33 @@ class MultiBalanceFetcher:
 
         return out
 
-    async def get_balances(self, mode: str = "real", *, force_refresh: bool = False) -> Dict[str, Dict[str, Dict[str, float]]]:
+    async def resync_balances_for_alias(self, exchange: str, alias: str) -> Dict[str, float]:
+        """
+        Resync ciblé des balances pour un (exchange, alias).
+
+        Utilisé en mode dégradé (signaux WS/Reconciler) pour forcer un refresh
+        REST ponctuel sans impacter les autres aliases.
+        """
+        ex, al = _upper(exchange), _upper(alias)
+
+        if ex == "BINANCE":
+            balances = await self.get_binance_balances(al, force_refresh=True)
+        elif ex in ("COINBASE", "COINBASE_AT"):
+            balances = await self.get_coinbase_at_balances(al, force_refresh=True)
+        elif ex == "BYBIT":
+            balances = await self.get_bybit_balances(al, force_refresh=True)
+        else:
+            raise ValueError(f"Exchange inconnu pour resync balances: {exchange}")
+
+        # Event interne pour tracer le moment où MBF a effectivement rafraîchi
+        # les balances pour (exchange, alias) après un signal de capital en mouvement.
+        self._emit_capital_refresh_event(ex, al, source="resync_alias")
+
+        return balances
+
+
+    async def get_balances(self, mode: str = "real", *, force_refresh: bool = False) -> Dict[
+        str, Dict[str, Dict[str, float]]]:
         if mode.lower() != "virtual":
             await self.get_all_balances(force_refresh=force_refresh)
         return self.get_balances_snapshot(mode)
@@ -867,14 +946,75 @@ class MultiBalanceFetcher:
     def as_buffers_snapshot(
         self,
         *,
-        quotes: Tuple[str, ...] = ("USDC", "EUR", "USD"),
-        fee_tokens: Tuple[str, ...] = ("BNB", "MNT"),
-        mode: str = "real",
+        mode: str = "merged",
+        quotes: Iterable[str] = ("USDC",),
+        fee_tokens: Iterable[str] = ("BNB", "MNT"),
+        cached_only: bool = True,
     ) -> Dict[str, Any]:
-        pockets = self.get_pockets_by_quote(mode=mode, quotes=quotes)
-        tokens  = self.get_fee_token_levels_from_balances(mode=mode, tokens=fee_tokens)
-        return {"pockets_by_quote": pockets, "fee_token_levels": tokens}
+        """
+        Vue unique des « buffers » de capital pour le RiskManager et le
+        simulateur d’exécution.
 
+        Contrat de sortie (schéma logique) :
+
+        {
+            "mode": "merged" | "real" | "virtual",
+            "as_of_ts": <float monotonic>,
+            "pockets_by_quote": {
+                "<exchange>": {
+                    "<alias>": {
+                        "<quote>": {
+                            "total": <float>,      # solde total dans cette quote
+                            "available": <float>,  # part exploitable pour trading
+                        },
+                        ...
+                    },
+                    ...
+                },
+                ...
+            },
+            "fee_token_levels": {
+                "<exchange>": {
+                    "<alias>": {
+                        "<token>": <balance_float>,  # solde brut du token de fees
+                        ...
+                    },
+                    ...
+                },
+                ...
+            },
+        }
+
+        - pockets_by_quote est la base UNIQUE pour dimensionner les capacités
+          de capital par quote / alias (caps profils, RM, simulateur).
+        - fee_token_levels donne l’état brut des tokens de fees par alias.
+          (Les vues enrichies type meta_fee[token][ex.alias] restent fournies
+          par as_rm_snapshot(...).)
+
+        Cette méthode est la SOURCE OFFICIELLE pour :
+        - calculer la capacité de capital disponible par quote/alias,
+        - aligner les caps par profil (NANO/MICRO/…),
+        - alimenter le simulateur en capacité (DRY_RUN vs LIVE).
+        """
+        # Vue « poches par quote » : base de capacité capital
+        pockets = self.get_pockets_by_quote(
+            mode=mode,
+            quotes=tuple(quotes),
+            cached_only=cached_only,
+        )
+
+        # Vue simplifiée des tokens de fees par (exchange, alias, token)
+        fee_token_levels = self.get_fee_token_levels_from_balances(
+            mode=mode,
+            tokens=tuple(fee_tokens),
+        )
+
+        return {
+            "mode": mode,
+            "as_of_ts": time.time(),
+            "pockets_by_quote": pockets,
+            "fee_token_levels": fee_token_levels,
+        }
     def get_available_quote_simple(
         self,
         exchange: str,
@@ -891,59 +1031,220 @@ class MultiBalanceFetcher:
         return 0.0
 
     # =========================== Snap enrichi / VIP ==========================
+    # =========================== Snap enrichi / VIP ==========================
     def set_event_sink(self, sink) -> None:
+        """Enregistre un callback d'évènements internes MBF.
+
+        Évènements émis actuellement (liste non exhaustive) :
+          - {"type": "capital_refresh", "exchange": ..., "alias": ..., "source": ..., "ts": ...}
+            → utilisé notamment par le Ticket 8 pour tracer la visibilité des resyncs
+              de balances post-transfert interne.
+        """
         self._event_sink = sink
+
+    def set_ws_status_providers(
+            self,
+            *,
+            hub: Optional[Any] = None,
+            reconciler: Optional[Any] = None,
+    ) -> None:
+        """
+        Injection optionnelle des providers de statut comptes WS:
+
+        - hub: objet ou callable fournissant get_alias_ws_status_snapshot(ex, alias)
+        - reconciler: objet ou callable fournissant get_alias_status_snapshot(ex, alias)
+
+        Ces statuts sont agrégés dans as_rm_snapshot().meta["ws_accounts"] afin que
+        le RiskManager puisse marquer un alias comme « capital_at_risk » et, si
+        besoin, déclencher/prioriser un resync balances ciblé.
+        """
+        if hub is not None:
+            fn = getattr(hub, "get_alias_ws_status_snapshot", hub)
+            if callable(fn):
+                self._ws_hub_status_provider = fn
+        if reconciler is not None:
+            fn = getattr(reconciler, "get_alias_status_snapshot", reconciler)
+            if callable(fn):
+                self._ws_reco_status_provider = fn
+
+    def _emit_capital_refresh_event(self, exchange: str, alias: str, source: str = "resync_alias") -> None:
+        """Émet un évènement interne lorsqu'un resync ciblé (exchange, alias)
+        vient d'être exécuté.
+
+        Utilisé dans le cadre du Ticket 8 pour corréler les transferts internes
+        (Hub/RM) avec la mise à jour effective des balances MBF.
+        """
+        sink = getattr(self, "_event_sink", None)
+        if not sink:
+            return
+        try:
+            ev = {
+                "type": "capital_refresh",
+                "exchange": _upper(exchange),
+                "alias": _upper(alias),
+                "source": str(source),
+                "ts": time.time(),
+            }
+            sink(ev)
+        except Exception:
+            log.exception("MultiBalanceFetcher: event_sink capital_refresh failed")
+
 
     async def _record_snapshot(self, exchange: str, alias: str, balances: Dict[str, float]) -> None:
         ex, al = _upper(exchange), _upper(alias)
         now = time.time()
         rec = self._snap.get((ex, al), {"balances": {}, "fee_tokens": {}, "vip": {}, "vip_ts": 0.0})
+
+        # Snapshot brut des soldes
         rec["balances"] = dict(balances or {})
         rec["ts"] = now
 
-        # fee token levels with watermarks
-        low = getattr_float(self.cfg, "FEE_LOW_WATERMARK", 15.0) if self.cfg is not None else 15.0
-        high = getattr_float(self.cfg, "FEE_HIGH_WATERMARK", 40.0) if self.cfg is not None else 40.0
-        ft = rec.get("fee_tokens") or {}
-        for tkn in ("BNB", "MNT"):
-            bal = float(rec["balances"].get(tkn, 0.0))
-            ft[tkn] = {"bal": bal, "low": low, "high": high, "is_low": bal < low}
-            try:
-                FEE_TOKEN_BALANCE.labels(ex, al, tkn).set(bal)
-            except Exception:
-                pass
-        rec["fee_tokens"] = ft
+        # Normalisation des niveaux de tokens de fees pour RM / caps.
+        # Source de seuils: FEE_TOKEN_LOW_WATERMARKS (par token) via BotConfig.
+        low_map = self._get_fee_token_low_map() if self.cfg is not None else {}
+        ft: Dict[str, Dict[str, Any]] = {}
 
+        for tkn, low in (low_map or {}).items():
+            bal = float(balances.get(tkn, 0.0) or 0.0)
+            level, high = self._compute_fee_level(bal, low)
+
+            ft[tkn] = {
+                # Structure standardisée pour le RM
+                "balance": bal,
+                "level": level,  # "low" | "ok" | "high"
+                "low_watermark": float(low or 0.0),
+                "high_watermark": float(high or 0.0),
+            }
+
+        rec["fee_tokens"] = ft
         self._snap[(ex, al)] = rec
+
+    def _get_ws_accounts_status_for_alias(self, exchange: str, alias: str) -> Dict[str, Any]:
+        """
+        Agrège les statuts comptes WS pour un (exchange, alias) à partir des
+        providers Hub / Reconciler, et dérive un flag capital_at_risk.
+        """
+        ex, al = _upper(exchange), _upper(alias)
+
+        hub_snap: Optional[Dict[str, Any]] = None
+        reco_snap: Optional[Dict[str, Any]] = None
+
         try:
-            BF_CACHE_AGE_SECONDS.labels(ex, al).set(0.0)
-            BF_LAST_SUCCESS_TS.labels(ex, al).set(now)
+            provider = getattr(self, "_ws_hub_status_provider", None)
+            if callable(provider):
+                hub_snap = provider(ex, al) or {}
         except Exception:
-            pass
+            hub_snap = None
+
+        try:
+            provider = getattr(self, "_ws_reco_status_provider", None)
+            if callable(provider):
+                reco_snap = provider(ex, al) or {}
+        except Exception:
+            reco_snap = None
+
+        hub_status = (hub_snap or {}).get("status", "WS_UNKNOWN")
+        reco_status = (reco_snap or {}).get("status", "UNKNOWN")
+
+        # Politique simple P0: on marque le capital « à risque » si le Hub est dégradé/down
+        # ou si le Reconciler voit des misses significatifs.
+        capital_at_risk = False
+        if hub_status in ("WS_DEGRADED", "WS_DOWN"):
+            capital_at_risk = True
+        if reco_status in ("AT_RISK", "BROKEN"):
+            capital_at_risk = True
+
+        out: Dict[str, Any] = {
+            "exchange": ex,
+            "alias": al,
+            "capital_at_risk": capital_at_risk,
+            "hub_status": hub_status,
+            "reco_status": reco_status,
+        }
+
+        if hub_snap:
+            out.update({
+                "hub_healthy": hub_snap.get("healthy"),
+                "hub_heartbeat_gap_s": hub_snap.get("heartbeat_gap_s"),
+                "hub_last_event_ts": hub_snap.get("last_event_ts"),
+                "hub_errors_total": hub_snap.get("errors_total"),
+                "hub_reconnects_total": hub_snap.get("reconnects_total"),
+            })
+
+        if reco_snap:
+            out.update({
+                "reco_miss_rate_per_min": reco_snap.get("miss_rate_per_min"),
+                "reco_misses_recent": reco_snap.get("misses_recent"),
+                "reco_last_alias_resync_ts": reco_snap.get("last_alias_resync_ts"),
+                "reco_age_since_last_alias_resync_s": reco_snap.get("age_since_last_alias_resync_s"),
+            })
+
+        return out
+
 
     def as_rm_snapshot(self, *, mode: str = "real", cached_only: bool = False) -> Dict[str, Any]:
-        """Retourne un snapshot prêt pour le RiskManager.
-
-        Le paramètre ``mode`` est aligné sur ``get_balances_snapshot`` et permet
-        enfin de distinguer les vues ``real``/``virtual``/``merged``. Le
-        ``cached_only`` ne déclenche aucune I/O supplémentaire : si aucune donnée
-        n’est disponible on renvoie simplement les métadonnées (âges infinis).
         """
+        Snapshot unifié prêt pour le RiskManager / Rebalancing.
+
+        Retourne toujours un dict de la forme :
+            {
+                "mode": str,                       # "real" | "virtual" | "merged"
+                "balances": {                      # vue capitale opérationnelle
+                    EXCHANGE: {
+                        ALIAS: {ASSET: float, ...},
+                        ...
+                    },
+                    ...
+                },
+                                "meta": {                          # métriques de fraîcheur & fees & WS
+                    "age_s": { "EX.ALIAS": float, ... },
+                    "vip": { "EX.ALIAS": {...}, ... },
+                    "fee_tokens": {
+                        "BNB": { "EX.ALIAS": {...}, ... },
+                        ...
+                    },
+                    "ws_accounts": {               # statut comptes WS agrégé
+                        "EX.ALIAS": {
+                            "capital_at_risk": bool,
+                            "hub_status": str,
+                            "reco_status": str,
+                            ...
+                        },
+                        ...
+                    },
+                    "view": str,                   # vue demandée ("real"/"virtual"/"merged")
+                    "cached_only": bool,
+                },
+
+        - `        - `mode` est aligné sur `get_balances_snapshot` (real/virtual/merged).
+        - `cached_only=True` ne déclenche aucune I/O : si rien n’est en cache,
+          on renvoie juste des métadonnées cohérentes.
+        - `meta["age_s"]` est la source UNIQUE des TTL balances par (exchange, alias)
+          pour le RiskManager, y compris la surcouche « capital en mouvement »
+          introduite au Ticket 8.
+        """
+
 
         view = (mode or "real").lower()
         if view not in ("real", "virtual", "merged"):
             view = "real"
 
-        balances = self.get_balances_snapshot(view)
+        # Vue brute selon le mode choisi (real/virtual/merged)
+        base_balances = self.get_balances_snapshot(view) or {}
+
         now = time.time()
         meta_age: Dict[str, float] = {}
         meta_vip: Dict[str, Any] = {}
         meta_fee: Dict[str, Dict[str, Any]] = {}
+        meta_ws_accounts: Dict[str, Dict[str, Any]] = {}
 
-        # Copie des balances (pour éviter toute mutation externe)
-        out: Dict[str, Any] = {ex: {al: dict(ccy_map or {}) for al, ccy_map in (per or {}).items()}
-                               for ex, per in (balances or {}).items()}
+        # Copie défensive des balances (pour éviter les mutations externes)
+        balances: Dict[str, Dict[str, Dict[str, float]]] = {
+            ex: {al: dict(ccy_map or {}) for al, ccy_map in (per or {}).items()}
+            for ex, per in (base_balances or {}).items()
+        }
 
+        # Parcours du cache interne _snap pour enrichir meta + backfill éventuel
         for (ex, al), rec in list(self._snap.items()):
             ts = float(rec.get("ts", 0.0))
             age = max(0.0, now - ts) if ts > 0.0 else float("inf")
@@ -954,23 +1255,42 @@ class MultiBalanceFetcher:
                 meta_vip[f"{ex}.{al}"] = vip
 
             ft = rec.get("fee_tokens") or {}
-            for tkn, info in ft.items():
+            for tkn, info in (ft or {}).items():
                 meta_fee.setdefault(tkn, {})
                 meta_fee[tkn][f"{ex}.{al}"] = info
 
-            # Si la vue choisie n'a pas encore de snapshot pour ce couple,
-            # expose quand même les balances réelles connues pour garder la
-            # rétro-compatibilité (utile en mode cached_only).
-            out.setdefault(ex, {}).setdefault(al, dict(rec.get("balances") or {}))
+            # Statut comptes WS / Reconciler (optionnel)
+            if getattr(self, "_ws_hub_status_provider", None) or getattr(self, "_ws_reco_status_provider", None):
+                try:
+                    ws_meta = self._get_ws_accounts_status_for_alias(ex, al)
+                    if ws_meta:
+                        meta_ws_accounts[f"{ex}.{al}"] = ws_meta
+                except Exception:
+                    # On ne casse jamais le snapshot RM sur erreur de télémétrie WS
+                    pass
 
-        out["meta"] = {
+            # Si la vue choisie n'a pas encore de snapshot pour ce couple,
+            # on backfill avec les balances "réelles" connues pour garder
+            # la rétro-compat (utile en mode cached_only).
+            if ex not in balances:
+                balances[ex] = {}
+            balances[ex].setdefault(al, dict(rec.get("balances") or {}))
+
+        meta = {
             "age_s": meta_age,
             "vip": meta_vip,
             "fee_tokens": meta_fee,
+            "ws_accounts": meta_ws_accounts,
             "view": view,
             "cached_only": bool(cached_only),
         }
-        return out
+
+        return {
+            "mode": view,
+            "balances": balances,
+            "meta": meta,
+        }
+
 
     # =========================== Public helpers ===============================
     async def get_all_wallets(self) -> Dict[str, Any]:

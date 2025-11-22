@@ -384,13 +384,41 @@ ROUTER_COMBO_SKEW_MS = _metric(Histogram, 'router_combo_skew_ms', 'Router combo 
 ROUTER_TO_SCANNER_MS = _metric(Histogram, 'router_to_scanner_ms', 'Latency Router→Scanner (ms)', ['route'], buckets=BUCKETS_MS)
 ROUTER_TO_SCANNER_ERRORS_TOTAL = _metric(Counter, 'router_to_scanner_errors_total', 'Errors Router→Scanner', ['route', 'reason'])
 
-def mark_router_to_scanner(route: str, ok: bool, dt_ms: float, reason: str='ok') -> None:
+def mark_router_to_scanner(route: str, ok: bool, dt_ms: float, reason: str = 'ok') -> None:
     try:
         ROUTER_TO_SCANNER_MS.labels(_norm(route)).observe(max(0.0, float(dt_ms)))
         if not ok:
             ROUTER_TO_SCANNER_ERRORS_TOTAL.labels(_norm(route), _norm(reason)).inc()
     except Exception:
         pass
+
+
+def mark_router_to_scanner_ts(
+    ts_start_ns: int,
+    *,
+    route: str = "tri_cex",
+    ok: bool = True,
+    reason: str = "ok",
+    **_labels: Any,
+) -> None:
+    """
+    Wrapper basé sur un timestamp perf_counter_ns() pour Router→Scanner.
+
+    - ts_start_ns: timestamp de départ en ns (perf_counter_ns()).
+    - route: label logique de la route (par défaut "tri_cex").
+    - ok: True si le push s'est bien passé, False sinon.
+    - reason: raison de l'échec ("queue_full", "exception", ...).
+    """
+    try:
+        now_ns = time.perf_counter_ns()
+        dt_ms = max(0.0, (float(now_ns - int(ts_start_ns)) / 1e6))
+        # On passe par la fonction canonique existante
+        mark_router_to_scanner(route, ok, dt_ms, reason=reason)
+    except Exception:
+        # Observabilité best-effort, jamais bloquante
+        pass
+
+
 SCANNER_DECISION_MS = _metric(Histogram, 'scanner_decision_ms', 'Scanner decision latency (ms)', buckets=BUCKETS_MS)
 SCANNER_EVAL_MS = _metric(
     Histogram,
@@ -430,6 +458,34 @@ def mark_scanner_to_rm(ok: bool, dt_ms: float, **labels: Any) -> None:
             inc_blocked('scanner_to_rm', labels.get('reason', 'unknown'), labels.get('pair'))
     except Exception:
         pass
+
+
+def mark_scanner_to_rm_ts(
+    ts_start_ns: int,
+    *,
+    ok: bool = True,
+    reason: str = "ok",
+    **labels: Any,
+) -> None:
+    """
+    Wrapper basé sur un timestamp perf_counter_ns() pour Scanner→RM.
+
+    - ts_start_ns: timestamp de départ en ns (perf_counter_ns()).
+    - ok: True si l'appel RM a abouti sans exception, False sinon.
+    - reason: code raison ("ok", "async_task", "no_callback", "exception", ...).
+    - labels: labels additionnels (pair, route, ...).
+    """
+    try:
+        now_ns = time.perf_counter_ns()
+        dt_ms = max(0.0, (float(now_ns - int(ts_start_ns)) / 1e6))
+        enriched = dict(labels) if labels else {}
+        # On force la présence d'un reason dans les labels pour inc_blocked
+        enriched.setdefault("reason", reason)
+        mark_scanner_to_rm(ok, dt_ms, **enriched)
+    except Exception:
+        # Best-effort
+        pass
+
 INVENTORY_USD = _metric(Gauge, 'inventory_usd', 'Inventory in USD', ['exchange', 'alias'])
 RM_REJECT_TOTAL = _metric(Counter, 'rm_reject_total', 'RM rejections', ['reason'])
 PAIR_HEALTH_PENALTY_TOTAL = _metric(Counter, 'pair_health_penalty_total', 'Pair health penalties', ['pair', 'reason'])
@@ -606,6 +662,57 @@ if "WS_PUBLIC_DROPPED_TOTAL" not in globals():
     WS_PUBLIC_DROPPED_TOTAL = Counter(
         "ws_public_dropped_total", "Evénements WS publics rejetés", ["exchange", "reason"]
     )
+
+# === WS publics v2 (exchange / region / deployment_mode) ===
+if "WS_PUBLIC_EVENTS_TOTAL_V2" not in globals():
+    WS_PUBLIC_EVENTS_TOTAL_V2 = Counter(
+        "ws_public_events_total_v2",
+        "Evénements WS publics reçus (v2, taggés par exchange/region/deployment_mode/stream)",
+        ["exchange", "region", "deployment_mode", "stream"],
+    )
+
+if "WS_PUBLIC_ERRORS_TOTAL_V2" not in globals():
+    WS_PUBLIC_ERRORS_TOTAL_V2 = Counter(
+        "ws_public_errors_total_v2",
+        "Erreurs WS publics (v2, taggées par exchange/region/deployment_mode/raison)",
+        ["exchange", "region", "deployment_mode", "reason"],
+    )
+
+if "WS_PUBLIC_RECONNECTS_TOTAL_V2" not in globals():
+    WS_PUBLIC_RECONNECTS_TOTAL_V2 = Counter(
+        "ws_public_reconnects_total_v2",
+        "Reconnects WS publics (v2, taggées par exchange/region/deployment_mode/raison)",
+        ["exchange", "region", "deployment_mode", "reason"],
+    )
+
+if "WS_PUBLIC_BACKOFF_SECONDS_V2" not in globals():
+    WS_PUBLIC_BACKOFF_SECONDS_V2 = Gauge(
+        "ws_public_backoff_seconds_v2",
+        "Backoff courant (secondes) WS publics (v2)",
+        ["exchange", "region", "deployment_mode"],
+    )
+
+if "WS_PUBLIC_CONNECTIONS_OPEN_V2" not in globals():
+    WS_PUBLIC_CONNECTIONS_OPEN_V2 = Gauge(
+        "ws_public_connections_open_v2",
+        "Connexions WS publiques ouvertes (v2)",
+        ["exchange", "region", "deployment_mode"],
+    )
+
+if "WS_PUBLIC_DROPPED_TOTAL_V2" not in globals():
+    WS_PUBLIC_DROPPED_TOTAL_V2 = Counter(
+        "ws_public_dropped_total_v2",
+        "Evénements WS publics rejetés (v2)",
+        ["exchange", "region", "deployment_mode", "reason"],
+    )
+
+if "WS_PUBLIC_STALENESS_SECONDS" not in globals():
+    WS_PUBLIC_STALENESS_SECONDS = Gauge(
+        "ws_public_staleness_seconds",
+        "Staleness estimée des flux WS publics (secondes, v2)",
+        ["exchange", "region", "deployment_mode"],
+    )
+
 
 # === Hub WS privés (PWS) ===
 if "PWS_DROPPED_TOTAL" not in globals():
@@ -909,6 +1016,54 @@ VOL_ANOMALY_TOTAL = _metric(Counter, 'vol_anomaly_total', 'Volatility anomalies'
 VOL_SIGNAL_STATE = _metric(Gauge, 'vol_signal_state', 'Volatility signal state', ['pair'])
 SIM_DECISION_MS = _metric(Histogram, 'sim_decision_ms', 'Simulator decision ms', buckets=BUCKETS_MS)
 SIMULATED_VWAP_DEVIATION_BPS = _metric(Histogram, 'simulated_vwap_deviation_bps', 'Simulated VWAP deviation (bps)', buckets=(0.1, 0.2, 0.5, 1, 2, 3, 5, 8, 13, 21))
+
+# Age des snapshots de volatilité (VM) par paire
+VOL_AGE_SECONDS = _metric(
+    Gauge,
+    "vol_age_seconds",
+    "Âge du dernier snapshot de volatilité (secondes)",
+    ["pair"],
+)
+
+# Age des points de slippage par pair/exchange/side
+SLIP_AGE_SECONDS = _metric(
+    Gauge,
+    "slip_age_seconds",
+    "Âge du dernier point de slippage observé (secondes)",
+    ["pair", "exchange", "side"],
+)
+
+
+def set_vol_age_seconds(pair: str, age_seconds: float) -> None:
+    """
+    Met à jour l'âge (en secondes) du dernier snapshot de volatilité pour une paire.
+    """
+    try:
+        VOL_AGE_SECONDS.labels(_norm(pair)).set(max(0.0, float(age_seconds)))
+    except Exception:
+        # Observabilité best-effort
+        pass
+
+
+def set_slip_age_seconds(
+    pair: str,
+    exchange: str,
+    side: str,
+    age_seconds: float,
+) -> None:
+    """
+    Met à jour l'âge (en secondes) du dernier point de slippage pour pair/exchange/side.
+    """
+    try:
+        SLIP_AGE_SECONDS.labels(
+            _norm(pair),
+            lbl_exchange(exchange),
+            _norm(side),
+        ).set(max(0.0, float(age_seconds)))
+    except Exception:
+        # Observabilité best-effort
+        pass
+
 
 def sim_on_run(mode: str, vwap_dev: Optional[float]=None, fragments: int=0, blocked: bool=False) -> None:
     try:
@@ -1395,12 +1550,345 @@ def router_health_on_beat(
         _obs_shim_log.exception('router_health_on_beat failed')
 
 
+# --- Helpers high-level WS publics (v2) ---
+
+def ws_public_event(
+    exchange: str,
+    *,
+    region: str,
+    deployment_mode: str,
+    stream: str = "generic",
+) -> None:
+    """Incrémente le compteur d'événements WS publics (v2).
+
+    Labels:
+      - exchange: nom de la plateforme (BINANCE, BYBIT, COINBASE…)
+      - region: région logique (EU, US, EU_CB…)
+      - deployment_mode: EU_ONLY, SPLIT, …
+      - stream: type de flux (l2, trades, ticker, all…)
+    """
+    try:
+        safe_inc(
+            WS_PUBLIC_EVENTS_TOTAL_V2,
+            "ws_public_events_total_v2",
+            "ws_public_event",
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+            stream=stream or "generic",
+        )
+    except Exception:  # pragma: no cover - observabilité optionnelle
+        _obs_shim_log.exception("ws_public_event failed")
+
+
+def ws_public_reconnect(
+    exchange: str,
+    *,
+    region: str,
+    deployment_mode: str,
+    reason: str = "unknown",
+) -> None:
+    """Incrémente le compteur de reconnexions WS publics (v2)."""
+    try:
+        safe_inc(
+            WS_PUBLIC_RECONNECTS_TOTAL_V2,
+            "ws_public_reconnects_total_v2",
+            "ws_public_reconnect",
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+            reason=_norm(reason),
+        )
+    except Exception:  # pragma: no cover
+        _obs_shim_log.exception("ws_public_reconnect failed")
+
+
+def ws_public_error(
+    exchange: str,
+    *,
+    region: str,
+    deployment_mode: str,
+    reason: str = "unknown",
+) -> None:
+    """Incrémente le compteur d'erreurs WS publics (v2)."""
+    try:
+        safe_inc(
+            WS_PUBLIC_ERRORS_TOTAL_V2,
+            "ws_public_errors_total_v2",
+            "ws_public_error",
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+            reason=_norm(reason),
+        )
+    except Exception:  # pragma: no cover
+        _obs_shim_log.exception("ws_public_error failed")
+
+
+def ws_public_backoff(
+    exchange: str,
+    *,
+    region: str,
+    deployment_mode: str,
+    seconds: float,
+) -> None:
+    """Met à jour le backoff courant WS publics (v2)."""
+    try:
+        safe_set(
+            WS_PUBLIC_BACKOFF_SECONDS_V2,
+            "ws_public_backoff_seconds_v2",
+            "ws_public_backoff",
+            max(0.0, float(seconds)),
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+        )
+    except Exception:  # pragma: no cover
+        _obs_shim_log.exception("ws_public_backoff failed")
+
+
+def ws_public_connections_open(
+    exchange: str,
+    *,
+    region: str,
+    deployment_mode: str,
+    value: int,
+) -> None:
+    """Met à jour le nombre de connexions WS publiques ouvertes (v2)."""
+    try:
+        safe_set(
+            WS_PUBLIC_CONNECTIONS_OPEN_V2,
+            "ws_public_connections_open_v2",
+            "ws_public_connections_open",
+            max(0, int(value)),
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+        )
+    except Exception:  # pragma: no cover
+        _obs_shim_log.exception("ws_public_connections_open failed")
+
+
+def ws_public_drop(
+    exchange: str,
+    *,
+    region: str,
+    deployment_mode: str,
+    reason: str = "unknown",
+) -> None:
+    """Incrémente le compteur d'événements WS publics droppés (v2)."""
+    try:
+        safe_inc(
+            WS_PUBLIC_DROPPED_TOTAL_V2,
+            "ws_public_dropped_total_v2",
+            "ws_public_drop",
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+            reason=_norm(reason),
+        )
+    except Exception:  # pragma: no cover
+        _obs_shim_log.exception("ws_public_drop failed")
+
+
+def ws_public_staleness(
+    exchange: str,
+    *,
+    region: str,
+    deployment_mode: str,
+    seconds: float,
+) -> None:
+    """Met à jour la staleness estimée d'un flux WS public (v2)."""
+    try:
+        safe_set(
+            WS_PUBLIC_STALENESS_SECONDS,
+            "ws_public_staleness_seconds",
+            "ws_public_staleness",
+            max(0.0, float(seconds)),
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+        )
+    except Exception:  # pragma: no cover
+        _obs_shim_log.exception("ws_public_staleness failed")
+
+
+# --- Wrappers legacy (compat v1) ---
+
+
 def ws_public_on_frame(exchange: str) -> None:
-    _obs_shim_log.debug('ws_public_on_frame(%s) [legacy no-op]', exchange)
+    """Compatibilité v1: utilisé par d'anciens modules.
+
+    Par défaut, taggue l'évènement avec region/deployment_mode = "UNKNOWN".
+    Les nouveaux appels devraient passer par ws_public_event().
+    """
+    try:
+        ws_public_event(exchange, region="UNKNOWN", deployment_mode="UNKNOWN", stream="legacy")
+    except Exception:  # pragma: no cover
+        _obs_shim_log.debug("ws_public_on_frame(%s) [legacy]", exchange)
+
+
+# --- Wrappers “note_*” consommés par websockets_clients.py -----------------
+
+
+def ws_public_note_connection_open(
+    exchange: str,
+    region: str,
+    deployment_mode: str,
+    *,
+    open_count: int,
+) -> None:
+    """
+    Wrapper appelé par websockets_clients.py quand une connexion WS publique
+    est (re)ouverte.
+
+    Effet:
+      - met à jour WS_PUBLIC_CONNECTIONS_OPEN_V2 avec exchange/region/mode.
+    """
+    try:
+        ws_public_connections_open(
+            exchange=exchange,
+            region=region,
+            deployment_mode=deployment_mode,
+            value=open_count,
+        )
+    except Exception:  # best effort, jamais de propagation vers le flux métier
+        return
+
+
+def ws_public_note_connection_closed(
+    exchange: str,
+    region: str,
+    deployment_mode: str,
+    *,
+    open_count: int,
+) -> None:
+    """
+    Wrapper appelé par websockets_clients.py quand une connexion WS publique
+    est fermée.
+
+    Effet:
+      - met à jour WS_PUBLIC_CONNECTIONS_OPEN_V2 avec le nouveau compteur.
+    """
+    try:
+        ws_public_connections_open(
+            exchange=exchange,
+            region=region,
+            deployment_mode=deployment_mode,
+            value=open_count,
+        )
+    except Exception:
+        return
+
+
+def ws_public_note_reconnect(
+    exchange: str,
+    region: str,
+    deployment_mode: str,
+    *,
+    reason: str,
+    delay_s: float | int | None = None,
+) -> None:
+    """
+    Wrapper pour un reconnect.
+
+    Effets:
+      - incrémente WS_RECONNECTS_TOTAL_V2 avec exchange/region/mode + reason,
+      - met à jour WS_PUBLIC_BACKOFF_SECONDS_V2 si delay_s est fourni.
+    """
+    try:
+        ws_public_reconnect(
+            exchange=exchange,
+            region=region,
+            deployment_mode=deployment_mode,
+            reason=reason,
+        )
+        if delay_s is not None:
+            ws_public_backoff(
+                exchange=exchange,
+                region=region,
+                deployment_mode=deployment_mode,
+                delay_s=float(delay_s),
+            )
+    except Exception:
+        return
+
+
+def ws_public_note_event_ok(
+    exchange: str,
+    region: str,
+    deployment_mode: str,
+    *,
+    kind: str,
+) -> None:
+    """
+    Wrapper pour un message WS consommé correctement.
+
+    kind = type logique du flux ("combo", "l2", "trades", ...).
+    """
+    try:
+        ws_public_event(
+            exchange=exchange,
+            region=region,
+            deployment_mode=deployment_mode,
+            stream=kind,
+            ok=True,
+        )
+    except Exception:
+        return
+
+
+def ws_public_note_event_dropped(
+    exchange: str,
+    region: str,
+    deployment_mode: str,
+    *,
+    reason: str,
+    kind: str | None = None,
+) -> None:
+    """
+    Wrapper pour un message WS droppé.
+
+    Effets:
+      - incrémente WS_PUBLIC_DROPPED_TOTAL_V2 (taggé par reason),
+      - optionnel: logge aussi un event WS_PUBLIC_EVENTS_TOTAL_V2 avec ok=False
+        et stream=kind si fourni.
+    """
+    try:
+        # compteur “dropped” taggé par raison
+        ws_public_drop(
+            exchange=exchange,
+            region=region,
+            deployment_mode=deployment_mode,
+            reason=reason,
+        )
+
+        # trace dans le flux d’events (avec ok=False) si on connaît le type
+        if kind:
+            ws_public_event(
+                exchange=exchange,
+                region=region,
+                deployment_mode=deployment_mode,
+                stream=kind,
+                ok=False,
+            )
+    except Exception:
+        return
 
 
 def ws_public_set_staleness(exchange: str, seconds: float) -> None:
-    _obs_shim_log.debug('ws_public_set_staleness(%s, %.3f) [legacy no-op]', exchange, seconds)
+    """Compatibilité v1 pour la staleness WS publics."""
+    try:
+        ws_public_staleness(
+            exchange,
+            region="UNKNOWN",
+            deployment_mode="UNKNOWN",
+            seconds=seconds,
+        )
+    except Exception:  # pragma: no cover
+        _obs_shim_log.debug(
+            "ws_public_set_staleness(%s, %.3f) [legacy]", exchange, seconds
+        )
 
 
 def mark_books_fresh_by_exchange(exchange: str) -> None:
@@ -1581,7 +2069,21 @@ def set_engine_running(flag: bool) -> None:
 
 __all__ = ['BUCKETS_MS',"LAT_ACK_MS", "LAT_FILL_FIRST_MS", "LAT_FILL_ALL_MS", "LAT_E2E_MS","LOGGERH_FILE_ROTATIONS_TOTAL",
     "LAT_EVENTS_TOTAL", "LAT_PIPELINE_EVENTS_TOTAL","OBS_READY", "obs_is_ready",
-    "PAIR_HISTORY_ROWS_TOTAL", "PAIR_HISTORY_COMPUTE_MS", 'set_region', 'set_deployment_mode', 'lbl_exchange', 'lbl_region', 'lbl_mode', 'start_time_skew_probe', 'start_loop_lag_probe', 'update_time_skew', 'TIME_SKEW_MS', 'TIME_SKEW_STATUS', 'EVENT_LOOP_LAG_MS', 'report_nonfatal', 'inc_blocked', 'NONFATAL_ERRORS_TOTAL', 'BLOCKED_TOTAL', 'BF_API_ERRORS_TOTAL', 'BF_API_LATENCY_MS', 'BF_CACHE_AGE_SECONDS', 'BF_LAST_SUCCESS_TS', 'FEE_TOKEN_BALANCE', 'mark_bf_latency', 'RPC_LATENCY_MS', 'RPC_ERR_TOTAL', 'RPC_RETRIES_TOTAL', 'RPC_PAYLOAD_REJECTED_TOTAL', 'ROUTER_QUEUE_DEPTH', 'ROUTER_PAIR_QUEUE_DEPTH', 'ROUTER_QUEUE_HIGH_WATERMARK_TOTAL', 'ROUTER_QUEUE_DEPTH_BY_EX', 'ROUTER_DROPPED_TOTAL', 'ROUTER_COMBO_SKEW_MS', 'ROUTER_TO_SCANNER_MS', 'ROUTER_TO_SCANNER_ERRORS_TOTAL', 'mark_router_to_scanner', 'SCANNER_DECISION_MS', 'SCANNER_GLOBAL_LOAD', 'SCANNER_RATE_LIMITED_TOTAL', 'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SC_STRATEGY_SCORE', 'SC_ELIGIBLE', 'SC_BANNED', 'SC_PROMOTED_PRIMARY', 'SC_ROTATION_PRIMARY_SIZE', 'SC_ROTATION_AUDITION_SIZE', 'RM_DECISION_MS', 'mark_scanner_to_rm', 'INVENTORY_USD', 'RM_REJECT_TOTAL', 'PAIR_HEALTH_PENALTY_TOTAL', 'VOL_EWMA_BPS', 'VOL_P95_BPS', 'VOL_BAND_TOTAL', 'FEE_SNAPSHOT_AGE_SECONDS', 'TOTAL_COST_BPS', 'FEE_MISMATCH_TOTAL', 'FEES_EXPECTED_BPS', 'FEES_REALIZED_BPS', 'FEESYNC_LAST_TS', 'FEESYNC_ERRORS', 'REBAL_DETECTED_TOTAL', 'REBAL_PLAN_QUANTUM_QUOTE', 'RM_PAUSED_COUNT', 'LAST_BOOKS_FRESH_TS', 'LAST_BALANCES_FRESH_TS', 'DYNAMIC_MIN_BPS', 'mark_books_fresh', 'mark_balances_fresh', 'set_rm_paused_count', 'set_dynamic_min', 'inc_rm_reject', 'mark_rm_to_engine', 'MM_FILLS_BOTH', 'MM_SINGLE_FILL_HEDGED', 'MM_PANIC_HEDGE_TOTAL', 'ENGINE_SUBMIT_TO_ACK_MS', 'ENGINE_ACK_TO_FILL_MS', 'ENGINE_CANCELLATIONS_TOTAL', 'ENGINE_RETRIES_TOTAL', 'ENGINE_QUEUEPOS_BLOCKED_TOTAL', 'ENGINE_SUBMIT_QUEUE_DEPTH', 'INFLIGHT_GAUGE', 'PNL_LIVE_DAY_USD', 'TRADES_LIVE_DAY_TOTAL', 'DERIVED_NET_PROFIT_SIGN_TOTAL', 'MISSING_NET_PROFIT_TOTAL', 'ENGINE_PACER_DELAY_MS', 'ENGINE_PACER_INFLIGHT_MAX', 'ENGINE_PACER_MODE', 'ENGINE_DRAIN_LATENCY_MS', 'ENGINE_PACING_BACKPRESSURE_TOTAL', 'inc_engine_pacing_backpressure', 'WS_RECONNECTS_TOTAL', 'WS_BACKOFF_SECONDS', 'WS_CONNECTIONS_OPEN', 'PACER_STATE', 'PACER_CLAMP_SECONDS', 'ENGINE_MUTE_TOTAL', 'FEE_TOKEN_LEVEL', 'FEE_TOKEN_TARGET_PERCENT', 'PWS_DEDUP_HITS_TOTAL', 'PWS_RECONNECTS_TOTAL', 'PWS_EVENT_LAG_MS', 'PWS_TRANSFERS_TOTAL', 'PWS_EVENTS_TOTAL', 'PWS_BACKOFF_SECONDS', 'PWS_HEARTBEAT_GAP_SECONDS', 'PWS_DROPPED_TOTAL', 'PWS_ACK_LATENCY_MS', 'PWS_FILL_LATENCY_MS', 'WS_FAILOVER_TOTAL', 'PWS_POOL_SIZE', 'PWS_QUEUE_DEPTH', 'PWS_QUEUE_CAP', 'WS_RECO_RUN_MS', 'WS_RECO_ERRORS_TOTAL', 'RECONCILE_MISS_TOTAL', 'RECONCILE_RESYNC_TOTAL', 'RECONCILE_RESYNC_LATENCY_MS', 'COLD_RESYNC_TOTAL', 'COLD_RESYNC_RUN_MS', 'recon_run_ms', 'recon_error', 'recon_on_resync', 'recon_observe_latency', 'pws_on_failover', 'pws_set_pool_size', 'LOGGERH_WRITE_MS', 'LOGGERH_QUEUE_PLATEAU_TOTAL', 'LHM_JSONL_INGESTED_TOTAL', 'LHM_JSONL_DROPPED_TOTAL', 'LHM_JSONL_QUEUE_SIZE', 'LOGGERH_TRADE_QUEUE_SIZE', 'LOGGERH_JSONL_ROTATIONS_TOTAL', 'LOGGERH_LAST_FLUSH_TS_SECONDS', 'LOGGERH_LAST_ROTATION_TS_SECONDS', 'loggerh_observe_write_ms', 'lhm_on_ingested', 'lhm_on_dropped', 'lhm_set_queue_size', 'lhm_on_rotation', 'loggerh_set_last_flush_now', 'loggerh_set_last_rotation_now', 'STORAGE_USAGE_PCT', 'STORAGE_BYTES_FREE', 'STORAGE_ALERTS_TOTAL', 'LOGGERH_JSONL_BYTES', 'LOGGERH_DB_STALLS_TOTAL', 'LOGGERH_DB_FILE_BYTES', 'update_storage_metrics', 'VOL_PRICE_VOL_MICRO', 'VOL_SPREAD_VOL_MICRO', 'VOL_PRICE_PCTL', 'VOL_SPREAD_PCTL', 'VOL_ANOMALY_TOTAL', 'VOL_SIGNAL_STATE', 'SIM_DECISION_MS', 'SIMULATED_VWAP_DEVIATION_BPS', 'sim_on_run', 'PAYLOAD_REJECTED_TOTAL', 'ObsServer', 'StatusHTTPServer', 'MainMetrics', 'BOT_STARTUPS_TOTAL', 'BOT_STATE', 'start_servers_from_env', 'WS_RECONNECTS_TOTAL', 'RM_DECISION_MS', 'RM_PREFLIGHT_MS', 'RM_DECISIONS_TOTAL', 'RM_SKIPS_TOTAL', 'RM_QUEUE_DEPTH', 'RM_REVALIDATE_MS', 'RM_FRAGMENT_PROFIT_MS', 'PAIR_HEALTH_PENALTY_TOTAL', 'POOL_GATE_THROTTLES_TOTAL', 'RM_FINAL_DECISIONS_TOTAL', 'RM_ADMITTED_TOTAL', 'RM_DROPPED_TOTAL', 'STALE_OPPORTUNITY_DROPPED_TOTAL']
+    "PAIR_HISTORY_ROWS_TOTAL", "PAIR_HISTORY_COMPUTE_MS", 'set_region', 'set_deployment_mode', 'lbl_exchange', 'lbl_region', 'lbl_mode', 'start_time_skew_probe', 'start_loop_lag_probe', 'update_time_skew', 'TIME_SKEW_MS', 'TIME_SKEW_STATUS', 'EVENT_LOOP_LAG_MS', 'report_nonfatal', 'inc_blocked', 'NONFATAL_ERRORS_TOTAL', 'BLOCKED_TOTAL', 'BF_API_ERRORS_TOTAL', 'BF_API_LATENCY_MS', 'BF_CACHE_AGE_SECONDS', 'BF_LAST_SUCCESS_TS', 'FEE_TOKEN_BALANCE', 'mark_bf_latency', 'RPC_LATENCY_MS', 'RPC_ERR_TOTAL', 'RPC_RETRIES_TOTAL', 'RPC_PAYLOAD_REJECTED_TOTAL', 'ROUTER_QUEUE_DEPTH', 'ROUTER_PAIR_QUEUE_DEPTH', 'ROUTER_QUEUE_HIGH_WATERMARK_TOTAL', 'ROUTER_QUEUE_DEPTH_BY_EX', 'ROUTER_DROPPED_TOTAL', 'ROUTER_COMBO_SKEW_MS', 'ROUTER_TO_SCANNER_MS', 'ROUTER_TO_SCANNER_ERRORS_TOTAL', 'mark_router_to_scanner', 'SCANNER_DECISION_MS', 'SCANNER_GLOBAL_LOAD', 'SCANNER_RATE_LIMITED_TOTAL', 'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SC_STRATEGY_SCORE', 'SC_ELIGIBLE', 'SC_BANNED', 'SC_PROMOTED_PRIMARY', 'SC_ROTATION_PRIMARY_SIZE', 'SC_ROTATION_AUDITION_SIZE', 'RM_DECISION_MS', 'mark_scanner_to_rm', 'INVENTORY_USD', 'RM_REJECT_TOTAL', 'PAIR_HEALTH_PENALTY_TOTAL', 'VOL_EWMA_BPS', 'VOL_P95_BPS', 'FEE_MISMATCH_TOTAL', 'FEES_EXPECTED_BPS', 'FEES_REALIZED_BPS', 'FEESYNC_LAST_TS', 'FEESYNC_ERRORS', 'REBAL_DETECTED_TOTAL', 'REBAL_PLAN_QUANTUM_QUOTE', 'RM_PAUSED_COUNT', 'LAST_BOOKS_FRESH_TS', 'LAST_BALANCES_FRESH_TS', 'DYNAMIC_MIN_BPS', 'mark_books_fresh', 'mark_balances_fresh', 'set_rm_paused_count', 'set_dynamic_min', 'inc_rm_reject', 'mark_rm_to_engine', 'MM_FILLS_BOTH', 'MM_SINGLE_FILL_HEDGED', 'MM_PANIC_HEDGE_TOTAL', 'ENGINE_SUBMIT_TO_ACK_MS', 'ENGINE_ACK_TO_FILL_MS', 'ENGINE_CANCELLATIONS_TOTAL', 'ENGINE_RETRIES_TOTAL', 'ENGINE_QUEUEPOS_BLOCKED_TOTAL', 'ENGINE_SUBMIT_QUEUE_DEPTH', 'INFLIGHT_GAUGE', 'PNL_LIVE_DAY_USD', 'TRADES_LIVE_DAY_TOTAL', 'DERIVED_NET_PROFIT_SIGN_TOTAL', 'MISSING_NET_PROFIT_TOTAL', 'ENGINE_PACER_DELAY_MS', 'ENGINE_PACER_INFLIGHT_MAX', 'ENGINE_PACER_MODE', 'ENGINE_DRAIN_LATENCY_MS', 'ENGINE_PACING_BACKPRESSURE_TOTAL', 'inc_engine_pacing_backpressure', 'WS_RECONNECTS_TOTAL', 'WS_BACKOFF_SECONDS', 'WS_CONNECTIONS_OPEN', 'PACER_STATE', 'PACER_CLAMP_SECONDS', 'ENGINE_MUTE_TOTAL', 'FEE_TOKEN_LEVEL', 'FEE_TOKEN_TARGET_PERCENT', 'PWS_DEDUP_HITS_TOTAL', 'PWS_RECONNECTS_TOTAL', 'PWS_EVENT_LAG_MS', 'PWS_TRANSFERS_TOTAL', 'PWS_EVENTS_TOTAL', 'PWS_BACKOFF_SECONDS', 'PWS_HEARTBEAT_GAP_SECONDS', 'PWS_DROPPED_TOTAL', 'PWS_ACK_LATENCY_MS', 'PWS_FILL_LATENCY_MS', 'WS_FAILOVER_TOTAL', 'PWS_POOL_SIZE', 'PWS_QUEUE_DEPTH', 'PWS_QUEUE_CAP', 'WS_RECO_RUN_MS', 'WS_RECO_ERRORS_TOTAL', 'RECONCILE_MISS_TOTAL', 'RECONCILE_RESYNC_TOTAL', 'RECONCILE_RESYNC_LATENCY_MS', 'COLD_RESYNC_TOTAL', 'COLD_RESYNC_RUN_MS', 'recon_run_ms', 'recon_error', 'recon_on_resync', 'recon_observe_latency', 'pws_on_failover', 'pws_set_pool_size', 'LOGGERH_WRITE_MS', 'LOGGERH_QUEUE_PLATEAU_TOTAL', 'LHM_JSONL_INGESTED_TOTAL', 'LHM_JSONL_DROPPED_TOTAL', 'LHM_JSONL_QUEUE_SIZE', 'LOGGERH_TRADE_QUEUE_SIZE', 'LOGGERH_JSONL_ROTATIONS_TOTAL', 'LOGGERH_LAST_FLUSH_TS_SECONDS', 'LOGGERH_LAST_ROTATION_TS_SECONDS', 'loggerh_observe_write_ms', 'lhm_on_ingested', 'lhm_on_dropped', 'lhm_set_queue_size', 'lhm_on_rotation', 'loggerh_set_last_flush_now', 'loggerh_set_last_rotation_now', 'STORAGE_USAGE_PCT', 'STORAGE_BYTES_FREE', 'STORAGE_ALERTS_TOTAL', 'LOGGERH_JSONL_BYTES', 'LOGGERH_DB_STALLS_TOTAL', 'LOGGERH_DB_FILE_BYTES', 'update_storage_metrics',  'SIM_DECISION_MS', 'SIMULATED_VWAP_DEVIATION_BPS', 'sim_on_run', 'PAYLOAD_REJECTED_TOTAL', 'ObsServer', 'StatusHTTPServer', 'MainMetrics', 'BOT_STARTUPS_TOTAL', 'BOT_STATE', 'start_servers_from_env', 'WS_RECONNECTS_TOTAL', 'RM_DECISION_MS', 'RM_PREFLIGHT_MS', 'RM_DECISIONS_TOTAL', 'RM_SKIPS_TOTAL', 'RM_QUEUE_DEPTH', 'RM_REVALIDATE_MS', 'RM_FRAGMENT_PROFIT_MS', 'PAIR_HEALTH_PENALTY_TOTAL', 'POOL_GATE_THROTTLES_TOTAL', 'RM_FINAL_DECISIONS_TOTAL', 'RM_ADMITTED_TOTAL', 'RM_DROPPED_TOTAL',
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "VOL_PRICE_VOL_MICRO",
+           "VOL_SPREAD_VOL_MICRO",
+           "VOL_PRICE_PCTL",
+           "VOL_SPREAD_PCTL",
+           "VOL_ANOMALY_TOTAL",
+           "VOL_SIGNAL_STATE",
+           "VOL_BAND_TOTAL",
+           "VOL_AGE_SECONDS",
+           "SLIP_AGE_SECONDS",
+           "set_vol_age_seconds",
+           "set_slip_age_seconds",
+           "FEE_SNAPSHOT_AGE_SECONDS",
+           "TOTAL_COST_BPS",
+           ]
 __all__ += [
     'BF_HTTP_LATENCY_SECONDS',
     'BF_HTTP_ERRORS_TOTAL',
@@ -1612,4 +2114,7 @@ __all__ += [
     'inc_scanner_emitted',
     'observe_scanner_latency',
     'set_engine_running',
+    'mark_router_to_scanner_ts',
+    'mark_scanner_to_rm_ts',
+
 ]

@@ -335,27 +335,47 @@ class RebalancingManager:
             log.exception("ingest_snapshot failed")
             self._emit("ERROR", "ingest_snapshot_failed", exchange=(data or {}).get("exchange"), error=str(exc))
 
-    def update_balances(self, balances: Dict[str, Dict[str, Dict[str, float]]]) -> None:
+    def update_balances(self, balances: Dict[str, Any]) -> None:
         """
-        balances: {"BINANCE":{"TT":{"USDC":..., "ETH":...}, "TM":{...}}, "BYBIT":{...}}
+        Alimente la vue capital du Rebalancer à partir du MBF / RM.
+
+        Entrées acceptées :
+        - snapshot complet MBF/RM :
+            {"mode": ..., "balances": {ex: {alias: {asset: amount}}}, "meta": {...}}
+        - ou directement le dict balances :
+            {ex: {alias: {asset: amount}}} (legacy/tests).
+
+        Effets :
+        - met à jour `self.latest_balances` (miroir capital pour Rebalancing + RM),
+        - ne gère aucun cap métier ni overlay : ces décisions restent côté RM.
         """
-        try:
-            norm: Dict[str, Dict[str, Dict[str, float]]] = {}
-            for ex, per_alias in (balances or {}).items():
-                exu = _norm(ex)
+        raw = balances or {}
+
+        # Support des snapshots complets MBF/RM
+        if isinstance(raw, dict) and "balances" in raw and isinstance(raw["balances"], dict):
+            raw = raw["balances"] or {}
+
+        latest: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+        for ex, per_alias in (raw or {}).items():
+            if not ex:
+                continue
+            exu = ex.upper()
+            # On ne garde que les exchanges activés
+            if hasattr(self, "enabled_exchanges") and self.enabled_exchanges:
                 if exu not in self.enabled_exchanges:
                     continue
-                norm[exu] = {}
-                for alias, assets in (per_alias or {}).items():
-                    al = _norm(alias)
-                    if self.enabled_aliases and al not in self.enabled_aliases:
+
+            dst_ex = latest.setdefault(exu, {})
+            for alias, per_ccy in (per_alias or {}).items():
+                alias_key = alias or ""
+                dst_alias = dst_ex.setdefault(alias_key, {})
+                for asset, amount in (per_ccy or {}).items():
+                    if amount is None:
                         continue
-                    norm[exu][al] = {str(a).upper(): _to_f(q) for a, q in (assets or {}).items()}
-            self.latest_balances = norm
-            self.last_update = _now()
-        except Exception as exc:
-            log.exception("update_balances failed")
-            self._emit("ERROR", "update_balances_failed", error=str(exc))
+                    dst_alias[asset.upper()] = float(amount or 0.0)
+
+        self.latest_balances = latest
 
 
     def update_wallets(self, wallets: Dict[str, Dict[str, Dict[str, Dict[str, float]]]]) -> None:

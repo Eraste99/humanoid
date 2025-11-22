@@ -29,9 +29,10 @@ import contextlib
 import hashlib
 import hmac
 import json
-import logging
 import socket
 import time
+import logging
+log = logging.getLogger(__name__)
 import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
@@ -1061,13 +1062,50 @@ class ExecutionEngine:
         self._auto_ready_on_start: bool = bool(getattr(self.config, "ready_autoset_on_start", False))
 
         # --- File d’ordres bornée & workers ---
-        qmax = int(getattr(self.config, "engine_submit_queue_size", 256))
+        # --- Profil capital & capacités Engine (Ticket 10) ---
+        try:
+            profile = str(
+                getattr(self.config, "capital_profile",
+                        getattr(self.config, "engine_profile", "NANO"))
+            ).upper()
+        except Exception:
+            profile = "NANO"
+        self._capital_profile = profile
+
+        engine_cfg = None
+        try:
+            root_cfg = getattr(self, "cfg", None)
+            engine_cfg = getattr(root_cfg, "engine", None) if root_cfg is not None else None
+        except Exception:
+            engine_cfg = None
+
+        # Workers: priorité à l’override explicite max_concurrent,
+        # sinon grille workers_by_profile, sinon fallback legacy.
+        workers_from_profile = None
+        if engine_cfg is not None:
+            try:
+                wb = getattr(engine_cfg, "workers_by_profile", None) or {}
+                workers_from_profile = int(wb.get(profile, wb.get("LARGE") or 0) or 0)
+            except Exception:
+                workers_from_profile = None
+
+        if max_concurrent is not None and max_concurrent > 0:
+            worker_count = int(max_concurrent)
+        elif workers_from_profile:
+            worker_count = workers_from_profile
+        else:
+            worker_count = int(getattr(self.config, "max_concurrent", 1) or 1)
+
+        worker_count = max(1, worker_count)
+
+        # --- File d’ordres bornée & workers ---
+        qmax = int(getattr(self.config, "engine_submit_queue_size", 256) or 256)
         qmax = max(1, qmax)
         self.order_queue: asyncio.Queue = asyncio.Queue(maxsize=qmax)
         self.running: bool = False
         self._session: Optional[Any] = None  # aiohttp.ClientSession si utilisé
         self._workers: List[Any] = []
-        self._max_concurrent = max(1, int(getattr(self.config, "max_concurrent", max_concurrent)))
+        self._max_concurrent = worker_count
 
         # --- Rate limiting par CEX (utilise ta classe TokenBucket existante) ---
         # au lieu de self._rl_binance_order = TokenBucket(...):
@@ -1236,6 +1274,11 @@ class ExecutionEngine:
                     int(getattr(self.config, "tm_nn_max_exposure_s", 3.0) * 1000))
         )
         self.tm_exposure_ttl_hedge_ratio = float(getattr(self.config, "tm_exposure_ttl_hedge_ratio", 0.50))
+        # Hub WS privé (injecté par le Boot) + flags wiring
+        self.private_ws_hub = None
+        self._has_private_ws_hub = False
+        self._wiring_checked = False
+        self._ready = False
 
         # ---- Pacer optionnel ----
         try:
@@ -1243,11 +1286,45 @@ class ExecutionEngine:
         except Exception:
             pass
 
-        # ---- Inflight ceilings par venue (semaphores) + métriques ----
-        lim_bin = int(getattr(self.config, "inflight_max_binance", getattr(self.config, "INFLIGHT_MAX_BINANCE", 8)))
-        lim_byb = int(getattr(self.config, "inflight_max_bybit", getattr(self.config, "INFLIGHT_MAX_BYBIT", 8)))
-        lim_cb = int(
-            getattr(self.config, "inflight_max_coinbase", getattr(self.config, "INFLIGHT_MAX_COINBASE", 6)))
+        # ---- Inflight ceilings par venue (semaphores) + métriques — Ticket 10 ----
+        limits_profile: Dict[str, int] = {}
+        try:
+            if engine_cfg is None:
+                root_cfg = getattr(self, "cfg", None)
+                engine_cfg = getattr(root_cfg, "engine", None) if root_cfg is not None else None
+        except Exception:
+            engine_cfg = None
+
+        if engine_cfg is not None:
+            try:
+                by_profile = getattr(engine_cfg, "inflight_max_by_exchange_by_profile", None) or {}
+                limits_profile = by_profile.get(self._capital_profile, {}) or by_profile.get("LARGE", {}) or {}
+            except Exception:
+                limits_profile = {}
+
+        def _limit_for(exchange: str, legacy_attr: str, legacy_env: str, default: int) -> int:
+            ex = exchange.upper()
+            # 1) Nouveau schéma: grille par profil / CEX (BotConfig.engine)
+            if limits_profile:
+                val = limits_profile.get(ex)
+                if val is not None:
+                    try:
+                        return int(val)
+                    except Exception:
+                        pass
+            # 2) Fallback legacy: attributs plats sur config
+            try:
+                return int(
+                    getattr(self.config, legacy_attr,
+                            getattr(self.config, legacy_env, default))
+                )
+            except Exception:
+                return int(default)
+
+        lim_bin = _limit_for("BINANCE", "inflight_max_binance", "INFLIGHT_MAX_BINANCE", 8)
+        lim_byb = _limit_for("BYBIT", "inflight_max_bybit", "INFLIGHT_MAX_BYBIT", 8)
+        lim_cb = _limit_for("COINBASE", "inflight_max_coinbase", "INFLIGHT_MAX_COINBASE", 6)
+
         self._sem_inflight = {
             "BINANCE": asyncio.Semaphore(max(1, lim_bin)),
             "BYBIT": asyncio.Semaphore(max(1, lim_byb)),
@@ -1264,6 +1341,52 @@ class ExecutionEngine:
             ENGINE_SUBMIT_QUEUE_DEPTH.labels(exchange="ALL").set(0)
         except Exception:
             pass
+
+
+    def set_private_ws_hub(self, hub) -> None:
+        """
+        Injection tardive du PrivateWSHub (par le Boot).
+
+        Contrat:
+          - Le hub doit avoir un callback "engine" déjà enregistré sur
+            ExecutionEngine.on_private_order_update.
+          - Le hub doit également disposer d'un callback "risk" (RiskManager).
+          - Toute absence de callback requis = wiring incomplet (non READY).
+        """
+        self.private_ws_hub = hub
+        self._has_private_ws_hub = bool(hub)
+        self._wiring_checked = False
+
+        if not hub:
+            log.warning("[ExecutionEngine] Aucun PrivateWSHub attaché (mode test/dry-run)")
+            return
+
+        status = {}
+        try:
+            if hasattr(hub, "get_status"):
+                status = hub.get_status()
+        except Exception:
+            log.exception("[ExecutionEngine] Impossible de lire le status du Hub")
+
+        wiring = status.get("wiring", {}) if isinstance(status, dict) else {}
+        has_engine_cb = bool(wiring.get("has_engine_callback"))
+        has_rm_cb = bool(wiring.get("has_rm_callback"))
+        auto_rm = bool(wiring.get("auto_rm_from_engine"))
+
+        if not (has_engine_cb and has_rm_cb) or auto_rm:
+            log.error(
+                "[ExecutionEngine] Wiring Hub incomplet: engine=%s rm=%s auto_rm=%s",
+                has_engine_cb,
+                has_rm_cb,
+                auto_rm,
+            )
+            self._ready = False
+            self._wiring_checked = True
+            return
+
+        self._wiring_checked = True
+        log.info("[ExecutionEngine] Hub wiring OK (engine + rm branchés)")
+
 
     async def submit_maker_or_delay(self, order: dict, meta: dict) -> Optional[str]:
         """
@@ -1400,23 +1523,154 @@ class ExecutionEngine:
 
     def _normalize_fill_to_private_event(self, exchange: str, alias: str, data: dict, source: str = "resync") -> dict:
         """
-        Convertit un fill/trade REST en event privé standardisé (toujours FILL ou PARTIAL).
+        Convertit un fill/trade REST en event privé standardisé pour Hub/RM/Reconciler.
+
+        Contrat:
+          - type="fill"
+          - status="FILL" (un trade = un fill ; les PARTIAL sont la somme de plusieurs fills par ordre)
+          - Champs clés: exchange, alias, symbol, side, client_id / exchange_order_id,
+            fill_px, base_qty, quote, quote_qty, ts_exchange, ts_local, fee_ccy, fee, meta.source.
         """
         import time
+
+        # --- Champs de contexte ordre / marché ---
+        symbol = (
+                data.get("symbol")
+                or data.get("product_id")
+                or data.get("market")
+                or data.get("instrument")
+                or data.get("s")
+                or data.get("instId")
+        )
+
+        side_raw = data.get("side")
+        side = str(side_raw).upper() if side_raw is not None else None
+
+        order_id = (
+                data.get("orderId")
+                or data.get("order_id")
+                or data.get("orderID")
+                or data.get("id")
+        )
+        client_id = (
+                data.get("clientOrderId")
+                or data.get("client_id")
+                or data.get("cid")
+                or data.get("clOrdID")
+                or data.get("client_oid")
+        )
+        exchange_order_id = (
+                data.get("orderId")
+                or data.get("order_id")
+                or data.get("orderID")
+        )
+
+        # --- Prix & tailles ---
+        # Prix de fill (REST varie beaucoup entre CEX, on agrège les champs usuels)
+        price_raw = (
+                data.get("price")
+                or data.get("execPrice")
+                or data.get("trade_price")
+                or data.get("tradePrice")
+                or data.get("avgPrice")
+        )
+        fill_px = float(price_raw) if price_raw not in (None, "") else None
+
+        # Taille base
+        base_raw = (
+                data.get("qty")
+                or data.get("executedQty")
+                or data.get("filled_qty")
+                or data.get("size")
+                or data.get("filled_size")
+                or data.get("execQty")
+        )
+        base_qty = float(base_raw) if base_raw not in (None, "") else None
+
+        # Taille quote
+        quote_raw = (
+                data.get("quoteQty")
+                or data.get("cummulativeQuoteQty")
+                or data.get("executedValue")
+                or data.get("filled_quote")
+                or data.get("filled_notional")
+                or data.get("funds")
+        )
+        quote_qty = float(quote_raw) if quote_raw not in (None, "") else None
+        if quote_qty is None and base_qty is not None and fill_px is not None:
+            quote_qty = base_qty * fill_px
+
+        # Devise de quote
+        quote_ccy = (
+                data.get("quote")
+                or data.get("quoteAsset")
+                or data.get("quote_currency")
+                or data.get("quoteCurrency")
+        )
+        if not quote_ccy and symbol and isinstance(symbol, str):
+            up_sym = symbol.upper()
+            # Formats "BTC-USDC", "ETH/USD"
+            if "-" in up_sym:
+                quote_ccy = up_sym.split("-")[-1]
+            elif "/" in up_sym:
+                quote_ccy = up_sym.split("/")[-1]
+            else:
+                # Heuristique simple pour les symboles compacts type "BTCUSDC"
+                known_quotes = (
+                    "USDC",
+                    "USDT",
+                    "BUSD",
+                    "USD",
+                    "EUR",
+                    "GBP",
+                    "TRY",
+                    "BRL",
+                    "FDUSD",
+                    "DAI",
+                    "BTC",
+                    "ETH",
+                )
+                for q in known_quotes:
+                    if up_sym.endswith(q):
+                        quote_ccy = q
+                        break
+
+        # Timestamps
+        ts_exchange = float(
+            data.get("time")
+            or data.get("timestamp")
+            or data.get("ts")
+            or data.get("created_at")
+            or time.time()
+        )
+
         ev = {
             "exchange": exchange,
             "alias": alias,
+            "type": "fill",
             "status": "FILL",
-            "order_id": data.get("orderId") or data.get("order_id") or data.get("id"),
-            "client_id": data.get("clientOrderId") or data.get("client_id") or data.get("cid"),
-            "ts_exchange": float(data.get("time") or data.get("timestamp") or data.get("ts") or time.time()),
+            "symbol": symbol,
+            "side": side,
+            "order_id": order_id,
+            "client_id": client_id,
+            "exchange_order_id": exchange_order_id,
+            "fill_px": fill_px,
+            "base_qty": base_qty,
+            "quote": quote_ccy,
+            "quote_qty": quote_qty,
+            "ts_exchange": ts_exchange,
             "ts_local": time.time(),
-            "filled_qty": data.get("qty") or data.get("executedQty") or data.get("filled_qty"),
-            "filled_quote": data.get("quoteQty") or data.get("cummulativeQuoteQty") or data.get("filled_quote"),
             "fee_ccy": data.get("commissionAsset") or data.get("fee_ccy"),
             "fee": data.get("commission") or data.get("fee"),
             "meta": {"source": source},
         }
+
+        # Compatibilité ascendante: exposer aussi filled_* pour les anciens consommateurs
+        if "filled_qty" not in ev:
+            ev["filled_qty"] = base_qty
+        if "filled_quote" not in ev:
+            ev["filled_quote"] = quote_qty
+
         return ev
 
     # --- Exchange normalization helpers ---
@@ -2122,8 +2376,8 @@ class ExecutionEngine:
         Soumission non-bloquante:
           - Garde readiness strict (hedges jamais bloqués si override conf)
           - Idempotence via CID déterministe
-          - Backpressure (watermarks configurables + policy defer/reject)
-          - Observabilité: enqueue_ms + profondeur file
+          - Backpressure explicite (watermarks configurables + policy defer/reject)
+          - Observabilité: enqueue_ms + profondeur file + utilisation de capacité
         """
         # 0) Readiness
         drop_makers = bool(getattr(self.config, "engine_ready_drop_makers_when_not_ready", False))
@@ -2131,28 +2385,170 @@ class ExecutionEngine:
             # Hedges (TT) autorisés en dégradé si le flag est False
             kind = (bundle.get("meta", {}).get("kind") or "").upper()
             if drop_makers or kind in ("MAKER", "MAKER_TM", "MAKER_MM"):
+                # On garde RuntimeError pour compat, mais message explicite
                 raise RuntimeError("ENGINE_NOT_READY")
 
-            # 1) Idempotence
-            if not hasattr(self, "_seen_cids"):
-                self._seen_cids = {}
-            import hashlib, json, time, asyncio
-            h = hashlib.sha256()
+        # 1) Idempotence via CID stable
+        if not hasattr(self, "_seen_cids"):
+            self._seen_cids = {}
+
+        h = hashlib.sha256()
+        try:
             h.update(json.dumps(bundle, sort_keys=True, default=str).encode("utf-8"))
-            cid = h.hexdigest()[:16]
-            now = time.time()
-            self._prune_seen_cids(now)
-            if cid in self._seen_cids:
-                return
+        except Exception:
+            # fallback très conservateur: on ne déduplique pas mais on logge
+            try:
+                logger.warning("[ExecutionEngine] submit: impossible de sérialiser le bundle pour CID")
+            except Exception:
+                pass
+        cid = h.hexdigest()[:16]
+        now = time.time()
+        self._prune_seen_cids(now)
+        if cid in self._seen_cids:
+            # Idempotence: on court-circuite silencieusement (même bundle récemment vu)
+            # Compat: on ne renvoie pas d'exception pour ne pas surprendre le RM
+            try:
+                logger.info("[ExecutionEngine] submit: bundle déjà vu (cid=%s) — no-op", cid)
+            except Exception:
+                pass
+            return
 
-        # 2) Queue & watermarks
-        queue_max = getattr(self.order_queue, "maxsize", 0) or int(getattr(self.config, "engine_queue_max", 2048))
-        high_wm = int(getattr(self.config, "engine_queue_high_wm", int(queue_max * 0.85)))
-        policy = str(getattr(self.config, "engine_enqueue_overflow_policy", "defer")).lower()  # "defer"|"reject"
+        # 1-bis) Langage commun de capacité (branch / profil / caps_local)
+        meta = bundle.get("meta") or {}
+        route = bundle.get("route") or {}
+        branch = str(
+            meta.get("branch")
+            or meta.get("kind")
+            or bundle.get("strategy")
+            or route.get("strategy")
+            or ""
+        ).upper() or "UNKNOWN"
+        profile = str(
+            meta.get("capital_profile")
+            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
+        ).upper()
 
-        if self.order_queue.qsize() >= high_wm and policy == "defer":
-            await asyncio.sleep(float(getattr(self.config, "engine_defer_sleep_ms", 8)) / 1000.0)
+        caps_local = bundle.get("caps") or {}
+        if not isinstance(caps_local, dict):
+            caps_local = {}
 
+        bundle_concurrency = caps_local.get("bundle_concurrency")
+        # inflight_cap = budget business calculé côté RM (Ticket 10).
+        # Côté Engine, on l'utilise uniquement pour l'observabilité, pas pour refaire un GO/NO-GO économique.
+        inflight_cap = caps_local.get("inflight_cap")
+        headroom_min = int(caps_local.get("headroom_min") or 0)
+
+        # 2) Backpressure technique: queue globale et éventuelle concurrence par branche
+        queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
+        queue_max = getattr(self.order_queue, "maxsize", 0) or queue_max_cfg or 0
+        depth = int(self.order_queue.qsize())
+        overflow_policy = str(getattr(self.config, "engine_enqueue_overflow_policy", "defer")).lower()
+        high_wm = 0
+        if queue_max:
+            high_wm = int(
+                getattr(self.config, "engine_queue_high_wm", int(queue_max * 0.85))
+            )
+
+        # Profondeur de file par branche (meilleur alignement caps_local → Engine)
+        branch_depth = 0
+        try:
+            q = getattr(self.order_queue, "_queue", None)
+            if q is not None and branch != "UNKNOWN":
+                for item in list(q):
+                    if not isinstance(item, dict):
+                        continue
+                    imeta = item.get("meta") or {}
+                    ibranch = str(
+                        imeta.get("branch")
+                        or imeta.get("kind")
+                        or item.get("strategy")
+                        or ""
+                    ).upper()
+                    if ibranch == branch:
+                        branch_depth += 1
+        except Exception:
+            branch_depth = 0
+
+        # Observabilité business: ratio profondeur / inflight_cap si fourni par RM
+        try:
+            if inflight_cap and branch_depth is not None and hasattr(self, "obs_hist"):
+                try:
+                    eff_inflight_cap = max(1, int(inflight_cap))
+                    inflight_util = max(
+                        0.0,
+                        min(100.0, 100.0 * float(branch_depth) / float(eff_inflight_cap)),
+                    )
+                    self.obs_hist("engine_branch_inflight_util_pct", inflight_util)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Observabilité capacité (queue globale + branche)
+
+
+        # Observabilité capacité (queue globale + branche)
+        try:
+            if hasattr(self, "obs_hist"):
+                # profondeur brute
+                self.obs_hist("engine_queue_depth", float(depth))
+                if queue_max:
+                    util_pct = max(0.0, min(100.0, 100.0 * float(depth) / float(queue_max)))
+                    self.obs_hist("engine_queue_util_pct", util_pct)
+                if bundle_concurrency and branch_depth is not None:
+                    try:
+                        eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
+                        br_util_pct = max(0.0, min(100.0, 100.0 * float(branch_depth) / float(eff_cap)))
+                        self.obs_hist("engine_branch_capacity_util_pct", br_util_pct)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 2-a) Hard backpressure: queue pleine
+        if queue_max and depth >= queue_max:
+            # Raison explicite pour RM + métriques
+            try:
+                logger.warning(
+                    "[ExecutionEngine] BACKPRESSURE_QUEUE_FULL branch=%s profile=%s depth=%s max=%s",
+                    branch, profile, depth, queue_max,
+                )
+            except Exception:
+                pass
+            raise EngineSubmitError("ENGINE_BACKPRESSURE_QUEUE_FULL")
+
+        # 2-b) Hard backpressure: caps_local par branche (optionnel)
+        if bundle_concurrency is not None and branch_depth is not None:
+            try:
+                eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
+            except Exception:
+                eff_cap = None
+            if eff_cap and branch_depth >= eff_cap:
+                try:
+                    logger.info(
+                        "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH branch=%s profile=%s depth=%s eff_cap=%s",
+                        branch, profile, branch_depth, eff_cap,
+                    )
+                except Exception:
+                    pass
+                raise EngineSubmitError("ENGINE_BACKPRESSURE_CAP_BRANCH")
+
+        # 2-c) Soft backpressure: high watermark
+        if queue_max and high_wm and depth >= high_wm and overflow_policy == "defer":
+            sleep_ms = int(getattr(self.config, "engine_defer_sleep_ms", 8))
+            await asyncio.sleep(float(sleep_ms) / 1000.0)
+
+        if queue_max and high_wm and depth >= high_wm and overflow_policy == "reject":
+            try:
+                logger.warning(
+                    "[ExecutionEngine] BACKPRESSURE_HIGH_WM branch=%s profile=%s depth=%s high_wm=%s",
+                    branch, profile, depth, high_wm,
+                )
+            except Exception:
+                pass
+            raise EngineSubmitError("ENGINE_BACKPRESSURE_HIGH_WM")
+
+        # 3) Lock REB éventuel (on garde le comportement existant)
         combo = self._bundle_combo_signature(bundle)
         rm = getattr(self, "risk_manager", None)
         if combo and rm and hasattr(rm, "is_rebalancing_locked"):
@@ -2165,25 +2561,33 @@ class ExecutionEngine:
                 logger.info("[ExecutionEngine] combo lock actif (%s) — bundle ignoré", combo_key)
                 return
 
-        # 3) Enqueue + obs
+        # 4) Enqueue + obs
         t0 = time.time()
         job = dict(bundle)
-
         job.setdefault("type", "bundle")
         job["cid"] = cid
+
         await self.order_queue.put(job)
         self._seen_cids[cid] = now
+
         try:
             if hasattr(self, "obs_hist"):
                 self.obs_hist("engine_enqueue_ms", (time.time() - t0) * 1000.0)
         except Exception:
             pass
+
         try:
             if hasattr(self, "_update_submit_queue_gauge"):
                 self._update_submit_queue_gauge()
         except Exception:
             pass
-        self.stats.queue_length = self.order_queue.qsize()
+
+        # Stat interne sur la queue
+        try:
+            self.stats.queue_length = self.order_queue.qsize()
+        except Exception:
+            pass
+
 
     def _prune_seen_cids(self, now: Optional[float] = None) -> None:
         if not hasattr(self, "_seen_cids"):
@@ -3877,34 +4281,26 @@ class ExecutionEngine:
             float((sell_leg.get("meta") or {}).get("allow_loss_bps", 0) or 0),
         )
 
+        # Ticket 9 — aucune décision économique REB dans l'Engine :
+        # le coût net des rebalancings cross-CEX est arbitré côté RiskManager
+        # via _validate_rebalancing_cross / REBAL_CROSS_TOO_EXPENSIVE_TOTAL("rm_validate").
         if is_rebal:
             estimator = getattr(self.risk_manager, "rebal_mgr", None)
             if estimator and hasattr(estimator, "estimate_cross_cex_net_bps"):
                 try:
-                    est_bps_bundle = float(estimator.estimate_cross_cex_net_bps(
+                    # Diagnostic éventuel (logs/metrics à ajouter plus tard si besoin),
+                    # mais sans jamais décider GO/NO-GO économique au niveau Engine.
+                    _ = float(estimator.estimate_cross_cex_net_bps(
                         pair_key=pair_key,
                         from_exchange=sell_leg["exchange"],
                         to_exchange=buy_leg["exchange"],
                     ))
                 except Exception:
-                    est_bps_bundle = None
-                else:
-                    if est_bps_bundle < -allow_loss_bps:
-                        logger.info(
-                            "[ExecutionEngine] rebal bundle %s→%s rejeté (net=%.1f bps < -%.1f)",
-                            sell_leg["exchange"],
-                            buy_leg["exchange"],
-                            est_bps_bundle,
-                            allow_loss_bps,
-                        )
-                        try:
-                            REBAL_CROSS_TOO_EXPENSIVE_TOTAL.labels("engine_bundle").inc()
-                        except Exception:
-                            pass
-                        self._reject(pair_key, payload, "rebalancing_cost")
-                        return
+                    # On ignore l'erreur ici : la vraie validation REB est gérée par le RM.
+                    pass
 
         # Revalidation arbitrage
+        # Revalidation arbitrage (RM = owner économique du min_required_bps)
         try:
             ok_arbi = self.risk_manager.revalidate_arbitrage(
                 buy_ex=buy_leg["exchange"],
@@ -3916,18 +4312,16 @@ class ExecutionEngine:
                 is_rebalancing=is_rebal,
                 allow_final_loss_bps=allow_loss_bps,
             )
-        except TypeError:
-            ok_arbi = self.risk_manager.revalidate_arbitrage(
-                buy_ex=buy_leg["exchange"],
-                sell_ex=sell_leg["exchange"],
-                pair_key=pair_key,
-                expected_net=(expected if expected > 0 else None),
-                max_drift_bps=7.0,
-                min_required_bps=(0.0 if is_rebal else 20.0),
-                is_rebalancing=is_rebal,
-            )
+        except TypeError as e:
+            # Compat legacy : si la signature RM est incompatible, on traite ça comme
+            # une erreur technique (API mismatch) et pas comme une seconde décision
+            # économique locale avec un min_required_bps différent.
+            report_nonfatal("ExecutionEngine", "rm_revalidate_type_error", e, phase="_exec_bundle")
+            self._reject(pair_key, payload, "rm_revalidate_type_error")
+            return
+
         if not ok_arbi and (not is_rebal):
-            self._reject(pair_key, payload, "revalidation arbitrage (dérive/net)")
+            self._reject(pair_key, payload, "revalidation arbitrage (dérive/net)", plane="RM_BPS")
             return
 
         # Guards jambe par jambe (ancre + RM)
@@ -5652,6 +6046,36 @@ class ExecutionEngine:
         self._cleanup_client(client_id)
         return False
 
+    def get_status(self) -> dict:
+        """
+        Statut synthétique de l'ExecutionEngine, y compris wiring Hub.
+        """
+        wiring_info = {
+            "hub_present": bool(self.private_ws_hub),
+            "hub_wiring_checked": bool(self._wiring_checked),
+            "hub_wiring_ok": False,
+        }
+
+        try:
+            if self.private_ws_hub and hasattr(self.private_ws_hub, "get_status"):
+                status = self.private_ws_hub.get_status()
+                w = status.get("wiring", {})
+                wiring_info["hub_wiring_ok"] = bool(
+                    w.get("has_engine_callback") and w.get("has_rm_callback") and not w.get("auto_rm_from_engine")
+                )
+        except Exception:
+            wiring_info["hub_wiring_ok"] = False
+
+        return {
+            "module": "ExecutionEngine",
+            "ready": bool(getattr(self, "_ready", False)),
+            "private_ws": wiring_info,
+            "orders_inflight": len(getattr(self, "_orders", {})),
+            "tm_active": getattr(self, "enable_tm", False),
+            "tt_active": getattr(self, "enable_tt", False),
+        }
+
+
 
 # ---------------------------------------------------------------------------
 # Coinbase signer (Advanced Trade): base64(HMAC_SHA256(secret, prehash))
@@ -5694,25 +6118,38 @@ async def _hist(self: "ExecutionEngine", kind: str, data: dict) -> None:
 # ---------------------------------------------------------------------------
 # Rejet "propre" (stats + navette observabilité + historisation)
 # ---------------------------------------------------------------------------
-def _reject(self: "ExecutionEngine", symbol_or_pair: str, order_or_payload: dict, reason: str) -> None:
+def _reject(
+        self: "ExecutionEngine",
+        symbol_or_pair: str,
+        order_or_payload: dict,
+        reason: str,
+        plane: str = "ENGINE_TECH",
+    ) -> None:
     try:
         self.stats.rejected_by_risk += 1
         sym = str(symbol_or_pair or "").replace("-", "").upper()
         rej = self.stats.rejected_symbols or {}
         rej[sym] = int(rej.get(sym, 0)) + 1
         self.stats.rejected_symbols = rej
+
+        # On ne change pas la signature Prometheus pour ce compteur (reason-only)
         ENGINE_CANCELLATIONS_TOTAL.labels(reason=str(reason or "rejected")).inc()
 
         evt = {
             "status": "rejected",
             "reason": reason,
+            "plane": plane,
             "symbol": sym,
-            "payload": {k: order_or_payload.get(k) for k in ("type", "exchange", "side", "price", "volume_usdc", "meta")},
+            "payload": {
+                k: order_or_payload.get(k)
+                for k in ("type", "exchange", "side", "price", "volume_usdc", "meta")
+            },
             "ts": time.time(),
         }
         asyncio.create_task(self._hist("reject", evt))
     except Exception:
         logging.exception("ExecutionEngine._reject: error")
+
 
 # ---------------------------------------------------------------------------
 # Notification fill DRY-RUN (listeners + stats)

@@ -26,7 +26,7 @@ API d’entrée/sortie inchangée côté snapshots ; clés out_queues explicites
 """
 
 
-
+import mapping
 import asyncio, contextlib, inspect, logging, math, time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
@@ -46,9 +46,11 @@ except Exception:  # pragma: no cover
 
 # --- Observability (canonique) ----------------------------------------------
 # On importe TOUT depuis modules.obs_metrics ; si non dispo, on no-op.
+# --- Observability (canonique) ----------------------------------------------
+# On importe TOUT depuis modules.obs_metrics ; si non dispo, on no-op.
 try:
     from modules.obs_metrics import (
-        mark_router_to_scanner,
+        mark_router_to_scanner_ts,
         ROUTER_QUEUE_DEPTH,
         ROUTER_PAIR_QUEUE_DEPTH,
         ROUTER_QUEUE_DEPTH_BY_EX,
@@ -57,12 +59,21 @@ try:
         WS_RECONNECTS_TOTAL,
     )
 except Exception:  # pragma: no cover
-    def mark_router_to_scanner(ts_start_ns: int) -> None:
+    def mark_router_to_scanner_ts(
+        ts_start_ns: int,
+        *,
+        route: str = "tri_cex",
+        ok: bool = True,
+        reason: str = "ok",
+        **labels: Any,
+    ) -> None:
         return
+
     class _NoopMetric:
         def labels(self, *a, **k): return self
         def inc(self, *a, **k):    return None
         def set(self, *a, **k):    return None
+
     ROUTER_QUEUE_DEPTH = _NoopMetric()
     ROUTER_PAIR_QUEUE_DEPTH = _NoopMetric()
     ROUTER_QUEUE_DEPTH_BY_EX = _NoopMetric()
@@ -196,10 +207,71 @@ class MarketDataRouter:
             for (a, b) in (combos or [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")])
         ]
 
-        # out_queues : clés explicites "combo:..." et "cex:..."
-        self.out_queues: Dict[str, Dict[str, asyncio.Queue]] = out_queues or self.build_default_out_queues(
-            combos=self.combos, maxsize=2000
-        )
+        # --- Queues de sortie vers Scanner / Vol / Slip / Health -------------------
+        if out_queues is not None:
+            # Boot peut injecter un mapping explicite pré-construit
+            self.out_queues = out_queues
+        else:
+            # P0 Marché Public — tailles de queues pilotées par BotConfig.router
+            # 1) base globale (ROUTER_OUT_QUEUES_MAXLEN)
+            base_max = 2000  # fallback legacy
+            router_cfg = None
+            try:
+                cfg = getattr(self, "bot_cfg", None)
+                router_cfg = getattr(cfg, "router", None) if cfg is not None else None
+                v = getattr(router_cfg, "out_queues_maxlen", None) if router_cfg is not None else None
+                if v is not None:
+                    base_max = int(v)
+            except Exception:
+                # on garde le fallback 2000 si la cfg n'est pas disponible
+                base_max = 2000
+
+            if base_max <= 0:
+                base_max = 2000
+
+            # 2) Priorité à la map stream-centrics si fournie (ROUTER_OUT_QUEUES_MAXLEN_BY_KIND)
+            custom_by_kind: Dict[str, int] = {}
+            if router_cfg is not None:
+                try:
+                    raw = getattr(router_cfg, "out_queues_maxlen_by_kind", {}) or {}
+                    if isinstance(raw, dict):
+                        # on force en int, on filtre les valeurs invalides
+                        custom_by_kind = {
+                            str(k): int(v)
+                            for k, v in raw.items()
+                            if v is not None
+                        }
+                except Exception:
+                    custom_by_kind = {}
+
+            if custom_by_kind:
+                # On s'assure que tous les streams critiques ont une capacité définie
+                other_default = max(1000, base_max // 2)
+                maxsize_spec: int | Dict[str, int] = dict(custom_by_kind)
+                # combo = flux critique (Router → Scanner)
+                maxsize_spec.setdefault("combo", int(base_max))
+                # vol/slip/health = au moins un plancher raisonnable
+                maxsize_spec.setdefault("vol", int(other_default))
+                maxsize_spec.setdefault("slip", int(other_default))
+                maxsize_spec.setdefault("health", int(other_default))
+            else:
+                # Fallback P0 documenté :
+                #   - la file "combo" prend la capacité complète (base_max)
+                #   - les files vol/slip/health prennent une fraction (base_max // 2, plancher 1000)
+                #   ex: base_max=5000  => combo=5000, vol/slip/health=2500
+                other_max = max(1000, base_max // 2)
+                maxsize_spec: int | Dict[str, int] = {
+                    "combo": int(base_max),
+                    "vol": int(other_max),
+                    "slip": int(other_max),
+                    "health": int(other_max),
+                }
+
+            self.out_queues = self.build_default_out_queues(
+                combos=self.combos,
+                maxsize=maxsize_spec,
+            )
+
 
         # vues latest (full & light) + lock
         self._latest_lock = asyncio.Lock()
@@ -526,9 +598,30 @@ class MarketDataRouter:
         ts = int(d.get("exchange_ts_ms") or d.get("recv_ts_ms") or 0)
         return price, ts
 
-    def _new_deque_for(self, ex: str) -> "collections.deque":
-        exu = str(ex).upper()
-        per_ex = getattr(self.bot_cfg, "ROUTER_DEQUE_MAXLEN_PER_EX", {}) if hasattr(self, "bot_cfg") else {}
+    def _new_deque_for(self, ex: str, *, key: str) -> deque:
+        """
+        Crée un deque pour le cache par exchange, dimensionné via RouterCfg.deque_maxlen_per_ex.
+
+        Gouvernance P0 :
+          - BotConfig.router.deque_maxlen_per_ex est la source unique.
+          - Fallback legacy : champ plat ROUTER_DEQUE_MAXLEN_PER_EX si présent.
+          - DEFAULT sert de base pour tous les exchanges non explicitement configurés.
+        """
+        exu = ex.upper()
+        per_ex: Mapping[str, int] = {}
+
+        cfg = getattr(self, "bot_cfg", None)
+        if cfg is not None:
+            try:
+                router_cfg = getattr(cfg, "router", None)
+                if router_cfg is not None:
+                    per_ex = getattr(router_cfg, "deque_maxlen_per_ex", {}) or {}
+            except Exception:
+                per_ex = {}
+            if not per_ex:
+                # fallback legacy sur l'ancien champ plat
+                per_ex = getattr(cfg, "ROUTER_DEQUE_MAXLEN_PER_EX", {}) or {}
+
         default = int(per_ex.get("DEFAULT", getattr(self, "coalesce_maxlen", 8)))
         mx = int(per_ex.get(exu, default))
         return deque(maxlen=mx)
@@ -607,13 +700,31 @@ class MarketDataRouter:
         flush_every_ms = max(5, getattr_int(self, "coalesce_window_ms", 20))
         hb_every_ms = 1000
         last_flush_ms = last_hb_ms = int(time.time() * 1000)
+
+        # P0 Marché Public — backpressure piloté par BotConfig.router.backpressure
         bp_cfg = getattr(self, "bot_cfg", None)
-        bp = getattr(bp_cfg, "ROUTER_BACKPRESSURE", {}) if bp_cfg else {}
+        bp: Dict[str, Any] = {}
+        if bp_cfg is not None:
+            # Priorité à RouterCfg.backpressure, fallback sur l'ancien champ plat ROUTER_BACKPRESSURE
+            try:
+                router_cfg = getattr(bp_cfg, "router", None)
+                if router_cfg is not None:
+                    bp = getattr(router_cfg, "backpressure", {}) or {}
+            except Exception:
+                bp = {}
+            if not bp:
+                try:
+                    bp = getattr(bp_cfg, "ROUTER_BACKPRESSURE", {}) or {}
+                except Exception:
+                    bp = {}
+
         wm_ratio = float(bp.get("HIGH_WM_RATIO", 0.70))
         bump_ms = int(bp.get("BP_COALESCE_BUMP_MS", 8))
         grow = int(bp.get("BP_DEQUE_GROW", 8))
         cooldown = float(bp.get("COOLDOWN_S", 5.0))
         bp_until = 0.0
+
+        # Valeurs de base de coalescing / profondeur, pilotées par la cfg Router
         base_coalesce_ms = getattr_int(self, "coalesce_window_ms", 20)
         base_maxlen = getattr_int(self, "coalesce_maxlen", 8)
 
@@ -1241,9 +1352,12 @@ class MarketDataRouter:
             self._update_queue_depth_metrics_for(ex)
 
     # ----------------------------- Push vers Scanner -----------------------------
+    # ----------------------------- Push vers Scanner -----------------------------
     async def _push_to_scanner(self, ev_a: Dict[str, Any], ev_b: Dict[str, Any]) -> None:
         """Push ultra-low-latency de deux L1 vers le scanner (sync/async)."""
         ts0 = time.perf_counter_ns()
+        ok = False
+        reason = "ok"
         try:
             upd = getattr(self.scanner, "update_orderbook", None)
             if inspect.iscoroutinefunction(upd):
@@ -1252,12 +1366,15 @@ class MarketDataRouter:
             else:
                 upd(ev_a)  # type: ignore
                 upd(ev_b)  # type: ignore
+            ok = True
         except Exception as e:
+            reason = "exception"
             report_nonfatal("MarketDataRouter", "scanner_update_failed", e)
             logger.exception("[Router] update_orderbook error")
         finally:
             try:
-                mark_router_to_scanner(ts0)
+                # route logique : tri_cex (aligné avec obs)
+                mark_router_to_scanner_ts(ts0, route="tri_cex", ok=ok, reason=reason)
             except Exception:
                 # Pas critique
                 pass
@@ -1443,43 +1560,6 @@ class MarketDataRouter:
             "ws_source_backpressure": self._ws_backpressure_state,
         }
 
-# === BEGIN LATENCY INSTRUMENTATION (Router) ===
-try:
-    import time, inspect
-    from modules.obs_metrics import mark_router_to_scanner
-    RouterClass = None
-    for _n, _o in list(globals().items()):
-        if _n in ("MarketDataRouter", "MarketDataRouterV2") and isinstance(_o, type):
-            RouterClass = _o
-            break
-
-    if RouterClass:
-        for meth_name in ("_push_to_scanner", "push_to_scanner", "emit_to_scanner"):
-            if hasattr(RouterClass, meth_name):
-                _orig = getattr(RouterClass, meth_name)
-                if inspect.iscoroutinefunction(_orig):
-                    async def _wrapped(self, *args, __orig=_orig, **kwargs):
-                        ts = time.perf_counter_ns()
-                        try:
-                            return await __orig(self, *args, **kwargs)
-                        finally:
-                            try: mark_router_to_scanner(ts)
-                            except Exception:
-                                logging.exception("Unhandled exception")
-                else:
-                    def _wrapped(self, *args, __orig=_orig, **kwargs):
-                        ts = time.perf_counter_ns()
-                        try:
-                            return __orig(self, *args, **kwargs)
-                        finally:
-                            try: mark_router_to_scanner(ts)
-                            except Exception:
-                                logging.exception("Unhandled exception")
-                setattr(RouterClass, meth_name, _wrapped)
-                break
-except Exception:
-    logging.exception("Unhandled exception")
-# === END LATENCY INSTRUMENTATION (Router) ===
 
 # PATCH 6 — Mux WS sharding (fan-in 2–3 sockets/venue → in_queue du Router)
 # À coller n’importe où dans le module (niveau top), usage optionnel:

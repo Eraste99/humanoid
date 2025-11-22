@@ -525,6 +525,26 @@ class DynamicExecutionSimulator:
             return (None, abs(vwap_sell - vwap_buy))
 
         deviation = abs(vwap_sell - vwap_buy)
+        # --- Ticket 4: traçage du capital basé sur MBF (budget RM -> usage simu) ---
+        try:
+            capital_budget_usdc = max(0.0, float(capital_available_usdc))
+        except Exception:
+            capital_budget_usdc = 0.0
+
+        capital_used_usdc = float(total_cost)
+        capital_usage_ratio = (
+            capital_used_usdc / capital_budget_usdc if capital_budget_usdc > 0 else 0.0
+        )
+        over_budget = capital_budget_usdc > 0 and capital_used_usdc > capital_budget_usdc * 1.000001
+
+        if over_budget and not rebalancing_mode:
+            # On loggue pour gouvernance capital, mais on ne bloque pas la simu.
+            logger.warning(
+                "[Sim] volume executable (%.2f USDC) > budget capital (%.2f USDC) "
+                "(budget dérivé MBF/RM - Ticket 4)",
+                capital_used_usdc,
+                capital_budget_usdc,
+            )
 
         trade_id = self._mk_trade_id(strategy=strategy.upper(), combo_key=combo_key, pair=symbol)
         result = {
@@ -554,6 +574,12 @@ class DynamicExecutionSimulator:
                 "count": int(max(1, fragment_count)),
                 "avg_fragment_usdc": round(fragment_usdc, 2),
                 "auto": bool(auto_fragment),
+            },
+            "capital": {
+                "input_budget_usdc": round(capital_budget_usdc, 2),
+                "used_usdc": round(capital_used_usdc, 2),
+                "usage_ratio": round(capital_usage_ratio, 4),
+                "over_budget": bool(over_budget),
             },
         }
         if maker_price_used is not None:

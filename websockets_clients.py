@@ -59,6 +59,32 @@ except Exception:  # pragma: no cover
     WS_CONNECTIONS_OPEN = _Noop()
     WS_PUBLIC_DROPPED_TOTAL = _Noop()
 
+# --- Helpers d'observabilité WS publics (labels exchange / region / deployment_mode) ---
+try:
+    from modules.obs_metrics import (
+        ws_public_note_connection_open,
+        ws_public_note_connection_closed,
+        ws_public_note_reconnect,
+        ws_public_note_event_ok,
+        ws_public_note_event_dropped,
+    )
+except Exception:  # pragma: no cover
+    # Fallback no-op : on ne casse jamais le flux WS si obs_metrics n'est pas à jour
+    def ws_public_note_connection_open(*a, **k):  # type: ignore[no-redef]
+        return None
+
+    def ws_public_note_connection_closed(*a, **k):  # type: ignore[no-redef]
+        return None
+
+    def ws_public_note_reconnect(*a, **k):  # type: ignore[no-redef]
+        return None
+
+    def ws_public_note_event_ok(*a, **k):  # type: ignore[no-redef]
+        return None
+
+    def ws_public_note_event_dropped(*a, **k):  # type: ignore[no-redef]
+        return None
+
 
 logger = logging.getLogger("WebSocketExchangeClient")
 
@@ -160,6 +186,23 @@ class WebSocketExchangeClient:
         self.url = url
         self.loop = loop
         self.verbose = bool(verbose)
+
+        # --- contexte région / mode (pod) ---
+        # Source: BotConfig / Boot (pas de heuristique locale ici)
+        base_cfg = getattr(cfg, "bot_cfg", cfg)
+        pod_region = getattr(base_cfg, "POD_REGION", "EU")
+        dep_mode = getattr(base_cfg, "DEPLOYMENT_MODE", "EU_ONLY")
+
+        # Normalisation en MAJUSCULES pour les labels Prometheus
+        self.region = str(pod_region).upper()
+        self.deployment_mode = str(dep_mode).upper()
+
+        # --- cfg.ws_public (source de vérité) ---
+        wscfg = self.cfg.ws_public
+        bo_cfg = dict(getattr(wscfg, "ws_backoff", {}))
+        cfg_bo_base_s = float(bo_cfg.get("base_ms", 500)) / 1000.0
+        cfg_bo_cap_s = float(bo_cfg.get("max_ms", 15_000)) / 1000.0
+        cfg_bo_jitter = bool(bo_cfg.get("jitter", 1))
 
         # --- cfg.ws_public (source de vérité) ---
         wscfg = self.cfg.ws_public
@@ -449,39 +492,82 @@ class WebSocketExchangeClient:
 
     # --- métriques internes par exchange ---
     def _metrics_conn_open(self, exchange: str) -> None:
+        ex = exchange.upper()
         try:
-            ex = exchange.upper()
+            # compteur local par exchange
             self._open_by_exchange[ex] = max(0, int(self._open_by_exchange.get(ex, 0)) + 1)
-            WS_CONNECTIONS_OPEN.labels(exchange=ex).set(self._open_by_exchange[ex])
+            # métrique legacy (exchange-only) pour compatibilité
+            WS_CONNECTIONS_OPEN.labels(exchange=ex).set(self._open_by_exchange[ex])  # type: ignore[name-defined]
         except Exception:
-            logging.exception("Unhandled exception")
+            logging.exception("Unhandled exception in _metrics_conn_open")
+        # helper high-level labelisé exchange / region / deployment_mode
+        try:
+            ws_public_note_connection_open(  # type: ignore[name-defined]
+                exchange=ex,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+                open_count=self._open_by_exchange.get(ex, 0),
+            )
+        except Exception:
+            # on ne casse jamais le flux WS pour un problème de métriques
+            pass
 
     def _metrics_conn_closed(self, exchange: str) -> None:
+        ex = exchange.upper()
         try:
-            ex = exchange.upper()
             self._open_by_exchange[ex] = max(0, int(self._open_by_exchange.get(ex, 0)) - 1)
-            WS_CONNECTIONS_OPEN.labels(exchange=ex).set(self._open_by_exchange[ex])
-        except Exception:
-            logging.exception("Unhandled exception")
-
-    def _metrics_reconnect(self, exchange: str, delay_s: float, *, reason: str) -> None:
-        try:
-            ex = exchange.upper()
-            try:
-                WS_RECONNECTS_TOTAL.labels(exchange=ex, reason=reason).inc()
-            except Exception:
-                WS_RECONNECTS_TOTAL.labels(exchange=ex).inc()
-            WS_BACKOFF_SECONDS.labels(exchange=ex).set(max(0.0, float(delay_s)))
+            if self._open_by_exchange[ex] <= 0:
+                self._open_by_exchange[ex] = 0
+            # métrique legacy (exchange-only)
+            WS_CONNECTIONS_OPEN.labels(exchange=ex).set(self._open_by_exchange[ex])  # type: ignore[name-defined]
         except Exception:
             pass
+        # helper high-level labelisé exchange / region / deployment_mode
+        try:
+            ws_public_note_connection_closed(  # type: ignore[name-defined]
+                exchange=ex,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+                open_count=self._open_by_exchange.get(ex, 0),
+            )
+        except Exception:
+            pass
+
+    def _metrics_reconnect(self, exchange: str, delay_s: float, *, reason: str) -> None:
+        ex = exchange.upper()
+        # métriques legacy (compat dashboards actuels)
+        try:
+            try:
+                WS_RECONNECTS_TOTAL.labels(exchange=ex, reason=reason).inc()  # type: ignore[name-defined]
+            except Exception:
+                WS_RECONNECTS_TOTAL.labels(exchange=ex).inc()  # type: ignore[name-defined]
+            WS_BACKOFF_SECONDS.labels(exchange=ex).set(max(0.0, float(delay_s)))  # type: ignore[name-defined]
+        except Exception:
+            pass
+        # helper high-level avec labels exchange / region / deployment_mode
+        try:
+            ws_public_note_reconnect(  # type: ignore[name-defined]
+                exchange=ex,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+                reason=reason,
+                delay_s=float(delay_s),
+            )
+        except Exception:
+            pass
+        # logging texte inchangé
         try:
             logger.info(
                 '{"ws_event":"reconnect_scheduled","exchange":"%s","delay_s":%.3f,'
                 '"policy":"decorr_jitter","open_conns":%d,"reason":"%s"}',
-                ex, float(delay_s), int(self._open_connections), reason,
+                ex,
+                float(delay_s),
+                int(self._open_connections),
+                reason,
             )
         except Exception:
-            logging.exception("Unhandled exception")
+            logger.exception("Erreur lors du log de reconnect WS")
+
 
     # ------------------- mapping utils -------------------
     def _rebuild_inv_map(self):
@@ -657,7 +743,20 @@ class WebSocketExchangeClient:
     def _note_out_success(self, exchange: str) -> None:
         now = time.time()
         self._last_publish_ts = now
-        self._last_publish_by_exchange[exchange] = now
+        ex = exchange.upper()
+        self._last_publish_by_exchange[ex] = now
+
+        # helper high-level: "événement WS publié avec succès"
+        try:
+            ws_public_note_event_ok(  # type: ignore[name-defined]
+                exchange=ex,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+                kind="combo",
+            )
+        except Exception:
+            pass
+
         self._flush_control_events()
 
     def _note_backpressure(self, exchange: str, *, reason: str) -> None:
@@ -665,18 +764,43 @@ class WebSocketExchangeClient:
         self._out_queue_drops[ex] += 1
         self._out_queue_last_drop_reason[ex] = reason
         self._out_queue_last_drop_ts[ex] = time.time()
+
+        # métrique legacy (exchange + reason)
         try:
-            WS_PUBLIC_DROPPED_TOTAL.labels(exchange=ex, reason=reason).inc()
+            WS_PUBLIC_DROPPED_TOTAL.labels(exchange=ex, reason=reason).inc()  # type: ignore[name-defined]
         except Exception:
             pass
+
+        # helper high-level avec labels exchange / region / deployment_mode
+        try:
+            ws_public_note_event_dropped(  # type: ignore[name-defined]
+                exchange=ex,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+                reason=reason,
+                kind="combo",
+            )
+        except Exception:
+            pass
+
+        try:
+            logger.warning(
+                "Backpressure on out_queue for %s, drop #%d, reason=%s",
+                ex,
+                self._out_queue_drops[ex],
+                reason,
+            )
+        except Exception:
+            logger.exception("Erreur lors du log de backpressure")
+
         payload = {
-            "__ws_backpressure__": True,
+            "kind": "ws_backpressure",
             "exchange": ex,
             "reason": reason,
             "drops": self._out_queue_drops[ex],
-            "ts_ms": int(time.time() * 1000),
         }
         self._queue_control_event(payload)
+
 
     def _queue_control_event(self, payload: Dict[str, Any]) -> None:
         self._control_events_pending.append(payload)

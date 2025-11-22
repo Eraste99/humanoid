@@ -772,7 +772,7 @@ async def main() -> None:
     # Obs
     metrics = _metrics_factory()
     metrics.set_deployment_info(region, dep_mode, cap_profile)
-
+    cfg.status_sink = status_bus
 
     # Alertes
     alerts = _load_alert_dispatcher(cfg)

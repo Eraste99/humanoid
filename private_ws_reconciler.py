@@ -13,7 +13,7 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import Callable, Awaitable, Optional, Tuple, List, Dict, Any,Set
+from typing import Callable, Awaitable, Optional, Tuple, List, Dict, Any, Set, Deque
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 try:
@@ -165,13 +165,34 @@ class PrivateWSReconciler:
         self._resync_alias: Optional[Callable[[str, str], Awaitable[bool]]] = None
 
         # Dédup bornée (client_id/fill-key)
+        # Dédup bornée (client_id/fill-key)
         self._seen_keys = _LRUSet(maxlen=int(dedup_max))
 
-        # Champs client_id tolérants (fallback si évènement non normalisé)
+        # Champs client_id tolérants (fallback si évènement non normalisé).
+        # Ordre de priorité:
+        #   1) client_id "métier" (Engine)
+        #   2) variantes clientOrderId
+        #   3) identifiants CEX (exchange_order_id / orderId/...)
         self._client_id_fields = (
-            "client_id", "clientOrderId", "client_order_id", "clientId",
-            "cl_id", "cid"
+            # ID logique piloté par l'Engine / RM
+            "client_id",
+            # Variantes clientOrderId (CEX)
+            "clientOrderId",
+            "client_order_id",
+            "clientId",
+            "origClientOrderId",
+            # ID CEX (fallback si client_id absent)
+            "exchange_order_id",
+            "orderId",
+            "order_id",
+            "orderID",
+            "clOrdID",
+            "client_oid",
+            # Héritage/local
+            "cl_id",
+            "cid",
         )
+
         # Cold-resync scheduler (désactivé si request_full_resync absent)
         self._cold_every_h = float(getattr(self, "cold_resync_interval_h", 6.0))
         self._cold_task = None
@@ -179,7 +200,8 @@ class PrivateWSReconciler:
         self._missing_hook_warned: Set[Tuple[str, str, str]] = set()
 
         # Fenêtre glissante pour le taux de miss (~60s)
-        self._miss_win: Deque[float] = collections.deque(maxlen=512)
+        # NB: on utilise directement deque(), importé depuis collections.
+        self._miss_win: Deque[float] = deque(maxlen=512)
         self._miss_alert_task: Optional[asyncio.Task] = None
 
 
@@ -189,6 +211,24 @@ class PrivateWSReconciler:
             self._miss_win.append(_now())
         except Exception as exc:
             log.exception("[Reconciler] unable to record miss: %s", exc)
+
+    def _compute_miss_rate_per_minute(self) -> float:
+        """
+        Retourne le taux de miss/minute sur la fenêtre glissante (~60s).
+
+        Utilisé par :
+          - run_miss_alerts (Prometheus/alerting),
+          - health()/get_alias_status_snapshot (statut métier alias).
+        """
+        try:
+            now = _now()
+            win = self._miss_win
+            # On nettoie localement au cas où run_miss_alerts n'est pas actif.
+            while win and (now - win[0]) > 60.0:
+                win.popleft()
+            return float(len(win))
+        except Exception:
+            return 0.0
 
 
     async def run_miss_alerts(self, threshold_per_minute: int = 30, period_s: float = 5.0) -> None:
@@ -439,32 +479,72 @@ class PrivateWSReconciler:
 
     def observe_fill_event(self, ev: dict) -> None:
         """
-        À appeler dès réception d’un *fill* (évènement Hub).
-        - Détecte les 'miss' (fill sans inflight connu) via _lookup/_is_inflight.
-        - Incrémente RECONCILE_MISS_TOTAL{exchange,alias,reason}.
+        À appeler dès réception d’un *fill* (évènement déjà normalisé par Hub/RM).
+
+        Contrat minimal pour ev:
+          - type="fill"
+          - status in {"FILL", "PARTIAL"}
+          - exchange, alias
+          - au moins un identifiant corrélable: client_id ou exchange_order_id
+
+        Rôle:
+          - Détecter les "miss" (fill sans inflight connu) via _lookup/_is_inflight.
+          - Alimenter RECONCILE_MISS_TOTAL{exchange,alias,reason}.
         """
-        ex = (ev or {}).get("exchange") or "UNKNOWN"
-        al = (ev or {}).get("alias") or "-"
+        if not ev:
+            return
+
+        # Normalisation légère
+        ex = str((ev.get("exchange") or "UNKNOWN")).upper()
+        al = str((ev.get("alias") or "-")).upper()
         cid = self._extract_client_id(ev)
         key = (ex, al)
 
+        # Sans identifiant corrélable => violation du contrat en amont (Hub/RM)
+        if not cid:
+            reason = "no_id"
+            try:
+                RECONCILE_MISS_TOTAL.labels(ex, al, reason).inc()
+                self._record_miss()
+            except Exception:
+                pass
+            try:
+                log.warning(
+                    "[Reconciler:%s:%s] observe_fill_event sans client_id/exchange_order_id, drop head=%s",
+                    ex,
+                    al,
+                    {
+                        "symbol": ev.get("symbol"),
+                        "side": ev.get("side"),
+                        "status": ev.get("status"),
+                        "type": ev.get("type"),
+                    },
+                )
+            except Exception:
+                pass
+            # On incrémente le compteur de miss alias pour déclencher la logique de resync
+            self._alias_miss_counter[key] = int(self._alias_miss_counter.get(key, 0)) + 1
+            return
+
         inflight = None
         try:
-            if callable(self._lookup) and cid:
+            if callable(self._lookup):
                 inflight = self._lookup(ex, al, cid)
-            elif callable(self._is_inflight) and cid:
+            elif callable(self._is_inflight):
                 inflight = True if self._is_inflight(cid) else None
         except Exception:
             inflight = None
 
         if inflight is None:
-            reason = "orphan" if cid else "unknown"
+            # Fill "orphelin" (pas d'ordre inflight correspondant côté Engine)
+            reason = "orphan"
             try:
                 RECONCILE_MISS_TOTAL.labels(ex, al, reason).inc()
                 self._record_miss()
             except Exception:
                 pass
             self._alias_miss_counter[key] = int(self._alias_miss_counter.get(key, 0)) + 1
+
 
     async def correlate_and_maybe_resync(self, exchange: str, alias: str, client_id: Optional[str]) -> None:
         """
@@ -656,23 +736,120 @@ class PrivateWSReconciler:
             except Exception:
                 logging.exception("Unhandled exception (miss_alerts)")
 
-
     def health(self, exchange: str, alias: str) -> dict:
-        key = (exchange, alias)
+        """
+        Vue santé/corrélation pour un couple (exchange, alias).
+
+        Inclut:
+          - métriques locales (misses, dernier resync alias),
+          - état de wiring des hooks requis:
+              * _lookup
+              * _is_inflight
+              * _resync_order
+              * _resync_alias
+          - un statut métier dérivé pour l'alias du point de vue Reconciler.
+        """
+        # On normalise en UPPER pour coller aux clés internes (_alias_miss_counter)
+        ex_u = str(exchange).upper()
+        alias_u = str(alias).upper()
+        key = (ex_u, alias_u)
+
         last = float(self._last_alias_resync.get(key, 0.0))
         age = (time.time() - last) if last else None
+
+        wiring = {
+            "lookup": callable(getattr(self, "_lookup", None)),
+            "is_inflight": callable(getattr(self, "_is_inflight", None)),
+            "resync_order": callable(getattr(self, "_resync_order", None)),
+            "resync_alias": callable(getattr(self, "_resync_alias", None)),
+        }
+        wiring_ok = all(bool(v) for v in wiring.values())
+
+        misses_recent = int(self._alias_miss_counter.get(key, 0))
+        miss_rate_per_min = self._compute_miss_rate_per_minute()
+
+        # Heuristique de classement local (Reconciler-only)
+        cfg = getattr(self, "cfg", None)
+        try:
+            burst_thr = float(getattr(cfg, "RECO_MISS_BURST_THRESHOLD", 30.0))
+        except Exception:
+            burst_thr = 30.0
+        try:
+            recent_thr = float(getattr(cfg, "RECO_MISS_RECENT_THRESHOLD", burst_thr))
+        except Exception:
+            recent_thr = burst_thr
+        try:
+            max_age_s = float(getattr(cfg, "RECO_ALIAS_RESYNC_MAX_AGE_S", 6 * 3600.0))
+        except Exception:
+            max_age_s = 6 * 3600.0
+
+        age_val = float(age or 0.0)
+
+        if not wiring_ok:
+            status = "UNKNOWN"
+        elif misses_recent <= 0 and miss_rate_per_min <= 0.0:
+            # Pas de signal suspect récent
+            status = "OK"
+        else:
+            # Cas sévère : bursts forts + pas de resync récent -> BROKEN
+            if miss_rate_per_min >= 2.0 * burst_thr and age_val > max_age_s:
+                status = "BROKEN"
+            # Cas intermédiaire : bursts, beaucoup de miss ou resync trop ancien -> AT_RISK
+            elif (
+                    miss_rate_per_min >= burst_thr
+                    or misses_recent >= recent_thr
+                    or age_val > max_age_s
+            ):
+                status = "AT_RISK"
+            else:
+                status = "OK"
+
         return {
             "venue": self.venue,
-            "exchange": exchange,
-            "alias": alias,
-            "misses_recent": int(self._alias_miss_counter.get(key, 0)),
+            "exchange": ex_u,
+            "alias": alias_u,
+            "misses_recent": misses_recent,
+            "miss_rate_per_min": miss_rate_per_min,
             "last_alias_resync_ts": last,
             "age_since_last_alias_resync_s": age,
-            "cooldown_s": self._cooldown_s,
-            "stale_ms": self._stale_ms,
-            "poll_every_s": self._poll_every_s,
-            "running": self._task is not None and not self._task.done(),
+            "wiring": wiring,
+            "wiring_ok": wiring_ok,
+            "status": status,
         }
+
+    def get_alias_status_snapshot(self, exchange: str, alias: str) -> Dict[str, Any]:
+        """
+        Snapshot stable pour un couple (exchange, alias) destiné aux
+        consommateurs externes (MBF, RM, watchdog, etc.).
+
+        Retourne un dict minimal avec :
+          - exchange, alias
+          - status ("OK" | "AT_RISK" | "BROKEN" | "UNKNOWN")
+          - misses_recent, miss_rate_per_min
+          - last_alias_resync_ts, age_since_last_alias_resync_s
+          - wiring_ok, wiring
+        """
+        h = self.health(exchange, alias) or {}
+        return {
+            "exchange": h.get("exchange", str(exchange).upper()),
+            "alias": h.get("alias", str(alias).upper()),
+            "status": h.get("status", "UNKNOWN"),
+            "misses_recent": int(h.get("misses_recent", 0) or 0),
+            "miss_rate_per_min": float(h.get("miss_rate_per_min", 0.0) or 0.0),
+            "last_alias_resync_ts": h.get("last_alias_resync_ts"),
+            "age_since_last_alias_resync_s": h.get("age_since_last_alias_resync_s"),
+            "wiring_ok": bool(h.get("wiring_ok", False)),
+            "wiring": h.get("wiring", {}) or {},
+        }
+
+    def is_alias_at_risk(self, exchange: str, alias: str) -> bool:
+        """
+        Helper métier : True si l'alias est considéré 'à risque' du point de vue
+        Reconciler (utilisé plus tard par MBF/RM pour marquer le capital à risque).
+        """
+        snap = self.get_alias_status_snapshot(exchange, alias)
+        return snap.get("status") in ("AT_RISK", "BROKEN")
+
 
     def start_cold_resync_loop(self, *, period_hours: float = 6.0) -> None:
         """Déclenche un full-resync périodique; ne bloque jamais et supporte Cancel."""

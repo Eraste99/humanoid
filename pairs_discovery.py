@@ -342,22 +342,16 @@ async def discover_pairs_3cex(
     rp_cfg         = dict(getattr(d, "retry_policy", {"base_ms":500,"max_ms":20_000,"max_attempts":5,"jitter":1}))
     quotes_allowed = set(q.upper() for q in getattr(d, "quotes_allowed", ["USDC","EUR"]))
     # Seuils: si non fournis, dériver de min_24h_volume_usd (EUR = 0.3x par défaut comme ta version)
+
     # Seuils: si non fournis en args, on lit la conf; sinon on dérive d’un base_min
     base_min = getattr_float(d, "min_24h_volume_usd", 100_000.0)
-
     conf_usdc = getattr(d, "min_quote_volume_usdc", None)
     conf_eur = getattr(d, "min_quote_volume_eur", None)
+    eur_factor = getattr_float(d, "eur_quote_volume_factor", 0.30)
+    eur_floor = getattr_float(d, "min_quote_volume_floor", 1.0)
 
-    thr_usdc = float(
-        min_quote_volume_usdc
-        if min_quote_volume_usdc is not None else
-        (conf_usdc if conf_usdc is not None else base_min)
-    )
-    thr_eur = float(
-        min_quote_volume_eur
-        if min_quote_volume_eur is not None else
-        (conf_eur if conf_eur is not None else max(1.0, 0.30 * base_min))
-    )
+    thr_usdc = conf_usdc if conf_usdc is not None else base_min
+    thr_eur = conf_eur if conf_eur is not None else max(eur_floor, eur_factor * base_min)
 
     # Listes allow/deny (args > cfg)
     whitelist = set(x.upper() for x in (allowlist if allowlist is not None else getattr(d, "whitelist", [])))
