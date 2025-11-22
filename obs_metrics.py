@@ -210,6 +210,9 @@ def lbl_exchange(ex: str) -> str:
     ex = _norm(ex).upper()
     return ex if ex in ('BINANCE', 'BYBIT', 'COINBASE') else ex
 
+def lbl_alias(alias: str) -> str:
+    return _norm(alias).upper()
+
 def lbl_region(r: str) -> str:
     r = _norm(r).upper()
     return r if r in ('EU', 'US', 'EU-CB') else r
@@ -357,18 +360,18 @@ BF_FEE_TOKEN_LOW_TOTAL = _metric(
 
 def mark_bf_latency(exchange: str, alias: str, seconds: float, ok: bool, endpoint: str='generic', reason: str='ok') -> None:
     try:
-        BF_API_LATENCY_MS.labels(lbl_exchange(exchange), _norm(alias), _norm(endpoint)).observe(
+        BF_API_LATENCY_MS.labels(lbl_exchange(exchange), lbl_alias(alias), _norm(endpoint)).observe(
             max(0.0, float(seconds * 1000.0))
         )
         if not ok:
             BF_API_ERRORS_TOTAL.labels(
                 lbl_exchange(exchange),
-                _norm(alias),
+                lbl_alias(alias),
                 _norm(endpoint),
                 _norm(reason or 'error'),
             ).inc()
         else:
-            BF_LAST_SUCCESS_TS.labels(lbl_exchange(exchange), _norm(alias)).set(time.time())
+            BF_LAST_SUCCESS_TS.labels(lbl_exchange(exchange), lbl_alias(alias)).set(time.time())
     except Exception:
         pass
 RPC_LATENCY_MS = _metric(Histogram, 'rpc_latency_ms', 'RPC latency (ms)', ['method', 'region'], buckets=BUCKETS_MS)
@@ -450,6 +453,42 @@ RM_DROPPED_TOTAL = _metric(Counter, 'rm_dropped_total', 'Opportunities dropped b
 STALE_OPPORTUNITY_DROPPED_TOTAL = _metric(Counter, 'stale_opportunity_dropped_total', 'Opportunities dropped due to stale/invalid orderbooks')
 PAIR_HEALTH_PENALTY_TOTAL = _metric(Counter, 'pair_health_penalty_total', 'Pair-level penalties applied (circuit-breakers)', labelnames=('pair', 'reason'))
 POOL_GATE_THROTTLES_TOTAL = _metric(Counter, 'pool_gate_throttles_total', 'Pool gate throttles fired (insufficient quote buffer)', labelnames=('quote',))
+RM_BALANCES_TTL_BREACH = _metric(
+    Counter,
+    'rm_balances_ttl_breach_total',
+    'TTL balance breaches detected by RM',
+    ['exchange', 'alias', 'status'],
+)
+RM_BALANCES_STALE_TOTAL = _metric(
+    Counter,
+    'rm_balances_stale_total',
+    'Stale balance occurrences detected by RM',
+    ['exchange', 'alias', 'status'],
+)
+RM_CAPITAL_MOVE_VISIBILITY_LATENCY_S = _metric(
+    Histogram,
+    'rm_capital_move_visibility_latency_seconds',
+    'Latency for capital move visibility (seconds)',
+    ['exchange', 'alias', 'status'],
+)
+RM_CAPITAL_MOVE_VISIBILITY_TOTAL = _metric(
+    Counter,
+    'rm_capital_move_visibility_total',
+    'Capital move visibility events observed by RM',
+    ['exchange', 'alias', 'status'],
+)
+RM_CAPITAL_MOVE_TOTAL = _metric(
+    Counter,
+    'rm_capital_move_total',
+    'Capital move events emitted by RM',
+    ['exchange', 'subtype', 'source', 'status'],
+)
+RM_CAPITAL_MOVE_NOTIONAL_USD = _metric(
+    Histogram,
+    'rm_capital_move_notional_usd',
+    'Capital move notional (USD)',
+    ['exchange', 'subtype', 'source'],
+)
 
 def mark_scanner_to_rm(ok: bool, dt_ms: float, **labels: Any) -> None:
     try:
@@ -520,7 +559,7 @@ def mark_books_fresh(pair: str) -> None:
 
 def mark_balances_fresh(exchange: str, alias: str) -> None:
     try:
-        LAST_BALANCES_FRESH_TS.labels(lbl_exchange(exchange), _norm(alias)).set(time.time())
+        LAST_BALANCES_FRESH_TS.labels(lbl_exchange(exchange), lbl_alias(alias)).set(time.time())
     except Exception:
         pass
 
@@ -831,15 +870,21 @@ WS_RECO_MISS_BURST_TOTAL = _metric(
     'Bursts de miss > seuil par minute',
     ['exchange', 'alias'],
 )
-RECONCILE_MISS_TOTAL = _metric(Counter, 'reconcile_miss_total', 'Reconciler misses', ['exchange', 'kind'])
-RECONCILE_RESYNC_TOTAL = _metric(Counter, 'reconcile_resync_total', 'Resyncs requested by reconciler', ['exchange', 'reason'])
+RECONCILE_MISS_TOTAL = _metric(Counter, 'reconcile_miss_total', 'Reconciler misses', ['exchange', 'alias', 'reason'])
+RECONCILE_RESYNC_TOTAL = _metric(Counter, 'reconcile_resync_total', 'Resyncs requested by reconciler', ['exchange', 'alias', 'scope'])
 RECONCILE_RESYNC_FAILED_TOTAL = _metric(
     Counter,
     'reconcile_resync_failed_total',
     'Failed resync attempts triggered by reconciler',
-    ['exchange', 'reason'],
+    ['exchange', 'alias', 'scope'],
 )
-RECONCILE_RESYNC_LATENCY_MS = _metric(Histogram, 'reconcile_resync_latency_ms', 'Resync rebuild latency (ms)', ['exchange'], buckets=BUCKETS_MS)
+RECONCILE_RESYNC_LATENCY_MS = _metric(
+    Histogram,
+    'reconcile_resync_latency_ms',
+    'Resync rebuild latency (ms)',
+    ['exchange', 'alias', 'scope'],
+    buckets=BUCKETS_MS,
+)
 COLD_RESYNC_TOTAL = _metric(Counter, 'cold_resync_total', 'Cold resyncs', ['exchange'])
 COLD_RESYNC_RUN_MS = _metric(Histogram, 'cold_resync_run_ms', 'Cold resync duration (ms)', ['exchange'], buckets=BUCKETS_MS)
 
@@ -855,15 +900,19 @@ def recon_error(exchange: str) -> None:
     except Exception:
         pass
 
-def recon_on_resync(exchange: str, reason: str='unknown') -> None:
+def recon_on_resync(exchange: str, alias: str, scope: str='unknown') -> None:
     try:
-        RECONCILE_RESYNC_TOTAL.labels(lbl_exchange(exchange), _norm(reason)).inc()
+        RECONCILE_RESYNC_TOTAL.labels(lbl_exchange(exchange), lbl_alias(alias), _norm(scope)).inc()
     except Exception:
         pass
 
-def recon_observe_latency(exchange: str, dt_ms: float) -> None:
+def recon_observe_latency(exchange: str, alias: str, scope: str, dt_ms: float) -> None:
     try:
-        RECONCILE_RESYNC_LATENCY_MS.labels(lbl_exchange(exchange)).observe(max(0.0, float(dt_ms)))
+        RECONCILE_RESYNC_LATENCY_MS.labels(
+            lbl_exchange(exchange),
+            lbl_alias(alias),
+            _norm(scope),
+        ).observe(max(0.0, float(dt_ms)))
     except Exception:
         pass
 
@@ -2117,4 +2166,13 @@ __all__ += [
     'mark_router_to_scanner_ts',
     'mark_scanner_to_rm_ts',
 
+]
+__all__ += [
+    'lbl_alias',
+    'RM_BALANCES_TTL_BREACH',
+    'RM_BALANCES_STALE_TOTAL',
+    'RM_CAPITAL_MOVE_VISIBILITY_LATENCY_S',
+    'RM_CAPITAL_MOVE_VISIBILITY_TOTAL',
+    'RM_CAPITAL_MOVE_TOTAL',
+    'RM_CAPITAL_MOVE_NOTIONAL_USD',
 ]

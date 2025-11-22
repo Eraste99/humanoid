@@ -512,20 +512,20 @@ class BinanceUserStream(_BaseWSClient):
                     self._ws_ix = (self._ws_ix + 1) % max(1, len(self._ws_bases))
                     new = self._ws_bases[self._ws_ix % len(self._ws_bases)]
                     if new != old:
-                        WS_FAILOVER_TOTAL.labels(exchange="BINANCE", alias=self.alias, endpoint=new).inc()
+                        WS_FAILOVER_TOTAL.labels(exchange="BINANCE", alias=_upper(self.alias), endpoint=new).inc()
                 except Exception:
                     pass
                 # backoff jitteré
                 delay = min(30.0, backoff * (0.3 + 0.7 * random.random()))
                 try:
-                    PWS_RECONNECTS_TOTAL.labels(exchange="BINANCE", alias=self.alias).inc()
+                    PWS_RECONNECTS_TOTAL.labels(exchange="BINANCE", alias=_upper(self.alias)).inc()
                     log.info("[PrivateWSHub] %s", json.dumps({
                         "pws_reconnect": True, "exchange": "BINANCE",
-                        "alias": self.alias, "delay_s": round(delay, 2), "endpoint": base
+                        "alias": _upper(self.alias), "delay_s": round(delay, 2), "endpoint": base
                     }))
                 except Exception:
                     pass
-                log.exception("[BINANCE:%s] reconnect in %.2fs (next endpoint idx=%d)", self.alias, delay, self._ws_ix)
+                log.exception("[BINANCE:%s] reconnect in %.2fs (next endpoint idx=%d)", _upper(self.alias), delay, self._ws_ix)
                 await asyncio.sleep(delay)
                 backoff = min(backoff * 2, 30.0)
 
@@ -646,7 +646,7 @@ class BybitPrivateWS(_BaseWSClient):
             except Exception:
                 # failover: endpoint suivant + métrique
                 try:
-                    WS_FAILOVER_TOTAL.labels("BYBIT", self.alias).inc()
+                    WS_FAILOVER_TOTAL.labels("BYBIT", _upper(self.alias)).inc()
                 except Exception:
                     pass
                 self._ws_ix = (self._ws_ix + 1) % len(self._ws_urls)
@@ -743,12 +743,12 @@ class CoinbaseOrdersWS(_BaseWSClient):
                     self._ws_idx = (self._ws_idx + 1) % max(1, len(self.ws_urls))
                     new = self.ws_urls[self._ws_idx % len(self.ws_urls)]
                     if new != old:
-                        WS_FAILOVER_TOTAL.labels(exchange="COINBASE", alias=self.alias, endpoint=new).inc()
+                        WS_FAILOVER_TOTAL.labels(exchange="COINBASE", alias=_upper(self.alias), endpoint=new).inc()
                 except Exception:
                     pass
                 delay = min(30.0, backoff * (0.3 + 0.7 * random.random()))
-                PWS_RECONNECTS_TOTAL.labels(exchange="COINBASE", alias=self.alias).inc()
-                log.exception("[COINBASE:%s] reconnect in %.2fs", self.alias, delay)
+                PWS_RECONNECTS_TOTAL.labels(exchange="COINBASE", alias=_upper(self.alias)).inc()
+                log.exception("[COINBASE:%s] reconnect in %.2fs", _upper(self.alias), delay)
                 await asyncio.sleep(delay)
                 backoff = min(backoff * 2, 30.0)
 

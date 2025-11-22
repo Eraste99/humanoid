@@ -140,7 +140,7 @@ class PrivateWSReconciler:
             apply_reconciliation = args[3]
 
         # --- Commun aux deux modes ---
-        self.venue: str = str(venue_name) if venue_name is not None else "UNKNOWN"
+        self.venue: str = str(venue_name).upper() if venue_name is not None else "UNKNOWN"
         self._list_open_orders = list_open_orders
         self._list_recent_fills = list_recent_fills
         self._apply_reco = apply_reconciliation

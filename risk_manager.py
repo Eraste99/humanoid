@@ -915,6 +915,8 @@ class RiskManager:
         self._mode_timeout_s = 30 * 60  # 30 min fenêtre opportuniste
         self._enter_hyst_s = 180  # 3 min verts
         self._exit_hyst_s = 120  # 2 min verts
+        self._last_rm_mode_obs = self.rm_mode
+        self._last_trade_mode_obs = self.trade_mode
 
         # Etat consolidé exposé au moteur (FSM centrale)
         # Domaines : NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE
@@ -2631,8 +2633,10 @@ class RiskManager:
         if metric is None:
             return
 
+        ex_u = str(exchange).upper()
+        alias_u = str(alias).upper()
         try:
-            metric.labels(exchange=exchange, alias=alias, status=status).inc()
+            metric.labels(exchange=ex_u, alias=alias_u, status=str(status).upper()).inc()
         except Exception:
             # On ne casse jamais la décision RM pour un problème de métriques.
             logging.exception("RM: erreur métrique RM_BALANCES_TTL_BREACH")
@@ -2655,10 +2659,14 @@ class RiskManager:
         if metric is None:
             return
 
+        ex_u = str(exchange).upper()
+        alias_u = str(alias).upper()
+
         try:
-            metric.labels(exchange=exchange, alias=alias, status=status).inc()
+            metric.labels(exchange=ex_u, alias=alias_u, status=str(status).upper()).inc()
         except Exception:
             logging.exception("RM: erreur métrique RM_BALANCES_STALE_TOTAL")
+
 
     def _obs_capital_move_visibility(
         self,
@@ -2685,7 +2693,7 @@ class RiskManager:
                 hist.labels(
                     exchange=str(exchange).upper(),
                     alias=str(alias).upper(),
-                    status=status,
+                    status=str(status).upper(),
                 ).observe(float(max(0.0, latency_s)))
             except Exception:
                 logging.exception("RM: erreur métrique RM_CAPITAL_MOVE_VISIBILITY_LATENCY_S")
@@ -2697,7 +2705,7 @@ class RiskManager:
                 counter.labels(
                     exchange=str(exchange).upper(),
                     alias=str(alias).upper(),
-                    status=status,
+                    status=str(status).upper(),
                 ).inc()
             except Exception:
                 logging.exception("RM: erreur métrique RM_CAPITAL_MOVE_VISIBILITY_TOTAL")
@@ -2729,7 +2737,7 @@ class RiskManager:
                     exchange=str(exchange).upper(),
                     subtype=subtype,
                     source=source,
-                    status=status,
+                    status=str(status).upper(),
                 ).inc()
             except Exception:
                 logging.exception("RM: erreur métrique RM_CAPITAL_MOVE_TOTAL")
@@ -2745,6 +2753,37 @@ class RiskManager:
             except Exception:
                 logging.exception("RM: erreur métrique RM_CAPITAL_MOVE_NOTIONAL_USD")
 
+    def _obs_set_mode_gauges(self, rm_mode: str, trade_mode: str) -> None:
+        try:
+            from . import obs_metrics  # type: ignore
+        except Exception:  # pragma: no cover
+            return
+
+        rm_gauge = getattr(obs_metrics, "RM_MODE_CURRENT", None)
+        trade_gauge = getattr(obs_metrics, "RM_TRADE_MODE_CURRENT", None)
+
+        rm_mode_u = str(rm_mode).upper()
+        trade_mode_u = str(trade_mode).upper()
+        rm_value = {"NORMAL": 0, "OPP_VOLUME": 1, "OPP_VOL": 2, "SEVERE": 3}.get(rm_mode_u, -1)
+        trade_value = {"NORMAL": 0, "CONSTRAINED": 1, "SEVERE": 2, "OPPORTUNISTE": 3}.get(trade_mode_u, -1)
+
+        if rm_gauge is not None:
+            try:
+                rm_gauge.labels(mode=rm_mode_u).set(1)
+            except Exception:
+                try:
+                    rm_gauge.set(float(rm_value))
+                except Exception:
+                    pass
+
+        if trade_gauge is not None:
+            try:
+                trade_gauge.labels(mode=trade_mode_u).set(1)
+            except Exception:
+                try:
+                    trade_gauge.set(float(trade_value))
+                except Exception:
+                    pass
 
     def set_orderbooks_source(self, fn):
         """Définit la source d’orderbooks pour les accès ponctuels et la boucle interne."""
@@ -3809,6 +3848,8 @@ class RiskManager:
 
         now = time.time()
         cur = self.rm_mode
+        prev_rm_mode = getattr(self, "_last_rm_mode_obs", cur)
+        prev_trade_mode = getattr(self, "_last_trade_mode_obs", getattr(self, "trade_mode", "NORMAL"))
 
         # ---- Sorties ----
         if cur == "OPP_VOLUME":
@@ -3851,6 +3892,33 @@ class RiskManager:
 
             # Consolidation du mode pour l'Engine (toujours mise à jour)
         self.trade_mode = self._compute_trade_mode()
+
+        try:
+            from . import obs_metrics  # type: ignore
+        except Exception:  # pragma: no cover
+            obs_metrics = None
+
+        if obs_metrics is not None:
+            if self.rm_mode != prev_rm_mode:
+                entries = getattr(obs_metrics, "RM_MODE_ENTRIES_TOTAL", None)
+                if entries is not None:
+                    try:
+                        entries.labels(mode=str(self.rm_mode).upper()).inc()
+                    except Exception:
+                        pass
+
+                exits = getattr(obs_metrics, "RM_MODE_EXITS_TOTAL", None)
+                if exits is not None and prev_rm_mode is not None:
+                    try:
+                        exits.labels(mode=str(prev_rm_mode).upper(), reason="transition").inc()
+                    except Exception:
+                        pass
+                self._last_rm_mode_obs = self.rm_mode
+
+            if self.trade_mode != prev_trade_mode:
+                self._last_trade_mode_obs = self.trade_mode
+
+            self._obs_set_mode_gauges(self.rm_mode, self.trade_mode)
 
         # ---- Appliquer les overlays du mode courant ----
         self._apply_mode_overrides()
