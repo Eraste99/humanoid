@@ -1118,7 +1118,15 @@ class ExecutionEngine:
         worker_count = max(1, worker_count)
 
         # --- File d’ordres bornée & workers ---
-        qmax = int(getattr(self.config, "engine_submit_queue_size", 256) or 256)
+        # --- File d’ordres bornée & workers ---
+        qmax = int(
+            getattr(
+                self.config,
+                "engine_queue_max",
+                getattr(self.config, "engine_submit_queue_size", 256),
+            )
+            or 256
+        )
         qmax = max(1, qmax)
         self.order_queue: asyncio.Queue = asyncio.Queue(maxsize=qmax)
         self.running: bool = False
@@ -2397,6 +2405,13 @@ class ExecutionEngine:
         except Exception:
             pass
 
+    def _engine_backpressure_metric(self, bp_type: str, *, branch: str | None = None, profile: str | None = None) -> None:
+        try:
+            if hasattr(self, "obs_inc"):
+                self.obs_inc("engine_backpressure_total", type=bp_type, branch=branch, profile=profile)
+        except Exception:
+            pass
+
     def _raise_engine_submit_error(self, reason: str, *, branch: str | None = None, profile: str | None = None):
         self._engine_reject_metric(reason, branch=branch, profile=profile)
         err = EngineSubmitError(reason)
@@ -2474,14 +2489,18 @@ class ExecutionEngine:
         headroom_min = int(caps_local.get("headroom_min") or 0)
 
         # 2) Backpressure technique: queue globale et éventuelle concurrence par branche
+
         queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
         queue_max = getattr(self.order_queue, "maxsize", 0) or queue_max_cfg or 0
         depth = int(self.order_queue.qsize())
         overflow_policy = str(getattr(self.config, "engine_enqueue_overflow_policy", "defer")).lower()
         high_wm = 0
         if queue_max:
+            high_wm_ratio = float(
+                getattr(self.config, "engine_queue_high_wm_ratio", 0.85)
+            )
             high_wm = int(
-                getattr(self.config, "engine_queue_high_wm", int(queue_max * 0.85))
+                getattr(self.config, "engine_queue_high_wm", int(queue_max * high_wm_ratio))
             )
 
         # Profondeur de file par branche (meilleur alignement caps_local → Engine)
@@ -2519,8 +2538,6 @@ class ExecutionEngine:
         except Exception:
             pass
 
-        # Observabilité capacité (queue globale + branche)
-
 
         # Observabilité capacité (queue globale + branche)
         try:
@@ -2540,19 +2557,29 @@ class ExecutionEngine:
         except Exception:
             pass
 
-        # 2-a) Hard backpressure: queue pleine
+            # Capacités techniques (Ticket 10):
+            # - Limite globale de queue (order_queue.maxsize) pilotée par config.engine_queue_max
+            # - High watermark pour backpressure souple (config.engine_queue_high_wm ou engine_queue_high_wm_ratio)
+            # - Cap inflight global côté pacer (self._pacer.current_policy["inflight_max"])
+            # - Cap de concurrence par branche (caps_local["bundle_concurrency"] avec marge headroom_min)
+            # - Caps makers / TM (tm_max_open_makers, caps caps_local spécifiques MM si présents)
+            # Scénario de test: pousser plus de bundles que engine_queue_max et/ou bundle_concurrency,
+            # vérifier engine_queue_* et engine_backpressure_total{type} puis rm_engine_reject_total côté RM.
+
+            # 2-a) Hard backpressure: queue pleine
         if queue_max and depth >= queue_max:
-            # Raison explicite pour RM + métriques
+                # Raison explicite pour RM + métriques
             try:
                 logger.warning(
-                    "[ExecutionEngine] BACKPRESSURE_QUEUE_FULL branch=%s profile=%s depth=%s max=%s",
-                    branch, profile, depth, queue_max,
+                "[ExecutionEngine] BACKPRESSURE_QUEUE_FULL branch=%s profile=%s depth=%s max=%s",
+                branch, profile, depth, queue_max,
                 )
             except Exception:
                 pass
-            self._raise_engine_submit_error(ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile)
+                self._engine_backpressure_metric("QUEUE_FULL", branch=branch, profile=profile)
+                self._raise_engine_submit_error(ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile)
 
-        # 2-b) Hard backpressure: caps_local par branche (optionnel)
+                # 2-b) Hard backpressure: caps_local par branche (optionnel)
         if bundle_concurrency is not None and branch_depth is not None:
             try:
                 eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
@@ -2561,16 +2588,18 @@ class ExecutionEngine:
             if eff_cap and branch_depth >= eff_cap:
                 try:
                     logger.info(
-                        "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH branch=%s profile=%s depth=%s eff_cap=%s",
+                                      "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH branch=%s profile=%s depth=%s eff_cap=%s",
                         branch, profile, branch_depth, eff_cap,
                     )
                 except Exception:
                     pass
+                self._engine_backpressure_metric("CAP_BRANCH", branch=branch, profile=profile)
                 self._raise_engine_submit_error(ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile)
 
         # 2-c) Soft backpressure: high watermark
         if queue_max and high_wm and depth >= high_wm and overflow_policy == "defer":
             sleep_ms = int(getattr(self.config, "engine_defer_sleep_ms", 8))
+            self._engine_backpressure_metric("HIGH_WM", branch=branch, profile=profile)
             await asyncio.sleep(float(sleep_ms) / 1000.0)
 
         if queue_max and high_wm and depth >= high_wm and overflow_policy == "reject":
@@ -2581,8 +2610,8 @@ class ExecutionEngine:
                 )
             except Exception:
                 pass
+            self._engine_backpressure_metric("HIGH_WM", branch=branch, profile=profile)
             self._raise_engine_submit_error(ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile)
-
 
         # 3) Lock REB éventuel (on garde le comportement existant)
         combo = self._bundle_combo_signature(bundle)

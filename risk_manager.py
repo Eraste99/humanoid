@@ -36,6 +36,7 @@ import threading
 from typing import Dict, Any, List, Optional
 from modules.obs_metrics import inc_blocked
 import logging
+from collections import defaultdict
 from modules.obs_metrics import TIME_SKEW_MS
 from contracts.payloads import make_submit_bundle, submit_leg_from_intent
 from dataclasses import dataclass, asdict
@@ -70,7 +71,7 @@ from modules.risk_manager.volatility_manager import VolatilityManager
 from modules.risk_manager.slippage_and_fees_collector import SlippageAndFeesCollector
 from modules.private_ws_reconciler import PrivateWSReconciler
 from contracts.errors import (
-    RMError, NotReadyError, DataStaleError, InconsistentStateError, ExternalServiceError
+    RMError, NotReadyError, DataStaleError, InconsistentStateError, ExternalServiceError, EngineSubmitError
 )
 import time
 
@@ -1339,7 +1340,7 @@ class RiskManager:
 
     # === /RM: capital net & profil ===
 
-    def _apply_caps_and_preempt(self, strategy: str, ex: str, desired_notional: float) -> float:
+    def _apply_caps_and_preempt_cex(self, strategy: str, ex: str, desired_notional: float) -> float:
         """
         Applique le cap notionnel par (stratégie,CEX). Si TT/TM dépasse:
           - préempte MM sur ce CEX (si autorisé), puis tronque à cap.
@@ -1350,6 +1351,109 @@ class RiskManager:
         if strategy in ("TT", "TM") and self.preempt_mm_for_tt_tm:
             self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
         return max(0.0, cap)
+
+    def _get_caps_for_bundle(self, branch: str, profile: str, quote: str, meta: dict) -> dict:
+        """
+        Calcule les caps business (profil × branche) à transmettre à l'Engine.
+        Retourne un dict caps_local complet : inflight_cap (business),
+        bundle_concurrency (technique interprétation RM) et headroom_min.
+        """
+        rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+        branch_u = str(branch or "").upper()
+        profile_u = str(profile or "").upper() or "LARGE"
+
+        inflight_cap = None
+        bundle_concurrency = None
+
+        try:
+            if branch_u == "REB":
+                caps_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) or {}
+                inflight_cap = int((caps_reb.get(profile_u) or caps_reb.get("LARGE") or 0))
+            else:
+                caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
+                prof_caps = caps_by_profile.get(profile_u) or caps_by_profile.get("LARGE", {})
+                inflight_cap = int(prof_caps.get(branch_u, 0) or 0)
+        except Exception:
+            inflight_cap = None
+
+        pacer_factor = 1.0
+        pacer = getattr(self, "pacer", None)
+        if pacer and hasattr(pacer, "factor_for_branch"):
+            try:
+                pacer_factor = float(pacer.factor_for_branch(branch_u))
+            except Exception:
+                pacer_factor = 1.0
+
+        try:
+            bundle_concurrency = max(0, int(round((inflight_cap or 0) * pacer_factor)))
+        except Exception:
+            bundle_concurrency = max(0, int(inflight_cap or 0))
+
+        headroom_min = int(getattr(self, "inflight_headroom_min", 1) or 0)
+
+        caps_local = {
+            "inflight_cap": inflight_cap,
+            "bundle_concurrency": bundle_concurrency,
+            "headroom_min": headroom_min,
+        }
+
+        return caps_local
+
+    def _apply_caps_and_preempt(self, bundle: dict, profile: str, caps_local: dict) -> tuple[bool, str | None]:
+        """
+        Entrée unique bundle-centrée pour l'application des caps business → Engine.
+        Ne prend aucune décision métier côté Engine: on enrichit seulement caps_local et
+        on stoppe si la capacité business est nulle.
+        """
+        caps_local = dict(caps_local or {})
+        branch = (bundle.get("branch") or bundle.get("strategy") or "").upper() or "UNKNOWN"
+
+        inflight_cap = int(caps_local.get("inflight_cap") or 0)
+        bundle_concurrency = int(caps_local.get("bundle_concurrency") or 0)
+        headroom_min = max(0, int(caps_local.get("headroom_min") or 0))
+
+        # Si aucune capacité n'est fournie pour la branche, on bloque explicitement côté RM.
+        if branch in {"TT", "TM", "MM", "REB"} and bundle_concurrency <= 0:
+            return False, f"CAP_ZERO_{branch}"
+
+        meta = bundle.setdefault("meta", {})
+        meta.setdefault("profile", profile)
+        bundle["caps"] = {
+            "inflight_cap": inflight_cap,
+            "bundle_concurrency": bundle_concurrency,
+            "headroom_min": headroom_min,
+        }
+        return True, None
+
+    def _record_engine_backpressure(self, reason: str) -> None:
+        """
+        Compteur dédié aux rejets Engine (namespace rm_engine_reject_total) et hook pacer.
+        Dégrade le pacer si des BACKPRESSURE Queue/Cap se répètent.
+        """
+        code = str(reason or "").upper()
+        try:
+            if not hasattr(self, "_engine_backpressure_counts"):
+                self._engine_backpressure_counts = defaultdict(int)
+            self._engine_backpressure_counts[code] += 1
+        except Exception:
+            return
+
+        threshold = int(getattr(self, "engine_backpressure_degrade_threshold", 3) or 3)
+        if code in {ENGINE_BACKPRESSURE_QUEUE_FULL, ENGINE_BACKPRESSURE_CAP_BRANCH} and \
+                self._engine_backpressure_counts[code] >= threshold:
+            try:
+                logger.warning(
+                    "[RiskManager] pacer degrade source=engine_backpressure reason=%s count=%s", code,
+                    self._engine_backpressure_counts[code]
+                )
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "pacer") and hasattr(self.pacer, "degrade"):
+                    self.pacer.degrade(source="engine_backpressure")
+            except Exception:
+                pass
+            self._engine_backpressure_counts[code] = 0
 
     def _can_reserve_quote(self, ex: str, alias: str, quote: str, usd: float) -> bool:
         """
@@ -1476,15 +1580,27 @@ class RiskManager:
             return False
 
         # 3) Caps notionnels par CEX / profil / branche (+ préemption MM)
-        caps = self._get_caps_for_bundle(branch, profile, quote, meta)
-        ok, reason_caps = self._apply_caps_and_preempt(bundle, caps, eligible, profile)
+        caps_local = self._get_caps_for_bundle(branch, profile, quote, meta)
+        ok, reason_caps = self._apply_caps_and_preempt(bundle, profile, caps_local)
         if not ok:
             if self._shadow:
                 self._shadow.on_bundle_drop(bundle, reason_caps or "CAPS")
             return False
 
         # 4) Passage au moteur
-        accepted = self.engine.execute_bundle(bundle)
+        try:
+            accepted = self.engine.execute_bundle(bundle)
+        except EngineSubmitError as exc:
+            reason = str(getattr(exc, "reason", None) or str(exc))
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc("rm_engine_reject_total", reason=reason)
+            except Exception:
+                pass
+            self._record_engine_backpressure(reason)
+            if self._shadow:
+                self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
+            return False
         if not accepted and self._shadow:
             self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
         return accepted
@@ -5995,8 +6111,8 @@ class RiskManager:
                 continue
 
             # Applique cap par CEX (min des deux côtés pour TT/TM)
-            allow_buy = getattr(self, "_apply_caps_and_preempt", None)
-            allow_sell = getattr(self, "_apply_caps_and_preempt", None)
+            allow_buy = getattr(self, "_apply_caps_and_preempt_cex", None)
+            allow_sell = getattr(self, "_apply_caps_and_preempt_cex", None)
             allowed = desired
             if callable(allow_buy):
                 if strat in ("TT", "TM"):
