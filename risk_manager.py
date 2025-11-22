@@ -106,6 +106,23 @@ from modules.obs_metrics import (
     set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL
 )
 
+# --- Taxonomie commune des raisons (Ticket 12) -----------------------------
+# NB: Ces codes doivent rester synchrones avec ceux d'execution_engine.py
+# et, à terme, pourront être extraits dans contracts/reasons.py.
+
+# Famille RM_* : rejets économiques / guards métier
+RM_STALE_VOL = "RM_STALE_VOL"
+RM_SFC_UNAVAILABLE = "RM_SFC_UNAVAILABLE"
+RM_COST_COMPUTE_ERROR = "RM_COST_COMPUTE_ERROR"
+RM_BUNDLE_EMPTY_PARAMS = "RM_BUNDLE_EMPTY_PARAMS"
+
+# Famille RM_* mais pour causes techniques côté Engine vues par le RM
+RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
+RM_ENGINE_NACK_TIMEOUT = "RM_ENGINE_NACK_TIMEOUT"
+RM_ENGINE_NACK_429 = "RM_ENGINE_NACK_429"
+RM_ENGINE_NACK_5XX = "RM_ENGINE_NACK_5XX"
+RM_ENGINE_NACK_REJECT = "RM_ENGINE_NACK_REJECT"
+
 
 # --- Helpers robusti per cast da ENV/config --------------------------------
 # --- Helpers robusti per cast da ENV/config (module-scope, no decorator) ---
@@ -641,6 +658,15 @@ class RiskManager:
         # --- MM toggles & budgets ---
         self.enable_mm = bool(getattr(self.bot_cfg, "enable_maker_maker", False))
         self.mm_ttl_ms = _cfg_int(self.bot_cfg, "mm_ttl_ms", 2200)
+
+        self.mm_alias = _cfg_str(self.bot_cfg, "mm_alias_name", "MM").upper()
+
+        # Sink optionnel pour les drops de bundles (shadow, simu, recorder…)
+        self._shadow = None
+
+        # ==== [ADD INSIDE __init__ RIGHT AFTER "MM toggles & budgets" BLOCK] =========
+
+
         self.mm_alias = _cfg_str(self.bot_cfg, "mm_alias_name", "MM").upper()
         # ==== [ADD INSIDE __init__ RIGHT AFTER "MM toggles & budgets" BLOCK] =========
         # Kill switch global + budgets (en mémoire, resetés par ton scheduler quotidien)
@@ -884,13 +910,19 @@ class RiskManager:
 
         # --- RM Mode Overlay (FSM P0) ---
         self.rm_mode = "NORMAL"  # NORMAL | OPP_VOLUME | OPP_VOL | SEVERE
+        self.trade_mode = "NORMAL"  # NORMAL | CONSTRAINED | SEVERE | OPPORTUNISTE
         self._mode_since = 0.0
         self._mode_timeout_s = 30 * 60  # 30 min fenêtre opportuniste
         self._enter_hyst_s = 180  # 3 min verts
         self._exit_hyst_s = 120  # 2 min verts
 
+        # Etat consolidé exposé au moteur (FSM centrale)
+        # Domaines : NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE
+        self.trade_mode = "NORMAL"
+
+
         # Plancher net (empêche “volume toxique”)
-        self._net_floor_bps =_cfg_float(self.cfg, "net_floor_bps", 4.5)
+        self._net_floor_bps = _cfg_float(self.cfg, "net_floor_bps", 4.5)
 
         # Deltas par mode (défauts sûrs ; profile-aware clamp appliqué plus bas)
         self._overlay = {
@@ -899,6 +931,15 @@ class RiskManager:
             "SEVERE": {"tt_min_bps_delta": +5.0, "tm_min_bps_delta": +8.0, "cap_factor": 0.5, "mm_enable": False,
                        "ioc_only": True},
         }
+        # Overlay consolidé par trade_mode (normalisé, clamp down uniquement)
+        self._overlay_by_trade_mode = {
+            "NORMAL": {"tt_min_bps_delta": 0.0, "tm_min_bps_delta": 0.0, "cap_factor": 1.0, "ioc_only": False},
+            "CONSTRAINED": {"tt_min_bps_delta": 0.0, "tm_min_bps_delta": 0.0, "cap_factor": 0.8, "mm_enable": True,
+                            "ioc_only": False},
+            "SEVERE": dict(self._overlay.get("SEVERE", {})),
+            "OPPORTUNISTE": {},  # fusionné avec le sous-mode opportuniste (OPP_VOLUME / OPP_VOL)
+        }
+
         # --- PnL guard (config & état) ---
         self._pnl_guard_lvl1 = _cfg_float(self.cfg, "pnl_guard_day_lvl1_pct", -0.3)  # %
         self._pnl_guard_lvl2 = _cfg_float(self.cfg, "pnl_guard_day_lvl2_pct", -0.7)  # %
@@ -1352,78 +1393,164 @@ class RiskManager:
             self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
         return max(0.0, cap)
 
-    def _get_caps_for_bundle(self, branch: str, profile: str, quote: str, meta: dict) -> dict:
+    def _get_caps_for_bundle(
+            self,
+            bundle: Dict[str, Any],
+            branch: str,
+            profile: str,
+            quote: str,
+            meta: dict,
+    ) -> dict:
         """
-        Calcule les caps business (profil × branche) à transmettre à l'Engine.
-        Retourne un dict caps_local complet : inflight_cap (business),
-        bundle_concurrency (technique interprétation RM) et headroom_min.
+        Calcule/normalise les caps locaux pour ce bundle (Ticket 10).
+
+        Règles :
+        - Source de vérité business = BotConfig.RiskManagerCfg
+          (caps_trading_by_profile, inflight_rebal_by_profile).
+        - On part des caps déjà packés dans le bundle (bundle["caps"])
+          pour respecter les décisions prises lors de la construction
+          (_build_bundle + degraded["caps"]).
+        - On ne complète que les champs manquants :
+          inflight_cap, bundle_concurrency, headroom_min.
         """
         rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
-        branch_u = str(branch or "").upper()
-        profile_u = str(profile or "").upper() or "LARGE"
+        branch_u = str(branch or meta.get("branch") or "").upper()
+        profile_u = str(profile or getattr(self, "capital_profile", "LARGE")).upper()
 
-        inflight_cap = None
-        bundle_concurrency = None
-
+        # 0) Point de départ = ce que le builder a déjà packé
+        caps_local: dict = {}
         try:
-            if branch_u == "REB":
-                caps_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) or {}
-                inflight_cap = int((caps_reb.get(profile_u) or caps_reb.get("LARGE") or 0))
-            else:
-                caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
-                prof_caps = caps_by_profile.get(profile_u) or caps_by_profile.get("LARGE", {})
-                inflight_cap = int(prof_caps.get(branch_u, 0) or 0)
+            initial = bundle.get("caps") or {}
+            if isinstance(initial, dict):
+                caps_local.update(initial)
         except Exception:
+            caps_local = {}
+
+        # 1) inflight_cap : si absent, on reprend ta logique actuelle (profil × branche)
+        if "inflight_cap" not in caps_local:
             inflight_cap = None
-
-        pacer_factor = 1.0
-        pacer = getattr(self, "pacer", None)
-        if pacer and hasattr(pacer, "factor_for_branch"):
             try:
-                pacer_factor = float(pacer.factor_for_branch(branch_u))
+                if branch_u == "REB":
+                    caps_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) or {}
+                    inflight_cap = int((caps_reb.get(profile_u) or caps_reb.get("LARGE") or 0))
+                else:
+                    caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
+                    prof_caps = caps_by_profile.get(profile_u) or caps_by_profile.get("LARGE", {})
+                    inflight_cap = int(prof_caps.get(branch_u, 0) or 0)
             except Exception:
-                pacer_factor = 1.0
+                inflight_cap = None
+            caps_local["inflight_cap"] = inflight_cap
 
-        try:
-            bundle_concurrency = max(0, int(round((inflight_cap or 0) * pacer_factor)))
-        except Exception:
-            bundle_concurrency = max(0, int(inflight_cap or 0))
+        inflight_cap_eff = caps_local.get("inflight_cap") or 0
 
-        headroom_min = int(getattr(self, "inflight_headroom_min", 1) or 0)
+        # 2) bundle_concurrency : si absent, on remet ta logique pacer_factor
+        if "bundle_concurrency" not in caps_local:
+            pacer_factor = 1.0
+            pacer = getattr(self, "pacer", None)
+            if pacer and hasattr(pacer, "factor_for_branch"):
+                try:
+                    pacer_factor = float(pacer.factor_for_branch(branch_u))
+                except Exception:
+                    pacer_factor = 1.0
 
-        caps_local = {
-            "inflight_cap": inflight_cap,
-            "bundle_concurrency": bundle_concurrency,
-            "headroom_min": headroom_min,
-        }
+            try:
+                bundle_concurrency = max(0, int(round(float(inflight_cap_eff) * pacer_factor)))
+            except Exception:
+                bundle_concurrency = max(0, int(float(inflight_cap_eff or 0)))
+
+            caps_local["bundle_concurrency"] = bundle_concurrency
+
+        # 3) headroom_min : si absent, on garde ta valeur par défaut config
+        if "headroom_min" not in caps_local:
+            caps_local["headroom_min"] = int(getattr(self, "inflight_headroom_min", 1) or 0)
 
         return caps_local
 
-    def _apply_caps_and_preempt(self, bundle: dict, profile: str, caps_local: dict) -> tuple[bool, str | None]:
+    # === /RM: capital net & profil ===
+
+    def _apply_caps_and_preempt(self, *args, **kwargs):
+        """Helper central Ticket 10 — API unique des caps.
+
+        Deux usages coexistent pour compatibilité :
+
+        - Legacy (niveau opportunité) :
+          _apply_caps_and_preempt(strategy, ex, desired_notional) -> float
+
+        - Nouveau (niveau bundle) :
+          _apply_caps_and_preempt(bundle, caps_local, eligible, profile) -> (ok: bool, reason: str)
+
+        La branche legacy continue d'exister pour ne pas casser le flux Scanner→RM,
+        mais la décision « caps business vs backpressure Engine » se fait désormais
+        au niveau bundle via caps_local.
         """
-        Entrée unique bundle-centrée pour l'application des caps business → Engine.
-        Ne prend aucune décision métier côté Engine: on enrichit seulement caps_local et
-        on stoppe si la capacité business est nulle.
+        # Nouveau contrat bundle-centric : premier argument = bundle (dict)
+        if args and isinstance(args[0], dict):
+            bundle = args[0]
+            caps_local = args[1] if len(args) > 1 else {}
+            eligible = args[2] if len(args) > 2 else None
+            profile = args[3] if len(args) > 3 else None
+            return self._apply_caps_and_preempt_bundle(bundle, caps_local, eligible, profile)
+
+        # Fallback : ancien contrat (strategy, ex, desired_notional)
+        if len(args) >= 3:
+            strategy, ex, desired_notional = args[0], args[1], args[2]
+        else:
+            # Appel incohérent : on renvoie 0.0 pour rester conservateur.
+            return 0.0
+        return self._apply_caps_and_preempt_legacy(strategy, ex, desired_notional)
+
+    def _apply_caps_and_preempt_legacy(
+            self,
+            strategy: str,
+            ex: str,
+            desired_notional: float,
+    ) -> float:
+        """Legacy — cap notionnel par (stratégie,CEX) au niveau opportunité.
+
+        Comportement historique :
+        - lecture de per_strategy_notional_cap,
+        - éventuelle préemption des MM si TT/TM dépasse le cap.
         """
-        caps_local = dict(caps_local or {})
-        branch = (bundle.get("branch") or bundle.get("strategy") or "").upper() or "UNKNOWN"
+        cap = float(
+            ((self.per_strategy_notional_cap or {}).get(strategy, {}) or {}).get(
+                str(ex).upper(), float("inf")
+            )
+        )
+        if desired_notional <= cap:
+            return max(0.0, desired_notional)
+        if strategy in ("TT", "TM") and getattr(self, "preempt_mm_for_tt_tm", False):
+            self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
+        return max(0.0, cap)
 
-        inflight_cap = int(caps_local.get("inflight_cap") or 0)
-        bundle_concurrency = int(caps_local.get("bundle_concurrency") or 0)
-        headroom_min = max(0, int(caps_local.get("headroom_min") or 0))
+    def _apply_caps_and_preempt_bundle(
+            self,
+            bundle: Dict[str, Any],
+            caps_local: Dict[str, Any],
+            eligible: Any,
+            profile: str,
+    ):
+        """Contrat bundle-centric (Ticket 10) — utilisé par engine_enqueue_bundle.
 
-        # Si aucune capacité n'est fournie pour la branche, on bloque explicitement côté RM.
-        if branch in {"TT", "TM", "MM", "REB"} and bundle_concurrency <= 0:
-            return False, f"CAP_ZERO_{branch}"
+        Rôle :
+        - S'assurer qu'on a un caps_local cohérent pour le bundle.
+        - Préparer un reason lisible en cas de rejet caps côté RM.
 
-        meta = bundle.setdefault("meta", {})
-        meta.setdefault("profile", profile)
-        bundle["caps"] = {
-            "inflight_cap": inflight_cap,
-            "bundle_concurrency": bundle_concurrency,
-            "headroom_min": headroom_min,
-        }
-        return True, None
+        NB : la limitation réelle de concurrence par branche reste appliquée
+        côté Engine via bundle_concurrency/headroom_min ; ici on se contente
+        d'un pré-check très léger pour la traçabilité.
+        """
+        if not isinstance(caps_local, dict):
+            return False, "RM_CAPS_INVALID"
+
+        inflight_cap = caps_local.get("inflight_cap")
+        try:
+            if isinstance(inflight_cap, (int, float)) and inflight_cap <= 0:
+                return False, "RM_CAPS_ZERO"
+        except Exception:
+            # On ne bloque pas si on ne sait pas interpréter le cap.
+            pass
+
+        return True, ""
 
     def _record_engine_backpressure(self, reason: str) -> None:
         """
@@ -1484,12 +1611,25 @@ class RiskManager:
             logging.warning("RM : engine indisponible, drop bundle")
             return False
 
+            # Rafraîchit le mode consolidé et ses overlays avant d'exposer au moteur
+        try:
+            self.trade_mode = self._compute_trade_mode()
+        except Exception:
+            self.trade_mode = getattr(self, "trade_mode", "NORMAL") or "NORMAL"
+        self._apply_mode_overrides()
+
         meta = bundle.get("meta") or {}
+        meta.setdefault("mode", self.trade_mode)
+        meta.setdefault("mode_overrides", dict(getattr(self, "_current_mode_overrides", {}) or {}))
+        if self.trade_mode == "OPPORTUNISTE" and self.rm_mode in ("OPP_VOLUME", "OPP_VOL"):
+            meta.setdefault("mode_overrides", {}).setdefault("submode", self.rm_mode)
+        bundle["meta"] = meta
         branch = (meta.get("branch") or self._current_branch or "TT").upper()
         profile = (meta.get("profile") or self._capital_profile or "NANO").upper()
         priority = int(meta.get("priority") or 0)
         trace_id = meta.get("trace_id") or bundle.get("trace_id") or "NA"
         quote = (meta.get("quote") or "USDC").upper()
+
 
         # 1) Éligibilités de base (branch / profile / pacer / draws / netfloor…)
         eligible, reason = self._is_branch_eligible(branch, profile)
@@ -1580,12 +1720,38 @@ class RiskManager:
             return False
 
         # 3) Caps notionnels par CEX / profil / branche (+ préemption MM)
-        caps_local = self._get_caps_for_bundle(branch, profile, quote, meta)
+        caps_local = self._get_caps_for_bundle(bundle, branch, profile, quote, meta)
+
         ok, reason_caps = self._apply_caps_and_preempt(bundle, profile, caps_local)
         if not ok:
             if self._shadow:
                 self._shadow.on_bundle_drop(bundle, reason_caps or "CAPS")
             return False
+
+        # 3.b) Mode consolidé & overrides → Engine (Ticket 11)
+        try:
+            trade_mode = str(getattr(self, "trade_mode", "NORMAL")).upper()
+        except Exception:
+            trade_mode = "NORMAL"
+
+        # Overrides exposés à l’Engine pour ce bundle
+        ioc_only = bool(getattr(self, "_ioc_only", False))
+        mm_enabled = bool(getattr(self, "enable_mm", False))
+
+        mode_overrides = dict(meta.get("mode_overrides") or {})
+        mode_overrides.update(
+            {
+                "ioc_only": ioc_only,
+                "mm_enabled": mm_enabled,
+                # Optionnel : on expose aussi le sous-mode interne pour debug
+                "rm_mode": str(getattr(self, "rm_mode", "NORMAL")).upper(),
+            }
+        )
+        meta["mode"] = trade_mode
+        meta["mode_overrides"] = mode_overrides
+        bundle["meta"] = meta
+
+
 
         # 4) Passage au moteur
         try:
@@ -1605,7 +1771,43 @@ class RiskManager:
             self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
         return accepted
 
-    # risk_manager.py — class RiskManager (suite)
+
+    # ------------------------------------------------------------------
+    # Légalité bundle & REB lock (stubs P0)
+    # ------------------------------------------------------------------
+    def _is_bundle_legal(self, bundle: Dict[str, Any]) -> bool:
+        """
+        Stub P0 : vérifie la « légalité » d'un bundle.
+        À ce stade, on ne met PAS de logique métier complexe ici pour ne pas
+        créer de faux négatifs : on laisse les autres gardes (branch/profile,
+        TTL balances, caps, guards de prix…) faire le gros du travail.
+
+        Implémentation actuelle : toujours True tant que la structure de
+        base est présente.
+        """
+        if not isinstance(bundle, dict):
+            return False
+        # Si tu veux être un peu plus strict sans risque, tu peux vérifier la présence
+        # de quelques clés minimales, mais pour l’instant on reste permissif.
+        return True
+
+    def _is_rebal_lock_active(self, bundle: Dict[str, Any]) -> bool:
+        """
+        Stub P0 : hook pour le « REB lock » (lock combo REB sur une route).
+
+        Le design cible (roadmap RM/Sim/Engine) :
+        - un lock par combo (ex_from, ex_to, pair, alias…) posé par REB,
+        - qui gèle TT/TM/MM sur cette combo pendant l'exécution du plan REB.
+
+        Implémentation actuelle : toujours False tant que le scheduler REB
+        et la gestion fine des locks ne sont pas câblés.
+        """
+        # Quand tu implémenteras le vrai lock, tu pourras typiquement :
+        # - récupérer un combo_key depuis le bundle['meta'],
+        # - interroger un map de locks maintenu par rebalancing/RebalancingManager.
+        return False
+
+
 
     # ---- RiskManager helpers (remplacement complet) ----
     def _cfg(self, key: str, default):
@@ -3367,28 +3569,46 @@ class RiskManager:
         - Ajuste min_bps TT (base_min_bps) et min_bps TM (tm_min_required_bps)
         - Recalcule les caps notionnels TT/TM/MM pour USDC/USDT/EUR (profile-aware × cap_factor)
         - Active/désactive MM et communique un hint IOC-only au moteur si nécessaire
+
+        Scénarios de validation (Ticket 11.C):
+          • NORMAL: trade_mode=NORMAL, caps profil standard, ioc_only=False, mm_enabled=True.
+          • CONSTRAINED: pacer en CONSTRAINED → caps clampés (downscale), mm_enabled=True, ioc_only=False.
+          • SEVERE: PnL-guard ou pacer SEVERE → caps réduits, ioc_only=True, mm_enabled=False.
+          • OPPORTUNISTE: rm_mode opportuniste & pacer NORMAL → min_bps ajustés selon sous-mode, caps ≤ profil, mm_enabled policy.
+        Côté Engine, TIF doit respecter mode_overrides["ioc_only"] et les jambes maker ne sont créées que si mode_overrides["mm_enabled"] est True.
         """
         # Profil capital (fallback safe)
         prof = getattr(self, "capital_profile", None) \
                or getattr(getattr(self, "pacer", None), "_profile", None) \
                or "NANO"
-
-        ov = self._overlay.get(self.rm_mode, {})
+        trade_ov = dict(self._overlay_by_trade_mode.get(self.trade_mode, {}) or {})
+        if self.trade_mode == "OPPORTUNISTE" and self.rm_mode in self._overlay:
+            trade_ov.update(self._overlay.get(self.rm_mode, {}))
+        elif self.trade_mode == "SEVERE" and not trade_ov:
+            trade_ov = dict(self._overlay.get("SEVERE", {}))
 
         # 1) Min bps dynamiques
         base_tt = float(getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 6.5)))
-        delta_tt = float(ov.get("tt_min_bps_delta", 0.0))
+        delta_tt = float(trade_ov.get("tt_min_bps_delta", 0.0))
         self.base_min_bps = max(0.0, base_tt + delta_tt)
 
         base_tm = float(getattr(self, "tm_min_required_bps", getattr(self.cfg, "tm_min_required_bps_base", 11.0)))
-        delta_tm = float(ov.get("tm_min_bps_delta", 0.0))
+        delta_tm = float(trade_ov.get("tm_min_bps_delta", 0.0))
         self.tm_min_required_bps = max(0.0, base_tm + delta_tm)
 
         # 2) Caps notionnels profile-aware × cap_factor (down-clamp only)
         cap_eff = float(self._profile_cap_notional(profile=prof))  # méthode existante
-        factor = float(ov.get("cap_factor", 1.0))
+        factor = min(1.0, float(trade_ov.get("cap_factor", 1.0)))
 
-        caps = dict(getattr(self, "per_strategy_notional_cap", {}))  # {'TT': {'USDC': ...}, ...}
+        def _copy_caps(src: dict) -> dict:
+            return {k: dict(v) for k, v in (src or {}).items()}
+
+        base_caps_src = getattr(self, "_per_strategy_notional_cap_base", None)
+        if base_caps_src is None:
+            self._per_strategy_notional_cap_base = _copy_caps(getattr(self, "per_strategy_notional_cap", {}))
+            base_caps_src = self._per_strategy_notional_cap_base
+
+        caps = _copy_caps(base_caps_src)  # {'TT': {'USDC': ...}, ...}
         for strat in ("TT", "TM", "MM"):
             for q in ("USDC", "USDT", "EUR"):
                 cur = float(((caps.get(strat) or {}).get(q) or 0.0) or 0.0)
@@ -3397,7 +3617,11 @@ class RiskManager:
         self.per_strategy_notional_cap = caps
 
         # 3) MM & IOC-only
-        self.enable_mm = bool(ov.get("mm_enable", getattr(self, "enable_mm", False)))
+        mm_override = trade_ov.get("mm_enable")
+        if mm_override is None:
+            self.enable_mm = bool(getattr(self, "enable_mm", False))
+        else:
+            self.enable_mm = bool(mm_override)
         if not self.enable_mm:
             try:
                 # best-effort : adapte la venue si besoin
@@ -3406,7 +3630,14 @@ class RiskManager:
                 pass
 
         # Hint pour l'Engine (TM en IOC si nécessaire)
-        self._ioc_only = bool(ov.get("ioc_only", False))
+        self._ioc_only = bool(trade_ov.get("ioc_only", False))
+        self._current_mode_overrides = {
+            "ioc_only": self._ioc_only,
+            "mm_enabled": bool(self.enable_mm),
+        }
+        if self.trade_mode == "OPPORTUNISTE" and self.rm_mode in ("OPP_VOLUME", "OPP_VOL"):
+            self._current_mode_overrides["submode"] = self.rm_mode
+        self._last_applied_trade_mode = self.trade_mode
 
     def _latest_book_age_s(self) -> float:
         """
@@ -3488,6 +3719,24 @@ class RiskManager:
 
         return bool(vol_bad or stale_bad or pws_bad)
 
+    def _compute_trade_mode(self) -> str:
+        """
+        Consolidation des états locaux et Pacer en mode unique exposé à l'Engine.
+        Règles:
+          - SEVERE si PnL-guard actif (rm_mode="SEVERE") ou pacer_mode=="SEVERE".
+          - CONSTRAINED si pacer_mode=="CONSTRAINED" (et aucune condition SEVERE).
+          - OPPORTUNISTE si rm_mode opportuniste (OPP_VOLUME/OPP_VOL) avec pacer en NORMAL.
+          - NORMAL sinon.
+        """
+        pacer_mode = str(getattr(self, "pacer_mode", "NORMAL")).upper()
+        rm_mode = str(getattr(self, "rm_mode", "NORMAL")).upper()
+        if rm_mode == "SEVERE" or pacer_mode == "SEVERE":
+            return "SEVERE"
+        if pacer_mode == "CONSTRAINED":
+            return "CONSTRAINED"
+        if rm_mode in ("OPP_VOLUME", "OPP_VOL") and pacer_mode == "NORMAL":
+            return "OPPORTUNISTE"
+        return "NORMAL"
     def _split_penalty_bps(self, buy_ex: str, sell_ex: str) -> float:
         """
         Penalty deterministica basata su metriche SPLIT correnti e soglie cfg.
@@ -3519,6 +3768,40 @@ class RiskManager:
         """
         pct = self.get_total_cost_pct(buy_ex, sell_ex, pair_key)
         return float(1e4 * pct + self._split_penalty_bps(buy_ex, sell_ex))
+
+    def _update_trade_mode(self) -> None:
+        """
+        Calcule le trade_mode consolidé (Ticket 11) à partir de rm_mode + pacer_mode.
+        Domaines :
+        - NORMAL
+        - CONSTRAINED
+        - SEVERE
+        - OPPORTUNISTE (marché "vert" + pacer NORMAL)
+        """
+        rm_mode = str(getattr(self, "rm_mode", "NORMAL")).upper()
+        pacer_mode = str(getattr(self, "pacer_mode", "NORMAL")).upper()
+
+        # Règles de priorité
+        if rm_mode == "SEVERE" or pacer_mode == "SEVERE":
+            mode = "SEVERE"
+        elif pacer_mode == "CONSTRAINED":
+            mode = "CONSTRAINED"
+        elif pacer_mode == "NORMAL" and rm_mode in ("OPP_VOLUME", "OPP_VOL"):
+            mode = "OPPORTUNISTE"
+        else:
+            mode = "NORMAL"
+
+        # Log compact pour validation runtime
+        prev = getattr(self, "trade_mode", "NORMAL")
+        if mode != prev:
+            logging.info(
+                "RM: trade_mode=%s (rm_mode=%s, pacer_mode=%s)",
+                mode,
+                rm_mode,
+                pacer_mode,
+            )
+        self.trade_mode = mode
+
 
     def _tick_mode(self) -> None:
         # 1) PnL-guard (peut forcer OPP_VOL / SEVERE)
@@ -3566,8 +3849,12 @@ class RiskManager:
                 # Marqueur : dernier "pas calme" (reset la fenêtre d'hystérésis)
                 self._last_all_green_ts = now
 
+            # Consolidation du mode pour l'Engine (toujours mise à jour)
+        self.trade_mode = self._compute_trade_mode()
+
         # ---- Appliquer les overlays du mode courant ----
         self._apply_mode_overrides()
+        self._update_trade_mode()
         # risk_manager.py — dans _tick_mode(), juste avant de sortir de la méthode
         self._split_auto_fallback_tick()
 
@@ -5998,7 +6285,7 @@ class RiskManager:
         P2: scheduler multi-branches TT/TM/MM simultanés + caps notionnels et préemption MM,
             REB lock par combo, shadow non-bloquant.
         - TTL-strict slip/vol (2s/5s)
-        - Caps par (branche,CEX) via _apply_caps_and_preempt (préempte MM sur TT/TM si nécessaire)
+        - Caps par (branche,CEX) via _apply_caps_and_preempt (legacy opp-level, préempte MM sur TT/TM si nécessaire)
         - REB: lock combo et exécute TM neutral
         """
         now = time.time()
@@ -6044,6 +6331,14 @@ class RiskManager:
             return
 
         # --- 3) Budgets d’in-flight (branche×profil) & pacer ----------------------
+        # Hiérarchie des caps (Ticket 10) :
+        #   - RM = caps business par branche/profil/route
+        #           (caps_trading_by_profile, inflight_rebal_by_profile).
+        #   - EnginePacer = caps infra (queue globale, inflight max pod).
+        #   - Les deux lisent uniquement BotConfig ; l'Engine n'applique
+        #     aucune décision économique additionnelle au-delà de
+        #     bundle_concurrency/headroom_min.
+
         profile = getattr(self, "capital_profile", "LARGE")
         profile_name = str(profile).upper()
         pacer = getattr(self, "pacer", None)
@@ -6294,14 +6589,18 @@ class RiskManager:
             caps_local |= degraded["caps"]
 
         if not legs:
-            raise RMError("BUNDLE_EMPTY_LEGS")
+            raise RMError(RM_BUNDLE_EMPTY_PARAMS)
+
 
         for i, leg in enumerate(legs):
             q = float(leg.get("qty") or 0.0)
             px = float(leg.get("px_limit") or 0.0)
             if q <= 0.0 or px <= 0.0:
-                raise RMError(f"BUNDLE_EMPTY_PARAMS leg={i} qty={q} px={px}")
-            
+                inc_rm_reject(reason=RM_BUNDLE_EMPTY_PARAMS,
+                              pair=pair,
+                              route=f"{buy_ex}->{sell_ex}")
+                raise RMError(f"{RM_BUNDLE_EMPTY_PARAMS} leg={i} qty={q} px={px}")
+
 
         bundle = make_submit_bundle(
             legs=legs,
@@ -6803,10 +7102,12 @@ class RiskManager:
         vm = getattr(self, "vol_manager", None)
         met = vm.get_current_metrics(pair) if vm and hasattr(vm, "get_current_metrics") else None
         last_age_s = float((met or {}).get("last_age_s", float("inf")))
+
         if not met or not (last_age_s < float("inf")):
-            inc_rm_reject(reason="RM_STALE_VOL", pair=pair,
+            inc_rm_reject(reason=RM_STALE_VOL,
+                          pair=pair,
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
-            raise RMError("RM_STALE_VOL")
+            raise RMError(RM_STALE_VOL)
 
         # 2) Prudence et source de slippage
         prudence = vm.get_prudence(pair).upper() if hasattr(vm, "get_prudence") else "UNKNOWN"
@@ -6814,10 +7115,12 @@ class RiskManager:
 
         # 3) Coût total via collecteur unique (SFC)
         sfc = getattr(self, "slip_collector", None) or getattr(self, "sfc", None)
+
         if not sfc or not hasattr(sfc, "get_total_cost_pct"):
-            inc_rm_reject(reason="RM_SFC_UNAVAILABLE", pair=pair,
+            inc_rm_reject(reason=RM_SFC_UNAVAILABLE,
+                          pair=pair,
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
-            raise RMError("RM_SFC_UNAVAILABLE")
+            raise RMError(RM_SFC_UNAVAILABLE)
 
         cost_frac = float(sfc.get_total_cost_pct(
             route=route,
@@ -6829,11 +7132,12 @@ class RiskManager:
             explain={"stage": "prebundle"}
         ))
         # cost_frac doit être numérique et >= 0
+
         if not (cost_frac >= 0.0):
-            inc_rm_reject(reason="RM_COST_COMPUTE_ERROR", pair=pair,
+            inc_rm_reject(reason=RM_COST_COMPUTE_ERROR,
+                          pair=pair,
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
-            raise RMError("RM_COST_COMPUTE_ERROR")
-        return cost_frac
+            raise RMError(RM_COST_COMPUTE_ERROR)
 
     # ------------------------------------------------------------------
     # Statut

@@ -1027,13 +1027,13 @@ class ExecutionEngine:
 
     def __init__(
             self,
-            cfg,
             private_ws,
             rate_limiter,
             retry_policy,
             history_logger=None,
             *,
             config=None,
+            cfg=None,
             risk_manager=None,
             venue_keys: dict | None = None,
             max_concurrent: int = 1,
@@ -1057,6 +1057,7 @@ class ExecutionEngine:
 
         # Sous-config "engine" (si fournie) ; sinon cfg.engine ; sinon cfg
         self.config = config or getattr(self.cfg, "engine", self.cfg)
+
         self.risk_manager = risk_manager
 
         # --- Garde DRY_RUN/PROD cohérente ---
@@ -1478,26 +1479,55 @@ class ExecutionEngine:
         return True
 
     # execution_engine.py — dans class ExecutionEngine
-    def _rm_ioc_mm_overrides(self, *, tif: str, maker: bool, post_only: bool) -> tuple[str, bool, bool, bool]:
+    def _rm_ioc_mm_overrides(
+            self,
+            *,
+            tif: str,
+            maker: bool,
+            post_only: bool,
+            meta: Optional[dict] = None,
+    ) -> tuple[str, bool, bool, bool]:
         """
         Applique les overrides imposés par le RiskManager (overlay de mode).
         Retourne (tif, maker, post_only, skip_maker_leg).
-        - Si RM force IOC-only => tif="IOC", post_only=False, maker=False (pas d'ordre maker en IOC).
-        - Si RM disable MM => on marque skip_maker_leg=True pour ignorer tout ordre maker.
+
+        Source de vérité principale (Ticket 11) :
+        - bundle.meta.mode_overrides = {"ioc_only": ..., "mm_enabled": ...}
+
+        Fallback compat :
+        - attributs du RiskManager (_ioc_only, enable_mm) si meta absent/incomplet.
         """
         skip = False
+
+        mode_overrides: dict = {}
+        if isinstance(meta, dict):
+            try:
+                mode_overrides = dict(meta.get("mode_overrides") or {})
+            except Exception:
+                mode_overrides = {}
+
+        ioc_only = mode_overrides.get("ioc_only")
+        mm_enabled = mode_overrides.get("mm_enabled")
+
+        # Fallback compat : lire le RM si besoin
         rm = getattr(self, "risk_manager", None)
         if rm is not None:
-            # IOC-only (overlay)
-            if bool(getattr(rm, "_ioc_only", False)):
-                tif = "IOC"
-                post_only = False
-                maker = False
-            # MM désactivé (overlay)
-            if hasattr(rm, "enable_mm") and (rm.enable_mm is False) and maker:
-                skip = True
-                maker = False
-                post_only = False
+            if ioc_only is None:
+                ioc_only = bool(getattr(rm, "_ioc_only", False))
+            if mm_enabled is None and hasattr(rm, "enable_mm"):
+                mm_enabled = bool(getattr(rm, "enable_mm", False))
+
+        # Application des overrides
+        if bool(ioc_only):
+            tif = "IOC"
+            post_only = False
+            maker = False
+
+        if (mm_enabled is False) and maker:
+            skip = True
+            maker = False
+            post_only = False
+
         return tif, maker, post_only, skip
 
     # Helpers simplifiés
@@ -5494,9 +5524,14 @@ class ExecutionEngine:
             maker, post_only = False, False
 
         # RM overlays
+        # RM overlays
         tif, maker, post_only, skip_maker = self._rm_ioc_mm_overrides(
-            tif=tif, maker=maker, post_only=post_only
+            tif=tif,
+            maker=maker,
+            post_only=post_only,
+            meta=meta,
         )
+
         if skip_maker and meta.get("maker", False):
             # Leg maker interdit par RM: on refuse proprement ce leg
             return {"status": "REJECT", "reason": "mm_disabled_by_rm"}
