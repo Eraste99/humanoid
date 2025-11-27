@@ -230,15 +230,22 @@ class PrivateWSReconciler:
         except Exception:
             return 0.0
 
-
     async def run_miss_alerts(self, threshold_per_minute: int = 30, period_s: float = 5.0) -> None:
         """
         Alerte si le nombre de 'miss' sur ~60s dépasse le seuil.
         - Tolère l’absence de self.cfg.
         - S’arrête proprement via self._stop.
+
+        Observabilité :
+          - WS_RECO_MISS_PER_MINUTE{exchange,alias}
+          - WS_RECO_MISS_BURST_TOTAL{exchange,alias}
+          - WS_RECO_ERRORS_TOTAL{exchange}
         """
-        ex = getattr(self, "venue", getattr(self, "exchange", "UNKNOWN"))
-        al = getattr(self, "alias", "UNKNOWN")
+        # Normalisation stricte des labels pour jointure alias-centric
+        ex_raw = getattr(self, "venue", getattr(self, "exchange", "UNKNOWN"))
+        al_raw = getattr(self, "alias", "UNKNOWN")
+        ex = str(ex_raw).upper()
+        al = str(al_raw).upper()
         cfg = getattr(self, "cfg", None)
 
         while not self._stop.is_set():
@@ -248,10 +255,14 @@ class PrivateWSReconciler:
                 while self._miss_win and (now - self._miss_win[0]) > 60.0:
                     self._miss_win.popleft()
                 rate = len(self._miss_win)
+
+                # Gauge per-minute (fenêtre glissante ~60s)
                 try:
                     WS_RECO_MISS_PER_MINUTE.labels(ex, al).set(float(rate))
                 except Exception:
                     pass
+
+                # Burst detection configurable
                 thr = int(getattr(cfg, "RECO_MISS_BURST_THRESHOLD", threshold_per_minute))
                 if rate >= thr:
                     try:
@@ -259,16 +270,20 @@ class PrivateWSReconciler:
                     except Exception:
                         pass
                     log.warning("[Reconciler:%s:%s] Burst de miss: %d/min ≥ seuil", ex, al, rate)
+
             except Exception as exc:
                 log.exception("[Reconciler] miss_alert loop error: %s", exc)
-                WS_RECO_ERRORS_TOTAL.labels(exchange=ex).inc()
+                try:
+                    WS_RECO_ERRORS_TOTAL.labels(exchange=ex).inc()
+                except Exception:
+                    pass
 
             period = max(1.0, float(getattr(cfg, "RECO_ALERT_PERIOD_S", period_s)))
             try:
                 # wake-up anticipé si stop() est appelé
                 await asyncio.wait_for(self._stop.wait(), timeout=period)
             except asyncio.TimeoutError:
-                continue
+                pass
 
     # ----------------------------- Utils -------------------------------------
 

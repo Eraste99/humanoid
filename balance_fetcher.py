@@ -1249,6 +1249,14 @@ class MultiBalanceFetcher:
             ts = float(rec.get("ts", 0.0))
             age = max(0.0, now - ts) if ts > 0.0 else float("inf")
             meta_age[f"{ex}.{al}"] = age
+            # Observabilité TTL cache par alias (gauge Prometheus)
+            if ts > 0.0:
+                try:
+                    BF_CACHE_AGE_SECONDS.labels(ex, al).set(float(age))
+                except Exception:
+                    # On ne casse jamais la vue RM pour un problème de métriques.
+                    pass
+
 
             vip = rec.get("vip") or {}
             if vip:

@@ -220,18 +220,21 @@ class _Bucket:
             self.b = max(1.0, float(burst))
             self.tokens = min(self.tokens, self.b)
 
-@dataclass(frozen=True)
+@dataclass
 class DecisionRecord:
-    decision_id: str
-    status: str               # "admitted" | "skipped"
-    reason: str               # "" si admitted
+    ts_ns: int
+    status: str          # "admitted" | "skipped" | ...
+    reason: str          # code RM_* ou autre
     pair: str
     buy_exchange: str
     sell_exchange: str
-    prudence: str
-    slippage_kind: str
-    ts_ns: int
-    explain: dict
+    prudence: Optional[float] = None
+    slippage_kind: Optional[str] = None
+    # Ajouts M1-4 pour funnel GO/NO-GO
+    strategy: Optional[str] = None   # TT | TM | MM | REB | UNKNOWN
+    branch: Optional[str] = None     # pour l’instant = strategy (mais extensible)
+    profile: Optional[str] = None    # NANO | MICRO | SMALL | MID | LARGE | UNKNOWN
+    explain: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":"))
@@ -490,38 +493,107 @@ class ProfileController:
         import time
         self._last_change_ts[region] = time.time()
 
-    def maybe_upgrade(self, region: str, net_per_sc: float, slo_ok: bool, pnl_ok: bool, dd_ok: bool, inflight_util_ok: bool) -> Optional[str]:
-        if not self._cooldown_ok(region): return None
+    def _get_rm_cfg(self):
+        cfg = getattr(self, "cfg", None)
+        if cfg is None:
+            return None
+        rm_cfg = getattr(cfg, "rm", None)
+        return rm_cfg or cfg
+
+    def _get_capital_ladder_cfg(self) -> Dict[str, Dict[str, Any]]:
+        rm_cfg = self._get_rm_cfg()
+        try:
+            ladder_cfg = getattr(rm_cfg, "capital_ladder_cfg", {}) if rm_cfg is not None else {}
+        except Exception:
+            ladder_cfg = {}
+        if isinstance(ladder_cfg, dict):
+            return ladder_cfg
+        return {}
+
+    def _get_ladder_order(self) -> List[str]:
+        ladder_cfg = self._get_capital_ladder_cfg()
+        if ladder_cfg:
+            # On respecte l'ordre défini dans BotConfig.capital_ladder_cfg
+            return list(ladder_cfg.keys())
+        # Fallback statique si la policy est absente
+        return ["NANO", "MICRO", "SMALL", "MID", "LARGE"]
+
+    def maybe_upgrade(
+            self,
+            region: str,
+            net_per_sc: float,
+            slo_ok: bool,
+            pnl_ok: bool,
+            dd_ok: bool,
+            inflight_util_ok: bool,
+    ) -> Optional[str]:
+        if not self._cooldown_ok(region):
+            return None
+            # Si le Pacer n'est pas encore branché, on ne fait rien.
+        if not getattr(self, "pacer", None):
+            return None
+
         cur = getattr(self.pacer, "_profile", "NANO")
-        ladder = ["NANO","MICRO","SMALL","MID","LARGE"]
-        idx = ladder.index(cur) if cur in ladder else 0
-        if idx >= len(ladder)-1: return None  # déjà LARGE
-        # capital gates
-        next_prof = ladder[idx+1]
-        # évalue la gate capital (par sous-compte)
-        gates = {
-            "MICRO": 2000, "SMALL": 5000, "MID": 30000, "LARGE": 100000
-        }
-        gate_ok = (net_per_sc >= gates.get(next_prof, 1e12))
-        # autres gates (SLO/risque/pression)
+        ladder = self._get_ladder_order()
+        try:
+            idx = ladder.index(cur)
+        except ValueError:
+            idx = 0
+        if idx >= len(ladder) - 1:
+            return None  # déjà au sommet de la ladder
+
+        next_prof = ladder[idx + 1]
+        ladder_cfg = self._get_capital_ladder_cfg()
+        policy_next = (ladder_cfg or {}).get(next_prof, {}) or {}
+        min_cap = float(policy_next.get("min_capital_per_sc", 0.0) or 0.0)
+        allow_upgrade = bool(policy_next.get("allow_auto_upgrade", True))
+
+        # Gate capital (policy) + gates SLO/risque
+        gate_ok = allow_upgrade and (net_per_sc >= min_cap)
+
         if gate_ok and slo_ok and pnl_ok and dd_ok and inflight_util_ok:
             self.pacer.set_capital_profile(next_prof)
             self._mark_change(region)
             return next_prof
         return None
 
-    def maybe_downgrade(self, region: str, severe_evt: bool, err_spike: bool, lag_spike: bool, drain_spike: bool, dd_breach: bool) -> Optional[str]:
-        if not self._cooldown_ok(region): return None
+    def maybe_downgrade(
+            self,
+            region: str,
+            severe_evt: bool,
+            err_spike: bool,
+            lag_spike: bool,
+            drain_spike: bool,
+            dd_breach: bool,
+    ) -> Optional[str]:
+        if not self._cooldown_ok(region):
+            return None
+            # Si le Pacer n'est pas encore branché, on ne fait rien.
+        if not getattr(self, "pacer", None):
+            return None
         cur = getattr(self.pacer, "_profile", "NANO")
-        ladder = ["NANO","MICRO","SMALL","MID","LARGE"]
-        idx = ladder.index(cur) if cur in ladder else 0
-        if idx <= 0: return None  # déjà NANO
+        ladder = self._get_ladder_order()
+        try:
+            idx = ladder.index(cur)
+        except ValueError:
+            idx = 0
+        if idx <= 0:
+            return None  # déjà au profil le plus bas
+
+        ladder_cfg = self._get_capital_ladder_cfg()
+        policy_cur = (ladder_cfg or {}).get(cur, {}) or {}
+        allow_downgrade = bool(policy_cur.get("allow_auto_downgrade", True))
+        if not allow_downgrade:
+            return None
+
         if severe_evt or err_spike or lag_spike or drain_spike or dd_breach:
-            next_prof = ladder[idx-1]
+            next_prof = ladder[idx - 1]
             self.pacer.set_capital_profile(next_prof)
             self._mark_change(region)
             return next_prof
         return None
+
+
 # === /RM: Upgrade/Downgrade controller ===
 @staticmethod
 def _cfg_float(cfg, name: str, default: float) -> float:
@@ -653,15 +725,25 @@ class RiskManager:
         self.inventory_cap_usd = self.inventory_cap_quote  # compat interne
         self.min_buffer_quote = _cfg_float(self.cfg, "min_buffer_quote", 0.0)
 
-
-
         # --- MM toggles & budgets ---
         self.enable_mm = bool(getattr(self.bot_cfg, "enable_maker_maker", False))
         self.mm_ttl_ms = _cfg_int(self.bot_cfg, "mm_ttl_ms", 2200)
-
         self.mm_alias = _cfg_str(self.bot_cfg, "mm_alias_name", "MM").upper()
 
+        # --- TM TTL & hedge policy (source unique pour l'Engine) ---
+        # Ces champs sont les SEULES sources de vérité pour TM :
+        # - tm_exposure_ttl_ms : TTL d'exposition TM (ms)
+        # - tm_exposure_ttl_hedge_ratio : ratio hedge en mode NEUTRAL
+        # - tm_nn_hedge_ratio : ratio hedge cible en mode NON_NEUTRAL
+        self.tm_exposure_ttl_ms = _cfg_int(self.cfg, "tm_exposure_ttl_ms", 2500)
+        self.tm_exposure_ttl_hedge_ratio = _cfg_float(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50)
+        self.tm_nn_hedge_ratio = _cfg_float(self.cfg, "tm_nn_hedge_ratio", 0.65)
+
         # Sink optionnel pour les drops de bundles (shadow, simu, recorder…)
+        # Horizon métier maximum d'exposition TM NON_NEUTRAL (secondes).
+        # Utilisé pour alimenter meta["tm"]["max_exposure_s"] sur les bundles TM/REB.
+        self.tm_nn_max_exposure_s = _cfg_float(self.cfg, "tm_nn_max_exposure_s", 3.0)
+
         self._shadow = None
 
         # ==== [ADD INSIDE __init__ RIGHT AFTER "MM toggles & budgets" BLOCK] =========
@@ -909,14 +991,40 @@ class RiskManager:
         self.fee_buyer = FeeTokenBuyer(self.config, logger=getattr(self, "logger", None))
 
         # --- RM Mode Overlay (FSM P0) ---
+        # rm_mode      : état "business" interne (OPP_VOLUME / OPP_VOL / SEVERE…)
+        # trade_mode   : mode consolidé exposé à l'Engine (rm_mode × pacer_mode)
+        # pacer_mode   : vue consolidée du Pacer (NORMAL / CONSTRAINED / SEVERE)
         self.rm_mode = "NORMAL"  # NORMAL | OPP_VOLUME | OPP_VOL | SEVERE
         self.trade_mode = "NORMAL"  # NORMAL | CONSTRAINED | SEVERE | OPPORTUNISTE
+        self.pacer_mode = "NORMAL"  # NORMAL | CONSTRAINED | SEVERE (injecté par watcher/Pacer)
         self._mode_since = 0.0
         self._mode_timeout_s = 30 * 60  # 30 min fenêtre opportuniste
         self._enter_hyst_s = 180  # 3 min verts
         self._exit_hyst_s = 120  # 2 min verts
         self._last_rm_mode_obs = self.rm_mode
         self._last_trade_mode_obs = self.trade_mode
+
+        # --- Capital ladder / ProfileController (7-RM-2a) ---
+        try:
+            self._profile_ctrl = ProfileController(
+                getattr(self, "pacer", None),
+                getattr(self, "cfg", None),
+            )
+        except Exception:
+            # On ne bloque jamais l'init du RM sur la ladder.
+            self._profile_ctrl = None
+
+        #
+
+        # Contrat Macro 5 — rm_mode × pacer_mode → trade_mode :
+        #   rm_mode     pacer_mode    → trade_mode
+        #   ---------------------------------------
+        #   SEVERE      *             → SEVERE  (PnL-guard / incidents / infra)
+        #   *           SEVERE        → SEVERE  (infra en crise)
+        #   *           CONSTRAINED   → CONSTRAINED (infra sous pression)
+        #   OPP_VOLUME  NORMAL        → OPPORTUNISTE (volume ↑ sur marché "vert")
+        #   OPP_VOL     NORMAL        → OPPORTUNISTE (volatilité exploitée)
+        #   sinon       NORMAL        → NORMAL
 
         # Etat consolidé exposé au moteur (FSM centrale)
         # Domaines : NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE
@@ -1373,13 +1481,46 @@ class RiskManager:
         """
         return max(0.0, float(gross_equity) - float(fee_reserve_total))
 
-
     def decide_capital_profile(self, net_per_sc: float) -> str:
-        if net_per_sc < 2000: return "NANO"
-        if net_per_sc < 5000: return "MICRO"
-        if net_per_sc < 30000: return "SMALL"
-        if net_per_sc < 100000: return "MID"
-        return "LARGE"
+        """
+        Détermine le profil capital à partir du capital net moyen par sous-compte,
+        en se basant exclusivement sur la policy capital_ladder_cfg de BotConfig.
+        """
+        cfg = getattr(self, "cfg", None)
+
+        # Récupère la policy RM.capital_ladder_cfg
+        rm_cfg = getattr(cfg, "rm", None) if cfg is not None else None
+        ladder_cfg = {}
+        if rm_cfg is not None:
+            try:
+                ladder_cfg = dict(getattr(rm_cfg, "capital_ladder_cfg", {}) or {})
+            except Exception:
+                ladder_cfg = {}
+
+        if not ladder_cfg:
+            # Fallback conservateur : on renvoie simplement le profil global configuré.
+            g = getattr(cfg, "g", None) if cfg is not None else None
+            prof = getattr(g, "capital_profile", "LARGE") if g is not None else "LARGE"
+            return str(prof).upper()
+
+        best_prof = None
+        best_min_cap = None
+        for prof, policy in ladder_cfg.items():
+            policy = policy or {}
+            try:
+                min_cap = float(policy.get("min_capital_per_sc", 0.0) or 0.0)
+            except Exception:
+                continue
+            if net_per_sc >= min_cap and (best_min_cap is None or min_cap >= best_min_cap):
+                best_prof = prof
+                best_min_cap = min_cap
+
+        if best_prof is None:
+            # net_per_sc en-dessous de toutes les gates : on prend le premier profil de la ladder.
+            best_prof = next(iter(ladder_cfg.keys()))
+
+        return str(best_prof).upper()
+
 
     # === /RM: capital net & profil ===
 
@@ -1419,6 +1560,21 @@ class RiskManager:
         branch_u = str(branch or meta.get("branch") or "").upper()
         profile_u = str(profile or getattr(self, "capital_profile", "LARGE")).upper()
 
+        # Facteur TTL alias (balances_ttl) injecté par engine_enqueue_bundle.
+        # Par défaut, on est neutre (=1.0) si aucun overlay n'est présent.
+        alias_cap_factor = 1.0
+        try:
+            overlays = (meta or {}).get("overlays") or {}
+            ttl_overlay = overlays.get("balances_ttl") or {}
+            alias_cap_factor = float(ttl_overlay.get("alias_cap_factor", 1.0))
+        except Exception:
+            alias_cap_factor = 1.0
+        if alias_cap_factor > 1.0:
+            alias_cap_factor = 1.0
+        if alias_cap_factor < 0.0:
+            alias_cap_factor = 0.0
+
+
         # 0) Point de départ = ce que le builder a déjà packé
         caps_local: dict = {}
         try:
@@ -1445,26 +1601,41 @@ class RiskManager:
 
         inflight_cap_eff = caps_local.get("inflight_cap") or 0
 
-        # 2) bundle_concurrency : si absent, on remet ta logique pacer_factor
+        # 2) bundle_concurrency : si absent, on remet ta logique pacer_factor (down-clamp only)
         if "bundle_concurrency" not in caps_local:
-            pacer_factor = 1.0
             pacer = getattr(self, "pacer", None)
+            pacer_factor = 1.0
             if pacer and hasattr(pacer, "factor_for_branch"):
                 try:
                     pacer_factor = float(pacer.factor_for_branch(branch_u))
                 except Exception:
                     pacer_factor = 1.0
 
+            # Clamp explicite pour garantir le "down-clamp only"
+            if pacer_factor > 1.0:
+                pacer_factor = 1.0
+            if pacer_factor < 0.0:
+                pacer_factor = 0.0
+
             try:
-                bundle_concurrency = max(0, int(round(float(inflight_cap_eff) * pacer_factor)))
+                bundle_concurrency = max(
+                    0,
+                    int(round(float(inflight_cap_eff) * pacer_factor * alias_cap_factor)),
+                )
             except Exception:
-                bundle_concurrency = max(0, int(float(inflight_cap_eff or 0)))
+                bundle_concurrency = max(
+                    0,
+                    int(float(inflight_cap_eff or 0) * alias_cap_factor),
+                )
 
             caps_local["bundle_concurrency"] = bundle_concurrency
 
         # 3) headroom_min : si absent, on garde ta valeur par défaut config
         if "headroom_min" not in caps_local:
             caps_local["headroom_min"] = int(getattr(self, "inflight_headroom_min", 1) or 0)
+
+        # 4) Exposer le facteur TTL alias appliqué pour ce bundle (observabilité / debug).
+        caps_local["alias_cap_factor"] = alias_cap_factor
 
         return caps_local
 
@@ -1599,38 +1770,110 @@ class RiskManager:
 
     # risk_manager.py — class RiskManager
 
+    # modules/risk_manager.py — class RiskManager
+
+    # risk_manager.py — class RiskManager
+
+    def _is_branch_eligible(self, branch: str, profile: str) -> tuple[bool, str]:
+        """
+        Gate haut niveau avant allocation de capital sur un bundle.
+
+        Règles métier Macro 4 / Macro 5 (pré-Engine) :
+        - Kill switch global coupe toutes les branches.
+        - Branch MM désactivée si enable_mm=False.
+        - En mode SEVERE (PnL guard), la branche MM est coupée (MM=0),
+          TT/TM/REB restent autorisées mais sous caps/pacer/TTL renforcés.
+        - Les autres gardes (budget quotidien, net floor, etc.) sont appliquées
+          plus loin dans la chaîne, au plus près du sizing.
+
+        Retourne (True, "") si la branche est éligible, sinon (False, REASON).
+        """
+        try:
+            b = str(branch or "TT").upper()
+            p = str(profile or "LARGE").upper()
+        except Exception:
+            b = "TT"
+            p = "LARGE"
+
+        # 1) Kill switch global (ops) : coupe toutes les branches.
+        if getattr(self, "global_kill_switch", False):
+            return False, "GLOBAL_KILL_SWITCH"
+
+        # 2) Branch MM désactivée par config.
+        if b == "MM" and not bool(getattr(self, "enable_mm", False)):
+            return False, "MM_DISABLED"
+
+        # 3) Mode SEVERE (PnL guard) : MM = 0, les autres branches passent encore.
+        mode = str(getattr(self, "rm_mode", "NORMAL") or "NORMAL").upper()
+        if mode == "SEVERE" and b == "MM":
+            return False, "RM_MODE_SEVERE_MM_OFF"
+
+        # Hooks futurs : mute par branche/profil, netfloor global, etc.
+        return True, ""
+
+
+
     def engine_enqueue_bundle(self, bundle: Dict[str, Any]) -> bool:
         """
-        Point central pour envoyer un bundle vers l'Engine en appliquant:
-        - éligibilité RM (branch/profile/pacer/drawdowns),
-        - TTL balances par alias (MBF → RM),
-        - caps notionnels (TT/TM/MM/REB) + préemption MM,
-        - intégration shadow (simulateur) si actif.
+                Point central pour envoyer un bundle vers l'Engine en appliquant:
+                - éligibilité RM (branch/profile/pacer/drawdowns),
+                - TTL balances par alias (MBF → RM),
+                - dérivation d'un capital_mode consolidé pour le bundle
+                  ("OK" / "CONSTRAINED" / "BLOCKED"),
+                - caps notionnels (TT/TM/MM/REB) + préemption MM,
+                - intégration shadow (simulateur) si actif.
 
-        Retourne True si le bundle a été accepté par l'Engine.
-        """
+                Retourne True si le bundle a été accepté par l'Engine.
+                """
+
         if not self.engine:
             logging.warning("RM : engine indisponible, drop bundle")
             return False
 
-            # Rafraîchit le mode consolidé et ses overlays avant d'exposer au moteur
+        # Rafraîchit le mode consolidé et ses overlays avant d'exposer au moteur
         try:
-            self.trade_mode = self._compute_trade_mode()
+            self._update_trade_mode()
         except Exception:
+            # Défensif : ne jamais casser le flux si la consolidation échoue
             self.trade_mode = getattr(self, "trade_mode", "NORMAL") or "NORMAL"
         self._apply_mode_overrides()
+
 
         meta = bundle.get("meta") or {}
         meta.setdefault("mode", self.trade_mode)
         meta.setdefault("mode_overrides", dict(getattr(self, "_current_mode_overrides", {}) or {}))
         if self.trade_mode == "OPPORTUNISTE" and self.rm_mode in ("OPP_VOLUME", "OPP_VOL"):
             meta.setdefault("mode_overrides", {}).setdefault("submode", self.rm_mode)
+
+        # Macro 4 — capital_mode : vue consolidée du plane capital/TTL pour ce bundle.
+        # Par défaut on reste "UNKNOWN" tant que les règles TTL n'ont pas encore été appliquées.
+        meta.setdefault("capital_mode", "UNKNOWN")
+
         bundle["meta"] = meta
-        branch = (meta.get("branch") or self._current_branch or "TT").upper()
-        profile = (meta.get("profile") or self._capital_profile or "NANO").upper()
+
+        # Branche métier (TT/TM/MM/REB) : toujours dérivée du payload, jamais d'état global.
+        raw_branch = (
+                meta.get("branch")
+                or bundle.get("strategy")
+                or bundle.get("branch")
+                or "TT"
+        )
+        branch = str(raw_branch or "TT").upper()
+
+        # Profil capital : payload → attribut RM → config, avec fallback conservateur.
+        raw_profile = (
+                meta.get("profile")
+                or bundle.get("profile")
+                or getattr(self, "capital_profile", None)
+                or getattr(getattr(self, "cfg", None), "capital_profile", None)
+                or getattr(getattr(self, "cfg", None), "capital_profile_name", None)
+                or "LARGE"
+        )
+        profile = str(raw_profile or "LARGE").upper()
+
         priority = int(meta.get("priority") or 0)
         trace_id = meta.get("trace_id") or bundle.get("trace_id") or "NA"
-        quote = (meta.get("quote") or "USDC").upper()
+        quote = str(meta.get("quote") or "USDC").upper()
 
 
         # 1) Éligibilités de base (branch / profile / pacer / draws / netfloor…)
@@ -1642,14 +1885,46 @@ class RiskManager:
 
         # 1.b) Gate TTL balances (MBF → RM) avant d'autoriser du capital
         ttl_info = self._check_balance_ttl_for_bundle(bundle)
+
+        # Par défaut : aucun signal TTL exploitable.
+        status: Optional[str] = None
+        ex_ttl: Optional[str] = None
+        alias_ttl: Optional[str] = None
+        age_s: float = 0.0
+        capital_at_risk: bool = False
+        alias_cap_factor: float = 1.0
+        ws_info: Dict[str, Any] = {}
+
         if ttl_info:
             status = ttl_info["status"]
             ex_ttl = ttl_info["exchange"]
             alias_ttl = ttl_info["alias"]
             age_s = float(ttl_info.get("age_s") or 0.0)
 
+            # Macro 4 — dérive un capital_mode consolidé depuis le statut TTL effectif.
+            if status == "BLOCKED":
+                meta["capital_mode"] = "BLOCKED"
+            elif status == "DEGRADED":
+                # Alias dégradé : capital contraint (caps down-clampés, MM coupé plus bas).
+                meta["capital_mode"] = "CONSTRAINED"
+            else:
+                # Par construction _check_balance_ttl_for_bundle ne renvoie que DEGRADED/BLOCKED,
+                # mais on reste défensif pour les évolutions futures.
+                meta.setdefault("capital_mode", "OK")
+            bundle["meta"] = meta
+
             ws_info = ttl_info.get("ws_accounts") or {}
             capital_at_risk = bool(ws_info.get("capital_at_risk"))
+
+            # Facteur de down-clamp de caps appliqué sur cet alias (0.0–1.0, défensif).
+            try:
+                alias_cap_factor = float(ttl_info.get("alias_cap_factor", 1.0))
+                if alias_cap_factor < 0.0:
+                    alias_cap_factor = 0.0
+                elif alias_cap_factor > 1.0:
+                    alias_cap_factor = 1.0
+            except Exception:
+                alias_cap_factor = 1.0
 
             # Si l'alias est marqué "capital_at_risk" par la chaîne WS,
             # on déclenche/priorise un resync balances ciblé (throttlé).
@@ -1698,17 +1973,27 @@ class RiskManager:
                 # Pour les branches critiques, on laisse passer mais on taggue l'overlay.
                 overlays = meta.setdefault("overlays", {})
                 overlays_ttl = {
+                    # Statut TTL effectif pour ce bundle (après surcouche WS/capital_move).
                     "status": status,
+                    "effective_status": status,
                     "exchange": ex_ttl,
                     "alias": alias_ttl,
                     "age_s": age_s,
                     "capital_at_risk": capital_at_risk,
+                    "alias_cap_factor": alias_cap_factor,
+                    # Copie du capital_mode consolidé exposé au moteur.
+                    "capital_mode": str(meta.get("capital_mode") or "UNKNOWN").upper(),
                 }
                 if ws_info:
                     overlays_ttl["ws_accounts"] = dict(ws_info)
                 overlays["balances_ttl"] = overlays_ttl
                 bundle["meta"] = meta
 
+        # 1.c) Si aucune info TTL exploitable n'est disponible,
+        # on considère le capital_mode comme "OK" (aucune contrainte TTL détectée).
+        if not meta.get("capital_mode") or meta.get("capital_mode") == "UNKNOWN":
+            meta["capital_mode"] = "OK"
+            bundle["meta"] = meta
 
         # 2) Légalité & REB lock
         if not self._is_bundle_legal(bundle):
@@ -1724,11 +2009,89 @@ class RiskManager:
         # 3) Caps notionnels par CEX / profil / branche (+ préemption MM)
         caps_local = self._get_caps_for_bundle(bundle, branch, profile, quote, meta)
 
-        ok, reason_caps = self._apply_caps_and_preempt(bundle, profile, caps_local)
+        ok, caps_local, trade_mode = self._apply_caps_and_preempt(
+            bundle=bundle,
+            branch=branch,
+            profile=profile,
+            quote=quote,
+            caps_local=caps_local,
+        )
         if not ok:
             if self._shadow:
-                self._shadow.on_bundle_drop(bundle, reason_caps or "CAPS")
+                self._shadow.on_bundle_drop(bundle, "CAPS_PREEMPT")
             return False
+
+
+        # 3.a) Cap global par combo (TT+TM+REB) — Ticket 6-RM-2
+        combo_cap_usd = self._compute_combo_cap_for_bundle(
+            bundle=bundle,
+            branch=branch,
+            profile=profile,
+            quote=quote,
+            caps_local=caps_local,
+        )
+        if combo_cap_usd is not None and combo_cap_usd > 0.0:
+            notional_usd = self._estimate_bundle_notional_usd(bundle)
+            if notional_usd > combo_cap_usd:
+                ttl_status = ""
+                try:
+                    meta = bundle.get("meta") or {}
+                    overlays = meta.get("overlays") or {}
+                    ttl_overlay = overlays.get("balances_ttl") or {}
+                    if isinstance(ttl_overlay, dict):
+                        ttl_status = str(ttl_overlay.get("status") or "").upper()
+                except Exception:
+                    ttl_status = ""
+
+                reason_combo = f"CAPS_COMBO:{notional_usd:.2f}>{combo_cap_usd:.2f}"
+                try:
+                    self._obs_combo_cap_reject(
+                        combo_key=self._get_combo_key_from_bundle(bundle) or "NA",
+                        branch=branch,
+                        profile=profile,
+                        ttl_status=ttl_status,
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    logging.info(
+                        "RM: drop bundle for combo cap %s (branch=%s, profile=%s, quote=%s, trace_id=%s, ttl_status=%s, notional_usd=%.4f, combo_cap_usd=%.4f)",
+                        self._get_combo_key_from_bundle(bundle) or "NA",
+                        branch,
+                        profile,
+                        quote,
+                        trace_id,
+                        ttl_status,
+                        float(notional_usd or 0.0),
+                        float(combo_cap_usd or 0.0),
+                    )
+                except Exception:
+                    pass
+
+                if self._shadow:
+                    self._shadow.on_bundle_drop(bundle, reason_combo)
+                return False
+
+        # 3.a bis) Soft caps par sub-compte (SC) — Rate limiting SC (Macro 10)
+        if not self._should_bypass_sc_rl(bundle, branch):
+            ok_rl, rl_reason = self._check_sc_softcap_for_bundle(bundle, branch, profile)
+            if not ok_rl:
+                reason_sc = rl_reason or "RL_SC_SOFTCAP"
+                try:
+                    logging.info(
+                        "RM: drop bundle %s (branch=%s, profile=%s) pour RL SC (%s)",
+                        trace_id,
+                        branch,
+                        profile,
+                        reason_sc,
+                    )
+                except Exception:
+                    pass
+                if self._shadow:
+                    self._shadow.on_bundle_drop(bundle, reason_sc)
+                return False
+
 
         # 3.b) Mode consolidé & overrides → Engine (Ticket 11)
         try:
@@ -1795,20 +2158,296 @@ class RiskManager:
 
     def _is_rebal_lock_active(self, bundle: Dict[str, Any]) -> bool:
         """
-        Stub P0 : hook pour le « REB lock » (lock combo REB sur une route).
+        Lock combo REB partagé avec TT/TM/MM.
 
-        Le design cible (roadmap RM/Sim/Engine) :
-        - un lock par combo (ex_from, ex_to, pair, alias…) posé par REB,
-        - qui gèle TT/TM/MM sur cette combo pendant l'exécution du plan REB.
+        Principe business :
+        - un REB qui démarre sur un combo (pair, buy_ex, sell_ex) pose un lock TTL
+          via _reb_locks / is_rebalancing_locked(...),
+        - pendant ce lock, on gèle TT/TM/MM sur ce même combo pour éviter
+          sur-exposition et “course poursuite” REB vs TT/TM.
 
-        Implémentation actuelle : toujours False tant que le scheduler REB
-        et la gestion fine des locks ne sont pas câblés.
+        Détails d’implémentation :
+        - on ne bloque que les branches TT/TM/MM (pas REB, pas HEDGE isolé),
+        - on derive le combo depuis bundle['route'] ou bundle['meta'],
+        - on délègue la décision finale à is_rebalancing_locked(...)
+          qui s’appuie sur _reb_locks et nettoie les expirations.
         """
-        # Quand tu implémenteras le vrai lock, tu pourras typiquement :
-        # - récupérer un combo_key depuis le bundle['meta'],
-        # - interroger un map de locks maintenu par rebalancing/RebalancingManager.
-        return False
+        # 1) Sanity minimal sur la structure
+        if not isinstance(bundle, dict):
+          return False
 
+        meta = bundle.get("meta") or {}
+        route = bundle.get("route") or {}
+
+        # 2) Branch du bundle (TT/TM/MM uniquement)
+        try:
+            branch = self._branch_of(meta, bundle)
+        except Exception:
+            branch = "UNKNOWN"
+
+        # On ne gèle que les branches de trading “classiques”
+        if branch not in ("TT", "TM", "MM"):
+            # REB lui-même, HEDGE internes, etc. ne sont pas bloqués par ce hook.
+            return False
+
+        # 3) Extraction du combo (pair, buy_ex, sell_ex)
+        #    On reste best-effort : si on ne retrouve pas proprement la route,
+        #    on ne bloque pas (risque = faible sur un cas incomplet).
+        pair = (
+                meta.get("pair")
+                or meta.get("symbol")
+                or bundle.get("pair")
+                or bundle.get("symbol")
+                or route.get("pair")
+                or ""
+        )
+        pair = (str(pair) or "").replace("-", "").upper()
+
+        buy_ex = (
+                meta.get("buy_ex")
+                or route.get("buy_ex")
+                or meta.get("to_exchange")
+                or route.get("to_exchange")
+                or ""
+        )
+        sell_ex = (
+                meta.get("sell_ex")
+                or route.get("sell_ex")
+                or meta.get("from_exchange")
+                or route.get("from_exchange")
+                or ""
+        )
+
+        buy_ex_u = str(buy_ex or "").upper()
+        sell_ex_u = str(sell_ex or "").upper()
+
+        if not (pair and buy_ex_u and sell_ex_u):
+            # Pas assez d’info pour reconstruire le combo ⇒ on laisse passer.
+            return False
+
+        # 4) Délégation à la fonction canonique de lock REB
+        lock_fn = getattr(self, "is_rebalancing_locked", None)
+        if not callable(lock_fn):
+            return False
+
+        try:
+            return bool(lock_fn(pair, buy_ex_u, sell_ex_u))
+        except Exception:
+            # En cas de problème de lock, on préfère ne pas bloquer le trafic.
+            return False
+
+    def _get_combo_key_from_bundle(self, bundle: Dict[str, Any]) -> Optional[str]:
+        """
+        Extrait un identifiant de combo « PAIR|EX_FROM->EX_TO » à partir d'un bundle.
+
+        Utilisé pour appliquer un cap global par combo (TT+TM+REB), quelle que soit
+        la branche qui porte le trade.
+        """
+        try:
+            meta = bundle.get("meta") or {}
+        except Exception:
+            meta = {}
+        try:
+            route = bundle.get("route") or {}
+        except Exception:
+            route = {}
+
+        pair = meta.get("pair") or route.get("pair") or bundle.get("pair") or bundle.get("symbol")
+        buy_ex = meta.get("buy_ex") or route.get("buy_ex")
+        sell_ex = meta.get("sell_ex") or route.get("sell_ex")
+
+        if not pair or not buy_ex or not sell_ex:
+            return None
+
+        try:
+            pair_key = self._norm_pair(str(pair))
+        except Exception:
+            pair_key = (str(pair) or "").replace("-", "").upper()
+
+        buy_u = str(buy_ex).upper()
+        sell_u = str(sell_ex).upper()
+
+        if not pair_key or not buy_u or not sell_u:
+            return None
+
+        return f"{pair_key}|{buy_u}->{sell_u}"
+
+    def _estimate_bundle_notional_usd(self, bundle: Dict[str, Any]) -> float:
+        """
+        Estimation conservative du notionnel du bundle en « USD-like ».
+
+        Ordre de priorité:
+          1) meta["notional_quote"]["amount"] si présent,
+          2) champs numériques connus (notional_usdc, notional_usd, volume_*),
+          3) fallback: max(qty * px) sur les legs.
+        """
+        try:
+            meta = bundle.get("meta") or {}
+        except Exception:
+            meta = {}
+
+        # 1) notional_quote structuré
+        try:
+            nq = meta.get("notional_quote") or bundle.get("notional_quote")
+        except Exception:
+            nq = None
+        if isinstance(nq, dict):
+            try:
+                amt = float(nq.get("amount") or nq.get("volume") or 0.0)
+                if amt > 0.0:
+                    return amt
+            except Exception:
+                pass
+
+        # 2) Champs numériques simples
+        for container in (meta, bundle):
+            if not isinstance(container, dict):
+                continue
+            for key in (
+                "notional_usdc",
+                "notional_usd",
+                "notional",
+                "volume_selected_quote",
+                "volume_quote",
+                "volume_usdc",
+                "volume_selected_usdc",
+            ):
+                if key in container:
+                    try:
+                        v = float(container.get(key) or 0.0)
+                        if v > 0.0:
+                            return v
+                    except Exception:
+                        continue
+
+        # 3) Fallback: derive depuis les legs
+        legs = bundle.get("legs") or []
+        best = 0.0
+        if isinstance(legs, (list, tuple)):
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    continue
+                try:
+                    qty = float(leg.get("qty") or 0.0)
+                    px = float(leg.get("px_limit") or leg.get("px") or 0.0)
+                    if qty > 0.0 and px > 0.0:
+                        notional = abs(qty * px)
+                        if notional > best:
+                            best = notional
+                except Exception:
+                    continue
+        return best
+
+    def _compute_combo_cap_for_bundle(
+        self,
+        bundle: Dict[str, Any],
+        branch: str,
+        profile: str,
+        quote: str,
+        caps_local: Dict[str, Any],
+    ) -> Optional[float]:
+        """
+        Cap global par combo (TT+TM+REB) — Ticket 6-RM-2.
+
+        Objectif:
+          - bornes notionnelles par route (PAIR|EX_FROM->EX_TO) pour TT/TM/REB,
+            cohérentes avec les caps par profil,
+          - sur-correction prudente en mode DEGRADED (TTL balances) via un facteur
+            multiplicatif, sans jamais dépasser les caps de profil.
+
+        Retourne None si aucun cap spécifique n'est applicable.
+        """
+        branch_u = (branch or "").upper()
+        if branch_u not in ("TT", "TM", "REB"):
+            # Cap global par combo ciblé uniquement sur les branches de trading.
+            return None
+
+        combo_key = self._get_combo_key_from_bundle(bundle)
+        if not combo_key:
+            return None
+
+        rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+        profile_u = (profile or "").upper() or "LARGE"
+
+        base_cap: Optional[float] = None
+
+        # 1) Config directe combo_cap_usd_by_profile si disponible.
+        try:
+            if rm_cfg is not None:
+                combo_caps = getattr(rm_cfg, "combo_cap_usd_by_profile", None)
+                if isinstance(combo_caps, dict):
+                    raw = combo_caps.get(profile_u) or combo_caps.get("LARGE") or 0.0
+                    raw_f = float(raw or 0.0)
+                    if raw_f > 0.0:
+                        base_cap = raw_f
+        except Exception:
+            base_cap = None
+
+        # 2) Fallback: dériver un cap combo à partir des caps de profil.
+        if base_cap is None:
+            try:
+                inflight_cap_branch = float(caps_local.get("inflight_cap") or 0.0)
+            except Exception:
+                inflight_cap_branch = 0.0
+
+            tt_cap = tm_cap = reb_cap = 0.0
+            try:
+                if rm_cfg is not None:
+                    caps_trading = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
+                    prof_caps = caps_trading.get(profile_u) or caps_trading.get("LARGE") or {}
+                    if isinstance(prof_caps, dict):
+                        tt_cap = float(prof_caps.get("TT") or 0.0)
+                        tm_cap = float(prof_caps.get("TM") or 0.0)
+                    rebal_caps = getattr(rm_cfg, "inflight_rebal_by_profile", {}) or {}
+                    reb_cap = float(rebal_caps.get(profile_u) or rebal_caps.get("LARGE") or 0.0)
+            except Exception:
+                tt_cap = tm_cap = reb_cap = 0.0
+
+            positive_caps = [c for c in (tt_cap, tm_cap, reb_cap) if c > 0.0]
+            if positive_caps:
+                # Cap combo <= min(cap_TT, cap_TM, cap_REB) pour ne jamais dépasser
+                # le budget le plus conservateur.
+                base_cap = min(positive_caps)
+            else:
+                base_cap = inflight_cap_branch
+
+        if not base_cap or base_cap <= 0.0:
+            return None
+
+        # 3) Ajustement TTL balances (vue enrichie via overlay balances_ttl)
+        ttl_status = ""
+        try:
+            meta = bundle.get("meta") or {}
+            overlays = meta.get("overlays") or {}
+            ttl_overlay = overlays.get("balances_ttl") or {}
+            if isinstance(ttl_overlay, dict):
+                ttl_status = str(ttl_overlay.get("status") or "").upper()
+        except Exception:
+            ttl_status = ""
+
+        degraded_factor = 1.0
+        if ttl_status == "DEGRADED":
+            # Facteur configurable (0.0–1.0) pour mode DEGRADED.
+            factor_cfg = None
+            try:
+                if rm_cfg is not None:
+                    factor_cfg = getattr(rm_cfg, "combo_ttl_degraded_factor", None)
+            except Exception:
+                factor_cfg = None
+            try:
+                degraded_factor = float(factor_cfg)
+            except Exception:
+                degraded_factor = 0.5
+            if degraded_factor < 0.0:
+                degraded_factor = 0.0
+            if degraded_factor > 1.0:
+                degraded_factor = 1.0
+
+        combo_cap = float(base_cap) * float(degraded_factor or 1.0)
+        if combo_cap <= 0.0:
+            return None
+
+        return combo_cap
 
 
     # ---- RiskManager helpers (remplacement complet) ----
@@ -1836,6 +2475,97 @@ class RiskManager:
         burst = self._cfg(f"rl.sc.{ex}.{branch}.burst", self._sc_default_burst)
         self._sc_buckets[key] = _Bucket(rate, burst)
         return self._sc_buckets[key]
+
+    def _should_bypass_sc_rl(self, bundle: Dict[str, Any], branch: str) -> bool:
+        """
+        Détermine si le rate limiting SC doit être bypassé pour ce bundle.
+
+        On ne rate-limit pas les flux de secours:
+        - HEDGE (y compris PANIC_HEDGE),
+        - achats de tokens de frais (fee_token_topup),
+        - transferts internes / refresh capital explicite.
+        """
+        try:
+            meta = bundle.get("meta") or {}
+        except Exception:
+            meta = {}
+
+        kind = str(meta.get("kind") or bundle.get("kind") or "").upper()
+        if kind in (
+            "HEDGE",
+            "PANIC_HEDGE",
+            "FEE_TOKEN_TOPUP",
+            "FEE_TOPUP",
+            "INTERNAL_TRANSFER",
+            "INTERNAL",
+            "CAPITAL_REFRESH",
+        ):
+            return True
+
+        br = str(branch or meta.get("branch") or "").upper()
+        if br in ("HEDGE", "INTERNAL"):
+            return True
+
+        return False
+
+    def _check_sc_softcap_for_bundle(
+        self,
+        bundle: Dict[str, Any],
+        branch: str,
+        profile: str,
+    ):
+        """
+        Applique le rate limiting « soft cap » par sub-compte
+        (exchange, alias, branch) pour un bundle donné.
+
+        Retourne (ok, reason) où:
+        - ok = True  : RL SC laisse passer le bundle,
+        - ok = False : RL SC rejette le bundle avec reason non nul.
+        """
+        # Sécurité: si la config RL est absente/cassée, on ne casse pas le flux.
+        try:
+            self._ensure_sc_softcap()
+        except Exception:
+            return True, None
+
+        try:
+            aliases = self._iter_bundle_aliases(bundle)
+        except Exception:
+            aliases = []
+
+        if not aliases:
+            # Pas d’alias exploitable → pas de RL SC ici.
+            return True, None
+
+        branch_u = str(branch or "").upper() or "UNKNOWN"
+
+        for ex, alias in aliases:
+            ex_u = str(ex or "").upper()
+            alias_u = str(alias or "").upper()
+            key = (ex_u, alias_u, branch_u)
+
+            bucket = self._get_sc_bucket(key)
+            ok = bool(bucket.try_acquire())
+
+            if ok:
+                # Admission SC
+                try:
+                    self._obs_sc_counter("rm_rl_sc_admit_total", ex_u, alias_u, branch_u)
+                except Exception:
+                    pass
+                continue
+
+            # Rejet SC pour ce bundle (on logge + métriques)
+            try:
+                self._obs_sc_counter("rm_rl_sc_reject_total", ex_u, alias_u, branch_u)
+            except Exception:
+                pass
+
+            reason = f"RL_SC_SOFTCAP:{ex_u}.{alias_u}.{branch_u}"
+            return False, reason
+
+        # Tous les SC concernés ont laissé passer
+        return True, None
 
 
     def _branch_of(self, meta: dict, bundle: dict) -> str:
@@ -2286,6 +3016,113 @@ class RiskManager:
 
         return "BLOCKED"
 
+    def _get_alias_ttl_cap_factor(self, ttl_status: str, branch: str) -> float:
+        """
+               Calcule un facteur de cap par alias en fonction du statut TTL et de la branche.
+
+               Règles métier Macro 4 (alias_state × branch) :
+               - UNKNOWN / OK  -> 1.0 (aucun impact sur les caps, toutes branches)
+               - BLOCKED       -> 0.0 théorique (les alias BLOCKED sont déjà hard-gatés par
+                                 engine_enqueue_bundle, aucun bundle ne sort du RM)
+               - DEGRADED      -> down-clamp piloté par branche via cfg.rm.ttl_factor_*_degraded :
+
+                   | alias_state | TT            | TM            | REB           | MM              |
+                   |-------------|---------------|---------------|---------------|-----------------|
+                   | OK/UNKNOWN  | 1.0           | 1.0           | 1.0           | 1.0             |
+                   | DEGRADED    | f_TT (≤1.0)   | f_TM (≤1.0)   | f_REB (≤1.0)  | f_MM (=0.0 par défaut + DROP RM) |
+                   | BLOCKED     | 0.0 + DROP RM | 0.0 + DROP RM | 0.0 + DROP RM | 0.0 + DROP RM   |
+
+               Ici, f_TT/f_TM/f_REB/f_MM sont lus dans cfg.rm.ttl_factor_*_degraded, avec des
+               valeurs par défaut conservatrices. Le DROP MM sur alias DEGRADED/BLOCKED est
+               appliqué dans engine_enqueue_bundle, cette fonction ne fait que calculer un
+               facteur de down-clamp.
+
+               Les facteurs sont toujours clampés dans [0.0, 1.0] pour garantir le "down-clamp only".
+               """
+        status = str(ttl_status or "UNKNOWN").upper()
+        b = str(branch or "").upper()
+
+        # Cas neutres
+        if status in ("UNKNOWN", "OK"):
+            return 1.0
+        if status == "BLOCKED":
+            return 0.0
+
+        # DEGRADED : lookup config, sinon fallback conservateur.
+        rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+
+        default_map = {
+            "TT": 0.5,
+            "TM": 0.4,
+            "REB": 0.3,
+            "MM": 0.0,
+        }
+
+        if b == "TT":
+            val = getattr(rm_cfg, "ttl_factor_tt_degraded", default_map["TT"])
+        elif b == "TM":
+            val = getattr(rm_cfg, "ttl_factor_tm_degraded", default_map["TM"])
+        elif b == "REB":
+            val = getattr(rm_cfg, "ttl_factor_reb_degraded", default_map["REB"])
+        elif b == "MM":
+            val = getattr(rm_cfg, "ttl_factor_mm_degraded", default_map["MM"])
+        else:
+            val = getattr(rm_cfg, "ttl_factor_default_degraded", 1.0)
+
+        try:
+            f = float(val)
+        except Exception:
+            f = 1.0
+
+        if f < 0.0:
+            f = 0.0
+        if f > 1.0:
+            f = 1.0
+        return f
+
+
+    def _is_critical_alias(self, exchange: str, alias: str) -> bool:
+        """
+        Retourne True si (exchange, alias) doit contribuer aux escalades globales
+        de mode (TTL / WS). Permet de ne pas faire basculer toute la plateforme
+        sur un alias purement sandbox/test.
+
+        Règles:
+        - si cfg.RM_CRITICAL_ALIASES est défini: liste de patterns "EX.ALIAS"
+          ou "*.ALIAS" (EX ou ALIAS peuvent être "*" ou vides pour matcher tout).
+        - sinon: on considère comme NON critiques uniquement les alias dont le
+          nom contient "SANDBOX" ou "TEST" (en insensible à la casse).
+        """
+        ex_u = str(exchange or "").upper()
+        alias_u = str(alias or "").upper()
+
+        patterns = getattr(self.cfg, "RM_CRITICAL_ALIASES", None)
+        if isinstance(patterns, (list, tuple, set)):
+            for pat in patterns:
+                try:
+                    ex_pat, alias_pat = str(pat).upper().split(".", 1)
+                except ValueError:
+                    # Pattern inattendu, on l'ignore.
+                    continue
+
+                if ex_pat not in ("", "*") and ex_pat != ex_u:
+                    continue
+                if alias_pat not in ("", "*") and alias_pat != alias_u:
+                    continue
+                return True
+
+            # Une liste explicite existe mais aucun pattern ne matche :
+            # on considère l'alias comme non critique.
+            return False
+
+        # Fallback heuristique : tout est critique sauf les alias explicitement
+        # marqués sandbox/test.
+        if "SANDBOX" in alias_u or "TEST" in alias_u:
+            return False
+
+        return True
+
+
     def _refresh_balances_ttl_cache(self) -> None:
         """
         Récupère le snapshot MBF (cached_only) et met à jour :
@@ -2416,6 +3253,150 @@ class RiskManager:
         for key in done:
             self._alias_capital_move_state.pop(key, None)
 
+    def get_private_alias_status_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """Retourne un snapshot alias-centric du marché privé pour obs/dashboard.
+
+        Structure de retour (exemple) ::
+
+            {
+                "BINANCE": {
+                    "TT": {
+                        "age_s": 12.3,
+                        "ttl_status": "OK",
+                        "effective_status": "OK",  # TTL + WS + capital_move
+                        "capital_move": {
+                            "active": false,
+                            "start_ts": 0.0,
+                            "deadline_ts": 0.0,
+                            "last_notional_usdc": 0.0,
+                            "source": "",
+                            "subtype": "",
+                        },
+                        "ws_accounts": {...},      # hub_status / reco_status / last_resync_ts / capital_at_risk
+                        "capital_at_risk": false,
+                    },
+                    ...
+                },
+                ...
+                "_meta": {
+                    "rm_mode": "NORMAL",
+                    "trade_mode": "NORMAL",
+                },
+            }
+
+        Cette vue est strictement read-only et destinée à la couche
+        observabilité / dashboard (Ticket 13).
+        """
+        snapshot: Dict[str, Dict[str, Any]] = {}
+
+        # Caches internes mis à jour par _refresh_balances_ttl_cache().
+        try:
+            alias_age = dict(getattr(self, "_alias_balance_age_s", {}) or {})
+        except Exception:
+            alias_age = {}
+        try:
+            alias_status = dict(getattr(self, "_alias_balance_status", {}) or {})
+        except Exception:
+            alias_status = {}
+        try:
+            ws_cache = dict(getattr(self, "_alias_ws_accounts_status", {}) or {})
+        except Exception:
+            ws_cache = {}
+        try:
+            move_cache = dict(getattr(self, "_alias_capital_move_state", {}) or {})
+        except Exception:
+            move_cache = {}
+
+        if not alias_age and not ws_cache and not move_cache:
+            # Rien à exposer pour l'instant : on renvoie uniquement le contexte global.
+            return {
+                "_meta": {
+                    "rm_mode": str(getattr(self, "rm_mode", "NORMAL")).upper(),
+                    "trade_mode": str(getattr(self, "trade_mode", "NORMAL")).upper(),
+                }
+            }
+
+        # Union de toutes les clés vues côté balances/WS/capital_move.
+        all_keys: Set[Tuple[str, str]] = set()
+        for d in (alias_age, alias_status, ws_cache, move_cache):
+            try:
+                all_keys.update(d.keys())
+            except Exception:
+                continue
+
+        now = time.time()
+
+        for raw_key in all_keys:
+            try:
+                ex_u, alias_u = raw_key
+            except Exception:
+                # Clé inattendue (pas un tuple (ex, alias)), on ignore.
+                continue
+
+            ex = str(ex_u).upper()
+            alias = str(alias_u).upper()
+            key = (ex_u, alias_u)
+
+            # 1) TTL balances (âge + statut brut)
+            try:
+                age_raw = alias_age.get(key, None)
+                age_s = float(age_raw) if age_raw is not None else None
+            except Exception:
+                age_s = None
+
+            ttl_status = str(alias_status.get(key, "UNKNOWN")).upper()
+
+            # 2) Surcouche WS + capital_at_risk
+            ws_meta_raw = ws_cache.get(key) or {}
+            ws_meta = dict(ws_meta_raw) if isinstance(ws_meta_raw, dict) else {}
+            capital_at_risk = bool(ws_meta.get("capital_at_risk"))
+
+            # 3) Surcouche "capital en mouvement"
+            move_state_raw = move_cache.get(key) or {}
+            move_state = dict(move_state_raw) if isinstance(move_state_raw, dict) else {}
+            deadline_ts = float(move_state.get("deadline_ts") or 0.0)
+            start_ts = float(move_state.get("start_ts") or 0.0)
+            last_notional = float(move_state.get("last_notional_usdc") or 0.0)
+            capital_move_active = bool(deadline_ts > 0.0 and now < deadline_ts)
+
+            # 4) Statut effectif aligné sur _check_balance_ttl_for_bundle():
+            effective_status = ttl_status
+            if capital_move_active and effective_status in ("UNKNOWN", "OK"):
+                effective_status = "DEGRADED"
+
+            if capital_at_risk:
+                if effective_status in ("UNKNOWN", "OK"):
+                    effective_status = "DEGRADED"
+                elif effective_status == "DEGRADED":
+                    effective_status = "BLOCKED"
+
+            # 5) Construction de la vue par (exchange, alias)
+            per_ex = snapshot.setdefault(ex, {})
+            per_ex[alias] = {
+                "age_s": age_s,
+                "ttl_status": ttl_status,
+                "effective_status": effective_status,
+                "capital_move": {
+                    "active": capital_move_active,
+                    "start_ts": start_ts,
+                    "deadline_ts": deadline_ts,
+                    "last_notional_usdc": last_notional,
+                    "source": str(move_state.get("source") or ""),
+                    "subtype": str(move_state.get("subtype") or ""),
+                } if move_state else {
+                    "active": False,
+                },
+                "ws_accounts": ws_meta,
+                "capital_at_risk": capital_at_risk,
+            }
+
+        # 6) Ajout du contexte global RM/Trade mode.
+        snapshot["_meta"] = {
+            "rm_mode": str(getattr(self, "rm_mode", "NORMAL")).upper(),
+            "trade_mode": str(getattr(self, "trade_mode", "NORMAL")).upper(),
+        }
+        return snapshot
+
 
     def _iter_bundle_aliases(self, bundle: Dict[str, Any]) -> List[Tuple[str, str]]:
         """
@@ -2475,6 +3456,10 @@ class RiskManager:
         """
         if not getattr(self, "_mbf_glue", None):
             return None
+
+        meta = bundle.get("meta") or {}
+        branch = self._branch_of(meta, bundle)
+
 
         # Rafraîchit le cache TTL + statuts WS depuis MBF.as_rm_snapshot()
         self._refresh_balances_ttl_cache()
@@ -2539,13 +3524,25 @@ class RiskManager:
 
             if rank > worst_rank:
                 worst_rank = rank
+                alias_cap_factor = self._get_alias_ttl_cap_factor(effective_status, branch)
+                try:
+                    alias_cap_factor = float(alias_cap_factor)
+                except Exception:
+                    alias_cap_factor = 1.0
+                if alias_cap_factor < 0.0:
+                    alias_cap_factor = 0.0
+                if alias_cap_factor > 1.0:
+                    alias_cap_factor = 1.0
+
                 worst = {
                     "status": effective_status,
                     "exchange": ex.upper(),
                     "alias": alias.upper(),
                     "age_s": float(age_s),
                     "ws_accounts": ws_info,
+                    "alias_cap_factor": alias_cap_factor,
                 }
+
 
         if not worst:
             return None
@@ -2667,6 +3664,36 @@ class RiskManager:
         except Exception:
             logging.exception("RM: erreur métrique RM_BALANCES_STALE_TOTAL")
 
+    def _obs_combo_cap_reject(
+        self,
+        *,
+        combo_key: str,
+        branch: str,
+        profile: str,
+        ttl_status: str,
+    ) -> None:
+        """
+        Observabilité: compteur de rejets liés au cap global par combo.
+        """
+        try:
+            from . import obs_metrics  # type: ignore
+        except Exception:  # pragma: no cover
+            return
+
+        metric = getattr(obs_metrics, "RM_COMBO_CAP_REJECT_TOTAL", None)
+        if metric is None:
+            return
+
+        try:
+            metric.labels(
+                combo=str(combo_key),
+                branch=str(branch).upper(),
+                profile=str(profile).upper(),
+                ttl_status=str(ttl_status).upper() or "NA",
+            ).inc()
+        except Exception:
+            logging.exception("RM: erreur métrique RM_COMBO_CAP_REJECT_TOTAL")
+
 
     def _obs_capital_move_visibility(
         self,
@@ -2754,22 +3781,41 @@ class RiskManager:
                 logging.exception("RM: erreur métrique RM_CAPITAL_MOVE_NOTIONAL_USD")
 
     def _obs_set_mode_gauges(self, rm_mode: str, trade_mode: str) -> None:
+        """
+        Bridge RM → Prometheus pour les modes.
+
+        5-OBS-1 :
+        - expose rm_mode et trade_mode via RM_MODE_CURRENT / RM_TRADE_MODE_CURRENT
+        - un seul mode actif à 1 par métrique (one-hot sur label "mode").
+        """
         try:
             from . import obs_metrics  # type: ignore
         except Exception:  # pragma: no cover
             return
 
+        # Préférence : déléguer à obs_metrics si le helper existe
+        helper = getattr(obs_metrics, "rm_update_mode_gauges", None)
+        if callable(helper):
+            try:
+                helper(rm_mode, trade_mode)
+                return
+            except Exception:
+                # On retombe sur le fallback local pour ne pas casser le RM
+                pass
+
         rm_gauge = getattr(obs_metrics, "RM_MODE_CURRENT", None)
         trade_gauge = getattr(obs_metrics, "RM_TRADE_MODE_CURRENT", None)
 
-        rm_mode_u = str(rm_mode).upper()
-        trade_mode_u = str(trade_mode).upper()
+        rm_mode_u = str(rm_mode or "").upper()
+        trade_mode_u = str(trade_mode or "").upper()
         rm_value = {"NORMAL": 0, "OPP_VOLUME": 1, "OPP_VOL": 2, "SEVERE": 3}.get(rm_mode_u, -1)
         trade_value = {"NORMAL": 0, "CONSTRAINED": 1, "SEVERE": 2, "OPPORTUNISTE": 3}.get(trade_mode_u, -1)
 
+        # Fallback "one-hot" local si rm_update_mode_gauges n'est pas disponible
         if rm_gauge is not None:
             try:
-                rm_gauge.labels(mode=rm_mode_u).set(1)
+                for m in ("NORMAL", "OPP_VOLUME", "OPP_VOL", "SEVERE"):
+                    rm_gauge.labels(mode=m).set(1.0 if m == rm_mode_u else 0.0)
             except Exception:
                 try:
                     rm_gauge.set(float(rm_value))
@@ -2778,12 +3824,14 @@ class RiskManager:
 
         if trade_gauge is not None:
             try:
-                trade_gauge.labels(mode=trade_mode_u).set(1)
+                for m in ("NORMAL", "CONSTRAINED", "SEVERE", "OPPORTUNISTE"):
+                    trade_gauge.labels(mode=m).set(1.0 if m == trade_mode_u else 0.0)
             except Exception:
                 try:
                     trade_gauge.set(float(trade_value))
                 except Exception:
                     pass
+
 
     def set_orderbooks_source(self, fn):
         """Définit la source d’orderbooks pour les accès ponctuels et la boucle interne."""
@@ -2965,6 +4013,95 @@ class RiskManager:
         except Exception:
             logger.debug("[RiskManager] record budget spend failed", exc_info=False)
 
+    def _record_exposure_for_bundle(self, branch: Optional[str], bundle: Dict[str, Any]) -> None:
+        """
+        Observabilité P0 (M3-4) — enregistre la taille d'exposition notionnelle par branche/profil/combo.
+
+        On se place côté RM, au moment où le bundle est effectivement admis et
+        envoyé vers l’Engine/Simu. On logue ici le notional "planifié" du bundle
+        (pré-trade), avec les labels:
+          - branch  ∈ {"TM", "MM", "REB"} (les autres branches sont ignorées),
+          - profile (profil capital RM),
+          - combo   (clé combo RM),
+          - quote   (devise de quote).
+
+        Cela fournit la métrique rm_exposure_usd{branch,profile,combo,quote}
+        demandée par M3-4, côté RM.
+        """
+        # 0) Branche + filtre sur les branches pertinentes
+        branch_u = str(branch or bundle.get("branch") or "").upper()
+        if branch_u not in ("TM", "MM", "REB"):
+            return
+
+        # 1) Import lazy des métriques pour ne jamais casser la décision
+        try:
+            from . import obs_metrics  # type: ignore
+        except Exception:
+            return
+
+        metric = getattr(obs_metrics, "RM_EXPOSURE_USD", None)
+        if metric is None:
+            # Compat si la métrique n'est pas encore définie dans obs_metrics
+            return
+
+        route = bundle.get("route") or {}
+        meta = bundle.get("meta") or {}
+
+        # 2) Profil capital et quote
+        profile = (
+            str(bundle.get("profile")
+                or meta.get("profile")
+                or getattr(self, "capital_profile", "")
+                or "LARGE")
+            .upper()
+        )
+        quote = str(route.get("quote") or meta.get("quote") or "NA").upper()
+
+        # 3) Combo key RM (helper existant)
+        combo = ""
+        try:
+            combo = self._get_combo_key_from_bundle(bundle) or ""
+        except Exception:
+            combo = ""
+
+        # 4) Notional : on privilégie notional_quote si présent,
+        #    sinon on retombe sur _estimate_bundle_notional_usd(...)
+        notional = 0.0
+        notional_quote = route.get("notional_quote")
+
+        try:
+            if isinstance(notional_quote, dict):
+                notional = float(notional_quote.get("amount") or 0.0)
+            elif notional_quote is not None:
+                notional = float(notional_quote)
+        except Exception:
+            notional = 0.0
+
+        if notional <= 0.0:
+            try:
+                notional = float(self._estimate_bundle_notional_usd(bundle))
+            except Exception:
+                notional = 0.0
+
+        if notional <= 0.0:
+            # Rien d’exploitable pour l’observabilité, on sort proprement.
+            return
+
+        # 5) Publication de la métrique (histogramme ou gauge côté obs_metrics)
+        try:
+            metric.labels(
+                branch=branch_u,
+                profile=profile,
+                combo=str(combo),
+                quote=quote,
+            ).observe(notional)
+        except Exception:
+            # On ne casse jamais le chemin critique pour une simple métrique.
+            logging.debug(
+                "[RiskManager] _record_exposure_for_bundle: erreur métrique",
+                exc_info=False,
+            )
+
 
     def _preflight_gate(self, opp: dict) -> tuple[bool, str, dict]:
         """
@@ -3025,35 +4162,149 @@ class RiskManager:
             except Exception:
                 pass
 
-    def _emit_decision_record(self, status: str, reason: str, opp: dict, ctx: dict) -> None:
-        """Émet un enregistrement JSONL minimal + métriques (admitted|skipped)."""
+    def _emit_decision_record(
+            self,
+            status: str,
+            reason: str,
+            opp: Dict[str, Any],
+            ctx: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Enregistre une décision RM (GO/NO-GO) avec vue funnel.
+
+        - status: "admitted" | "skipped" | ...
+        - reason: code RM_* ou autre
+        - opp: opportunité brute (Scanner)
+        - ctx: contexte enrichi (préflight / décision interne)
+        """
         try:
-            pair = str(opp.get("pair") or opp.get("symbol") or "")
-            buy = str(opp.get("buy_exchange") or "").upper()
-            sell = str(opp.get("sell_exchange") or "").upper()
-            ts_ns = time.time_ns()
-            rec = DecisionRecord(
-                decision_id=self._hash_decision_id(pair, buy, sell, ts_ns),
-                status=status,
-                reason=reason,
-                pair=pair,
-                buy_exchange=buy,
-                sell_exchange=sell,
-                prudence=str(ctx.get("prudence", "UNKNOWN")),
-                slippage_kind=getattr_str(self, "slippage_source", "ewma"),
-                ts_ns=ts_ns,
-                explain=ctx or {},
+            now_ns = time.time_ns()
+            ctx = dict(ctx or {})
+
+            # --- Extraction pair / venues ---
+            pair = str(opp.get("pair") or opp.get("symbol") or "").upper()
+            buy_ex = str(
+                opp.get("buy_exchange") or
+                (opp.get("legs") or [{}])[0].get("buy_exchange") or
+                ctx.get("buy_exchange") or
+                ""
+            ).upper()
+            sell_ex = str(
+                opp.get("sell_exchange") or
+                (opp.get("legs") or [{}])[0].get("sell_exchange") or
+                ctx.get("sell_exchange") or
+                ""
+            ).upper()
+
+            # --- Prudence + source slippage (si exposés) ---
+            prudence = None
+            try:
+                if hasattr(self, "_current_prudence"):
+                    prudence = float(self._current_prudence(pair))
+            except Exception:
+                prudence = None
+
+            slippage_kind = None
+            try:
+                slippage_kind = str(getattr(self, "slippage_source", "") or "") or None
+            except Exception:
+                slippage_kind = None
+
+            # --- Strategy / branch / profile pour le funnel ---
+            # Strategy : TT / TM / MM / REB (fallback TT)
+            raw_strategy = (
+                    ctx.get("strategy")
+                    or opp.get("strategy")
+                    or opp.get("kind")
+                    or (opp.get("route") or {}).get("strategy")
+                    or (opp.get("meta") or {}).get("strategy")
+                    or ""
             )
-            # métriques
-            RM_DECISIONS_TOTAL.labels(status).inc()
-            if status == "skipped":
-                RM_SKIPS_TOTAL.labels(reason or "UNKNOWN").inc()
-            # JSONL optionnel
-            if getattr(self, "decision_log_path", ""):
-                with open(self.decision_log_path, "a", encoding="utf-8") as f:
-                    f.write(rec.to_json() + "\n")
+            strategy = str(raw_strategy or "TT").upper()
+            if strategy not in ("TT", "TM", "MM", "REB"):
+                strategy = "TT"
+
+            # Branch : pour l’instant = strategy (extensible si besoin)
+            raw_branch = ctx.get("branch") or (opp.get("route") or {}).get("branch") or strategy
+            branch = str(raw_branch or strategy).upper()
+
+            # Profile capital : tiré du RM / config
+            raw_profile = (
+                    getattr(self, "capital_profile", None)
+                    or getattr(getattr(self, "cfg", None), "capital_profile", None)
+                    or getattr(getattr(self, "cfg", None), "capital_profile_name", None)
+                    or "LARGE"
+            )
+            profile = str(raw_profile or "LARGE").upper()
+
+            # On pousse ces valeurs aussi dans le ctx pour les logs JSONL
+            ctx.setdefault("strategy", strategy)
+            ctx.setdefault("branch", branch)
+            ctx.setdefault("profile", profile)
+
+            # --- Construction de l’enregistrement structuré ---
+            rec = DecisionRecord(
+                ts_ns=now_ns,
+                status=str(status or "").upper(),
+                reason=str(reason or ""),
+                pair=pair,
+                buy_exchange=buy_ex,
+                sell_exchange=sell_ex,
+                prudence=prudence,
+                slippage_kind=slippage_kind,
+                strategy=strategy,
+                branch=branch,
+                profile=profile,
+                explain=ctx or None,
+            )
+
+            # --- JSONL local (fichier RM) ---
+            path = getattr(self, "decision_log_path", "") or ""
+            if path:
+                try:
+                    with open(path, "a", encoding="utf-8") as f:
+                        f.write(
+                            json.dumps(asdict(rec), ensure_ascii=False, separators=(",", ":"))
+                            + "\n"
+                        )
+                except Exception:
+                    # On ne casse jamais le RM pour la traçabilité
+                    logger.exception("[RM] Impossible d'écrire dans decision_log_path", exc_info=False)
+
+            # --- Compteurs RM hérités (par status / reason) ---
+            try:
+                if RM_DECISIONS_TOTAL is not None:
+                    RM_DECISIONS_TOTAL.labels(str(status or "").upper()).inc()
+            except Exception:
+                pass
+
+            if str(status or "").lower() == "skipped":
+                try:
+                    if RM_SKIPS_TOTAL is not None:
+                        RM_SKIPS_TOTAL.labels(str(reason or "")).inc()
+                except Exception:
+                    pass
+
+            # --- Nouveau funnel métrique rm_decision_total (Macro M1-4) ---
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc(
+                        "rm_decision_total",
+                        strategy=strategy,
+                        branch=branch,
+                        profile=profile,
+                        status=str(status or "").upper(),
+                        reason=str(reason or ""),
+                        reason_kind="RM",
+                    )
+            except Exception:
+                # Never break decision path for obs
+                pass
+
         except Exception:
-            pass
+            # Sécurité maximale : jamais d'exception qui remonte
+            logger.exception("[RM] _emit_decision_record failed", exc_info=False)
+
 
     # ==== [ADD THIS METHOD INSIDE class RiskManager] =============================
     def _emit_final_decision(self, opp: dict, choice: dict, outcome: str = "submitted") -> None:
@@ -3410,6 +4661,53 @@ class RiskManager:
                 self._mark_loop_error("orderbooks", e)
             await asyncio.sleep(self.t_books)
 
+    def _get_ladder_region(self) -> str:
+        cfg = getattr(self, "cfg", None)
+        if cfg is None:
+            return "DEFAULT"
+        region = getattr(cfg, "pod_region", getattr(cfg, "region", "DEFAULT"))
+        try:
+            return str(region or "DEFAULT").upper()
+        except Exception:
+            return "DEFAULT"
+
+    def _run_capital_ladder_tick(self) -> None:
+        """Tick léger de la ladder capital (v1 — placeholders).
+
+        7-RM-2a : structure uniquement, les signaux riches seront câblés en 7-RM-2b.
+        """
+        ctrl = getattr(self, "_profile_ctrl", None)
+        if not ctrl:
+            return
+
+        # Si le Pacer n'est pas encore branché, on ne fait rien.
+        if not getattr(ctrl, "pacer", None):
+            return
+
+        region = self._get_ladder_region()
+
+        try:
+            # Placeholders : conditions volontairement non favorables pour éviter
+            # tout changement de profil tant que 7-RM-2b n'est pas en place.
+            ctrl.maybe_upgrade(
+                region=region,
+                net_per_sc=0.0,
+                slo_ok=False,
+                pnl_ok=False,
+                dd_ok=True,
+                inflight_util_ok=False,
+            )
+            ctrl.maybe_downgrade(
+                region=region,
+                severe_evt=False,
+                err_spike=False,
+                lag_spike=False,
+                drain_spike=False,
+                dd_breach=False,
+            )
+        except Exception:
+            logger.debug("[RiskManager] ladder_tick placeholder failed", exc_info=False)
+
 
     async def _loop_balances(self):
         while self._running:
@@ -3460,12 +4758,19 @@ class RiskManager:
                                 for ex, m in targets.items():
                                     for tok, pct in (m or {}).items():
                                         self.slip_collector.set_fee_token_target_percent(ex, tok, float(pct))
+
                     except Exception:
                         logger.debug("[RiskManager] fee-token levels push failed", exc_info=False)
+                        # Tick ladder capital (v1 — placeholders; signaux riches en 7-RM-2b)
+                try:
+                    self._run_capital_ladder_tick()
+                except Exception:
+                    logger.debug("[RiskManager] ladder_tick from balances loop failed", exc_info=False)
 
                 if self.rebalancing and hasattr(self.rebalancing, "update_balances"):
                     self.rebalancing.update_balances(bals)
                     mark_balances_fresh()
+
                 self.last_update = time.time()
                 self._mark_loop_success("balances")
             except Exception as e:
@@ -3760,22 +5065,182 @@ class RiskManager:
 
     def _compute_trade_mode(self) -> str:
         """
-        Consolidation des états locaux et Pacer en mode unique exposé à l'Engine.
-        Règles:
-          - SEVERE si PnL-guard actif (rm_mode="SEVERE") ou pacer_mode=="SEVERE".
-          - CONSTRAINED si pacer_mode=="CONSTRAINED" (et aucune condition SEVERE).
-          - OPPORTUNISTE si rm_mode opportuniste (OPP_VOLUME/OPP_VOL) avec pacer en NORMAL.
-          - NORMAL sinon.
+        Consolidation rm_mode × pacer_mode en mode unique exposé à l'Engine.
+
+        Contrat Macro 5 (RM = owner métier, Pacer = overlay infra) :
+
+          rm_mode      pacer_mode     → trade_mode
+          ----------------------------------------
+          SEVERE       *              → SEVERE
+          *            SEVERE         → SEVERE
+          *            CONSTRAINED    → CONSTRAINED
+          OPP_VOLUME   NORMAL         → OPPORTUNISTE
+          OPP_VOL      NORMAL         → OPPORTUNISTE
+          (autres)     NORMAL         → NORMAL
+
+        - rm_mode est piloté par PnL-guard, incidents TTL/WS/fees, OPP_VOLUME/OPP_VOL.
+        - pacer_mode est injecté depuis l'EnginePacer (NORMAL / CONSTRAINED / SEVERE).
+        - trade_mode ne peut jamais être plus "ouvert" que ce que dictent rm_mode ou pacer_mode.
         """
-        pacer_mode = str(getattr(self, "pacer_mode", "NORMAL")).upper()
         rm_mode = str(getattr(self, "rm_mode", "NORMAL")).upper()
+        pacer_mode = str(getattr(self, "pacer_mode", "NORMAL")).upper()
+
         if rm_mode == "SEVERE" or pacer_mode == "SEVERE":
             return "SEVERE"
         if pacer_mode == "CONSTRAINED":
             return "CONSTRAINED"
-        if rm_mode in ("OPP_VOLUME", "OPP_VOL") and pacer_mode == "NORMAL":
+        if pacer_mode == "NORMAL" and rm_mode in ("OPP_VOLUME", "OPP_VOL"):
             return "OPPORTUNISTE"
         return "NORMAL"
+
+
+    def _evaluate_incident_triggers(self) -> tuple[Optional[str], Optional[str]]:
+        """
+        Analyse les signaux incident (TTL balances, WS, fees) pour forcer
+        rm_mode vers CONSTRAINED/SEVERE.
+
+        Retourne un tuple (mode_cible | None, raison) pour documenter l'escalade.
+        Cette version applique les règles suivantes (Ticket 14):
+          - TTL balances / WS: on ne regarde que les alias "critiques".
+          - Reconciler miss rate et latences WS: escalade globale.
+          - Fee tokens "LOW" : n'escalade que si l'état dégradé est prolongé.
+        """
+        target_mode: Optional[str] = None
+        target_reason: Optional[str] = None
+        rank = {"NORMAL": 0, "CONSTRAINED": 1, "SEVERE": 2}
+        now = time.time()
+
+        # --- 1) TTL balances (MBF → RM) -----------------------------------
+        # DEGRADED -> CONSTRAINED, BLOCKED -> SEVERE, mais uniquement sur les
+        # alias jugés "critiques" par _is_critical_alias().
+        try:
+            self._refresh_balances_ttl_cache()
+        except Exception:
+            # On ne casse jamais la boucle de mode sur une erreur MBF.
+            pass
+
+        ttl_rank = {"BLOCKED": 2, "DEGRADED": 1}
+        worst_ttl = 0
+        ttl_cache = getattr(self, "_alias_balance_status", {}) or {}
+        for (ex, alias), status in ttl_cache.items():
+            try:
+                if not self._is_critical_alias(ex, alias):
+                    continue
+            except Exception:
+                # En cas de bug de config/parse, on ne bloque pas le mode.
+                continue
+            worst_ttl = max(worst_ttl, ttl_rank.get(status, 0))
+
+        if worst_ttl == 2:
+            target_mode, target_reason = "SEVERE", "ttl_blocked"
+        elif worst_ttl == 1 and rank.get(target_mode or "NORMAL", 0) < 1:
+            target_mode, target_reason = "CONSTRAINED", "ttl_degraded"
+
+        # --- 2) Statut comptes WS (Hub + Reconciler) ----------------------
+        # Si un alias critique est en statut à risque, on force au minimum
+        # CONSTRAINED, mais on laisse les autres signaux prendre la main
+        # pour aller jusqu'à SEVERE.
+        ws_cache = getattr(self, "_alias_ws_accounts_status", {}) or {}
+        for (ex, alias), meta in ws_cache.items():
+            try:
+                if not self._is_critical_alias(ex, alias):
+                    continue
+            except Exception:
+                continue
+
+            hub = str((meta or {}).get("hub_status") or "").upper()
+            reco = str((meta or {}).get("reco_status") or "").upper()
+            capital_at_risk = bool((meta or {}).get("capital_at_risk"))
+
+            if capital_at_risk or hub not in ("", "OK") or reco not in ("", "OK"):
+                if rank.get(target_mode or "NORMAL", 0) < 1:
+                    target_mode, target_reason = "CONSTRAINED", "ws_accounts_degraded"
+                break
+
+        # --- 3) Reconciler miss rate (bursts) -----------------------------
+        miss_rate = float(
+            getattr(self, "ws_reco_miss_rate_per_min", getattr(self, "ws_reco_miss_per_minute", 0.0))
+            or 0.0
+        )
+        thr_con = int(getattr(self.cfg, "RM_RECO_MISS_PER_MINUTE_CONSTRAINED", 30))
+        thr_sev = int(getattr(self.cfg, "RM_RECO_MISS_PER_MINUTE_SEVERE", 60))
+
+        if miss_rate >= thr_sev:
+            target_mode, target_reason = "SEVERE", "ws_reco_miss_burst"
+        elif miss_rate >= thr_con and rank.get(target_mode or "NORMAL", 0) < 1:
+            target_mode, target_reason = "CONSTRAINED", "ws_reco_miss_rate"
+
+        # --- 4) Latences WS (heartbeat/event/ack/fill) --------------------
+        latency_checks = [
+            ("pws_heartbeat_gap_seconds",
+             float(getattr(self.cfg, "RM_PWS_HEARTBEAT_GAP_SEVERE_S", 12.0)),
+             float(getattr(self.cfg, "RM_PWS_HEARTBEAT_GAP_CONSTRAINED_S", 6.0))),
+            ("pws_event_lag_ms",
+             float(getattr(self.cfg, "RM_PWS_EVENT_LAG_SEVERE_MS", 1200.0)),
+             float(getattr(self.cfg, "RM_PWS_EVENT_LAG_CONSTRAINED_MS", 600.0))),
+            ("pws_ack_latency_ms",
+             float(getattr(self.cfg, "RM_PWS_ACK_LATENCY_SEVERE_MS", 450.0)),
+             float(getattr(self.cfg, "RM_PWS_ACK_LATENCY_CONSTRAINED_MS", 250.0))),
+            ("pws_fill_latency_ms",
+             float(getattr(self.cfg, "RM_PWS_FILL_LATENCY_SEVERE_MS", 1200.0)),
+             float(getattr(self.cfg, "RM_PWS_FILL_LATENCY_CONSTRAINED_MS", 700.0))),
+        ]
+        for name, sev_thr, con_thr in latency_checks:
+            try:
+                val = float(
+                    getattr(self, f"{name}_p95", getattr(self, name, 0.0))
+                    or 0.0
+                )
+            except Exception:
+                continue
+
+            if val >= sev_thr:
+                target_mode, target_reason = "SEVERE", name
+                break
+            if val >= con_thr and rank.get(target_mode or "NORMAL", 0) < 1:
+                target_mode, target_reason = "CONSTRAINED", name
+
+        # --- 5) Fee tokens "LOW" prolongés -------------------------------
+        fee_meta = getattr(self, "_last_fee_tokens_meta", {}) or {}
+        fee_low_now = False
+        min_pct = float(getattr(self.cfg, "RM_FEE_TOKEN_MIN_PCT", 5.0))
+
+        for token_meta in fee_meta.values():
+            if not isinstance(token_meta, dict):
+                continue
+            for tok_meta in (token_meta or {}).values():
+                status = str((tok_meta or {}).get("status") or (tok_meta or {}).get("level") or "").upper()
+                pct = float((tok_meta or {}).get("percent") or (tok_meta or {}).get("pct", 100.0) or 100.0)
+                if status in ("LOW", "CRITICAL") or pct < min_pct:
+                    fee_low_now = True
+                    break
+            if fee_low_now:
+                break
+
+        low_since = getattr(self, "_fee_low_since_ts", None)
+        if fee_low_now:
+            if low_since is None:
+                low_since = now
+        else:
+            low_since = None
+        try:
+            self._fee_low_since_ts = low_since
+        except Exception:
+            # AttributeError possible si __slots__, on ignore.
+            pass
+
+        min_low_s = float(getattr(self.cfg, "RM_FEE_LOW_MIN_SECONDS", 60.0))
+        if (
+                fee_low_now
+                and low_since is not None
+                and (now - low_since) >= max(0.0, min_low_s)
+                and rank.get(target_mode or "NORMAL", 0) < 1
+        ):
+            target_mode, target_reason = "CONSTRAINED", "fees_low_prolonged"
+
+        return target_mode, target_reason
+
+
     def _split_penalty_bps(self, buy_ex: str, sell_ex: str) -> float:
         """
         Penalty deterministica basata su metriche SPLIT correnti e soglie cfg.
@@ -3804,40 +5269,43 @@ class RiskManager:
     def _total_cost_bps(self, buy_ex: str, sell_ex: str, pair_key: str) -> float:
         """
         bps = 1e4 * total_cost_pct + split_penalty_bps
+        (desk « coût total » centralisé)
         """
-        pct = self.get_total_cost_pct(buy_ex, sell_ex, pair_key)
-        return float(1e4 * pct + self._split_penalty_bps(buy_ex, sell_ex))
+        try:
+            breakdown = self._compute_cost_breakdown_for_route(buy_ex, sell_ex, pair_key)
+            return float(breakdown.get("total_cost_bps", 0.0))
+        except Exception:
+            # fallback sûr : ne jamais planter le RM sur une vue coût
+            try:
+                pct = float(self.get_total_cost_pct(buy_ex, sell_ex, pair_key))
+            except Exception:
+                pct = 0.0
+            try:
+                split_pen = float(self._split_penalty_bps(buy_ex, sell_ex))
+            except Exception:
+                split_pen = 0.0
+            return float(1e4 * pct + split_pen)
 
     def _update_trade_mode(self) -> None:
         """
-        Calcule le trade_mode consolidé (Ticket 11) à partir de rm_mode + pacer_mode.
+        Applique trade_mode (Macro 5) à partir de rm_mode + pacer_mode
+        en s'appuyant sur _compute_trade_mode(), puis logge les transitions.
+
         Domaines :
         - NORMAL
         - CONSTRAINED
         - SEVERE
         - OPPORTUNISTE (marché "vert" + pacer NORMAL)
         """
-        rm_mode = str(getattr(self, "rm_mode", "NORMAL")).upper()
-        pacer_mode = str(getattr(self, "pacer_mode", "NORMAL")).upper()
-
-        # Règles de priorité
-        if rm_mode == "SEVERE" or pacer_mode == "SEVERE":
-            mode = "SEVERE"
-        elif pacer_mode == "CONSTRAINED":
-            mode = "CONSTRAINED"
-        elif pacer_mode == "NORMAL" and rm_mode in ("OPP_VOLUME", "OPP_VOL"):
-            mode = "OPPORTUNISTE"
-        else:
-            mode = "NORMAL"
-
-        # Log compact pour validation runtime
         prev = getattr(self, "trade_mode", "NORMAL")
+        mode = self._compute_trade_mode()
+
         if mode != prev:
             logging.info(
                 "RM: trade_mode=%s (rm_mode=%s, pacer_mode=%s)",
                 mode,
-                rm_mode,
-                pacer_mode,
+                str(getattr(self, "rm_mode", "NORMAL")).upper(),
+                str(getattr(self, "pacer_mode", "NORMAL")).upper(),
             )
         self.trade_mode = mode
 
@@ -3850,6 +5318,15 @@ class RiskManager:
         cur = self.rm_mode
         prev_rm_mode = getattr(self, "_last_rm_mode_obs", cur)
         prev_trade_mode = getattr(self, "_last_trade_mode_obs", getattr(self, "trade_mode", "NORMAL"))
+        exit_reason = "transition"
+
+        # 2) Triggers incident (TTL/WS/fees)
+        target_mode, target_reason = self._evaluate_incident_triggers()
+        if target_mode is not None:
+            rank = {"NORMAL": 0, "OPP_VOLUME": 1, "OPP_VOL": 1, "CONSTRAINED": 2, "SEVERE": 3}
+            if rank.get(target_mode, 0) > rank.get(self.rm_mode, 0):
+                self.rm_mode, self._mode_since = target_mode, now
+                exit_reason = target_reason or "incident"
 
         # ---- Sorties ----
         if cur == "OPP_VOLUME":
@@ -3866,6 +5343,7 @@ class RiskManager:
                                     getattr(self, "_mode_timeout_s", 1800)))
             if (now - self._mode_since > timeout_s) or (not self._green_calme()) or net_floor_hit:
                 self.rm_mode, self._mode_since = "NORMAL", now
+                exit_reason = "opp_volume_exit"
 
         elif cur in ("OPP_VOL", "SEVERE"):
             # Sortie sous conditions vertes + hystérésis de sortie
@@ -3873,25 +5351,32 @@ class RiskManager:
             if self._green_calme():
                 if (now - getattr(self, "_last_all_green_ts", now)) >= exit_hyst:
                     self.rm_mode, self._mode_since = "NORMAL", now
+                    exit_reason = "calm_recovered"
             else:
                 # Marqueur : dernier "pas calme" (sert pour l'hystérésis de sortie)
                 self._last_all_green_ts = now
 
-        # ---- Entrées ----
+        # ---- Entrées opportunistes ----
         if self.rm_mode == "NORMAL":
             if self._red_tempete():
                 self.rm_mode, self._mode_since = "OPP_VOL", now
+                exit_reason = "tempete"
             elif self._green_calme():
                 # Hystérésis d'entrée : temps écoulé depuis le dernier "pas calme"
                 enter_hyst = int(getattr(self, "_enter_hyst_s", 180))
                 if (now - getattr(self, "_last_all_green_ts", now)) >= enter_hyst:
                     self.rm_mode, self._mode_since = "OPP_VOLUME", now
+                    exit_reason = "calm_entry"
             else:
                 # Marqueur : dernier "pas calme" (reset la fenêtre d'hystérésis)
                 self._last_all_green_ts = now
 
-            # Consolidation du mode pour l'Engine (toujours mise à jour)
-        self.trade_mode = self._compute_trade_mode()
+        # Consolidation du mode pour l'Engine (toujours mise à jour)
+        try:
+            self._update_trade_mode()
+        except Exception:
+            # Fallback : ne jamais casser la FSM pour un problème de consolidation
+            self.trade_mode = getattr(self, "trade_mode", "NORMAL") or "NORMAL"
 
         try:
             from . import obs_metrics  # type: ignore
@@ -3910,7 +5395,10 @@ class RiskManager:
                 exits = getattr(obs_metrics, "RM_MODE_EXITS_TOTAL", None)
                 if exits is not None and prev_rm_mode is not None:
                     try:
-                        exits.labels(mode=str(prev_rm_mode).upper(), reason="transition").inc()
+                        exits.labels(
+                            mode=str(prev_rm_mode).upper(),
+                            reason=str(exit_reason),
+                        ).inc()
                     except Exception:
                         pass
                 self._last_rm_mode_obs = self.rm_mode
@@ -3919,6 +5407,12 @@ class RiskManager:
                 self._last_trade_mode_obs = self.trade_mode
 
             self._obs_set_mode_gauges(self.rm_mode, self.trade_mode)
+
+        # ---- Appliquer les overlays du mode courant ----
+        self._apply_mode_overrides()
+        # Tick SPLIT/EU_ONLY auto-fallback après application des overlays
+        self._split_auto_fallback_tick()
+
 
         # ---- Appliquer les overlays du mode courant ----
         self._apply_mode_overrides()
@@ -4037,7 +5531,6 @@ class RiskManager:
             return 0.0
         return filled_quote / filled_base
 
-
     async def is_fragment_profitable(
             self,
             *,
@@ -4052,24 +5545,26 @@ class RiskManager:
         Fusion analytique + simulation.
         1) Pré-check analytique: VWAP(asks pour BUY, bids pour SELL) + fees/slip → net_bps_est.
            - Si très au-dessus du seuil: accepte sans sim.
-           - Si très au-dessous du seuil: refuse sans sim.
-        2) Sinon (zone grise) et si simulateur dispo: lance la simulation et tranche sur son 'status'.
-        Retour: (ok, res_or_none) où res contient toujours un bloc 'analytic' avec net_bps_est, vwap_buy/vwap_sell.
+           - Si très au-dessous du seuil:
+             rejette sans sim.
+           - Entre les deux: renvoie "zone_grise" pour sim.
+        2) La simulation (si appelée) utilise le même contrat de bundle que l’Engine.
         """
         try:
             pk = self._norm_pair(pair_key)
+
             if usdc_amt <= 0:
                 return (False, None)
 
-            # ---- Depth actuelle (sanitisée) ----
+            # VWAP côté acheteur (asks) et vendeur (bids)
             buy_asks, _ = self._levels_for(buy_ex, pk)
             _, sell_bids = self._levels_for(sell_ex, pk)
             if not buy_asks or not sell_bids:
-                return (False, None)
+                return (False, {"status": "rejete", "reason": "depth_insufficient"})
 
-            # ---- Estimation analytique rapide (VWAP + fees + slip) ----
             vwap_buy = self._vwap_from_depth(buy_asks, side="BUY", notional=usdc_amt)
             vwap_sell = self._vwap_from_depth(sell_bids, side="SELL", notional=usdc_amt)
+
             if vwap_buy <= 0 or vwap_sell <= 0 or vwap_sell <= vwap_buy:
                 return (False, {"status": "rejete", "reason": "depth_insufficient"})
 
@@ -4083,23 +5578,27 @@ class RiskManager:
             sell_take = vwap_sell * (1.0 - fee_sell - slip_sell)
             net_bps_est = 1e4 * (sell_take - buy_cost) / max(buy_cost, 1e-12)
 
-            # Seuils (TM=0, TT=base_min_bps)
-            min_req = float(getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0)))
-            thr_bps = 0.0 if str(strategy).upper() == "TM" else min_req
+            # Seuils unifiés via politique RM (TT/TM dynamiques)
+            strat = str(strategy or "TT").upper()
+            thr_bps = float(self._min_required_bps_for(pk, strat))
 
             # Bande de décision "auto" pour savoir si l'on simule (zone grise)
             margin_bps = float(getattr(self.cfg, "fragment_sim_margin_bps", 5.0))
 
             analytic_block = {
                 "method": "analytic",
-                "vwap_buy": vwap_buy,
-                "vwap_sell": vwap_sell,
-                "net_bps": net_bps_est,
-                "threshold_bps": thr_bps,
-                "margin_bps": margin_bps,
+                "vwap_buy": float(vwap_buy),
+                "vwap_sell": float(vwap_sell),
+                "fee_buy": float(fee_buy),
+                "fee_sell": float(fee_sell),
+                "slip_buy": float(slip_buy),
+                "slip_sell": float(slip_sell),
+                "net_bps_est": float(net_bps_est),
+                "min_required_bps": float(thr_bps),
+                "margin_bps": float(margin_bps),
             }
 
-            # ---- Décision anticipée (sans simulation) ----
+            # Cas 1: largement gagnant → OK sans sim
             if net_bps_est >= (thr_bps + margin_bps):
                 res = {
                     "status": "rentable",
@@ -4108,6 +5607,7 @@ class RiskManager:
                 }
                 return (True, res)
 
+            # Cas 2: largement perdant → rejet sans sim
             if net_bps_est <= (thr_bps - margin_bps):
                 res = {
                     "status": "rejete",
@@ -4116,55 +5616,19 @@ class RiskManager:
                 }
                 return (False, res)
 
-            # ---- Zone grise -> Simulation si possible, sinon tranche sur analytique borderline ----
-            sim_ok = False
-            sim_res: Optional[Dict[str, Any]] = None
-
-            if getattr(self, "simulator", None) and hasattr(self.simulator, "simulate"):
-                try:
-                    to = float(timeout_s if timeout_s is not None
-                               else getattr(self.cfg, "simulation_timeout_s", 2.0))
-                    f_buy, f_sell = self._fees_for_branch(buy_ex, sell_ex, pk, str(strategy).upper())
-                    sim_res = await self.simulator.simulate(
-                        opportunity={
-                            "pair": pk,
-                            "buy_exchange": buy_ex,
-                            "sell_exchange": sell_ex,
-                            "volume_possible_usdc": float(usdc_amt),
-                            "fees_buy_pct": float(f_buy),
-                            "fees_sell_pct": float(f_sell),
-                        },
-                        buy_levels_raw=buy_asks,
-                        sell_levels_raw=sell_bids,
-                        capital_available_usdc=float(usdc_amt),
-                        strategy=strategy.upper(),
-                        rebalancing_mode=False,
-                        timeout=to,
-                    )
-                    if sim_res:
-                        # enrichit avec l'analytique pour traçabilité
-                        sim_res = dict(sim_res)
-                        sim_res["method"] = "simulator"
-                        sim_res["analytic"] = analytic_block
-                        sim_ok = (str(sim_res.get("status", "")).lower() == "rentable")
-                except Exception:
-                    sim_ok = False
-                    sim_res = None
-
-            if sim_res is not None:
-                return (sim_ok, sim_res)
-
-            # Fallback si simulateur indispo/erreur: tranche sur l'estimation analytique borderline
-            borderline_ok = (net_bps_est >= thr_bps)
+            # Cas 3: zone grise → on autorise mais on demande une sim
             res = {
-                "status": "rentable" if borderline_ok else "rejete",
-                "decision": "analytic_borderline_fallback",
+                "status": "zone_grise",
+                "decision": "simulate",
                 **analytic_block,
             }
-            return (borderline_ok, res)
+            return (True, res)
 
-        except Exception as e:
-            return (False, {"status": "rejete", "reason": f"error:{e.__class__.__name__}"})
+        except Exception:
+            logging.exception("is_fragment_profitable failed")
+            return (False, None)
+
+
 
     async def _loop_fee_sync(self) -> None:
         """
@@ -4261,17 +5725,31 @@ class RiskManager:
         """
         ex = (exchange or "").upper()
         tok = (token or "").upper()
-        snap = self.get_balance_snapshot_for_rebal(mode=mode, cached_only=cached_only)  # cf. méthode existante
+        snap = self.get_balance_snapshot_for_rebal(mode=mode, cached_only=cached_only)
 
-        accounts = snap.get(ex, {}) or {}
+        # Nouveau contrat : snap = {"mode": ..., "balances": {...}, "meta": {...}}
+        if isinstance(snap, dict) and "balances" in snap:
+            balances = snap.get("balances") or {}
+        else:
+            # Compat legacy en cas d'appel direct à une ancienne version.
+            balances = snap or {}
+
+        accounts = (balances.get(ex, {}) or {}) if isinstance(balances, dict) else {}
+
         if account_alias:
             assets = accounts.get(account_alias, {}) or {}
-            return float(assets.get(tok, 0.0))
+            try:
+                return float(assets.get(tok, 0.0))
+            except Exception:
+                return 0.0
 
         # somme cross-alias
         total = 0.0
-        for assets in accounts.values():
-            total += float((assets or {}).get(tok, 0.0))
+        for assets in (accounts or {}).values():
+            try:
+                total += float((assets or {}).get(tok, 0.0))
+            except Exception:
+                continue
         return total
 
 
@@ -4422,36 +5900,101 @@ class RiskManager:
     def is_rebalancing_active(self) -> bool:
         return time.time() < float(self._rebalancing_until)
 
-    def get_balance_snapshot_for_rebal(self, *, cached_only: bool = True) -> Dict[str, Any]:
+    def get_balance_snapshot_for_rebal(
+            self,
+            *,
+            mode: Optional[str] = None,
+            cached_only: bool = True,
+    ) -> Dict[str, Any]:
         """
         Vue capitale officielle pour Rebalancing (et plus largement le desk de risque).
 
-        - Si `_mbf_glue` est actif : snapshot complet MBF (data-plane) + méta enrichie.
+        - Si `_mbf_glue` est actif : snapshot complet MBF (data-plane) + méta enrichie RM.
         - Sinon (tests / smoke) : snapshot minimal à partir de `rebalancing.latest_balances`.
 
         Retourne toujours un dict de la forme :
         {
             "mode": str,
             "balances": {exchange: {alias: {asset: amount}}},
-            "meta": {...}  # optionnel
+            "meta": {
+                ...,
+                "rm_ttl_balances": {
+                    "status": {"EX.ALIAS": "OK"/"DEGRADED"/"BLOCKED"/"UNKNOWN", ...},
+                    "age_s": {"EX.ALIAS": float, ...},
+                    "capital_buckets": {
+                        "by_status": {...},
+                        "by_status_quote": {...},
+                        "by_alias": {...}
+                    }
+                }
+            }
         }
         """
+
+        # Chemin nominal : MBF = source de vérité
         # Chemin nominal : MBF = source de vérité
         if getattr(self, "_mbf_glue", None) is not None:
             try:
-                snap = self._mbf_glue.snapshot(cached_only=cached_only)
+                snap = self._mbf_glue.snapshot(mode=mode, cached_only=cached_only)
             except Exception:
                 self._log.exception("RM×MBF: erreur lors de la récupération du snapshot MBF")
                 snap = None
 
             if isinstance(snap, dict) and snap:
                 balances = snap.get("balances") or {}
-                meta = snap.get("meta") or {}
-                mode = snap.get("mode", "mbf")
+                meta_in = snap.get("meta") or {}
+                mode_val = snap.get("mode", mode or "mbf")
+
+                # Vue TTL + capital par bucket, construite à partir des buffers MBF.
+                try:
+                    ttl_capital_view = self._compute_capital_by_ttl_from_buffers(mode=mode)
+                except Exception:
+                    ttl_capital_view = None
+
+                # Maps TTL par alias (statut + age_s) depuis le cache RM.
+                ttl_status_map: Dict[str, str] = {}
+                ttl_age_map: Dict[str, float] = {}
+
+                try:
+                    status_cache = getattr(self, "_alias_balance_status", {}) or {}
+                    age_cache = getattr(self, "_alias_balance_age_s", {}) or {}
+
+                    for (ex_u, alias_u), st in status_cache.items():
+                        key_str = f"{str(ex_u).upper()}.{str(alias_u).upper()}"
+                        ttl_status_map[key_str] = str(st or "UNKNOWN").upper()
+
+                    for (ex_u, alias_u), age in age_cache.items():
+                        key_str = f"{str(ex_u).upper()}.{str(alias_u).upper()}"
+                        try:
+                            ttl_age_map[key_str] = float(age or 0.0)
+                        except Exception:
+                            ttl_age_map[key_str] = 0.0
+                except Exception:
+                    ttl_status_map = {}
+                    ttl_age_map = {}
+
+                meta_out = dict(meta_in) if isinstance(meta_in, dict) else {}
+
+                ttl_meta: Dict[str, Any] = {}
+                if ttl_status_map:
+                    ttl_meta["status"] = ttl_status_map
+                if ttl_age_map:
+                    ttl_meta["age_s"] = ttl_age_map
+                if isinstance(ttl_capital_view, dict) and ttl_capital_view:
+                    ttl_meta["capital_buckets"] = ttl_capital_view
+
+                if ttl_meta:
+                    rm_ttl = meta_out.get("rm_ttl_balances") or {}
+                    if isinstance(rm_ttl, dict):
+                        rm_ttl.update(ttl_meta)
+                    else:
+                        rm_ttl = ttl_meta
+                    meta_out["rm_ttl_balances"] = rm_ttl
+
                 return {
-                    "mode": mode,
+                    "mode": mode_val,
                     "balances": balances,
-                    "meta": meta,
+                    "meta": meta_out,
                 }
 
         # Fallback legacy (sans MBF) : miroir brut de RebalancingManager
@@ -5218,6 +6761,102 @@ class RiskManager:
 
         return float(total)
 
+    def _compute_capital_by_ttl_from_buffers(
+        self,
+        *,
+        mode: Optional[str] = None,
+        quotes: Tuple[str, ...] = ("USDC", "USD", "USDT"),
+    ) -> Dict[str, Any]:
+        """
+        Agrège le capital disponible par statut TTL (OK/DEGRADED/BLOCKED/UNKNOWN),
+        à partir des poches MBF (pockets_by_quote).
+
+        Hypothèses :
+        - Les quotes USDC/USD/USDT sont considérées comme "USD-like" et sommées telles quelles.
+        - Les statuts TTL (OK/DEGRADED/BLOCKED/UNKNOWN) proviennent du cache local
+          self._alias_balance_status[(EX,ALIAS)] + self._alias_balance_age_s[(EX,ALIAS)].
+
+        Retourne un dict de la forme :
+        {
+          "by_status": { "OK": float, "DEGRADED": float, "BLOCKED": float, "UNKNOWN": float },
+          "by_status_quote": { "OK": {"USDC": float, ...}, ... },
+          "by_alias": {
+            "BINANCE.TT": {
+               "status": "OK",
+               "age_s": 12.3,
+               "by_quote": {"USDC": 123.0, "USDT": 45.0}
+            },
+            ...
+          },
+        }
+        """
+        # On s'assure que le cache TTL est rafraîchi à partir de MBF.as_rm_snapshot()
+        try:
+            self._refresh_balances_ttl_cache()
+        except Exception:
+            # En cas d'erreur, on retombe sur les valeurs déjà en cache
+            pass
+
+        view = self._get_capital_view_from_mbf(mode=mode)
+        pockets = view.get("pockets_by_quote") or {}
+
+        statuses = ("OK", "DEGRADED", "BLOCKED", "UNKNOWN")
+        by_status: Dict[str, float] = {s: 0.0 for s in statuses}
+        by_status_quote: Dict[str, Dict[str, float]] = {s: {} for s in statuses}
+        by_alias: Dict[str, Dict[str, Any]] = {}
+
+        qset = {str(q).upper() for q in (quotes or ())}
+
+        age_cache = getattr(self, "_alias_balance_age_s", {}) or {}
+        status_cache = getattr(self, "_alias_balance_status", {}) or {}
+
+        for ex, per_alias in (pockets or {}).items():
+            exu = str(ex).upper()
+            for alias, per_quote in (per_alias or {}).items():
+                alu = str(alias).upper()
+                key = (exu, alu)
+                key_str = f"{exu}.{alu}"
+
+                raw_status = status_cache.get(key, "UNKNOWN") or "UNKNOWN"
+                status_u = str(raw_status).upper()
+                if status_u not in by_status:
+                    status_u = "UNKNOWN"
+
+                try:
+                    age_s = float(age_cache.get(key, 0.0) or 0.0)
+                except Exception:
+                    age_s = 0.0
+
+                alias_info = by_alias.setdefault(
+                    key_str,
+                    {"status": status_u, "age_s": age_s, "by_quote": {}},
+                )
+                alias_info["status"] = status_u
+                alias_info["age_s"] = age_s
+                alias_quotes = alias_info["by_quote"]
+
+                for q, qdata in (per_quote or {}).items():
+                    qu = str(q).upper()
+                    if qset and qu not in qset:
+                        continue
+                    try:
+                        avail = float((qdata or {}).get("available", 0.0) or 0.0)
+                    except Exception:
+                        avail = 0.0
+                    if avail <= 0.0:
+                        continue
+
+                    alias_quotes[qu] = alias_quotes.get(qu, 0.0) + avail
+                    by_status[status_u] += avail
+                    bsq = by_status_quote[status_u]
+                    bsq[qu] = bsq.get(qu, 0.0) + avail
+
+        return {
+            "by_status": by_status,
+            "by_status_quote": by_status_quote,
+            "by_alias": by_alias,
+        }
+
 
     def _available_quote(self, exchange: str, alias: str, quote: str) -> float:
         """
@@ -5464,23 +7103,76 @@ class RiskManager:
             logging.exception("Unhandled exception")
         return dyn
 
+    def _min_required_bps_for(self, pair_key: str, strategy: str) -> float:
+        """
+        Helper interne: calcule le seuil min_required_bps (en bps) pour une paire et une stratégie.
+        - TT : base_min_bps dynamiques (dynamic_min_required + boost VM si disponible)
+        - TM : tm_min_required_bps + boost VM
+        - REB : 0.0 (le contrôle de perte finale est géré via allow_final_loss_bps)
+        """
+        pk = self._norm_pair(pair_key)
+        strat = str(strategy or "TT").upper()
 
+        # REB: on laisse min_required_bps à 0, la politique de perte finale est gérée ailleurs
+        if strat == "REB":
+            return 0.0
+
+        base_tt = float(getattr(self, "base_min_bps",
+                                getattr(self.cfg, "base_min_bps", 20.0)))
+        base_tm = float(getattr(self, "tm_min_required_bps",
+                                getattr(self.cfg, "tm_min_required_bps_base", 11.0)))
+
+        thr = base_tt
+        if strat == "TM":
+            thr = base_tm
+        else:  # TT
+            # Dynamic min optionnel
+            if getattr(self, "dynamic_min_required", False):
+                try:
+                    thr = float(self._dynamic_min_required_bps(pk))
+                except Exception:
+                    thr = base_tt
+
+        # VM adjustments: boost en fonction de la volatilité si disponible
+        try:
+            boost_bps, _, _ = self._vm_adjustments(pk)
+            if boost_bps > 0.0:
+                thr = float(thr) + float(boost_bps)
+        except Exception:
+            # best-effort: en cas d'erreur, on reste sur thr
+            pass
+
+        return float(thr)
+
+
+    # --- VM integration (PASSIF) -------------------------------------------------
     # --- VM integration (PASSIF) -------------------------------------------------
     def _vm_adjustments(self, pair_key: str) -> tuple[float, float, float]:
         """
         STRICT: richiede VolatilityManager; nessun fallback.
-        Ritorna (boost_min_required_bps, size_factor, tm_neutral_hedge_ratio).
+        Ritorna (boost_min_required_bps, size_factor, neutral_hedge_ratio_dyn).
+
         - boost_min_required_bps in bps (float)
         - size_factor in [0.30, 1.00]
+        - neutral_hedge_ratio_dyn:
+            override dynamique de la clé canonique tm_exposure_ttl_hedge_ratio.
+            Si la VM ne fournit rien, on retombe sur cfg.tm_exposure_ttl_hedge_ratio.
         """
         if self.vol_manager is None:
             raise RuntimeError("VolatilityManager non inizializzato")
 
         pk = self._norm_pair(pair_key)
         adj = self.vol_manager.step(pk)  # deve esistere e tornare il dict atteso
+
         boost_bps = float(adj.get("min_bps_boost", 0.0)) * 1e4
         size_factor = float(adj.get("size_factor", 1.0))
-        hedge_ratio = float(adj.get("tm_neutral_hedge_ratio", getattr(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50)))
+
+        # NB: la clé canonique reste tm_exposure_ttl_hedge_ratio.
+        # Le champ "tm_neutral_hedge_ratio" dans l'output de la VM est interprété
+        # comme un override dynamique de cette valeur canonique (neutral hedge ratio).
+        hedge_ratio = float(
+            adj.get("tm_neutral_hedge_ratio", getattr(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50))
+        )
 
         # clamp industry-like
         size_factor = max(0.30, min(size_factor, 1.00))
@@ -5497,6 +7189,7 @@ class RiskManager:
             min_required_bps: Optional[float] = None,
             is_rebalancing: bool = False,
             allow_final_loss_bps: float = 0.0,
+            enforce_min_required: bool = True,
             # overrides optionnels (compat)
             buy_px_override: Optional[float] = None,
             sell_px_override: Optional[float] = None,
@@ -5530,26 +7223,34 @@ class RiskManager:
         try:
             pk = self._norm_pair(pair_key)
             bo = price_overrides or {}
-
+            enforce_min_required = bool(enforce_min_required)
             # ===== min_required_bps resolution (param -> dynamic -> base) =====
-            if min_required_bps is None:
-                if getattr(self, "dynamic_min_required", False) and not is_rebalancing:
-                    try:
-                        min_required_bps = self._dynamic_min_required_bps(pk)
-                    except Exception:
-                        min_required_bps = float(getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0)))
-                else:
-                    min_required_bps = 0.0 if is_rebalancing else float(
-                        getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0)))
+            # ===== min_required_bps resolution (param -> dynamic -> base) =====
+            # enforce_min_required=False => mode "drift-only" (sonde Engine) :
+            # on ne recalcule pas min_required_bps ici pour éviter un 2e GO/NO-GO économique.
+            if enforce_min_required:
+                if min_required_bps is None:
+                    if getattr(self, "dynamic_min_required", False) and not is_rebalancing:
+                        try:
+                            min_required_bps = self._dynamic_min_required_bps(pk)
+                        except Exception:
+                            min_required_bps = float(
+                                getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0))
+                            )
+                    else:
+                        min_required_bps = 0.0 if is_rebalancing else float(
+                            getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0))
+                        )
 
-            # VM adjustments (boost threshold)
-            try:
-                vm_boost_bps, _, _ = self._vm_adjustments(pk)
-                if vm_boost_bps > 0.0 and not is_rebalancing:
-                    min_required_bps = float(min_required_bps) + float(vm_boost_bps)
-            except Exception:
-                # best-effort: ignore VM failure
-                pass
+                # VM adjustments (boost threshold)
+                try:
+                    vm_boost_bps, _, _ = self._vm_adjustments(pk)
+                    if vm_boost_bps > 0.0 and not is_rebalancing:
+                        min_required_bps = float(min_required_bps) + float(vm_boost_bps)
+                except Exception:
+                    # best-effort: ignore VM failure
+                    pass
+
 
             # ===== 1) read TOP-OF-BOOK (strict preferred) with graceful fallback =====
             buy_ask = None
@@ -5701,18 +7402,19 @@ class RiskManager:
                     pass
 
             # compare to minimum required (both are in bps)
-            if net_bps < float(min_required_bps):
-                # special-case rebalancing allow_final_loss path already handled above
-                try:
-                    if is_rebalancing and float(allow_final_loss_bps or 0.0) > 0.0:
-                        # allow a loss up to allow_final_loss_bps
-                        if net_bps >= -(float(allow_final_loss_bps) or 0.0):
-                            return True
-                    # otherwise penalize and reject
-                    self.penalize_pair(pk, reason="revalidate_below_min")
-                except Exception:
-                    pass
-                return False
+            if enforce_min_required:
+                if net_bps < float(min_required_bps):
+                    # special-case rebalancing allow_final_loss path déjà gérée au-dessus
+                    try:
+                        if is_rebalancing and float(allow_final_loss_bps or 0.0) > 0.0:
+                            # allow a loss up to allow_final_loss_bps
+                            if net_bps >= -(float(allow_final_loss_bps) or 0.0):
+                                return True
+                        # otherwise penalize and reject
+                        self.penalize_pair(pk, reason="revalidate_below_min")
+                    except Exception:
+                        pass
+                    return False
 
             # OK
             return True
@@ -5805,17 +7507,57 @@ class RiskManager:
             raise RuntimeError("SlippageAndFeesCollector non pronto (recent_slippage)")
         return float(self.slip_collector.get_recent_slippage(self._norm_pair(pair_key)))
 
-    def get_total_cost_pct(self, buy_ex: str, sell_ex: str, pair_key: str) -> float:
+    def _compute_cost_breakdown_for_route(self, buy_ex: str, sell_ex: str, pair_key: str) -> Dict[str, float]:
         """
-        Strict: costo % = fee_buy + fee_sell + slip_buy + slip_sell.
-        Nessun fallback allo SlippageHandler.
+        Desk « coût total » : fees, slippage, pénalité SPLIT en bps/pct pour une route.
+        Utilise la vue stricte SlippageAndFeesCollector (fees + slippage récents).
         """
         pk = self._norm_pair(pair_key)
-        fb = self.get_fee_pct(buy_ex, pk, "taker")
-        fs = self.get_fee_pct(sell_ex, pk, "taker")
-        sb = self.get_slippage(buy_ex, pk, "buy")
-        ss = self.get_slippage(sell_ex, pk, "sell")
-        return float(max(0.0, fb) + max(0.0, fs) + max(0.0, sb) + max(0.0, ss))
+
+        # Fees acheteur / vendeur (fractions)
+        try:
+            fb = float(max(0.0, self.get_fee_pct(buy_ex, pk, "taker")))
+            fs = float(max(0.0, self.get_fee_pct(sell_ex, pk, "taker")))
+        except Exception:
+            fb = fs = 0.0
+
+        # Slippage acheteur / vendeur (fractions)
+        try:
+            sb = float(max(0.0, self.get_slippage(buy_ex, pk, "buy")))
+            ss = float(max(0.0, self.get_slippage(sell_ex, pk, "sell")))
+        except Exception:
+            sb = ss = 0.0
+
+        fees_pct = fb + fs
+        slippage_pct = sb + ss
+        total_cost_pct = max(0.0, fees_pct + slippage_pct)
+
+        # Pénalité SPLIT (en bps)
+        try:
+            split_penalty_bps = float(self._split_penalty_bps(buy_ex, sell_ex))
+        except Exception:
+            split_penalty_bps = 0.0
+
+        return {
+            "fees_pct": total_cost_pct if (fees_pct or slippage_pct) and math.isnan(fees_pct) else fees_pct,
+            "slippage_pct": slippage_pct,
+            "total_cost_pct": total_cost_pct,
+            "fees_bps": fees_pct * 1e4,
+            "slippage_bps": slippage_pct * 1e4,
+            "split_penalty_bps": split_penalty_bps,
+            "total_cost_bps": total_cost_pct * 1e4 + split_penalty_bps,
+        }
+
+    def get_total_cost_pct(self, buy_ex: str, sell_ex: str, pair_key: str) -> float:
+        """
+        Strict: coût % = fee_buy + fee_sell + slip_buy + slip_sell.
+        Source unique pour le « total_cost_pct » (hors pénalité SPLIT).
+        """
+        try:
+            breakdown = self._compute_cost_breakdown_for_route(buy_ex, sell_ex, pair_key)
+            return float(breakdown.get("total_cost_pct", 0.0))
+        except Exception:
+            return 0.0
 
     # ------------------------------------------------------------------
     # Fast-path & mode strategy
@@ -5979,46 +7721,131 @@ class RiskManager:
         )
         return (ok, best_side, best_edge)
 
-    def decide_tm_mode(self, *, pair_key: str, maker_ex: str, taker_ex: str, usdc_amt: float) -> Dict[str, Any]:
-        default_mode = getattr_str(self.cfg, "tm_default_mode", "NEUTRAL").upper()
-        e_sell = self._tm_edge_bps(maker_side="SELL", maker_ex=maker_ex, taker_ex=taker_ex, pair_key=pair_key)
-        e_buy = self._tm_edge_bps(maker_side="BUY", maker_ex=maker_ex, taker_ex=taker_ex, pair_key=pair_key)
-        maker_side, edge = (("SELL", e_sell) if e_sell >= e_buy else ("BUY", e_buy))
+    def decide_tm_mode(
+            self,
+            *,
+            pair_key: str,
+            maker_ex: str,
+            taker_ex: str,
+            usdc_amt: float,
+    ) -> Dict[str, Any]:
+        """
+        Décide NEUTRAL vs NON_NEUTRAL (NN) pour un TM, en étant profile-aware.
 
-        if default_mode != "NON_NEUTRAL":
-            ok, best_side, best_edge = self.should_tm_non_neutral(
-                pair_key=pair_key, maker_ex=maker_ex, taker_ex=taker_ex, usdc_amt=usdc_amt
-            )
-            if ok:
-                return {
-                    "mode": "NON_NEUTRAL",
-                    "maker_side": best_side,
-                    "edge_bps": best_edge,
-                    "hedge_ratio": getattr_float(self.cfg, "tm_nn_hedge_ratio", 0.65),
-                }
-            return {
-                "mode": "NEUTRAL",
-                "maker_side": maker_side,
-                "edge_bps": edge,
-                "hedge_ratio": getattr_float(self.cfg, "tm_neutral_hedge_ratio", 0.60),
+        Contrat M3-A / meta["tm"] (côté RM) :
+        - mode: "NEUTRAL" ou "NON_NEUTRAL" (normalisé ensuite en {"NEUTRAL", "NN"}).
+        - maker_side: "BUY" ou "SELL" (jambe maker).
+        - edge_bps: edge TM (en bps) sur la jambe maker.
+        - hedge_ratio: ratio initial de couverture (0.0–1.0).
+        - max_exposure_s: horizon métier maximum d'exposition TM_NN, en secondes.
+
+        Points clés :
+        - Le RM reste l'unique owner économique de ce choix (mode + hedge + horizon).
+        - L'Engine consommera ce bloc via payload.meta["tm"] et appliquera uniquement
+          des gardes techniques (TTL, panic-hedge, backpressure).
+        """
+        cfg = self.cfg
+
+        # Gardé pour tuning ultérieur (NEUTRAL vs NON_NEUTRAL par défaut)
+        default_mode = getattr_str(cfg, "tm_default_mode", "NEUTRAL").upper()
+
+        # Clés canoniques pour le hedging et l'horizon d'exposition
+        neutral_hr = getattr_float(
+            cfg,
+            "tm_exposure_ttl_hedge_ratio",
+            getattr(self, "tm_exposure_ttl_hedge_ratio", 0.50),
+        )
+        nn_hr = getattr_float(
+            cfg,
+            "tm_nn_hedge_ratio",
+            getattr(self, "tm_nn_hedge_ratio", 0.65),
+        )
+        # Horizon métier d'exposition NN (secondes) : config ou fallback local.
+        nn_max_exposure_s = getattr_float(
+            cfg,
+            "tm_nn_max_exposure_s",
+            getattr(self, "tm_nn_max_exposure_s", 3.0),
+        )
+        # Pour NEUTRAL, on utilise le TTL canonique comme horizon (ms → s).
+        try:
+            neutral_max_exposure_s = float(
+                getattr(self, "tm_exposure_ttl_ms", 2500)
+            ) / 1000.0
+        except Exception:
+            neutral_max_exposure_s = nn_max_exposure_s
+
+        # Edge brut en bps, tel qu'évalué lors du scan / pricing.
+        e_sell = float(getattr(self, "last_edge_bps_sell", 0.0))
+        e_buy = float(getattr(self, "last_edge_bps_buy", 0.0))
+
+        # Décide la jambe maker par défaut : celle qui a le meilleur edge.
+        maker_side = "SELL" if e_sell >= e_buy else "BUY"
+        edge = e_sell if maker_side == "SELL" else e_buy
+
+        profile = str(getattr(self, "capital_profile", "LARGE") or "LARGE").upper()
+
+        # Config globale / par profil pour le NN
+        nn_enabled_global = bool(getattr(cfg, "allow_tm_non_neutral", True))
+        allowed_profiles_raw = getattr_str(cfg, "tm_nn_allowed_profiles", "MICRO,SMALL,MID,LARGE")
+
+        if allowed_profiles_raw:
+            allowed_profiles = {
+                p.strip().upper()
+                for p in str(allowed_profiles_raw or "").split(",")
+                if p.strip()
             }
         else:
-            ok, best_side, best_edge = self.should_tm_non_neutral(
-                pair_key=pair_key, maker_ex=maker_ex, taker_ex=taker_ex, usdc_amt=usdc_amt
-            )
-            if ok:
-                return {
-                    "mode": "NON_NEUTRAL",
-                    "maker_side": best_side,
-                    "edge_bps": best_edge,
-                    "hedge_ratio": getattr_float(self.cfg, "tm_nn_hedge_ratio", 0.65),
-                }
+            # Fallback : tous les profils sauf NANO
+            allowed_profiles = {"MICRO", "SMALL", "MID", "LARGE"}
+
+        profile_allows_nn = profile in allowed_profiles
+        nn_allowed = bool(nn_enabled_global and profile_allows_nn)
+
+        # Expose la vue "autorisé NN" pour l'Engine (lecture seule).
+        try:
+            setattr(self, "allow_tm_non_neutral", nn_allowed)
+        except Exception:
+            pass
+
+        # Si NN non autorisé (profil ou config), on fige NEUTRAL.
+        if not nn_allowed:
             return {
                 "mode": "NEUTRAL",
                 "maker_side": maker_side,
                 "edge_bps": edge,
-                "hedge_ratio": getattr_float(self.cfg, "tm_neutral_hedge_ratio", 0.60),
+                "hedge_ratio": neutral_hr,
+                "max_exposure_s": neutral_max_exposure_s,
             }
+
+        # Décision opportuniste : laisser un TM NON_NEUTRAL si le contexte le justifie.
+        ok, best_side, best_edge = self.should_tm_non_neutral(
+            pair_key=pair_key,
+            maker_ex=maker_ex,
+            taker_ex=taker_ex,
+            usdc_amt=usdc_amt,
+            edge_sell_bps=e_sell,
+            edge_buy_bps=e_buy,
+            profile=profile,
+        )
+
+        if ok:
+            return {
+                "mode": "NON_NEUTRAL",
+                "maker_side": best_side,
+                "edge_bps": best_edge,
+                "hedge_ratio": nn_hr,
+                "max_exposure_s": nn_max_exposure_s,
+            }
+
+        # Fallback : TM NEUTRAL avec hedge ratio canonique et horizon neutre.
+        return {
+            "mode": "NEUTRAL",
+            "maker_side": maker_side,
+            "edge_bps": edge,
+            "hedge_ratio": neutral_hr,
+            "max_exposure_s": neutral_max_exposure_s,
+        }
+
 
     # ------------------------------------------------------------------
     # Admin helpers (watchdogs / discovery)
@@ -6348,6 +8175,7 @@ class RiskManager:
     # ---------------------------------------------------------------------
     # REMPLACEMENT 1/3
     # ---------------------------------------------------------------------
+    # ---------------------------------------------------------------------
     def on_scanner_opportunity(self, opp: Dict[str, Any]) -> None:
         """
         P2: scheduler multi-branches TT/TM/MM simultanés + caps notionnels et préemption MM,
@@ -6359,16 +8187,68 @@ class RiskManager:
         now = time.time()
 
         # --- 0) Freshness guards (TTL strict) ------------------------------------
-        slip_getter = getattr(self, "slippage_handler", None)
-        vol_getter = getattr(self, "volatility_monitor", None)
+        # On aligne le TTL sur les briques réellement utilisées :
+        # - Slippage : priorité au SlippageAndFeesCollector (slip_collector) si disponible,
+        #   sinon slippage_handler legacy.
+        # - Volatilité : priorité au vol_monitor, fallback éventuel sur vol_manager.
         slip_age_ok = True
         vol_age_ok = True
-        if slip_getter and hasattr(slip_getter, "last_age_seconds"):
-            slip_age_ok = (slip_getter.last_age_seconds(opp) or 0) <= 2.0
+        slip_age_s = None
+        vol_age_s = None
+        slip_src = "none"
+        vol_src = "none"
+
+        # Slippage TTL (2s)
+        slip_col = getattr(self, "slip_collector", None)
+        if slip_col and hasattr(slip_col, "last_age_seconds"):
+            try:
+                slip_age_s = float(slip_col.last_age_seconds(opp) or 0.0)
+                slip_src = "collector"
+            except Exception:
+                slip_age_s = None
+
+        if slip_age_s is None:
+            slip_getter = getattr(self, "slippage_handler", None)
+            if slip_getter and hasattr(slip_getter, "last_age_seconds"):
+                try:
+                    slip_age_s = float(slip_getter.last_age_seconds(opp) or 0.0)
+                    slip_src = "handler"
+                except Exception:
+                    slip_age_s = None
+
+        if slip_age_s is not None:
+            slip_age_ok = slip_age_s <= 2.0
+
+        # Volatilité TTL (5s)
+        vol_getter = getattr(self, "vol_monitor", None)
         if vol_getter and hasattr(vol_getter, "last_age_seconds"):
-            vol_age_ok = (vol_getter.last_age_seconds(opp) or 0) <= 5.0
+            try:
+                vol_age_s = float(vol_getter.last_age_seconds(opp) or 0.0)
+                vol_src = "monitor"
+            except Exception:
+                vol_age_s = None
+
+        if vol_age_s is None:
+            vm = getattr(self, "vol_manager", None)
+            if vm and hasattr(vm, "last_age_seconds"):
+                try:
+                    vol_age_s = float(vm.last_age_seconds(opp) or 0.0)
+                    vol_src = "manager"
+                except Exception:
+                    vol_age_s = None
+
+        if vol_age_s is not None:
+            vol_age_ok = vol_age_s <= 5.0
+
         if not (slip_age_ok and vol_age_ok):
-            if getattr(self, "log", None): self.log.debug("RM.SKIP: stale slip/vol (TTL P2)")
+            if getattr(self, "log", None):
+                self.log.debug(
+                    "RM.SKIP: stale slip/vol (TTL P2) slip_age_s=%.3f vol_age_s=%.3f slip_src=%s vol_src=%s",
+                    float(slip_age_s or -1.0),
+                    float(vol_age_s or -1.0),
+                    slip_src,
+                    vol_src,
+                )
             return
 
         # --- 1) Contexte & combo --------------------------------------------------
@@ -6399,23 +8279,18 @@ class RiskManager:
             return
 
         # --- 3) Budgets d’in-flight (branche×profil) & pacer ----------------------
-        # Hiérarchie des caps (Ticket 10) :
-        #   - RM = caps business par branche/profil/route
-        #           (caps_trading_by_profile, inflight_rebal_by_profile).
-        #   - EnginePacer = caps infra (queue globale, inflight max pod).
-        #   - Les deux lisent uniquement BotConfig ; l'Engine n'applique
-        #     aucune décision économique additionnelle au-delà de
-        #     bundle_concurrency/headroom_min.
-
-        profile = getattr(self, "capital_profile", "LARGE")
-        profile_name = str(profile).upper()
-        pacer = getattr(self, "pacer", None)
+        # Hiérarchie des caps:
+        # 1) caps_trading_by_profile (cfg.rm) si présent
+        # 2) fallback legacy (NANO→LARGE) + pacer (NORMAL/CONSTRAINED/SEVERE)
         rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+        profile_name = (getattr(self, "capital_profile", None) or "LARGE").upper()
+        pacer = getattr(self, "pacer", None)
 
         def _base_cap_for_branch(branch: str) -> int:
             """
-            Cap business brut pour une branche TRADING (TT/TM/MM) selon le profil de capital,
-            piloté par BotConfig.RiskManagerCfg (Ticket 10).
+            Cap brut (avant pacer) pour la branche demandée.
+            Lit d'abord cfg.rm.caps_trading_by_profile si disponible,
+            sinon fallback legacy.
             """
             try:
                 if rm_cfg and getattr(rm_cfg, "caps_trading_by_profile", None):
@@ -6433,14 +8308,47 @@ class RiskManager:
                 "MID": {"TT": 6, "TM": 4, "MM": 3},
                 "LARGE": {"TT": 8, "TM": 6, "MM": 4},
             }
-            prof = legacy_caps.get(profile_name) or legacy_caps["LARGE"]
-            return int(prof.get(branch.upper(), 0) or 0)
+
+            # Visibiliser l'usage du fallback legacy (log une seule fois par profil)
+            try:
+                used = getattr(self, "_rm_caps_legacy_profiles", None)
+                if used is None:
+                    used = set()
+                    setattr(self, "_rm_caps_legacy_profiles", used)
+
+                if profile_name not in used:
+                    used.add(profile_name)
+                    logger = getattr(self, "logger", None)
+                    if logger is not None:
+                        try:
+                            logger.warning(
+                                "[RM] caps_trading_by_profile absent ou vide — "
+                                "fallback legacy caps pour profil %s",
+                                profile_name,
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                # On ne casse jamais sur de la télémétrie
+                pass
+
+            prof_caps = legacy_caps.get(profile_name, legacy_caps["LARGE"])
+            return int(prof_caps.get(branch.upper(), 0) or 0)
 
         def _cap(branch: str) -> int:
+            """
+            Cap effectif (après pacer).
+            factor_for_branch ne doit JAMAIS augmenter le cap au-delà du base.
+            """
             base = _base_cap_for_branch(branch)
             if pacer and hasattr(pacer, "factor_for_branch"):
                 try:
                     factor = float(pacer.factor_for_branch(branch))
+                    # Clamp dur pour éviter tout upscale accidentel
+                    if factor > 1.0:
+                        factor = 1.0
+                    if factor < 0.0:
+                        factor = 0.0
                     return max(0, int(round(base * factor)))
                 except Exception:
                     return max(0, int(base))
@@ -6448,6 +8356,50 @@ class RiskManager:
 
         # Caps TRADING par branche pour CETTE opportunité (TT/TM/MM uniquement)
         caps = {"TT": _cap("TT"), "TM": _cap("TM"), "MM": _cap("MM")}
+
+        # Observabilité des caps RM (profil×branche) — Macro M2-4
+        # On exporte à la fois le cap "base" (théorique) et le cap "effectif" (après pacer / overlays)
+        try:
+            try:
+                from . import obs_metrics  # type: ignore
+            except Exception:  # pragma: no cover
+                obs_metrics = None
+
+            if obs_metrics is not None:
+                base_g = getattr(obs_metrics, "RM_CAP_BASE_INFLIGHT_USD", None)
+                eff_g = getattr(obs_metrics, "RM_CAP_EFFECTIVE_INFLIGHT_USD", None)
+                if base_g is not None or eff_g is not None:
+                    for _branch in ("TT", "TM", "MM"):
+                        try:
+                            _base_val = float(_base_cap_for_branch(_branch))
+                        except Exception:
+                            _base_val = 0.0
+                        try:
+                            _eff_val = float(caps.get(_branch, 0) or 0)
+                        except Exception:
+                            _eff_val = 0.0
+
+                        if base_g is not None:
+                            try:
+                                base_g.labels(
+                                    profile=profile_name,
+                                    branch=_branch,
+                                ).set(_base_val)
+                            except Exception:
+                                pass
+
+                        if eff_g is not None:
+                            try:
+                                eff_g.labels(
+                                    profile=profile_name,
+                                    branch=_branch,
+                                ).set(_eff_val)
+                            except Exception:
+                                pass
+        except Exception:
+            # On ne casse jamais la décision pour un problème de télémétrie
+            pass
+
 
         # --- 4) Éligibilités de base ----------------------------------------------
         strategies: List[str] = []
@@ -6469,40 +8421,36 @@ class RiskManager:
         engine = getattr(self, "engine", None)
         sent_any = False
 
-        for strat in strategies:
-            if caps.get(strat, 0) <= 0:
+        if not engine:
+            if getattr(self, "log", None): self.log.error("RM.on_scanner_opportunity sans engine attaché")
+            return
+
+        # 5.a) TT/TM: utilisation directe des caps TT/TM par profil
+        for strat in ("TT", "TM"):
+            if strat not in strategies:
                 continue
-
-            # Applique cap par CEX (min des deux côtés pour TT/TM)
-            allow_buy = getattr(self, "_apply_caps_and_preempt_cex", None)
-            allow_sell = getattr(self, "_apply_caps_and_preempt_cex", None)
-            allowed = desired
-            if callable(allow_buy):
-                if strat in ("TT", "TM"):
-                    nb = allow_buy(strat, buy_ex, desired)
-                    ns = allow_sell(strat, sell_ex, desired)
-                    allowed = min(nb, ns, desired)
-                elif strat == "MM":
-                    allowed = allow_buy(strat, buy_ex or sell_ex, desired)
-            # Skip si trop petit
-            if allowed < max(1.0, min_trade_usdc):
+            cap_branch = caps.get(strat, 0)
+            if cap_branch <= 0:
                 continue
-
-            # Construire un opp “capé” pour le bundle
-            opp2 = dict(opp)
-            opp2["notional_usdc"] = float(allowed)
-            opp2["notional_quote"] = {"ccy": "USDC", "amount": float(allowed)}
-
-            bundle = self._build_bundle(opp2, strategy=strat)
-            if not bundle:
+            if desired < min_trade_usdc:
                 continue
+            try:
+                bundle = self._build_bundle(opp, strategy=strat)
+                if bundle:
+                    self._multicast_shadow(bundle)
+                    sent_any = True
+            except Exception:
+                if getattr(self, "log", None): self.log.exception(f"RM.on_scanner_opportunity: erreur sur {strat}")
 
-            # Shadow + envoi (non-bloquant via helper interne)
-            self._multicast_shadow(bundle)
-            caps[strat] -= 1
-            sent_any = True
+        # 5.b) MM: préemption si TT/TM encore “chargés”
+        if "MM" in strategies and caps.get("MM", 0) > 0 and not sent_any:
+            try:
+                bundle = self._build_bundle(opp, strategy="MM")
+                if bundle:
+                    self._multicast_shadow(bundle)
+            except Exception:
+                if getattr(self, "log", None): self.log.exception("RM.on_scanner_opportunity: erreur sur MM")
 
-        return
 
     # ---------------------------------------------------------------------
     # REMPLACEMENT 2/3
@@ -6570,6 +8518,99 @@ class RiskManager:
         if strategy == "REB":
             mode = "TM"  # Engine exécute TM NEUTRAL, lock combo géré par RM
 
+        # Décision TM (mode + hedge) calculée côté RM, consommée par l'Engine.
+        # Contrat canonique meta["tm"] (Ticket M3-A) :
+        #   - mode ∈ {"NEUTRAL", "NN"} (libellé interne "NON_NEUTRAL" normalisé plus bas),
+        #   - maker_side ∈ {"BUY", "SELL"},
+        #   - hedge_ratio ∈ [0.0, 1.0],
+        #   - max_exposure_s : horizon métier maximum d'exposition TM_NN (secondes).
+        tm_meta: Optional[Dict[str, Any]] = None
+
+        # Paramètres d'horizon TM utilisés comme fallback si le RM n'a pas encore posé max_exposure_s.
+        tm_nn_max_exposure_s = float(
+            getattr(
+                self,
+                "tm_nn_max_exposure_s",
+                getattr(self.cfg, "tm_nn_max_exposure_s", 3.0),
+            )
+        )
+        try:
+            tm_neutral_max_exposure_s = float(
+                getattr(self, "tm_exposure_ttl_ms", 2500)
+            ) / 1000.0
+        except Exception:
+            tm_neutral_max_exposure_s = tm_nn_max_exposure_s
+
+        if mode == "TM":
+            if strategy == "TM":
+                # Notionnel en devise de cotation pour la décision TM
+                try:
+                    usdc_amt = float((notional or {}).get("amount") or opp.get("notional_usdc") or 0.0)
+                except Exception:
+                    usdc_amt = float(opp.get("notional_usdc") or 0.0)
+
+                try:
+                    tm_meta = self.decide_tm_mode(
+                        pair_key=pk,
+                        maker_ex=sell_ex,  # TM = maker sur la jambe SELL, hedge sur BUY
+                        taker_ex=buy_ex,
+                        usdc_amt=usdc_amt,
+                    ) or {}
+                except Exception:
+                    # En cas d'erreur, on retombe sur un TM NEUTRAL standard.
+                    tm_meta = {}
+
+            elif strategy == "REB":
+                # REB traité comme TM NEUTRAL "full hedge" avec horizon borné.
+                max_expo_reb_s = min(tm_neutral_max_exposure_s, tm_nn_max_exposure_s)
+                tm_meta = {
+                    "mode": "NEUTRAL",
+                    "hedge_ratio": 1.0,
+                    "max_exposure_s": max_expo_reb_s,
+                    "source": "RM_REB",
+                }
+
+            # Normalisation minimale pour l'Engine
+            if tm_meta is None:
+                tm_meta = {}
+
+            mode_val = str(tm_meta.get("mode") or "").upper()
+            if mode_val == "NON_NEUTRAL":
+                tm_meta["mode"] = "NN"
+            elif mode_val not in {"NEUTRAL", "NN"}:
+                tm_meta["mode"] = "NEUTRAL"
+
+            # Hedge ratio par défaut si absent : TTL hedge neutre (clé canonique).
+            if "hedge_ratio" not in tm_meta:
+                tm_meta["hedge_ratio"] = float(
+                    getattr(
+                        self,
+                        "tm_exposure_ttl_hedge_ratio",
+                        getattr(self, "tm_neutral_hedge_ratio", 0.50),
+                    )
+                )
+
+            # max_exposure_s par défaut si absent : dépend du mode effectif.
+            if "max_exposure_s" not in tm_meta:
+                mode_eff = str(tm_meta.get("mode") or "NEUTRAL").upper()
+                if mode_eff == "NN":
+                    tm_meta["max_exposure_s"] = tm_nn_max_exposure_s
+                else:
+                    tm_meta["max_exposure_s"] = tm_neutral_max_exposure_s
+
+            # maker_side par défaut si absent (utile pour audit, Engine n'en dépend pas).
+            if "maker_side" not in tm_meta:
+                tm_meta["maker_side"] = "SELL"
+            else:
+                tm_meta["maker_side"] = str(tm_meta["maker_side"]).upper()
+                tm_meta["hedge_ratio"] = float(
+                    getattr(
+                        self,
+                        "tm_exposure_ttl_hedge_ratio",
+                        getattr(self, "tm_neutral_hedge_ratio", 0.50),
+                    )
+                )
+
         # Fragmentation suggérée par le Simulateur (industry-grade)
         frag_meta = None
         simulator = getattr(self, "simulator", None)
@@ -6593,11 +8634,28 @@ class RiskManager:
         # Contrôles TM (queuepos/TTL/hedge) en meta additifs (facultatifs)
         tm_controls = None
         if mode == "TM":
+            # Hedge ratio décisionnel = celui du RM dans tm_meta, sinon fallback neutre
+            base_hr: Optional[float] = None
+            if tm_meta:
+                try:
+                    base_hr = float(tm_meta.get("hedge_ratio"))
+                except (TypeError, ValueError):
+                    base_hr = None
+            if base_hr is None:
+                base_hr = float(
+                    getattr(
+                        self,
+                        "tm_exposure_ttl_hedge_ratio",
+                        getattr(self, "tm_neutral_hedge_ratio", 0.50),
+                    )
+                )
+
             tm_controls = {
                 "queuepos_max_usd": getattr(self, "tm_queuepos_max_usd", 25000),
                 "ttl_ms": getattr(self, "tm_exposure_ttl_ms", 2500),
-                "hedge_ratio": getattr(self, "tm_hedge_ratio", 0.50),
+                "hedge_ratio": base_hr,
             }
+
         # Merge overrides degraded (si présents)
         if degraded and isinstance(degraded.get("tm_controls"), dict):
             tm_controls = (tm_controls or {}) | degraded["tm_controls"]
@@ -6669,7 +8727,6 @@ class RiskManager:
                               route=f"{buy_ex}->{sell_ex}")
                 raise RMError(f"{RM_BUNDLE_EMPTY_PARAMS} leg={i} qty={q} px={px}")
 
-
         bundle = make_submit_bundle(
             legs=legs,
             route=route,
@@ -6686,6 +8743,40 @@ class RiskManager:
             shadow=False,
             client_id=client_id,
         )
+
+        # Injection explicite de la décision TM dans le payload pour l'Engine
+        if tm_meta and isinstance(bundle, dict):
+            bundle.setdefault("tm", tm_meta)
+
+        # --- Contrat M3-3 : TTL MM owner = RM (per-bundle) -----------------
+        if strategy_u == "MM":
+            # TTL d'exposition pour MM : calculé côté RM, envoyé dans le bundle.
+            # Priorité :
+            #   1) cfg.rm.mm_exposure_ttl_ms si présent
+            #   2) cfg.rm.tm_exposure_ttl_ms (fallback)
+            #   3) constante prudente 2500 ms
+            ttl_ms = None
+            try:
+                cfg_root = getattr(self, "cfg", None)
+                rm_cfg = getattr(cfg_root, "rm", None) if cfg_root else None
+            except Exception:
+                rm_cfg = None
+
+            if rm_cfg is not None:
+                ttl_ms = getattr(rm_cfg, "mm_exposure_ttl_ms", None)
+                if not ttl_ms:
+                    ttl_ms = getattr(rm_cfg, "tm_exposure_ttl_ms", None)
+
+            try:
+                ttl_ms = int(ttl_ms or 2500)
+            except Exception:
+                ttl_ms = 2500
+
+            # On pose le TTL directement au niveau bundle, pour que l'Engine
+            # puisse l'utiliser sans reconsulter la config.
+            bundle["ttl_ms"] = ttl_ms
+
+
         return bundle
 
     # ---------------------------------------------------------------------
@@ -6697,6 +8788,20 @@ class RiskManager:
         self.engine_enqueue_bundle(bundle)
         # 2) Shadow Simu (non-bloquant, sampling interne)
         self.shadow_simulate(bundle, l2_cache=getattr(self, "l2_cache", None))
+        # 3) Comptage des budgets (branch × profil × combo)
+        self._record_budget_spend(bundle.get("branch"), bundle)
+
+        # 4) Observabilité expo (M3-4) : notional par branche/profil/combo
+        #    On ne logue que TM/MM/REB, via la helper dédiée.
+        try:
+            self._record_exposure_for_bundle(bundle.get("branch"), bundle)
+        except Exception:
+            # Observabilité best-effort, jamais bloquante.
+            logging.debug(
+                "[RiskManager] _multicast_shadow: échec _record_exposure_for_bundle",
+                exc_info=False,
+            )
+
 
     # ------------------------------------------------------------------
     # Engine routing avec verrous (exchange, alias, pair)
@@ -7263,9 +9368,12 @@ class RiskManager:
                 "rebal_active_ttl_s": self.rebal_active_ttl_s,
                 "rebal_emit_cooldown_s": self.rebal_emit_cooldown_s,
                 "rebal_emit_next_allowed_in_s": max(0.0, self._rebal_emit_next_allowed - time.time()),
-                "tm_policy": {
+                                "tm_policy": {
                     "default_mode": getattr(self.cfg, "tm_default_mode", "NEUTRAL"),
-                    "neutral_hedge_ratio": getattr(self.cfg, "tm_neutral_hedge_ratio", 0.60),
+                    # Clé canonique pour la hedge NEUTRAL
+                    "neutral_hedge_ratio": getattr(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50),
+                    # Alias éventuel pour compat legacy (peut être None si non configuré)
+                    "legacy_neutral_hedge_ratio": getattr(self.cfg, "tm_neutral_hedge_ratio", None),
                     "nn_min_edge_bps": getattr(self.cfg, "tm_nn_min_edge_bps", 3.0),
                     "nn_max_vol_bps": getattr(self.cfg, "tm_nn_max_vol_bps", 60.0),
                     "nn_max_slip_bps": getattr(self.cfg, "tm_nn_max_slip_bps", 25.0),
@@ -7273,6 +9381,7 @@ class RiskManager:
                     "nn_hedge_ratio": getattr(self.cfg, "tm_nn_hedge_ratio", 0.65),
                     "nn_max_exposure_s": getattr(self.cfg, "tm_nn_max_exposure_s", 3.0),
                 },
+
                 "fragmentation": {
                     "min_fragment_usdc": self.min_fragment_usdc,
                     "max_fragments": self.max_fragments,

@@ -449,7 +449,87 @@ RM_SKIPS_TOTAL = _metric(Counter, 'rm_skips_total', 'RM skipped reasons', ['reas
 RM_QUEUE_DEPTH = _metric(Gauge, 'rm_queue_depth', 'Queue depth per stage', ['stage'])
 RM_FINAL_DECISIONS_TOTAL = _metric(Counter, 'rm_final_decisions_total', 'Final decisions emitted by RM, per route', ['route'])
 RM_ADMITTED_TOTAL = _metric(Counter, 'rm_admitted_total', 'Opportunities admitted by the RM', labelnames=('cohort',))
-RM_DROPPED_TOTAL = _metric(Counter, 'rm_dropped_total', 'Opportunities dropped by the RM', labelnames=('reason',))
+
+RM_DROPPED_TOTAL = _metric(
+    Counter,
+    'rm_dropped_total',
+    'Opportunities dropped by the RM',
+    labelnames=('reason',),
+)
+
+RM_MODE_CURRENT = _metric(
+    Gauge,
+    'rm_mode_current',
+    'Current RM mode (NORMAL=0, OPP_VOLUME=1, OPP_VOL=2, SEVERE=3)',
+    ['mode'],
+)
+RM_TRADE_MODE_CURRENT = _metric(
+    Gauge,
+    'rm_trade_mode_current',
+    'Current trade mode exposed to Engine (0=NORMAL,1=CONSTRAINED,2=SEVERE,3=OPPORTUNISTE)',
+    ['mode'],
+)
+RM_MODE_ENTRIES_TOTAL = _metric(
+    Counter,
+    'rm_mode_entries_total',
+    'RM mode entries',
+    ['mode', 'reason'],
+)
+RM_MODE_EXITS_TOTAL = _metric(
+    Counter,
+    'rm_mode_exits_total',
+    'RM mode exits with reason',
+    ['mode', 'reason'],
+)
+RM_MODE_ABORT_TOTAL = _metric(
+    Counter,
+    'rm_mode_abort_total',
+    'RM mode veto/abort by guard',
+    ['mode', 'guard'],
+)
+
+
+def rm_update_mode_gauges(rm_mode: str, trade_mode: str) -> None:
+    """
+    Helper RM pour exposer rm_mode / trade_mode sur les métriques de mode.
+
+    - rm_mode_current{mode="..."} = 1 pour le mode courant, 0 pour les autres.
+    - rm_trade_mode_current{mode="..."} = 1 pour le mode courant, 0 pour les autres.
+
+    Fallback: en cas de mismatch de labels (legacy), on expose un entier encodé.
+    """
+    try:
+        rm_mode_u = str(rm_mode or "NORMAL").upper()
+        trade_mode_u = str(trade_mode or "NORMAL").upper()
+
+        rm_rank = {"NORMAL": 0, "OPP_VOLUME": 1, "OPP_VOL": 2, "SEVERE": 3}
+        trade_rank = {"NORMAL": 0, "CONSTRAINED": 1, "SEVERE": 2, "OPPORTUNISTE": 3}
+
+        # One-hot sur label "mode" pour rm_mode
+        try:
+            for m in ("NORMAL", "OPP_VOLUME", "OPP_VOL", "SEVERE"):
+                RM_MODE_CURRENT.labels(mode=m).set(1.0 if m == rm_mode_u else 0.0)
+        except Exception:
+            try:
+                RM_MODE_CURRENT.set(float(rm_rank.get(rm_mode_u, -1)))
+            except Exception:
+                pass
+
+        # One-hot sur label "mode" pour trade_mode
+        try:
+            for m in ("NORMAL", "CONSTRAINED", "SEVERE", "OPPORTUNISTE"):
+                RM_TRADE_MODE_CURRENT.labels(mode=m).set(
+                    1.0 if m == trade_mode_u else 0.0
+                )
+        except Exception:
+            try:
+                RM_TRADE_MODE_CURRENT.set(float(trade_rank.get(trade_mode_u, -1)))
+            except Exception:
+                pass
+    except Exception:
+        _obs_shim_log.exception("rm_update_mode_gauges failed")
+
+
 STALE_OPPORTUNITY_DROPPED_TOTAL = _metric(Counter, 'stale_opportunity_dropped_total', 'Opportunities dropped due to stale/invalid orderbooks')
 PAIR_HEALTH_PENALTY_TOTAL = _metric(Counter, 'pair_health_penalty_total', 'Pair-level penalties applied (circuit-breakers)', labelnames=('pair', 'reason'))
 POOL_GATE_THROTTLES_TOTAL = _metric(Counter, 'pool_gate_throttles_total', 'Pool gate throttles fired (insufficient quote buffer)', labelnames=('quote',))
@@ -602,10 +682,32 @@ PNL_LIVE_DAY_USD = _metric(Gauge, 'pnl_live_day_usd', 'Live PnL for the current 
 TRADES_LIVE_DAY_TOTAL = _metric(Counter, 'trades_live_day_total', 'Trades live day total', ['result'])
 DERIVED_NET_PROFIT_SIGN_TOTAL = _metric(Counter, 'derived_net_profit_sign_total', 'Derived net profit sign (fallback)', ['reason'])
 MISSING_NET_PROFIT_TOTAL = _metric(Counter, 'missing_net_profit_total', 'Missing net profit values', ['stage'])
-ENGINE_PACER_DELAY_MS = _metric(Gauge, 'engine_pacer_delay_ms', 'Engine pacer delay (ms)')
-ENGINE_PACER_INFLIGHT_MAX = _metric(Gauge, 'engine_pacer_inflight_max', 'Engine pacer inflight cap')
-ENGINE_PACER_MODE = _metric(Gauge, 'engine_pacer_mode', 'Engine pacer mode (0=NORMAL,1=CONSTRAINED,2=SEVERE)')
-ENGINE_DRAIN_LATENCY_MS = _metric(Histogram, 'engine_drain_latency_ms', 'Engine drain latency (ms)', buckets=BUCKETS_MS)
+
+ENGINE_PACER_DELAY_MS = _metric(
+    Gauge,
+    'engine_pacer_delay_ms',
+    'Engine pacer delay (ms)',
+    ['region', 'profile', 'mode'],
+)
+ENGINE_PACER_INFLIGHT_MAX = _metric(
+    Gauge,
+    'engine_pacer_inflight_max',
+    'Engine pacer inflight cap',
+    ['region', 'profile', 'mode'],
+)
+ENGINE_PACER_MODE = _metric(
+    Gauge,
+    'engine_pacer_mode',
+    'Engine pacer mode (0=NORMAL,1=CONSTRAINED,2=SEVERE)',
+    ['region', 'profile'],
+)
+ENGINE_DRAIN_LATENCY_MS = _metric(
+    Histogram,
+    'engine_drain_latency_ms',
+    'Engine drain latency (ms)',
+    buckets=BUCKETS_MS,
+)
+
 ENGINE_PACING_BACKPRESSURE_TOTAL = _metric(Counter, 'engine_pacing_backpressure_total', 'Engine pacing backpressure', ['reason'])
 ENGINE_ACK_TIMEOUT_TOTAL = _metric(Counter, 'engine_ack_timeout_total', 'Engine ack timeouts')
 
@@ -885,6 +987,19 @@ RECONCILE_RESYNC_LATENCY_MS = _metric(
     ['exchange', 'alias', 'scope'],
     buckets=BUCKETS_MS,
 )
+
+RM_SC_RL_REJECT_TOTAL = Counter(
+    "rm_sc_rl_reject_total",
+    "Rejets RM pour dépassement du soft rate-limit SC (sub-account)",
+    labelnames=("exchange", "alias", "branch"),
+)
+
+RM_SC_RL_TOKENS = Gauge(
+    "rm_sc_rl_tokens",
+    "Tokens restants dans le bucket soft RL par SC",
+    labelnames=("exchange", "alias", "branch"),
+)
+
 COLD_RESYNC_TOTAL = _metric(Counter, 'cold_resync_total', 'Cold resyncs', ['exchange'])
 COLD_RESYNC_RUN_MS = _metric(Histogram, 'cold_resync_run_ms', 'Cold resync duration (ms)', ['exchange'], buckets=BUCKETS_MS)
 

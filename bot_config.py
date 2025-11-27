@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import json
 import ast
+import logging
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Tuple, Optional, Union
 
@@ -407,7 +408,8 @@ class RiskManagerCfg:
         "LARGE": {"TT": 12, "TM": 10, "MM": 6},
     })
 
-    # Budget séparé pour REB (mode exclusif par SC, pas dans le pool TRADING).
+    # Caps REB — nombre de bundles de rebalancing simultanés par profil.
+    # Distincts des inflight "trading" (TT/TM/MM).
     inflight_rebal_by_profile: Dict[str, int] = field(default_factory=lambda: {
         "NANO": 1,
         "MICRO": 1,
@@ -415,6 +417,54 @@ class RiskManagerCfg:
         "MID": 3,
         "LARGE": 4,
     })
+
+    # Policy "Capital Ladder" — source canonique pour les profils NANO→LARGE.
+    # Chaque profil porte :
+    #   - min_capital_per_sc : capital net moyen par sous-compte requis pour "entrer" dans ce profil.
+    #   - allow_auto_upgrade : le profil peut être atteint automatiquement par la ladder.
+    #   - allow_auto_downgrade : le profil peut être quitté automatiquement.
+    capital_ladder_cfg: Dict[str, Dict[str, Any]] = field(default_factory=lambda: {
+        "NANO": {
+            "min_capital_per_sc": 0.0,
+            "allow_auto_upgrade": True,
+            "allow_auto_downgrade": False,
+        },
+        "MICRO": {
+            "min_capital_per_sc": 2000.0,
+            "allow_auto_upgrade": True,
+            "allow_auto_downgrade": True,
+        },
+        "SMALL": {
+            "min_capital_per_sc": 5000.0,
+            "allow_auto_upgrade": True,
+            "allow_auto_downgrade": True,
+        },
+        "MID": {
+            "min_capital_per_sc": 30000.0,
+            "allow_auto_upgrade": True,
+            "allow_auto_downgrade": True,
+        },
+        "LARGE": {
+            "min_capital_per_sc": 100000.0,
+            "allow_auto_upgrade": False,  # upgrade vers LARGE = décision gouvernance
+            "allow_auto_downgrade": True,
+        },
+    })
+
+
+    # Ticket 6 — Cap notional global par combo (TT+TM+REB) par profil (en quote USDC/EUR)
+    # Aligné sur la borne “tail-risk” (_profile_cap_notional dans le RM).
+    combo_cap_usd_by_profile: Dict[str, float] = field(default_factory=lambda: {
+        "NANO": 200.0,  # loss_budget 0.5€ / (25 bps tail)
+        "MICRO": 400.0,  # 1€  / 0.0025
+        "SMALL": 800.0,  # 2€  / 0.0025
+        "MID": 1600.0,  # 4€  / 0.0025
+        "LARGE": 3200.0,  # 8€  / 0.0025
+    })
+
+    # Facteur de réduction si au moins un alias est en TTL=DEGRADED
+    # (BLOCKED => cap combo = 0 dans le RM, déjà géré)
+    combo_ttl_degraded_factor: float = 0.5
 
 
     default_notional: float = 500.0
@@ -451,10 +501,29 @@ class RiskManagerCfg:
     decision_log_path: str = ""
     preempt_mm_for_tt_tm: bool = True
     per_strategy_notional_cap: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    # Paramètres REB — version globale + variantes profilées (optionnelles).
+    # Le RM peut continuer à ne lire que les valeurs globales ; les maps
+    # *_by_profile sont là pour la "desk policy" et les futurs raffinements.
     rebal_allow_loss_bps: float = 0.0
+    rebal_allow_loss_bps_by_profile: Dict[str, float] = field(default_factory=lambda: {
+        "NANO": 0.0,
+        "MICRO": 0.0,
+        "SMALL": 0.0,
+        "MID": 0.0,
+        "LARGE": 0.0,
+    })
     rebal_volume_haircut: float = 0.80
+    rebal_volume_haircut_by_profile: Dict[str, float] = field(default_factory=lambda: {
+        "NANO": 0.80,
+        "MICRO": 0.80,
+        "SMALL": 0.80,
+        "MID": 0.80,
+        "LARGE": 0.80,
+    })
 
     dry_run: bool = True
+
 
 # --- Simulator ---
 @dataclass
@@ -527,8 +596,9 @@ class EngineCfg:
     tm_exposure_ttl_hedge_ratio: float = 0.5
     tm_watch_timeout_s: int = 2
 
-    tm_queuepos_max_ahead_usd: float = 20_000.0
+    tm_queuepos_max_ahead_usd: float = 20000.0
     tm_queuepos_max_eta_ms: int = 1200
+    tm_nn_hedge_ratio: float = 0.65
 
     maker_pad_ticks: int = 2
     tm_max_open_makers: int = 3
@@ -669,21 +739,50 @@ class VolatilityCfg:
     })
 
 # --- Rate Limiter ---
+# --- Rate Limiter ---
 @dataclass
 class RateLimiterCfg:
-    priorities: List[str] = field(default_factory=lambda: ["hedge","cancel","maker"])  # ordre
-    fair: bool = True
-    name_prefix: str = "RL"
-    min_sleep_s: float = 0.005
-    max_sleep_s: float = 0.05
-    default_rate_per_s: float = 9.0
-    default_burst: int = 10
+    # Hard caps "globaux" (déjà en place)
+    hard_caps_rps_by_exchange: Dict[str, float] = field(default_factory=dict)
     hard_caps_rps_by_exchange_kind: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    hard_caps_rps_by_exchange: Dict[str, float] = field(default_factory=lambda: {"BINANCE": 9.0, "BYBIT": 9.0, "COINBASE": 9.0})
     hard_caps_rps_by_kind: Dict[str, float] = field(default_factory=dict)
-    bursts_by_exchange_kind: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    bursts_by_exchange: Dict[str, int] = field(default_factory=lambda: {"BINANCE": 10, "BYBIT": 10, "COINBASE": 10})
-    bursts_by_kind: Dict[str, int] = field(default_factory=dict)
+
+    bursts_by_exchange: Dict[str, float] = field(default_factory=dict)
+    bursts_by_exchange_kind: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    bursts_by_kind: Dict[str, float] = field(default_factory=dict)
+
+    priorities: List[str] = field(default_factory=lambda: ["hedge", "cancel", "maker"])
+    fair: bool = True
+    name_prefix: str = "rl"
+
+    min_sleep_s: float = 0.001
+    max_sleep_s: float = 0.250
+
+    # Ticket RL global (déjà utilisé ailleurs)
+    default_rate_per_s: float = 30.0
+    default_burst: float = 30.0
+
+    # 🔹 Nouveau : soft-cap SC (sub-account) consommé par RiskManager._cfg("rl.sc.*")
+    #
+    # Structure attendue (exemple):
+    #   {
+    #     "default": {"rate_per_s": 3.0, "burst": 6.0},
+    #     "BINANCE": {
+    #       "TT": {"rate_per_s": 6.0, "burst": 10.0},
+    #       "TM": {"rate_per_s": 4.0, "burst": 8.0},
+    #     },
+    #     "BYBIT": { ... },
+    #   }
+    #
+    # => flatten via _rebuild_flat_cache():
+    #    rl.sc.default.rate_per_s
+    #    rl.sc.BINANCE.TT.rate_per_s
+    #    rl.sc.BINANCE.TM.burst
+    sc: Dict[str, Dict[str, Dict[str, float]]] = field(
+        default_factory=lambda: {
+            "default": {"rate_per_s": 3.0, "burst": 6.0},
+        }
+    )
 
 # --- Retry Policy ---
 @dataclass
@@ -821,6 +920,54 @@ class BotConfig:
             return "EU_ONLY"
         return str(val).upper()
 
+        val = getattr(self.g, "deployment_mode", "EU_ONLY")
+        if not val:
+            return "EU_ONLY"
+        return str(val).upper()
+
+    @property
+    def DESK_REBAL_POLICY(self) -> Dict[str, Any]:
+        """
+        Vue agrégée des paramètres de rebalancing (REB) pour pilotage "desk".
+        Read-only, ne modifie aucune valeur.
+        """
+        rm = self.rm
+        rebal = self.rebal
+
+        ttl_normal = getattr(self, "RM_BALANCE_TTL_S_NORMAL", 60.0)
+        ttl_degraded = getattr(self, "RM_BALANCE_TTL_S_DEGRADED", 180.0)
+        ttl_block = getattr(self, "RM_BALANCE_TTL_S_BLOCK", 600.0)
+
+        return {
+            "caps": {
+                "inflight_rebal_by_profile": getattr(rm, "inflight_rebal_by_profile", {}),
+                "combo_cap_usd_by_profile": getattr(rm, "combo_cap_usd_by_profile", {}),
+            },
+            "loss_bps": {
+                "global": getattr(rm, "rebal_allow_loss_bps", 0.0),
+                "by_profile": getattr(rm, "rebal_allow_loss_bps_by_profile", {}),
+            },
+            "volume_haircut": {
+                "global": getattr(rm, "rebal_volume_haircut", 0.80),
+                "by_profile": getattr(rm, "rebal_volume_haircut_by_profile", {}),
+            },
+            "quantum": {
+                "min_quote": getattr(rebal, "rebal_quantum_min_quote", 0.0),
+                "per_quote": getattr(rebal, "rebal_quantum_quote_map", {}),
+            },
+            "rate": {
+                "max_ops_per_min": getattr(rebal, "rebal_max_ops_per_min", 0),
+            },
+            "ttl_balances": {
+                "normal_s": ttl_normal,
+                "degraded_s": ttl_degraded,
+                "block_s": ttl_block,
+            },
+        }
+
+    # ------------- Construction -------------
+    @staticmethod
+
 
     # ------------- Construction -------------
     @staticmethod
@@ -934,7 +1081,8 @@ class BotConfig:
         # --- RM caps richiesti dal RiskManager (root-level, non dentro cfg.rm) ---
         def _float_or_none(name: str):
             v = _Env.get(name)
-            if v in (None, "", "None"): return None
+            if v in (None, "", "None"):
+                return None
             try:
                 return float(v)
             except Exception:
@@ -953,6 +1101,86 @@ class BotConfig:
         if buf is None:
             buf = 0.0
         setattr(cfg, "min_buffer_quote", float(buf))
+
+        # TTL balances par alias (OK / DEGRADED / BLOCKED)
+        cfg.RM_BALANCE_TTL_S_NORMAL = _Env.get_float(
+            "RM_BALANCE_TTL_S_NORMAL",
+            getattr(cfg, "RM_BALANCE_TTL_S_NORMAL", 60.0),
+        )
+        cfg.RM_BALANCE_TTL_S_DEGRADED = _Env.get_float(
+            "RM_BALANCE_TTL_S_DEGRADED",
+            getattr(cfg, "RM_BALANCE_TTL_S_DEGRADED", 180.0),
+        )
+        cfg.RM_BALANCE_TTL_S_BLOCK = _Env.get_float(
+            "RM_BALANCE_TTL_S_BLOCK",
+            getattr(cfg, "RM_BALANCE_TTL_S_BLOCK", 600.0),
+        )
+
+        # Alias critiques (accélération des modes SEVERE)
+        crit_aliases = _Env.get_list(
+            "RM_CRITICAL_ALIASES",
+            getattr(cfg, "RM_CRITICAL_ALIASES", []),
+        )
+        cfg.RM_CRITICAL_ALIASES = [
+            a.strip() for a in (crit_aliases or []) if isinstance(a, str) and a.strip()
+        ]
+
+        # Temps min (s) en statut LOW/CRITICAL sur tokens de frais avant escalade
+        cfg.RM_FEE_LOW_MIN_SECONDS = _Env.get_float(
+            "RM_FEE_LOW_MIN_SECONDS",
+            getattr(cfg, "RM_FEE_LOW_MIN_SECONDS", 60.0),
+        )
+
+        # Seuils Reconciler "miss" / minute (CONSTRAINED / SEVERE)
+        cfg.RM_RECO_MISS_PER_MINUTE_CONSTRAINED = _Env.get_int(
+            "RM_RECO_MISS_PER_MINUTE_CONSTRAINED",
+            getattr(cfg, "RM_RECO_MISS_PER_MINUTE_CONSTRAINED", 30),
+        )
+        cfg.RM_RECO_MISS_PER_MINUTE_SEVERE = _Env.get_int(
+            "RM_RECO_MISS_PER_MINUTE_SEVERE",
+            getattr(cfg, "RM_RECO_MISS_PER_MINUTE_SEVERE", 60),
+        )
+
+        # Seuils PrivateWS (heartbeat & latences) pour overlays RM
+        cfg.RM_PWS_HEARTBEAT_GAP_CONSTRAINED_S = _Env.get_float(
+            "RM_PWS_HEARTBEAT_GAP_CONSTRAINED_S",
+            getattr(cfg, "RM_PWS_HEARTBEAT_GAP_CONSTRAINED_S", 6.0),
+        )
+        cfg.RM_PWS_HEARTBEAT_GAP_SEVERE_S = _Env.get_float(
+            "RM_PWS_HEARTBEAT_GAP_SEVERE_S",
+            getattr(cfg, "RM_PWS_HEARTBEAT_GAP_SEVERE_S", 12.0),
+        )
+        cfg.RM_PWS_EVENT_LAG_CONSTRAINED_MS = _Env.get_float(
+            "RM_PWS_EVENT_LAG_CONSTRAINED_MS",
+            getattr(cfg, "RM_PWS_EVENT_LAG_CONSTRAINED_MS", 600.0),
+        )
+        cfg.RM_PWS_EVENT_LAG_SEVERE_MS = _Env.get_float(
+            "RM_PWS_EVENT_LAG_SEVERE_MS",
+            getattr(cfg, "RM_PWS_EVENT_LAG_SEVERE_MS", 1200.0),
+        )
+        cfg.RM_PWS_ACK_LATENCY_CONSTRAINED_MS = _Env.get_float(
+            "RM_PWS_ACK_LATENCY_CONSTRAINED_MS",
+            getattr(cfg, "RM_PWS_ACK_LATENCY_CONSTRAINED_MS", 250.0),
+        )
+        cfg.RM_PWS_ACK_LATENCY_SEVERE_MS = _Env.get_float(
+            "RM_PWS_ACK_LATENCY_SEVERE_MS",
+            getattr(cfg, "RM_PWS_ACK_LATENCY_SEVERE_MS", 450.0),
+        )
+        cfg.RM_PWS_FILL_LATENCY_CONSTRAINED_MS = _Env.get_float(
+            "RM_PWS_FILL_LATENCY_CONSTRAINED_MS",
+            getattr(cfg, "RM_PWS_FILL_LATENCY_CONSTRAINED_MS", 700.0),
+        )
+        cfg.RM_PWS_FILL_LATENCY_SEVERE_MS = _Env.get_float(
+            "RM_PWS_FILL_LATENCY_SEVERE_MS",
+            getattr(cfg, "RM_PWS_FILL_LATENCY_SEVERE_MS", 1200.0),
+        )
+
+        # Min % fee tokens utilisé par RM (fallback si non piloté via balances.*)
+        cfg.RM_FEE_TOKEN_MIN_PCT = _Env.get_float(
+            "RM_FEE_TOKEN_MIN_PCT",
+            getattr(cfg, "RM_FEE_TOKEN_MIN_PCT", 5.0),
+        )
+
 
         # --- Discovery : configuration centrale de l'univers -----------------
         # Volumes minimaux 24h (USD) et par quote
@@ -1144,9 +1372,50 @@ class BotConfig:
         cfg.rm.decision_log_path = _Env.get("RM_DECISION_LOG_PATH", cfg.rm.decision_log_path)
         cfg.rm.preempt_mm_for_tt_tm = _Env.get_bool("PREEMPT_MM_FOR_TT_TM", cfg.rm.preempt_mm_for_tt_tm)
         cfg.rm.per_strategy_notional_cap = _Env.get_dict("PER_STRATEGY_NOTIONAL_CAP", cfg.rm.per_strategy_notional_cap)
+        # Ticket 6 — Cap notional global par combo (TT+TM+REB) par profil
+        cfg.rm.combo_cap_usd_by_profile = _Env.get_dict(
+            "RM_COMBO_CAP_USD_BY_PROFILE",
+            cfg.rm.combo_cap_usd_by_profile,
+        )
+        cfg.rm.combo_ttl_degraded_factor = _Env.get_float(
+            "RM_COMBO_TTL_DEGRADED_FACTOR",
+            cfg.rm.combo_ttl_degraded_factor,
+        )
+
         cfg.rm.rebal_allow_loss_bps = _Env.get_float("REBAL_ALLOW_LOSS_BPS", cfg.rm.rebal_allow_loss_bps)
         cfg.rm.rebal_volume_haircut = _Env.get_float("REBAL_VOLUME_HAIRCUT", cfg.rm.rebal_volume_haircut)
-        cfg.rm.tm_neutral_hedge_ratio = _Env.get_float("TM_NEUTRAL_HEDGE_RATIO", cfg.rm.tm_neutral_hedge_ratio)
+        cfg.rm.rebal_allow_loss_bps_by_profile = _Env.get_dict(
+            "RM_REBAL_ALLOW_LOSS_BPS_BY_PROFILE",
+            cfg.rm.rebal_allow_loss_bps_by_profile,
+        )
+        cfg.rm.rebal_volume_haircut_by_profile = _Env.get_dict(
+            "RM_REBAL_VOLUME_HAIRCUT_BY_PROFILE",
+            cfg.rm.rebal_volume_haircut_by_profile,
+        )
+
+        # Canonique TM — hedge ratios (RM + Engine)
+
+        # NEUTRAL: TM_EXPOSURE_TTL_HEDGE_RATIO (alias TM_NEUTRAL_HEDGE_RATIO)
+        neutral_hr_env = _Env.get_float("TM_EXPOSURE_TTL_HEDGE_RATIO", None)
+        if neutral_hr_env is None:
+            neutral_hr_env = _Env.get_float(
+                "TM_NEUTRAL_HEDGE_RATIO",
+                getattr(cfg.rm, "tm_neutral_hedge_ratio", cfg.engine.tm_exposure_ttl_hedge_ratio),
+            )
+        neutral_hr = float(neutral_hr_env)
+
+        # Propagation NEUTRAL (TTL hedge ratio) vers RM + Engine
+        cfg.engine.tm_exposure_ttl_hedge_ratio = neutral_hr
+        setattr(cfg.rm, "tm_exposure_ttl_hedge_ratio", neutral_hr)
+        cfg.rm.tm_neutral_hedge_ratio = neutral_hr  # compat legacy
+
+        # NON-NEUTRAL: TM_NN_HEDGE_RATIO (canonique)
+        nn_hr = _Env.get_float(
+            "TM_NN_HEDGE_RATIO",
+            getattr(cfg.rm, "tm_nn_hedge_ratio", 0.65),
+        )
+        setattr(cfg.rm, "tm_nn_hedge_ratio", nn_hr)
+        setattr(cfg.engine, "tm_nn_hedge_ratio", nn_hr)
 
         # Ticket 10 — caps inflight business par profil / branche
         cfg.rm.inflight_trading_by_profile = _Env.get_dict(
@@ -1160,6 +1429,10 @@ class BotConfig:
         cfg.rm.inflight_rebal_by_profile = _Env.get_dict(
             "RM_INFLIGHT_REBAL_BY_PROFILE",
             cfg.rm.inflight_rebal_by_profile,
+        )
+        cfg.rm.capital_ladder_cfg = _Env.get_dict(
+            "RM_CAPITAL_LADDER_CFG",
+            cfg.rm.capital_ladder_cfg,
         )
 
 
@@ -1179,8 +1452,21 @@ class BotConfig:
 
         cfg.engine.tt_max_skew_ms = _Env.get_int("ENGINE_TT_MAX_SKEW_MS", cfg.engine.tt_max_skew_ms)
         cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
-        cfg.engine.tm_exposure_ttl_ms = _Env.get_int("ENGINE_TM_EXPOSURE_TTL_MS", cfg.engine.tm_exposure_ttl_ms)
+        cfg.engine.tt_max_skew_ms = _Env.get_int("ENGINE_TT_MAX_SKEW_MS", cfg.engine.tt_max_skew_ms)
+        cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
+
+        # Canonique TM — TTL d'exposition (ms)
+        ttl_ms_global = _Env.get_int(
+            "TM_EXPOSURE_TTL_MS",  # clé globale
+            _Env.get_int("ENGINE_TM_EXPOSURE_TTL_MS", cfg.engine.tm_exposure_ttl_ms),  # alias Engine
+        )
+        cfg.engine.tm_exposure_ttl_ms = ttl_ms_global
+        setattr(cfg.rm, "tm_exposure_ttl_ms", ttl_ms_global)
+
         cfg.engine.tm_queuepos_max_eta_ms = _Env.get_int("ENGINE_TM_QPOS_MAX_ETA_MS", cfg.engine.tm_queuepos_max_eta_ms)
+
+        cfg.engine.tm_queuepos_max_eta_ms = _Env.get_int("ENGINE_TM_QPOS_MAX_ETA_MS", cfg.engine.tm_queuepos_max_eta_ms)
+
         cfg.engine.vol_soft_cap_bps = _Env.get_float("ENGINE_VOL_SOFT_CAP_BPS", cfg.engine.vol_soft_cap_bps)
         cfg.engine.vol_hard_cap_bps = _Env.get_float("ENGINE_VOL_HARD_CAP_BPS", cfg.engine.vol_hard_cap_bps)
         cfg.engine.freeze_tm_on_vol = _Env.get_bool("ENGINE_FREEZE_TM_ON_VOL", cfg.engine.freeze_tm_on_vol)
@@ -1276,6 +1562,44 @@ class BotConfig:
         cfg.rl.max_sleep_s = _Env.get_float("RL_MAX_SLEEP_S", cfg.rl.max_sleep_s)
         cfg.rl.default_rate_per_s = _Env.get_float("RL_DEFAULT_RATE_PER_S", cfg.rl.default_rate_per_s)
         cfg.rl.default_burst = _Env.get_int("RL_DEFAULT_BURST", cfg.rl.default_burst)
+        # --- Rate Limiter global (déjà présent) ---
+        cfg.rl.hard_caps_rps_by_exchange = _Env.get_dict(
+            "RL_HARD_CAPS_RPS_BY_EXCHANGE",
+            cfg.rl.hard_caps_rps_by_exchange,
+        )
+        cfg.rl.hard_caps_rps_by_exchange_kind = _Env.get_dict(
+            "RL_HARD_CAPS_RPS_BY_EXCHANGE_KIND",
+            cfg.rl.hard_caps_rps_by_exchange_kind,
+        )
+        cfg.rl.hard_caps_rps_by_kind = _Env.get_dict(
+            "RL_HARD_CAPS_RPS_BY_KIND",
+            cfg.rl.hard_caps_rps_by_kind,
+        )
+        cfg.rl.bursts_by_exchange = _Env.get_dict(
+            "RL_BURSTS_BY_EXCHANGE",
+            cfg.rl.bursts_by_exchange,
+        )
+        cfg.rl.bursts_by_exchange_kind = _Env.get_dict(
+            "RL_BURSTS_BY_EXCHANGE_KIND",
+            cfg.rl.bursts_by_exchange_kind,
+        )
+        cfg.rl.bursts_by_kind = _Env.get_dict(
+            "RL_BURSTS_BY_KIND",
+            cfg.rl.bursts_by_kind,
+        )
+        cfg.rl.default_rate_per_s = _Env.get_float(
+            "RL_DEFAULT_RATE_PER_S",
+            cfg.rl.default_rate_per_s,
+        )
+        cfg.rl.default_burst = _Env.get_float(
+            "RL_DEFAULT_BURST",
+            cfg.rl.default_burst,
+        )
+
+        # 🔹 Nouveau : configuration SC (sub-account) en JSON
+        cfg.rl.sc = _Env.get_dict("RL_SC", cfg.rl.sc)
+
+
 
         # --- RPC Gateway (optionnel) ---
         cfg.rpc.enabled = _Env.get_bool("RPC_ENABLED", cfg.rpc.enabled)
@@ -1365,10 +1689,117 @@ class BotConfig:
         cfg.bybit_accounts = _mk_accounts(ac, "BYBIT")
         cfg.coinbase_at_accounts = _mk_accounts(ac, "COINBASE")
 
+        # --- Sanity checks RM / Desk REB ---
+        cfg._sanity_check_rm_caps()
+
         # --- Aliases & flatten ---
         cfg._init_aliases()
         cfg._rebuild_flat_cache()
         return cfg
+
+    def _sanity_check_rm_caps(cfg: "BotConfig") -> None:
+        """
+        Vérifications légères de cohérence RM :
+        - caps_trading_by_profile vs inflight_trading_by_profile
+        - budgets de branches par quote
+        - caps REB (inflight_rebal_by_profile / combo_cap_usd_by_profile)
+        Log en WARNING sans casser le boot.
+        """
+        log = logging.getLogger(__name__)
+
+        rm = getattr(cfg, "rm", None)
+        g = getattr(cfg, "g", None)
+        if rm is None or g is None:
+            return
+
+        # 1) caps trading vs inflight trading
+        try:
+            inflight = getattr(rm, "inflight_trading_by_profile", {}) or {}
+            caps = getattr(rm, "caps_trading_by_profile", {}) or {}
+            for profile, inflight_total in inflight.items():
+                prof_caps = caps.get(profile) or {}
+                tt_cap = int(prof_caps.get("TT", 0) or 0)
+                tm_cap = int(prof_caps.get("TM", 0) or 0)
+                mm_cap = int(prof_caps.get("MM", 0) or 0)
+                total_caps = tt_cap + tm_cap + mm_cap
+                if total_caps > int(inflight_total):
+                    log.warning(
+                        "BotConfig: caps_trading_by_profile[%s] (TT+TM+MM=%s) > inflight_trading_by_profile=%s",
+                        profile,
+                        total_caps,
+                        inflight_total,
+                    )
+        except Exception as exc:
+            log.warning("BotConfig: unable to sanity-check RM trading caps: %s", exc)
+
+        # 2) budgets branches par quote
+        try:
+            budgets = getattr(g, "branch_budgets_quote", {}) or {}
+            for quote, per_branch in budgets.items():
+                total = 0.0
+                for v in (per_branch or {}).values():
+                    try:
+                        total += float(v)
+                    except Exception:
+                        continue
+                if total > 1.0001:
+                    log.warning(
+                        "BotConfig: BRANCH_BUDGETS_QUOTE[%s] total=%.3f > 1.0 (TT+TM+MM+REB)",
+                        quote,
+                        total,
+                    )
+        except Exception as exc:
+            log.warning("BotConfig: unable to sanity-check branch_budgets_quote: %s", exc)
+
+        # 3) caps REB par profil
+        try:
+            combo_caps = getattr(rm, "combo_cap_usd_by_profile", {}) or {}
+            inflight_reb = getattr(rm, "inflight_rebal_by_profile", {}) or {}
+            for profile, combo_cap in combo_caps.items():
+                if combo_cap <= 0:
+                    log.warning(
+                        "BotConfig: combo_cap_usd_by_profile[%s]=%.3f <= 0 (REB effectivement désactivé pour ce profil)",
+                        profile,
+                        combo_cap,
+                    )
+            for profile, cap in inflight_reb.items():
+                if int(cap) < 0:
+                    log.warning(
+                        "BotConfig: inflight_rebal_by_profile[%s]=%r < 0 (corrige la config)",
+                        profile,
+                        cap,
+                    )
+        except Exception as exc:
+            log.warning("BotConfig: unable to sanity-check REB caps: %s", exc)
+        # 4) policy Capital Ladder
+        try:
+            ladder_cfg = getattr(rm, "capital_ladder_cfg", {}) or {}
+            if ladder_cfg:
+                last_min = None
+                for profile, policy in ladder_cfg.items():
+                    policy = policy or {}
+                    try:
+                        min_cap = float(policy.get("min_capital_per_sc", 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    if min_cap < 0:
+                        log.warning(
+                            "BotConfig: capital_ladder_cfg[%s].min_capital_per_sc=%.3f < 0 (corrige la config)",
+                            profile,
+                            min_cap,
+                        )
+                    if last_min is not None and min_cap < last_min:
+                        log.warning(
+                            "BotConfig: capital_ladder_cfg[%s].min_capital_per_sc=%.3f < précédent=%.3f (ordre ladder incohérent NANO→...→LARGE)",
+                            profile,
+                            min_cap,
+                            last_min,
+                        )
+                    last_min = min_cap
+        except Exception as exc:
+            log.warning("BotConfig: unable to sanity-check capital_ladder_cfg: %s", exc)
+
+
 
 
 

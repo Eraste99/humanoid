@@ -339,6 +339,23 @@ class EnginePacer:
     def current_policy(self) -> Dict[str, Any]:
         return self.policy(self._default_region)
 
+    def get_pacer_mode(self, region: Optional[str] = None) -> str:
+        """
+        Vue consolidée du mode infra (Macro 5) pour une région.
+
+        Retourne un pacer_mode canonique consommable par le RM:
+          - "NORMAL"
+          - "CONSTRAINED"
+          - "SEVERE"
+
+        Le mapping interne state/mode -> pacer_mode est défini par _derive_pacer_mode().
+        """
+        rg = self._norm_region(region or self._default_region)
+        with self._lock:
+            st = self._ensure_region(rg)
+            return self._derive_pacer_mode(st)
+
+
     # ------------------ core logic ------------------
 
     def _severity_score(self, st: RegionState, tgt: Dict[str, float]) -> float:
@@ -460,6 +477,34 @@ class EnginePacer:
         j = random.randint(0, max(0, self._jitter_ms))
         st.pacing_ms = int(max(self._min_ms, min(self._max_ms, st.pacing_ms + j)))
 
+    def _derive_pacer_mode(self, st: RegionState) -> str:
+        """
+        Mapping interne (FSM) -> pacer_mode métier (Macro 5).
+
+        Règles :
+          - SEVERE  : toujours "SEVERE" (infra en crise).
+          - CONSTRAINED : "CONSTRAINED" quand l'état est contraint ou en récupération.
+          - WARMUP : traité comme "CONSTRAINED" (pas encore "vert").
+          - NORMAL : "NORMAL", sauf si le code mode indique une sévérité plus forte.
+
+        On utilise state en premier, puis st.mode (0/1/2) comme filet de sécurité.
+        """
+        s = str(st.state or "").upper()
+
+        if s == _STATE_SEVERE:
+            return "SEVERE"
+        if s in (_STATE_CONSTR, _STATE_WARMUP, _STATE_RECOV):
+            return "CONSTRAINED"
+
+        # Fallback sur le code numérique (0/1/2) pour robustesse
+        if st.mode == _MODE_SEVERE:
+            return "SEVERE"
+        if st.mode == _MODE_CONSTRAIN:
+            return "CONSTRAINED"
+
+        return "NORMAL"
+
+
     def _policy_dict(self, rg: str, st: RegionState) -> Dict[str, Any]:
         return {
             "region": rg,
@@ -478,6 +523,8 @@ class EnginePacer:
             "reason": st.last_reason,
             "ts": st.last_update_ts,
         }
+
+
 
     def _export_metrics(self, rg: str, st: RegionState) -> None:
         try:

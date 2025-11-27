@@ -28,6 +28,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import math
 import json
 import socket
 import time
@@ -93,6 +94,10 @@ ENGINE_SHALLOW_BOOK = "ENGINE_SHALLOW_BOOK"
 ENGINE_SUBMIT_TIMEOUT = "ENGINE_SUBMIT_TIMEOUT"
 ENGINE_NACK_429 = "ENGINE_NACK_429"
 ENGINE_NACK_5XX = "ENGINE_NACK_5XX"
+
+ENGINE_ALIAS_TTL_BLOCK = "ENGINE_ALIAS_TTL_BLOCK"
+ENGINE_MM_DISABLED_BY_CAPITAL = "ENGINE_MM_DISABLED_BY_CAPITAL"
+
 
 class PnLAggregator:
     def __init__(self):
@@ -970,16 +975,59 @@ class ExecutionEngine:
 
     # === /PACER: init & targets ===
 
+    # === /PACER: init & targets ===
+
     def _pacing_sleep_s(self, regime: str) -> float:
+        """
+        Calcule le sleep à appliquer après un envoi d'ordre en se basant en priorité
+        sur la policy courante du PACER (pacing_ms). Fallback sur les anciens
+        paramètres pacing_ms_high / pacing_ms_normal si le PACER est indisponible.
+        """
         try:
+            # S'assure que le PACER est initialisé
             self._ensure_pacer_on()
-            if getattr(self, "_pacer", None):
-                return float(self._pacer.next_sleep_s())
+            pacer = getattr(self, "_pacer", None)
+            if pacer is not None:
+                try:
+                    # On privilégie la région de config si présente
+                    region = str(getattr(self.config, "region", "EU")).upper()
+                    if hasattr(pacer, "policy"):
+                        policy = pacer.policy(region)
+                    else:
+                        policy = getattr(pacer, "current_policy", {})
+                except Exception:
+                    policy = getattr(pacer, "current_policy", {})
+                try:
+                    pacing_ms = float((policy or {}).get("pacing_ms", 0.0))
+                except Exception:
+                    pacing_ms = 0.0
+                if pacing_ms > 0.0:
+                    return pacing_ms / 1000.0
         except Exception:
+            # Ne jamais casser l'Engine pour le pacing
             pass
-        if str(regime or "").lower().startswith("eleve"):
+
+        # Fallback legacy : comportement précédent
+        regime_l = str(regime or "").lower()
+        if regime_l.startswith("eleve"):
             return float(getattr(self, "pacing_ms_high", 140)) / 1000.0
         return float(getattr(self, "pacing_ms_normal", 0)) / 1000.0
+
+    async def _pacer_sleep(self, region: str, pacer) -> None:
+        """
+        Applique un sleep post-envoi en se basant sur la policy PACER actuelle.
+        Le paramètre `region` est conservé pour compatibilité mais la décision
+        de pacing se fait via _pacing_sleep_s().
+        """
+        try:
+            delay_s = float(self._pacing_sleep_s(regime="normal"))
+            if delay_s > 0.0:
+                await asyncio.sleep(delay_s)
+        except Exception:
+            # Ne jamais bloquer l'Engine à cause du pacing
+            return
+
+
 
     # === PACER: update helper (à appeler chaque tick ~1-2s) ===
     def _pacer_update(
@@ -1006,7 +1054,10 @@ class ExecutionEngine:
             if err_rate is None:
                 err_rate = float(getattr(self.metrics, "last_err_rate", 0.0)) if hasattr(self, "metrics") else 0.0
             if queue_depth is None:
-                queue_depth = int(self.submit_queue.qsize()) if hasattr(self, "submit_queue") else 0
+                try:
+                    queue_depth = int(self.get_queue_depth())
+                except Exception:
+                    queue_depth = 0
 
             self._pacer.update(
                 region=region,
@@ -1017,6 +1068,54 @@ class ExecutionEngine:
                 backpressure=bool(backpressure),
                 reason=reason,
             )
+            # --- Bridge PACER -> RM : pacer_mode canonique (Macro 5) ---
+            try:
+                rm = getattr(self, "risk_manager", None)
+                pacer = getattr(self, "_pacer", None)
+                if rm is not None and pacer is not None:
+                    pacer_mode = "NORMAL"
+
+                    # 1) Préférence : API dédiée get_pacer_mode(region)
+                    try:
+                        if hasattr(pacer, "get_pacer_mode"):
+                            pacer_mode = str(pacer.get_pacer_mode(region) or "NORMAL").upper()
+                        else:
+                            # 2) Fallback : policy()["pacer_mode"] ou dérivation depuis "mode"
+                            pol = {}
+                            try:
+                                if hasattr(pacer, "policy"):
+                                    pol = pacer.policy(region)
+                                else:
+                                    pol = getattr(pacer, "current_policy", {}) or {}
+                            except Exception:
+                                pol = getattr(pacer, "current_policy", {}) or {}
+
+                            if pol:
+                                pacer_mode = str((pol or {}).get("pacer_mode") or "NORMAL").upper()
+                            else:
+                                # dernier filet de sécurité : mode numérique 0/1/2
+                                m = int((pol or {}).get("mode", 0))
+                                if m == 2:
+                                    pacer_mode = "SEVERE"
+                                elif m == 1:
+                                    pacer_mode = "CONSTRAINED"
+                                else:
+                                    pacer_mode = "NORMAL"
+                    except Exception:
+                        pacer_mode = "NORMAL"
+
+                    # Push vers le RM (FSM Macro 5) + copie locale Engine
+                    try:
+                        setattr(rm, "pacer_mode", pacer_mode)
+                    except Exception:
+                        pass
+                    try:
+                        self.pacer_mode = pacer_mode
+                    except Exception:
+                        pass
+            except Exception:
+                # Le bridge Pacer -> RM ne doit jamais bloquer le PACER
+                pass
         except Exception:
             pass  # jamais bloquant
 
@@ -1092,14 +1191,41 @@ class ExecutionEngine:
             profile = "NANO"
         self._capital_profile = profile
 
+        # Sous-configs Engine / RM (BotConfig)
+        root_cfg = getattr(self, "cfg", None)
+
         engine_cfg = None
         try:
-            root_cfg = getattr(self, "cfg", None)
             engine_cfg = getattr(root_cfg, "engine", None) if root_cfg is not None else None
         except Exception:
             engine_cfg = None
 
-        # Workers: priorité à l’override explicite max_concurrent,
+        # Plafond d'inflight global recommandé par le RM (Macro M2-2).
+        # On part de cfg.rm.caps_trading_by_profile = {PROFILE: {TT/TM/MM/REB: inflight_cap, ...}}
+        # et on prend le max TT/TM/MM pour ce profil comme plafond "business"
+        # que le PACER ne devra pas dépasser (down-clamp seulement).
+        self._pacer_inflight_ceiling = None
+        rm_cfg = None
+        try:
+            rm_cfg = getattr(root_cfg, "rm", None) if root_cfg is not None else None
+        except Exception:
+            rm_cfg = None
+
+        if rm_cfg is not None:
+            try:
+                caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
+                prof_caps = caps_by_profile.get(self._capital_profile, {}) or \
+                            caps_by_profile.get("LARGE", {}) or {}
+                # TT/TM/MM/REB inclus, on garde le max pour ne jamais sur-capper une branche
+                # par rapport aux caps RM.
+                if prof_caps:
+                    self._pacer_inflight_ceiling = max(
+                        int(v) for v in prof_caps.values()
+                        if v is not None
+                    )
+            except Exception:
+                self._pacer_inflight_ceiling = None
+
         # sinon grille workers_by_profile, sinon fallback legacy.
         workers_from_profile = None
         if engine_cfg is not None:
@@ -1174,6 +1300,13 @@ class ExecutionEngine:
 
         # --- Pacing / slicing ---
         self.max_inflight_slices = int(getattr(self.config, "max_inflight_slices", 3))
+        # Nombre max de fragments TT effectifs par bundle.
+        # Par défaut : 3 × max_inflight_slices (ex: 9 si max_inflight_slices=3),
+        # override possible via config si besoin (max_tt_fragments_per_bundle).
+        self.max_tt_fragments_per_bundle = int(
+            getattr(self.config, "max_tt_fragments_per_bundle", max(3, self.max_inflight_slices * 3))
+        )
+
         self.pacing_ms_normal = int(getattr(self.config, "pacing_ms_normal", 0))
         self.pacing_ms_moderate = int(getattr(self.config, "pacing_ms_moderate", 80))
         self.pacing_ms_high = int(getattr(self.config, "pacing_ms_high", 140))
@@ -1216,19 +1349,46 @@ class ExecutionEngine:
         self._mute_until = {"TM": {}, "MM": {}}  # pair_key → epoch
 
         # ==== MM (Engine) ====
+        # TTL global des deux makers MM (A & B) sur le pair
         self.mm_ttl_ms = int(getattr(self.config, "mm_ttl_ms", 2300))
+
+        # Planning de hedging progressif :
+        #   [(t_frac in 0..1, target_ratio_cumulatif), ...]
+        #   ex défaut : 30% à mi-parcours, 50% à 80%, 70% à l'échéance.
         self.mm_hedge_schedule = tuple(
-            getattr(self.config, "mm_hedge_schedule", ((0.50, 0.30), (0.80, 0.50), (1.00, 0.70)))
+            getattr(
+                self.config,
+                "mm_hedge_schedule",
+                ((0.50, 0.30), (0.80, 0.50), (1.00, 0.70)),
+            )
+        )
+
+        # Toggle métier : hedging progressif activé ou non.
+        # Si False → uniquement panic hedge final à l'échéance.
+        self.mm_use_progressive_hedge = bool(
+            getattr(self.config, "mm_use_progressive_hedge", True)
+        )
+
+        # Ratio cible de couverture à l'échéance (panic hedge).
+        # 1.0 = couverture complète du notional initial côté maker non rempli.
+        self.mm_hedge_final_ratio = float(
+            getattr(self.config, "mm_hedge_final_ratio", 1.0)
         )
 
         # ==== Fragmentation front-loaded ====
-        self.frontload_weights = list(getattr(self.config, "frontload_weights", [0.6, 0.3, 0.1]))
+        self.frontload_weights = list(
+            getattr(self.config, "frontload_weights", [0.6, 0.3, 0.1])
+        )
         self.min_fragment_quote = float(getattr(self.config, "min_fragment_quote", 200.0))
 
         # ==== SAFE DEFAULTS / STATE ====
-        self._mm_scaled_until = {}
-        self._mm_scaled_pairs = set()
-        self._min_required_bps_offset = {}  # pair_key -> +bps
+        self._mm_scaled_until: Dict[str, float] = {}
+        self._seen_client_ids: set[str] = set()
+
+        # Reality-gap observabilité (Engine ne modifie jamais min_required_bps)
+        # Stocke, à des fins métriques uniquement, le dernier écart expected_vs_realized par pair_key.
+        self._reality_gap_bps: Dict[str, float] = {}
+
 
         # Knobs price-band vol-aware
         self.price_band_bps_floor = float(getattr(self.config, "price_band_bps_floor", 15.0))
@@ -1311,7 +1471,21 @@ class ExecutionEngine:
         # ---- Pacer optionnel ----
         try:
             self._ensure_pacer_on()
+            # Si le RM a fourni un plafond d'inflight global, on le pousse dans le PACER.
+            pacer = getattr(self, "_pacer", None)
+            ceiling = getattr(self, "_pacer_inflight_ceiling", None)
+            if pacer is not None and ceiling:
+                try:
+                    pacer.set_inflight_ceiling(int(ceiling))
+                except Exception:
+                    # Observabilité soft : on ne casse jamais le boot pour ça
+                    log.debug(
+                        "[ExecutionEngine] Impossible d'appliquer _pacer_inflight_ceiling=%s",
+                        ceiling,
+                        exc_info=False,
+                    )
         except Exception:
+            # Pacer complètement optionnel : pas de blocage au boot
             pass
 
         # ---- Inflight ceilings par venue (semaphores) + métriques — Ticket 10 ----
@@ -1322,6 +1496,7 @@ class ExecutionEngine:
                 engine_cfg = getattr(root_cfg, "engine", None) if root_cfg is not None else None
         except Exception:
             engine_cfg = None
+
 
         if engine_cfg is not None:
             try:
@@ -1488,47 +1663,110 @@ class ExecutionEngine:
             meta: Optional[dict] = None,
     ) -> tuple[str, bool, bool, bool]:
         """
-        Applique les overrides imposés par le RiskManager (overlay de mode).
-        Retourne (tif, maker, post_only, skip_maker_leg).
+        Applique les overrides TIF/MM issus du RiskManager (overlay de mode),
+        éventuellement enrichis par les flags du PACER.
 
-        Source de vérité principale (Ticket 11) :
-        - bundle.meta.mode_overrides = {"ioc_only": ..., "mm_enabled": ...}
+        Retourne (tif_effectif, maker_effectif, post_only_effectif, skip_maker_leg).
 
-        Fallback compat :
-        - attributs du RiskManager (_ioc_only, enable_mm) si meta absent/incomplet.
+        Source de vérité principale (Ticket 11/14 + Macro 5) :
+        - bundle.meta.mode_overrides = {
+              "ioc_only": ...,
+              "mm_enabled": ...,
+              "rm_mode": ...,
+              # enrichi côté Engine par:
+              #   - PACER: mm_frozen  => mm_enabled=False (clamp infra)
+              #   - PACER: ioc_only   => ioc_only=True si le RM n'a rien fixé
+          }
+        - bundle.meta.mode = trade_mode (NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE)
+
+        Règles de priorité :
+        - Le RM est owner de l'intention métier (mode / ioc_only / mm_enabled).
+        - Le PACER ne peut que SERRER (forcer MM off, IOC-only) pour raisons infra,
+          jamais assouplir une décision déjà restrictive du RM.
         """
         skip = False
 
+        meta = dict(meta or {})
         mode_overrides: dict = {}
-        if isinstance(meta, dict):
-            try:
+        try:
+            if isinstance(meta.get("mode_overrides"), dict):
                 mode_overrides = dict(meta.get("mode_overrides") or {})
-            except Exception:
-                mode_overrides = {}
+        except Exception:
+            mode_overrides = {}
 
-        ioc_only = mode_overrides.get("ioc_only")
-        mm_enabled = mode_overrides.get("mm_enabled")
+        # Flags bruts issus de l’overlay RM (on les garde pour l’obs)
+        raw_ioc_only = mode_overrides.get("ioc_only")
+        raw_mm_enabled = mode_overrides.get("mm_enabled")
 
-        # Fallback compat : lire le RM si besoin
+        ioc_only = raw_ioc_only
+        mm_enabled = raw_mm_enabled
+
+        # Contexte pour les labels obs
+        rm_mode = str(mode_overrides.get("rm_mode") or "").upper() or None
+        trade_mode = str(meta.get("mode") or "").upper() or None
+        exchange = (meta.get("exchange") or meta.get("ex") or "").upper() or None
+        alias = (meta.get("account_alias") or meta.get("alias") or meta.get("subaccount") or "").upper() or None
+        strategy = (meta.get("branch") or meta.get("strategy") or "").upper() or None
+
+        # Fallback compat : lire le RM si besoin (sans casser l’obs overlay)
         rm = getattr(self, "risk_manager", None)
         if rm is not None:
             if ioc_only is None:
                 ioc_only = bool(getattr(rm, "_ioc_only", False))
             if mm_enabled is None and hasattr(rm, "enable_mm"):
                 mm_enabled = bool(getattr(rm, "enable_mm", False))
+            if rm_mode is None:
+                try:
+                    rm_mode = str(getattr(rm, "rm_mode", "NORMAL")).upper()
+                except Exception:
+                    rm_mode = None
+            if trade_mode is None:
+                try:
+                    trade_mode = str(getattr(rm, "trade_mode", "NORMAL")).upper()
+                except Exception:
+                    trade_mode = None
 
         # Application des overrides
-        if bool(ioc_only):
-            tif = "IOC"
-            post_only = False
-            maker = False
+        original_tif = str(tif or "").upper()
+        tif_u = original_tif
+        maker_flag = bool(maker)
+        post_only_flag = bool(post_only)
 
+        # 1) IOC-only : on loggue un override uniquement si l’overlay le demande explicitement
+        if bool(ioc_only):
+            tif_u = "IOC"
+            post_only_flag = False
+            maker_flag = False
+
+            # Observabilité : FORCED_IOC
+            if raw_ioc_only is not None and original_tif != "IOC":
+                self._engine_rm_overrides_metric(
+                    "FORCED_IOC",
+                    rm_mode=rm_mode,
+                    trade_mode=trade_mode,
+                    exchange=exchange,
+                    alias=alias,
+                    strategy=strategy,
+                )
+
+        # 2) MM désactivé : on loggue seulement si l’overlay a explicitement coupé MM
         if (mm_enabled is False) and maker:
             skip = True
-            maker = False
-            post_only = False
+            maker_flag = False
+            post_only_flag = False
 
-        return tif, maker, post_only, skip
+            if raw_mm_enabled is not None:
+                self._engine_rm_overrides_metric(
+                    "MM_DISABLED",
+                    rm_mode=rm_mode,
+                    trade_mode=trade_mode,
+                    exchange=exchange,
+                    alias=alias,
+                    strategy=strategy,
+                )
+
+        return tif_u, maker_flag, post_only_flag, skip
+
 
     # Helpers simplifiés
     def _is_maker(self, order: dict) -> bool:
@@ -2322,6 +2560,46 @@ class ExecutionEngine:
             buy_cid = await self._mm_place_maker(pair_key=pair, exchange=buy_ex, side="BUY",
                                                  amount_quote=amt_buy, bundle_id=bundle_id)
 
+            # --- Contrat MM (RM -> Engine) ---
+            # Entrée attendue côté RM (branch == "MM") :
+            #   - bundle MM pour un seul pair_key `pair`
+            #   - deux makers symétriques :
+            #       * SELL sur `sell_ex` pour `amt_sell` (notional quote)
+            #       * BUY  sur `buy_ex` pour `amt_buy`  (notional quote)
+            #   - ttl_ms déjà choisi par le RM (profil, route, risque)
+            #   - notional déjà plafonné par les caps RM (profil x alias x route)
+            #
+            # Rôle de l'Engine pour MM :
+            #   - placer les 2 makers GTC/PostOnly via `_mm_place_maker`
+            #   - NE PAS appliquer de filtre économique supplémentaire
+            #       (min_required_bps, edge, vol, etc. restent 100% côté RM)
+            #   - gérer uniquement la mécanique de hedging :
+            #       * boucle d'attente jusqu'à `mm_ttl_ms`
+            #       * si asymétrie de fills :
+            #           - hedging progressif optionnel si `mm_use_progressive_hedge` est True,
+            #             suivant `mm_hedge_schedule`
+            #           - panic hedge final en IOC jusqu'à `mm_hedge_final_ratio`
+            #   - historiser tout le cycle via `_hist(..., _hist_kind="MM", ...)` et
+            #     les métriques Prometheus (MM_FILLS_BOTH, MM_SINGLE_FILL_HEDGED, MM_PANIC_HEDGE_TOTAL).
+            #
+            # Côté business : le RM reste owner du "GO/NO-GO" et des caps.
+            # L'Engine joue le rôle de circ
+
+            # TTL d'exposition MM : priorité au TTL envoyé par le RM (bundle),
+            # fallback sur la config Engine (mm_ttl_ms) pour les cas non standard.
+            try:
+                ttl_ms = int(bundle.get("ttl_ms", 0))
+            except Exception:
+                ttl_ms = 0
+
+            if ttl_ms <= 0:
+                # Fallback robuste : paramètre global Engine
+                try:
+                    ttl_ms = int(getattr(self, "mm_ttl_ms", 2300))
+                except Exception:
+                    ttl_ms = 2300
+
+
             deadline = time.monotonic() + (ttl_ms / 1000.0)
             is_dry = bool(getattr(self.config, "dry_run", True))
             progressive_task = None
@@ -2429,18 +2707,172 @@ class ExecutionEngine:
         # modules/execution_engine.py — class ExecutionEngine
 
     def _engine_reject_metric(self, reason: str, *, branch: str | None = None, profile: str | None = None) -> None:
+        """
+        Observabilité Engine — rejets d'ordres.
+
+        Labels:
+          - reason:     cause technique/métier (ex: ENGINE_SUBMIT_TIMEOUT, MM_DISABLED_BY_RM...)
+          - branch:     stratégie/branche (TT / TM / MM / REB...)
+          - profile:    profil capital (NANO / MICRO / SMALL / MID / LARGE...)
+          - rm_mode:    mode global RM (NORMAL / OPP_VOLUME / OPP_VOL / SEVERE...)
+          - trade_mode: mode de trading (NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE...)
+
+        Aligné Ticket 14 : on peut corréler les rejets Engine aux modes RM.
+        """
         try:
-            if hasattr(self, "obs_inc"):
-                self.obs_inc("engine_reject_total", reason=reason, branch=branch, profile=profile)
+            if not hasattr(self, "obs_inc"):
+                return
+
+            # Contexte RM (best-effort, ne casse jamais si absent)
+            rm = getattr(self, "risk_manager", None)
+            if rm is not None:
+                try:
+                    rm_mode = str(getattr(rm, "rm_mode", "NORMAL") or "").upper()
+                except Exception:
+                    rm_mode = "UNKNOWN"
+                try:
+                    trade_mode = str(getattr(rm, "trade_mode", "NORMAL") or "").upper()
+                except Exception:
+                    trade_mode = "UNKNOWN"
+            else:
+                rm_mode = "UNKNOWN"
+                trade_mode = "UNKNOWN"
+
+            self.obs_inc(
+                "engine_reject_total",
+                reason=str(reason or "").upper(),
+                branch=str(branch or "").upper() or "UNKNOWN",
+                profile=str(profile or "").upper() or "UNKNOWN",
+                rm_mode=rm_mode,
+                trade_mode=trade_mode,
+            )
+        except Exception:
+            # observabilité best-effort : jamais de blocage métier
+            pass
+
+    def _engine_backpressure_metric(self, bp_type: str, *, branch: str | None = None,
+                                    profile: str | None = None) -> None:
+        """
+        Observabilité Engine — backpressure.
+
+        Labels:
+          - type:       type de backpressure (QUEUE_FULL / CAP_BRANCH / HIGH_WM / ...)
+          - branch:     stratégie/branche (TT / TM / MM / REB...)
+          - profile:    profil capital (NANO / MICRO / SMALL / MID / LARGE...)
+          - rm_mode:    mode global RM
+          - trade_mode: mode de trading
+
+        Permet de voir comment les modes RM / trade_mode coïncident avec la pression Engine.
+        """
+        try:
+            if not hasattr(self, "obs_inc"):
+                return
+
+            rm = getattr(self, "risk_manager", None)
+            if rm is not None:
+                try:
+                    rm_mode = str(getattr(rm, "rm_mode", "NORMAL") or "").upper()
+                except Exception:
+                    rm_mode = "UNKNOWN"
+                try:
+                    trade_mode = str(getattr(rm, "trade_mode", "NORMAL") or "").upper()
+                except Exception:
+                    trade_mode = "UNKNOWN"
+            else:
+                rm_mode = "UNKNOWN"
+                trade_mode = "UNKNOWN"
+
+            self.obs_inc(
+                "engine_backpressure_total",
+                type=str(bp_type or "").upper(),
+                branch=str(branch or "").upper() or "UNKNOWN",
+                profile=str(profile or "").upper() or "UNKNOWN",
+                rm_mode=rm_mode,
+                trade_mode=trade_mode,
+            )
         except Exception:
             pass
 
-    def _engine_backpressure_metric(self, bp_type: str, *, branch: str | None = None, profile: str | None = None) -> None:
+    def _engine_rm_overrides_metric(
+            self,
+            action: str,
+            *,
+            rm_mode: str | None = None,
+            trade_mode: str | None = None,
+            exchange: str | None = None,
+            alias: str | None = None,
+            strategy: str | None = None,
+    ) -> None:
+        """
+        Observabilité Ticket 14 – effets des overlays RM vus par l’Engine.
+
+        action:      'FORCED_IOC' | 'MM_DISABLED' (et extensions futures)
+        rm_mode:     mode global RM (NORMAL / OPP_VOLUME / OPP_VOL / SEVERE / OPPORTUNISTE)
+        trade_mode:  mode de trading (NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE)
+        exchange:    CEX concerné
+        alias:       alias de sous-compte
+        strategy:    branche/stratégie (TT / TM / MM / REB / HEDGE, etc.)
+        """
         try:
             if hasattr(self, "obs_inc"):
-                self.obs_inc("engine_backpressure_total", type=bp_type, branch=branch, profile=profile)
+                self.obs_inc(
+                    "engine_rm_overrides_total",
+                    action=str(action or "").upper(),
+                    rm_mode=str(rm_mode or "").upper() or "UNKNOWN",
+                    trade_mode=str(trade_mode or "").upper() or "UNKNOWN",
+                    exchange=str(exchange or "").upper(),
+                    alias=str(alias or "").upper(),
+                    strategy=str(strategy or "").upper() or "UNKNOWN",
+                )
         except Exception:
+            # Observabilité best-effort : on ne bloque jamais le flux métier
             pass
+
+    def _engine_capital_ttl_metric(
+            self,
+            reason: str,
+            *,
+            branch: str | None = None,
+            profile: str | None = None,
+            capital_mode: str | None = None,
+            alias_status: str | None = None,
+            exchange: str | None = None,
+            alias: str | None = None,
+    ) -> None:
+        """
+        Observabilité Engine — gates capital/TTL (Macro 4 / Ticket 4-ENG-2).
+
+        Permet de compter spécifiquement les rejets techniques liés au plane capital
+        (capital_mode, statut TTL alias) côté moteur, en complément de
+        engine_reject_total.
+
+        Labels typiques :
+          - reason:        ENGINE_ALIAS_TTL_BLOCK / ENGINE_MM_DISABLED_BY_CAPITAL
+          - branch:        TT / TM / MM / REB...
+          - profile:       profil capital (NANO / MICRO / SMALL / MID / LARGE...)
+          - capital_mode:  OK / CONSTRAINED / BLOCKED...
+          - alias_status:  statut TTL de l'alias (OK / DEGRADED / BLOCKED...)
+          - exchange:      CEX concerné
+          - alias:         alias de sous-compte
+        """
+        try:
+            if not hasattr(self, "obs_inc"):
+                return
+
+            self.obs_inc(
+                "engine_capital_ttl_gate_total",
+                reason=str(reason or "").upper(),
+                branch=str(branch or "").upper() or "UNKNOWN",
+                profile=str(profile or "").upper() or "UNKNOWN",
+                capital_mode=str(capital_mode or "").upper() or "UNKNOWN",
+                alias_status=str(alias_status or "").upper() or "UNKNOWN",
+                exchange=str(exchange or "").upper() or "UNKNOWN",
+                alias=str(alias or "").upper() or "UNKNOWN",
+            )
+        except Exception:
+            # Observabilité best-effort : ne jamais bloquer le flux métier
+            pass
+
 
     def _raise_engine_submit_error(self, reason: str, *, branch: str | None = None, profile: str | None = None):
         self._engine_reject_metric(reason, branch=branch, profile=profile)
@@ -2508,6 +2940,75 @@ class ExecutionEngine:
             or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
         ).upper()
 
+        # 1-ter) Garde technique alias / capital_mode (Ticket 4-ENG-1 / 4-ENG-2)
+        capital_mode = str(meta.get("capital_mode") or "OK").upper()
+        overlays = meta.get("overlays") or {}
+        balances_ttl = overlays.get("balances_ttl") or {}
+        alias_status = str(
+            balances_ttl.get("effective_status")
+            or balances_ttl.get("status")
+            or ""
+        ).upper()
+        alias_age_s = float(balances_ttl.get("age_s") or 0.0)
+        alias_exchange = str(balances_ttl.get("exchange") or "").upper()
+        alias_name = str(balances_ttl.get("alias") or "").upper()
+
+        # RM est propriétaire business de la vue capital/TTL (voir _check_balance_ttl_for_bundle côté RM).
+        # Ici on applique un pare-feu "last resort" pour garantir qu'aucun bundle
+        # ne part si l'alias est explicitement BLOQUÉ.
+        if capital_mode == "BLOCKED" or alias_status == "BLOCKED":
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: drop bundle sur alias BLOCKED (branch=%s, profile=%s, status=%s, age_s=%.3f)",
+                    branch,
+                    profile,
+                    alias_status or capital_mode,
+                    alias_age_s,
+                )
+            except Exception:
+                pass
+            # Observabilité dédiée capital/TTL (Macro 4 / Ticket 4-ENG-2)
+            try:
+                self._engine_capital_ttl_metric(
+                    ENGINE_ALIAS_TTL_BLOCK,
+                    branch=branch,
+                    profile=profile,
+                    capital_mode=capital_mode,
+                    alias_status=alias_status,
+                    exchange=alias_exchange,
+                    alias=alias_name,
+                )
+            except Exception:
+                pass
+            # ENGINE_ALIAS_TTL_BLOCK = garde purement technique, miroir du RM_BALANCE_TTL_BLOCK.
+            self._raise_engine_submit_error(ENGINE_ALIAS_TTL_BLOCK, branch=branch, profile=profile)
+
+        # Défensif: aucun MM ne doit passer en mode capital contraint (alias DEGRADED).
+        elif branch == "MM" and capital_mode == "CONSTRAINED":
+            try:
+                logger.info(
+                    "[ExecutionEngine] submit: MM désactivé par capital_mode=%s (branch=%s, profile=%s)",
+                    capital_mode,
+                    branch,
+                    profile,
+                )
+            except Exception:
+                pass
+            try:
+                self._engine_capital_ttl_metric(
+                    ENGINE_MM_DISABLED_BY_CAPITAL,
+                    branch=branch,
+                    profile=profile,
+                    capital_mode=capital_mode,
+                    alias_status=alias_status,
+                    exchange=alias_exchange,
+                    alias=alias_name,
+                )
+            except Exception:
+                pass
+            # MM est déjà coupé côté RM dans ce cas; ici on double la garde côté moteur.
+            self._raise_engine_submit_error(ENGINE_MM_DISABLED_BY_CAPITAL, branch=branch, profile=profile)
+
         caps_local = bundle.get("caps") or {}
         if not isinstance(caps_local, dict):
             caps_local = {}
@@ -2517,6 +3018,7 @@ class ExecutionEngine:
         # Côté Engine, on l'utilise uniquement pour l'observabilité, pas pour refaire un GO/NO-GO économique.
         inflight_cap = caps_local.get("inflight_cap")
         headroom_min = int(caps_local.get("headroom_min") or 0)
+
 
         # 2) Backpressure technique: queue globale et éventuelle concurrence par branche
 
@@ -2627,6 +3129,22 @@ class ExecutionEngine:
                 self._raise_engine_submit_error(ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile)
 
         # 2-c) Soft backpressure: high watermark
+        # Priorité business TT/TM > MM : en cas de high watermark, on coupe d'abord la
+        # branche MM au lieu de ralentir tout le monde.
+        if queue_max and high_wm and depth >= high_wm and str(branch or "").upper() == "MM":
+            try:
+                logger.info(
+                    "[ExecutionEngine] BACKPRESSURE_MM_HIGH_WM branch=%s profile=%s depth=%s high_wm=%s",
+                    branch, profile, depth, high_wm,
+                )
+            except Exception:
+                pass
+            # Backpressure spécifique MM pour l'observabilité
+            self._engine_backpressure_metric("MM_HIGH_WM", branch=branch, profile=profile)
+            # Refus immédiat du bundle MM, sans sleep, pour préserver la capacité TT/TM
+            self._raise_engine_submit_error(ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile)
+
+        # High watermark générique (TT/TM/REB, éventuellement MM en dernier recours)
         if queue_max and high_wm and depth >= high_wm and overflow_policy == "defer":
             sleep_ms = int(getattr(self.config, "engine_defer_sleep_ms", 8))
             self._engine_backpressure_metric("HIGH_WM", branch=branch, profile=profile)
@@ -2642,6 +3160,7 @@ class ExecutionEngine:
                 pass
             self._engine_backpressure_metric("HIGH_WM", branch=branch, profile=profile)
             self._raise_engine_submit_error(ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile)
+
 
         # 3) Lock REB éventuel (on garde le comportement existant)
         combo = self._bundle_combo_signature(bundle)
@@ -2973,6 +3492,33 @@ class ExecutionEngine:
                     if usdc_amt > 0:
                         _, q = SymbolUtils.split_base_quote(sym)
                         hedge_alias = plan.get("hedge_alias")
+
+                        hedge_meta = {
+                            "best_price": px,
+                            "best_ts": int(time.time() * 1000),
+                            "tif_override": "IOC",
+                            "fastpath_ok": True,
+                            "skip_inventory": True,
+                            "bundle_id": plan.get("bundle_id"),
+                            "slice_id": plan.get("slice_id"),
+                            "slice_group": plan.get("slice_group"),
+                            "slice_weight": plan.get("slice_weight"),
+                            "planned_usdc": usdc_amt,
+                            # hedge = taker → router TT pour l’alias
+                            "strategy": "TT",
+                            "account_alias": hedge_alias
+                                             or self.wallet_router.pick_by_quote(hedge_ex, "TT", q),
+                        }
+
+                        # Si le plan vient d'un REB, on propage les tags
+                        if plan.get("is_rebalancing"):
+                            hedge_meta.update({
+                                "type": "rebalancing",
+                                "rebalancing": True,
+                                "rebal_mode": "TM_NEUTRAL",
+                                "rebal_bundle_id": plan.get("bundle_id"),
+                            })
+
                         hedge_order = {
                             "type": "single",
                             "exchange": hedge_ex,
@@ -2981,22 +3527,7 @@ class ExecutionEngine:
                             "price": px,
                             "volume_usdc": usdc_amt,
                             "client_id": f"H{int(time.time() * 1000)}",
-                            "meta": {
-                                "best_price": px,
-                                "best_ts": int(time.time() * 1000),
-                                "tif_override": "IOC",
-                                "fastpath_ok": True,
-                                "skip_inventory": True,
-                                "bundle_id": plan.get("bundle_id"),
-                                "slice_id": plan.get("slice_id"),
-                                "slice_group": plan.get("slice_group"),
-                                "slice_weight": plan.get("slice_weight"),
-                                "planned_usdc": usdc_amt,
-                                # hedge = taker → router TT pour l’alias
-                                "strategy": "TT",
-                                "account_alias": hedge_alias
-                                or self.wallet_router.pick_by_quote(hedge_ex, "TT", q),
-                            },
+                            "meta": hedge_meta,
                         }
 
                         asyncio.create_task(self._exec_single(hedge_order))
@@ -3750,6 +4281,7 @@ class ExecutionEngine:
             active.append(("G3", g3, w[2]))
         s = sum(x[2] for x in active) or 1.0
         active = [(label, size, weight / s) for (label, size, weight) in active]
+
         slices: List[Tuple[float, str, int, float]] = []
         allocated = 0.0
         for label, size, w_cohort in active:
@@ -4267,27 +4799,51 @@ class ExecutionEngine:
         except Exception:
             return True
 
-    def _apply_reality_gap_offset(self, pair_key: str, expected_net_bps: float = None,
-                                  realized_net_bps: float = None) -> None:
+    def _apply_reality_gap_offset(
+            self,
+            pair_key: str,
+            expected_net_bps: float | None = None,
+            realized_net_bps: float | None = None,
+    ) -> None:
         """
-        Si l'écart (réalité - attendu) est défavorable et significatif, on ajoute un offset
-        temporaire au min_required_bps (piloté par RM/Scanner), stocké localement.
+        Observabilité du « reality-gap » :
+        - calcule l'écart expected_vs_realized en bps par pair_key
+        - stocke le dernier gap pour debug
+        - pousse un event d'historique
+        L'Engine ne modifie JAMAIS min_required_bps ; toute adaptation économique reste côté RM/Scanner.
         """
         try:
             if expected_net_bps is None or realized_net_bps is None:
                 return
-            gap = float(expected_net_bps) - float(realized_net_bps)  # positif => on était trop optimiste
-            if gap <= 0:
-                # on peut relâcher doucement l'offset
-                cur = float(self._min_required_bps_offset.get(pair_key, 0.0))
-                self._min_required_bps_offset[pair_key] = max(0.0, cur * 0.8)
-                return
-            # ajoute 50% de la dérive (bounded)
-            cur = float(self._min_required_bps_offset.get(pair_key, 0.0))
-            bump = min(20.0, max(0.0, 0.5 * gap))
-            self._min_required_bps_offset[pair_key] = min(50.0, cur + bump)
+
+            exp = float(expected_net_bps)
+            real = float(realized_net_bps)
+            gap = exp - real  # positif => on était trop optimiste
+
+            # State interne purement observabilité
+            try:
+                self._reality_gap_bps[pair_key] = gap
+            except Exception:
+                # on ne casse jamais l'exécution pour de l'OBS
+                pass
+
+            # Event d'historique pour LHM / PnLAggregator / dashboards
+            evt = {
+                "pair_key": pair_key,
+                "expected_net_bps": exp,
+                "realized_net_bps": real,
+                "gap_bps": gap,
+                "ts": time.time(),
+            }
+            try:
+                asyncio.create_task(self._hist("reality_gap", evt))
+            except Exception:
+                # fallback discret, pas de raise
+                logging.getLogger("ExecutionEngine").debug("reality_gap hist failed", exc_info=True)
+
         except Exception:
             logging.exception("Unhandled in _apply_reality_gap_offset")
+
 
     # --------------------------- bundle (TT/TM) ---------------------------
     async def _exec_bundle(self, payload: Dict[str, Any]):
@@ -4322,14 +4878,29 @@ class ExecutionEngine:
                 or any((l.get("meta") or {}).get("type") == "rebalancing" for l in legs)
         )
         strategy = str((payload.get("meta") or {}).get("strategy", "")).upper()
+        # Canonise le marquage REB au niveau payload.meta
+        if is_rebal:
+            meta = payload.setdefault("meta", {}) or {}
+            meta.setdefault("type", "rebalancing")
+            meta.setdefault("rebalancing", True)
+            # On documente clairement que tout REB via l'Engine = TM NEUTRAL
+            meta.setdefault("rebal_strategy", "TM_NEUTRAL")
+
         if is_rebal:
             strategy = "TM"
         if strategy not in {"TM", "TT"}:
             strategy = "TT"
+
+        # REB = TM only : pas de fallback TT
         if not self.enable_taker_maker and strategy == "TM":
+            if is_rebal:
+                self._reject(pair_key, payload, "rebalancing_tm_disabled")
+                return
             strategy = "TT"
+
         if not self.enable_taker_taker and strategy == "TT":
             strategy = "TM" if self.enable_taker_maker else "TT"
+
 
         # Alias par défaut si absents (router par quote & stratégie)
         for l in (buy_leg, sell_leg):
@@ -4418,6 +4989,7 @@ class ExecutionEngine:
 
         # Revalidation arbitrage
         # Revalidation arbitrage (RM = owner économique du min_required_bps)
+        # Ici : sonde "drift-only" (enforce_min_required=False) côté Engine.
         try:
             ok_arbi = self.risk_manager.revalidate_arbitrage(
                 buy_ex=buy_leg["exchange"],
@@ -4428,6 +5000,7 @@ class ExecutionEngine:
                 min_required_bps=None,
                 is_rebalancing=is_rebal,
                 allow_final_loss_bps=allow_loss_bps,
+                enforce_min_required=False,
             )
         except TypeError as e:
             # Compat legacy : si la signature RM est incompatible, on traite ça comme
@@ -4564,12 +5137,17 @@ class ExecutionEngine:
 
         # ===== Plan fragments (Simulation > RM > fallback front-load) =====
         slices: List[Tuple[float, str, int, float]] = []
+        frag_source = "UNKNOWN"
+
         desired = sim_frag_count if self.frontload_enabled else None
         avg = sim_frag_avg_usdc if self.frontload_enabled else None
 
+        # 1) Plan Simulateur (si fourni et frontload activé)
         if (desired and desired > 0) or (avg and avg > 0):
             slices = self._build_frontloaded_slices(total_usdc, desired, avg)
+            frag_source = "SIM"
         else:
+            # 2) Plan RM (plan_fragments) si disponible
             plan = None
             try:
                 plan = self.risk_manager.plan_fragments(
@@ -4582,21 +5160,72 @@ class ExecutionEngine:
                 )
             except Exception:
                 plan = None
+
             if plan and (plan.get("amounts") or []):
                 amts = [float(a) for a in plan.get("amounts", []) if float(a) > 0]
                 grps = list(plan.get("groups", []))
                 for i, a in enumerate(amts):
                     g = grps[i] if i < len(grps) else "G1"
                     slices.append((a, g, i, a / total_usdc))
+                frag_source = "RM_PLAN"
             else:
+                # 3) Fallback full Engine (frontload interne)
                 slices = self._build_frontloaded_slices(total_usdc, None, None)
+                frag_source = "FALLBACK"
 
         if not slices:
+            # Dernier filet de sécurité : un seul tir G1 plein pot
             slices = [(total_usdc, "G1", 0, 1.0)]
+            frag_source = "SINGLE"
+
+        # Cap business sur le nombre de fragments TT effectifs
+        try:
+            max_slices = int(getattr(self, "max_tt_fragments_per_bundle", 0) or 0)
+        except Exception:
+            max_slices = 0
+
+        if max_slices > 0 and len(slices) > max_slices:
+            # On conserve les premières tranches et on regroupe la "queue" dans la dernière
+            new_slices: List[Tuple[float, str, int, float]] = []
+            for idx, (amt, label, idx_in_group, _w) in enumerate(slices):
+                if idx < max_slices - 1:
+                    new_slices.append((amt, label, idx_in_group, amt / total_usdc))
+                else:
+                    if not new_slices:
+                        new_slices.append((amt, label, idx_in_group, amt / total_usdc))
+                    else:
+                        last_amt, last_label, last_idx, _last_w = new_slices[-1]
+                        merged = last_amt + amt
+                        new_slices[-1] = (merged, last_label, last_idx, merged / total_usdc)
+            slices = new_slices
+
 
         cohorts: Dict[str, List[Tuple[int, float, float]]] = {"G1": [], "G2": [], "G3": []}
         for global_idx, (amt, label, _idx_in_group, w) in enumerate(slices):
             cohorts.setdefault(str(label), []).append((global_idx, float(amt), float(w)))
+
+        # Observabilité fragmentation TT (source + structure G1/G2/G3)
+        try:
+            frag_evt = {
+                "bundle_id": bundle_id,
+                "pair_key": pair_key,
+                "strategy": "TT",
+                "regime": regime,
+                "total_usdc": float(total_usdc),
+                "frag_source": frag_source,
+                "frag_count": len(slices),
+                "frag_g1": len(cohorts.get("G1", [])),
+                "frag_g2": len(cohorts.get("G2", [])),
+                "frag_g3": len(cohorts.get("G3", [])),
+                "sim_frag_count": int(sim_frag_count or 0),
+                "sim_frag_avg_usdc": float(sim_frag_avg_usdc or 0.0),
+                "is_rebalancing": bool(is_rebalancing),
+            }
+            # Non bloquant : on pousse l'event en tâche de fond
+            asyncio.create_task(self._hist("tt_frag_plan", frag_evt))
+        except Exception:
+            logger.debug("Engine TT: unable to push tt_frag_plan hist", exc_info=True)
+
 
         order = ["G1", "G2", "G3"]
         # PACER: plafond d'inflight recommandé (anti-collision)
@@ -4650,19 +5279,51 @@ class ExecutionEngine:
             return ok_b, ok_s
 
         async def _panic_hedge(
-            ex: str,
-            symbol: str,
-            side: str,
-            needed_usdc: float,
-            *,
-            max_loss_bps: float,
-            account_alias: Optional[str] = None,
+                ex: str,
+                symbol: str,
+                side: str,
+                needed_usdc: float,
+                *,
+                max_loss_bps: float,
+                account_alias: Optional[str] = None,
         ):
+            """
+            Hedge d'urgence TT en taker/taker pur (IOC) sur une seule jambe.
+
+            Hypothèses métier :
+            - On est déjà dans un scénario dégradé (une jambe exécutée, l'autre non).
+            - Le RM a déjà plafonné allow_loss_bps au niveau du bundle TT.
+            - Objectif : fermer vite le risque notionnel, pas optimiser le prix.
+            """
             bid, ask = (
-                getattr(self.risk_manager, "get_top_of_book", lambda *args: (0, 0))(
+                getattr(self.risk_manager, "get_top_of_book", lambda *args: (0.0, 0.0))(
                     ex, symbol.replace("-", "").upper()
                 )
             )
+            px = ask if side.upper() == "BUY" else bid
+            if px <= 0.0 or needed_usdc <= 0.0:
+                # Rien à faire si on n'a pas de prix fiable ou pas de notionnel à couvrir
+                return
+
+            order = {
+                "type": "single",
+                "exchange": ex,
+                "symbol": symbol,
+                "side": side,
+                "price": float(px),
+                "volume_usdc": float(needed_usdc),
+                "meta": {
+                    "tif_override": "IOC",
+                    "fastpath_ok": True,
+                    "skip_inventory": True,
+                    "strategy": "TT",  # hedge TT pur, même si déclenché en mode panic
+                    **({"account_alias": account_alias} if account_alias else {}),
+                },
+            }
+            try:
+                await self._exec_single(order)
+            except Exception:
+                logging.exception("Engine TT panic_hedge failed")
 
 
         async def _run_one_slice(
@@ -4908,6 +5569,7 @@ class ExecutionEngine:
         maker_alias = (maker_leg.get("meta") or {}).get("account_alias")
         taker_alias = (taker_leg.get("meta") or {}).get("account_alias")
 
+        # Décision TM (mode + hedge) pilotée par le RM via payload.meta["tm"]
         tm_dec = (payload_meta.get("tm") or {})
         can_nn = bool(getattr(self.risk_manager, "allow_tm_non_neutral", False))
         mode = str(tm_dec.get("mode") or getattr(self.config, "tm_default_mode", "NEUTRAL")).upper()
@@ -4916,11 +5578,111 @@ class ExecutionEngine:
         if mode == "NN" and not can_nn:
             mode = "NEUTRAL"
 
-        default_nn = float(getattr(self.config, "tm_nn_hedge_ratio", 0.60))
-        neutral_hr = float(getattr(self.config, "tm_neutral_hedge_ratio", 1.0))
-        hedge_ratio = float(tm_dec.get("hedge_ratio", (neutral_hr if mode == "NEUTRAL" else default_nn)))
+        # Fallback config si le RM n'a pas encore alimenté tm_controls.
+        if not hasattr(self, "tm_exposure_ttl_ms"):
+            try:
+                self.tm_exposure_ttl_ms = int(getattr(self.config, "tm_exposure_ttl_ms", 2500))
+            except Exception:
+                self.tm_exposure_ttl_ms = 2500
+
+        if not hasattr(self, "tm_exposure_ttl_hedge_ratio"):
+            try:
+                # Clé canonique côté EngineCfg : tm_exposure_ttl_hedge_ratio.
+                # tm_neutral_hedge_ratio reste un alias legacy, utilisé uniquement
+                # si la clé canonique n'est pas renseignée dans la config.
+                canonical = getattr(self.config, "tm_exposure_ttl_hedge_ratio", None)
+                if canonical is None:
+                    canonical = getattr(self.config, "tm_neutral_hedge_ratio", 0.50)
+                self.tm_exposure_ttl_hedge_ratio = float(canonical)
+            except Exception:
+                self.tm_exposure_ttl_hedge_ratio = 0.50
+
+        # Fallback config si le RM n'a pas encore alimenté tm_controls.
+        # Clé canonique : tm_exposure_ttl_hedge_ratio (NEUTRAL), tm_nn_hedge_ratio pour NN.
+        default_nn = float(getattr(self.config, "tm_nn_hedge_ratio", 0.65))
+
+        # neutral_hr utilise la clé canonique tm_exposure_ttl_hedge_ratio côté EngineCfg.
+        # tm_neutral_hedge_ratio reste un alias legacy, puis fallback sur l'attribut local
+        # alimenté par tm_controls (RM) si la config est muette.
+        neutral_hr = float(
+            getattr(
+                self.config,
+                "tm_exposure_ttl_hedge_ratio",
+                getattr(
+                    self.config,
+                    "tm_neutral_hedge_ratio",
+                    self.tm_exposure_ttl_hedge_ratio,
+                ),
+            )
+        )
+
+        # Priorité du hedge TM :
+        # 1) tm_dec.hedge_ratio (RM) si présent
+        # 2) neutral_hr pour mode NEUTRAL
+        # 3) default_nn pour mode NN.
+        hedge_ratio = float(
+            tm_dec.get("hedge_ratio", (neutral_hr if mode == "NEUTRAL" else default_nn))
+        )
+
+        # Horizon d'exposition métier pour le TM.
+        # Source canonique : meta["tm"].max_exposure_s (posé par le RM).
+        # La config n'est utilisée qu'en fallback si le RM n'a pas encore alimenté ce champ.
+        tm_max_exposure_s: float
+
+        try:
+            raw_max = tm_dec.get("max_exposure_s", None)
+            tm_max_exposure_s = float(raw_max) if raw_max is not None else math.nan
+        except Exception:
+            tm_max_exposure_s = math.nan
+
+        if not (tm_max_exposure_s == tm_max_exposure_s):  # NaN → fallback config
+            # TTL canonique côté Engine (ms → s)
+            ttl_s = max(0, int(getattr(self, "tm_exposure_ttl_ms", 0))) / 1000.0
+
+            # Fallback métier pour NN : config.tm_nn_max_exposure_s ou défaut local.
+            nn_max_s = float(
+                getattr(
+                    self.config,
+                    "tm_nn_max_exposure_s",
+                    getattr(self, "tm_nn_max_exposure_s", 3.0),
+                )
+            )
+
+            if mode == "NN":
+                tm_max_exposure_s = nn_max_s
+            else:
+                # En NEUTRAL, on s'aligne sur le TTL si disponible, sinon on retombe sur nn_max_s.
+                tm_max_exposure_s = ttl_s if ttl_s > 0 else nn_max_s
+
+
+        if is_rebalancing and tm_dec.get("hedge_ratio") not in (None, 1.0):
+            # Double filet : si le RM envoie une hedge_ratio incohérente sur REB,
+            # on log mais on garde le clamp 1.0 côté Engine.
+            try:
+                log.warning(
+                    "[ExecutionEngine] REB_TM_INCOHERENT_HEDGE bundle=%s pair=%s mode=%s tm_dec_hedge_ratio=%.4f",
+                    bundle_id,
+                    pair_key,
+                    mode,
+                    float(tm_dec.get("hedge_ratio")),
+                )
+            except Exception:
+                # Logging best-effort, aucun impact sur le flux d'exécution.
+                pass
+
         if is_rebalancing:
             mode, hedge_ratio = "NEUTRAL", 1.0
+
+        # Tag REB pour propagation sur tous les ordres TM/hedge
+        rebal_meta: Dict[str, Any] = {}
+        if is_rebalancing:
+            rebal_meta = {
+                "type": "rebalancing",
+                "rebalancing": True,
+                "rebal_mode": "TM_NEUTRAL",
+                "rebal_bundle_id": bundle_id,
+            }
+
 
         # ===== Plan fragments (Simulation > RM > fallback) =====
         slices: List[Tuple[float, str, int, float]] = []
@@ -5031,28 +5793,6 @@ class ExecutionEngine:
                         logging.exception("Unhandled exception")
                     break
 
-        def _estimate_ahead_qty(ex: str, symbol: str, price: float, side: str) -> float:
-            try:
-                src = getattr(self.risk_manager, "rebal_mgr", self.risk_manager)
-                ob = (getattr(src, "latest_orderbooks", {}) or {}).get(ex, {}).get(symbol.replace("-", "").upper(),
-                                                                                   {})
-                levels = ob.get("asks" if side.upper() == "SELL" else "bids") or []
-                ahead = 0.0
-                if side.upper() == "SELL":
-                    for p, q in levels:
-                        if p < price:
-                            ahead += float(q)
-                        else:
-                            break
-                else:
-                    for p, q in levels:
-                        if p > price:
-                            ahead += float(q)
-                        else:
-                            break
-                return float(ahead)
-            except Exception:
-                return 0.0
 
         async def _panic_hedge(
             ex: str,
@@ -5216,10 +5956,13 @@ class ExecutionEngine:
                 "planned_usdc": float(amt),
                 "strategy": "TM",
                 "account_alias": maker_alias
-                or self.wallet_router.pick_by_quote(
+                                 or self.wallet_router.pick_by_quote(
                     self._norm_ex(maker_leg["exchange"]), "TM", q_maker
                 ),
             }
+            if is_rebalancing:
+                meta_m.update(rebal_meta)
+
             maker_clid = _cid(kind="PO", bundle_id=bundle_id, slice_id=slice_id, leg=maker_leg_side)
             order_maker = {
                 "type": "single",
@@ -5247,12 +5990,15 @@ class ExecutionEngine:
                 "maker_exchange": maker_leg["exchange"],
                 "maker_side": maker_leg_side,
                 "hedge_alias": taker_alias,
+                "is_rebalancing": bool(is_rebalancing),
             }
+
             buy_ex = taker_leg["exchange"] if maker_leg_side == "SELL" else maker_leg["exchange"]
             sell_ex = maker_leg["exchange"] if maker_leg_side == "SELL" else taker_leg["exchange"]
             route = f"BUY:{buy_ex}→SELL:{sell_ex}"
 
             maker_evt = {
+                "_hist_kind": "REB" if is_rebalancing else "TM",
                 "pair": pair_key,
                 "timestamp": time.time(),
                 "executed_volume_usdc": 0.0,
@@ -5265,7 +6011,10 @@ class ExecutionEngine:
                 "trade_id": maker_clid,
                 "account_alias": meta_m["account_alias"],
             }
+            if is_rebalancing:
+                maker_evt["rebal_bundle_id"] = bundle_id
             await self._hist("trade", maker_evt)
+
 
             open_makers.append((maker_leg["exchange"], maker_clid))
             okg, whyg = self._pre_submit_guards({"exchange": maker_leg["exchange"], "symbol": maker_leg["symbol"],
@@ -5318,9 +6067,38 @@ class ExecutionEngine:
                         logging.exception("ack_timeout cancel failed")
 
         async def _tm_nn_ttl_enforcer():
-            if mode == "NEUTRAL":
+            # Driver TTL TM_NON_NEUTRAL :
+            # déclenche une hedge complémentaire lorsque le TTL technique
+            # OU l'horizon métier max_exposure_s posé par le RM est atteint
+            # (on prend le plus conservateur des deux).
+            if mode != "NN":
                 return
-            await asyncio.sleep(max(0, self.tm_exposure_ttl_ms) / 1000.0)
+
+            # TTL technique (Engine) en secondes
+            ttl_s = max(0, int(getattr(self, "tm_exposure_ttl_ms", 0))) / 1000.0
+
+            # Horizon métier d'exposition en secondes (RM → meta["tm"])
+            try:
+                max_s = float(tm_dec.get("max_exposure_s", tm_max_exposure_s))
+            except Exception:
+                max_s = tm_max_exposure_s
+
+            # Si aucun horizon valide → pas de TTL driver.
+            if (ttl_s <= 0.0) and (max_s <= 0.0):
+                return
+
+            candidates: List[float] = []
+            if ttl_s > 0.0:
+                candidates.append(ttl_s)
+            if max_s > 0.0:
+                candidates.append(max_s)
+
+            sleep_s = min(candidates) if candidates else 0.0
+            if sleep_s <= 0.0:
+                return
+
+            await asyncio.sleep(sleep_s)
+
             target_ratio = max(0.0, min(1.0, float(self.tm_exposure_ttl_hedge_ratio)))
             if target_ratio <= 0.0:
                 return
@@ -5412,6 +6190,8 @@ class ExecutionEngine:
                             max_drift_bps=float(getattr(self.config, "max_drift_bps", 7.0)),
                             min_required_bps=None,
                             is_rebalancing=((order_or_bundle.get("meta") or {}).get("type") == "rebalancing"),
+                            allow_final_loss_bps=allow_loss_bps,
+                            enforce_min_required=False,
                             buy_px_override=float(buy["price"]), sell_px_override=float(sell["price"]),
                         )
                     except TypeError:
@@ -5483,113 +6263,197 @@ class ExecutionEngine:
     # Remplace intégralement la méthode existante.
     # ---------------------------------------------------------------------------
     # execution_engine.py — class ExecutionEngine
+
     async def _place_limit(
-            self: "ExecutionEngine",
+            self,
+            *,
             exchange: str,
             symbol: str,
             side: str,
             qty: float,
             price: float,
-            client_id: str,
-            *,
             tif: str = "GTC",
-            maker: bool = False,
-            meta: dict = None,
-    ):
+            post_only: bool = False,
+            meta: Optional[dict] = None,
+            maker_leg: Optional[dict] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
         """
-        LIMIT (TT/TM) avec:
-          - Hints PACER (IOC / MM freeze),
-          - Overlays RM (IOC-only / MM off),
-          - Cap inflight global,
-          - Pacing post-envoi.
-        """
-        import asyncio
-        self._ensure_ready()  # readiness Engine
+        Envoie un LIMIT (ou POST_ONLY/MAKER) en respectant:
+        - Pacer (pacing_ms, inflight_max par région / profil)
+        - Politique RM (mode_overrides: ioc_only / mm_enabled)
+        - Anti-crossing maker×maker (Engine-level, optionnel)
 
-        ex = self._norm_ex(exchange)
+        Retourne:
+          (ok: bool, order_id: Optional[str], reason: Optional[str])
+        """
         meta = dict(meta or {})
-        alias = meta.get("account_alias")
-        strategy = meta.get("strategy")
 
-        # --- Step 2: PACER + RM overlays ---
-        pol = getattr(self, "_pacer", None).current_policy if getattr(self, "_pacer", None) else None
-        post_only = bool(meta.get("post_only", False))
-        tif = str(meta.get("tif") or tif or "GTC").upper()
-        maker = bool(meta.get("maker", maker))
+        # Normalisation symbol / side / exchange
+        ex = self._ex_upper(exchange)
+        sym = str(symbol).upper()
+        side_u = str(side).upper()
 
-        # PACER flags
-        if pol and bool((pol.get("flags") or {}).get("ioc_only")):
-            tif, post_only, maker = "IOC", False, False
-        if pol and bool((pol.get("flags") or {}).get("mm_frozen")):
-            maker, post_only = False, False
+        # Contexte alias / branche / profil pour l’obs
+        try:
+            if ex:
+                meta.setdefault("exchange", ex)
+        except Exception:
+            pass
 
-        # RM overlays
-        # RM overlays
-        tif, maker, post_only, skip_maker = self._rm_ioc_mm_overrides(
-            tif=tif,
-            maker=maker,
-            post_only=post_only,
-            meta=meta,
+        alias = (
+            meta.get("account_alias")
+            or meta.get("alias")
+            or meta.get("subaccount")
+            or ""
         )
 
-        if skip_maker and meta.get("maker", False):
-            # Leg maker interdit par RM: on refuse proprement ce leg
-            return {"status": "REJECT", "reason": "mm_disabled_by_rm"}
+        branch = (meta.get("branch") or meta.get("strategy") or "").upper() or "UNKNOWN"
+        profile = str(
+            meta.get("capital_profile")
+            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
+        ).upper()
 
-        # --- Cap inflight (global) ---
+        # 1) Pacer / région (EU/US/EU-CB, etc.) — via config.engine_pod_map
+        region = str(getattr(self.config, "region", "EU")).upper()
         try:
-            pol = getattr(self, "_pacer", None).current_policy if getattr(self, "_pacer", None) else {}
-            inflight_cap = int((pol or {}).get("inflight_max", 1))
-            if hasattr(self, "_inflight_curr") and isinstance(self._inflight_curr, dict):
-                current_inflight = sum(int(v or 0) for v in self._inflight_curr.values())
-            else:
-                current_inflight = int(getattr(self, "_inflight", 0))
-            if current_inflight >= inflight_cap:
-                return {"status": "DEFERRED", "reason": "pacer_inflight_cap", "cap": inflight_cap}
+            pod_map = getattr(self.config, "engine_pod_map", None) or {}
+            if pod_map:
+                region = str(pod_map.get(ex, region)).upper()
         except Exception:
+            # En cas de problème sur la config on garde la région globale
+            pass
+        pacer = getattr(self, "_pacer", None)
+
+
+        # 2) Build order de base
+        tif_u = str(tif or "GTC").upper()
+        order: dict = {
+            "exchange": ex,
+            "symbol": sym,
+            "side": side_u,
+            "type": "LIMIT",
+            "quantity": float(qty),
+            "price": float(price),
+            "time_in_force": tif_u,
+        }
+
+        # POST_ONLY / MAKER hints initiaux
+        if post_only:
+            order["time_in_force"] = "GTC"
+            order["post_only"] = True
+
+        is_maker_leg = bool(maker_leg and maker_leg.get("is_maker", True))
+        # On garde l’info dans meta pour compat éventuelle
+        meta.setdefault("maker", is_maker_leg)
+
+        maker_flag = is_maker_leg
+        post_only_flag = bool(order.get("post_only"))
+
+        # 2-bis) Overlays PACER (mm_frozen / ioc_only) fusionnés avec l'overlay RM
+        # On enrichit meta["mode_overrides"] avec les flags du PACER en respectant les règles :
+        #   - Pacer ne peut JAMAIS assouplir une décision business du RM.
+        #   - Pacer peut uniquement SERRER (forcer MM off, IOC-only) pour raisons infra.
+        try:
+            pacer_flags: dict = {}
+            if pacer is not None:
+                pol: dict = {}
+                try:
+                    if hasattr(pacer, "policy"):
+                        pol = pacer.policy(region)
+                    else:
+                        pol = getattr(pacer, "current_policy", {}) or {}
+                except Exception:
+                    pol = getattr(pacer, "current_policy", {}) or {}
+
+                if isinstance(pol, dict):
+                    flags = pol.get("flags") or {}
+                    if isinstance(flags, dict):
+                        pacer_flags = dict(flags)
+
+            mm_frozen = bool(pacer_flags.get("mm_frozen"))
+            ioc_flag = bool(pacer_flags.get("ioc_only"))
+
+            # On part des overrides éventuels posés par le RM
+            mode_overrides: dict = {}
+            try:
+                if isinstance(meta.get("mode_overrides"), dict):
+                    mode_overrides = dict(meta.get("mode_overrides") or {})
+            except Exception:
+                mode_overrides = {}
+
+            # Fusion stricte RM × Pacer :
+            # - MM : si le PACER freeze les makers, on force mm_enabled=False
+            #   (on ne ré-ouvre jamais un MM déjà coupé par le RM).
+            if mm_frozen:
+                prev_mm = mode_overrides.get("mm_enabled", None)
+                if prev_mm is not False:
+                    mode_overrides["mm_enabled"] = False
+
+            # - IOC : si l’infra demande IOC-only, on force ioc_only=True uniquement
+            #   si le RM n’a PAS explicitement posé un autre choix (clé absente / None).
+            if ioc_flag:
+                prev_ioc = mode_overrides.get("ioc_only", None)
+                if prev_ioc is None:
+                    mode_overrides["ioc_only"] = True
+
+            if mode_overrides:
+                meta["mode_overrides"] = mode_overrides
+        except Exception:
+            # Observabilité uniquement, ne jamais casser un envoi pour un problème de PACER.
             pass
 
-        # --- Routing vers le placer natif + retry standard ---
-        if ex == "BINANCE":
-            async def _do():
-                return await self._binance_limit(
-                    symbol, side, qty, price, client_id,
-                    tif=tif, maker=maker, keys=self._pick_keys("Binance", alias, strategy)
+        # 3) Application des overlays RM (mode_overrides: ioc_only / mm_enabled)
+        #    À ce stade, mode_overrides contient déjà les clamps RM + Pacer.
+        try:
+            tif_u, maker_flag, post_only_flag, skip_maker = self._rm_ioc_mm_overrides(
+                tif=order["time_in_force"],
+                maker=maker_flag,
+                post_only=post_only_flag,
+                meta=meta,
+            )
+        except Exception:
+            # En cas de problème dans les overlays, on garde le comportement par défaut.
+            tif_u = order["time_in_force"]
+            maker_flag = is_maker_leg
+            post_only_flag = bool(order.get("post_only"))
+            skip_maker = False
+
+        # Si RM a coupé le leg maker → rejet métier propre + métrique
+        if skip_maker and maker_flag:
+            try:
+                self._engine_reject_metric(
+                    "MM_DISABLED_BY_RM",
+                    branch=branch,
+                    profile=profile,
                 )
+            except Exception:
+                pass
+            return False, None, "mm_disabled_by_rm"
 
-            resp = await self._with_retry(_do)
-
-        elif ex == "BYBIT":
-            async def _do():
-                return await self._bybit_limit(
-                    symbol, side, qty, price, client_id,
-                    tif=tif, maker=maker, keys=self._pick_keys("Bybit", alias, strategy)
-                )
-
-            resp = await self._with_retry(_do)
-
-        elif ex == "COINBASE":
-            async def _do():
-                return await self._coinbase_limit(
-                    product_id=symbol, side=side, qty=qty, price=price, client_id=client_id,
-                    tif=tif, maker=maker, keys=self._pick_keys("Coinbase", alias, strategy)
-                )
-
-            resp = await self._with_retry(_do)
-
+        # Appliquer les valeurs finales dans l’order
+        order["time_in_force"] = tif_u
+        if post_only_flag:
+            order["post_only"] = True
         else:
-            raise ValueError(f"Unsupported exchange for limit order: {ex}")
+            order.pop("post_only", None)
 
-        # Pacing post-envoi (PACER)
-        try:
-            pol = getattr(self, "_pacer", None).current_policy if getattr(self, "_pacer", None) else {}
-            delay_ms = int((pol or {}).get("pacing_ms", 0))
-            if delay_ms > 0:
-                await asyncio.sleep(delay_ms / 1000.0)
-        except Exception:
-            pass
+        # 4) Envoi de l'ordre (avec anti-crossing éventuel)
+        oid: Optional[str] = None
+        # Le contrôle de capacité in-flight est assuré par les sémaphores / caps en amont.
+        if maker_flag and getattr(self, "_ac_enabled", False):
+            oid = await self._send_order_with_anti_crossing(order, meta)
+        else:
+            oid = await self._send_order_real(order, meta)
 
-        return resp
+        # 5) Gestion des rejets techniques (pas de order_id)
+        if not oid:
+            self._engine_reject_metric("NO_ORDER_ID", branch=branch, profile=profile)
+            return False, None, "no_order_id"
+
+        # 6) Pacing post-envoi
+        await self._pacer_sleep(region, pacer)
+
+        return True, oid, None
 
     # ----- Binance -----
     async def _binance_limit(self: "ExecutionEngine", symbol: str, side: str, qty: float, price: float,
@@ -6240,37 +7104,117 @@ async def _hist(self: "ExecutionEngine", kind: str, data: dict) -> None:
 # ---------------------------------------------------------------------------
 # Rejet "propre" (stats + navette observabilité + historisation)
 # ---------------------------------------------------------------------------
-def _reject(
-        self: "ExecutionEngine",
-        symbol_or_pair: str,
-        order_or_payload: dict,
-        reason: str,
-        plane: str = "ENGINE_TECH",
-    ) -> None:
+def _reject(self, pair: str, order_or_payload: Dict[str, Any], reason: str) -> None:
+    """
+    Rejet technique côté Engine (guard, backpressure, erreur CEX, etc.).
+    Enrichi pour le funnel GO/NO-GO RM × Engine.
+    """
     try:
-        self.stats.rejected_by_risk += 1
-        sym = str(symbol_or_pair or "").replace("-", "").upper()
-        rej = self.stats.rejected_symbols or {}
-        rej[sym] = int(rej.get(sym, 0)) + 1
-        self.stats.rejected_symbols = rej
+        reason = str(reason or "")
+        pair_fmt = self._fmt_pair(pair)
 
-        # On ne change pas la signature Prometheus pour ce compteur (reason-only)
-        ENGINE_CANCELLATIONS_TOTAL.labels(reason=str(reason or "rejected")).inc()
+        meta = {}
+        try:
+            if isinstance(order_or_payload, dict):
+                meta = (
+                               order_or_payload.get("meta")
+                               or order_or_payload.get("bundle_meta")
+                               or order_or_payload.get("payload", {}).get("meta")
+                               or {}
+                       ) or {}
+        except Exception:
+            meta = {}
 
-        evt = {
-            "status": "rejected",
-            "reason": reason,
-            "plane": plane,
-            "symbol": sym,
-            "payload": {
-                k: order_or_payload.get(k)
-                for k in ("type", "exchange", "side", "price", "volume_usdc", "meta")
-            },
-            "ts": time.time(),
+        # --- Strategy / branch / profile pour le funnel ---
+        raw_strategy = (
+                meta.get("strategy")
+                or (meta.get("route") or {}).get("strategy")
+                or meta.get("kind")
+                or ""
+        )
+        strategy = str(raw_strategy or "TT").upper()
+        if strategy not in ("TT", "TM", "MM", "REB"):
+            # Heuristique : MM si flag mm présent, sinon fallback TT
+            if meta.get("mm") or meta.get("is_mm"):
+                strategy = "MM"
+            else:
+                strategy = "TT"
+
+        raw_branch = meta.get("branch") or strategy
+        branch = str(raw_branch or strategy).upper()
+
+        raw_profile = (
+                meta.get("profile")
+                or getattr(self, "_capital_profile", None)
+                or getattr(self, "capital_profile", None)
+                or "LARGE"
+        )
+        profile = str(raw_profile or "LARGE").upper()
+
+        # --- Hist / LHM : événement de rejet enrichi ---
+        evt: Dict[str, Any] = {
+            "type": "reject",
+            "ts_ns": time.time_ns(),
+            "pair": pair_fmt,
+            "reason_engine": reason,
+            "reason_kind": "ENGINE",
+            "strategy": strategy,
+            "branch": branch,
+            "profile": profile,
         }
-        asyncio.create_task(self._hist("reject", evt))
+
+        # Si le RM a déjà injecté des hints, on les conserve
+        try:
+            rm_status = meta.get("rm_status") or meta.get("rm_decision_status")
+            rm_reason = meta.get("rm_reason") or meta.get("rm_decision_reason")
+            if rm_status:
+                evt["rm_status"] = rm_status
+            if rm_reason:
+                evt["reason_rm"] = rm_reason
+        except Exception:
+            pass
+
+        # Identifiants de corrélation si présents
+        try:
+            for k in ("trace_id", "bundle_id", "client_order_id", "cid"):
+                v = meta.get(k) or order_or_payload.get(k)
+                if v:
+                    evt[k] = v
+        except Exception:
+            pass
+
+        # Push vers LHM / history_sink (si câblé)
+        try:
+            self._hist("reject", evt)
+        except Exception:
+            # Hist ne doit jamais casser les rejets
+            logger.exception("[Engine] _hist reject failed", exc_info=False)
+
+        # --- Métrique spécifique Engine (déjà existante) ---
+        try:
+            # Centralise la logique de metric ENGINE_* avec rm_mode/trade_mode, etc.
+            self._engine_reject_metric(reason, branch=branch, profile=profile)
+        except Exception:
+            pass
+
+        # --- Nouveau funnel métrique engine_decision_total (Macro M1-4) ---
+        try:
+            if hasattr(self, "obs_inc"):
+                self.obs_inc(
+                    "engine_decision_total",
+                    strategy=strategy,
+                    branch=branch,
+                    profile=profile,
+                    status="REJECTED",
+                    reason=reason,
+                    reason_kind="ENGINE",
+                )
+        except Exception:
+            # On ne casse jamais l’Engine pour l’observabilité
+            pass
+
     except Exception:
-        logging.exception("ExecutionEngine._reject: error")
+        logger.exception("[Engine] _reject failed", exc_info=False)
 
 
 # ---------------------------------------------------------------------------
@@ -6281,7 +7225,7 @@ async def _on_filled(self: "ExecutionEngine", result: dict, *, order_type: str, 
     Callbacks post-FILL :
       - Maintien des compteurs & dernier trade
       - Notification listeners
-      - Learning 'reality-gap' (offset min_required_bps par paire)
+      - Observabilité 'reality-gap' (expected vs realized net_bps, sans modifier min_required_bps)
     """
     try:
         # ==== Stats ====
@@ -6305,7 +7249,8 @@ async def _on_filled(self: "ExecutionEngine", result: dict, *, order_type: str, 
                 except Exception:
                     logging.getLogger("ExecutionEngine").debug("listener error", exc_info=True)
 
-        # ==== Reality-gap learning (offset min_required_bps) ====
+        # ==== Reality-gap observability (expected vs realized net_bps) ====
+
         try:
             m = (result.get("meta") or {})
             pk = str(m.get("pair_key") or (result.get("symbol") or "").replace("-", "").upper())
