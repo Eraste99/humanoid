@@ -124,6 +124,24 @@ RM_ENGINE_NACK_429 = "RM_ENGINE_NACK_429"
 RM_ENGINE_NACK_5XX = "RM_ENGINE_NACK_5XX"
 RM_ENGINE_NACK_REJECT = "RM_ENGINE_NACK_REJECT"
 
+# Famille RM_CAP_* : rejets caps métier (profil/branche/combo/disable)
+RM_CAPS_INVALID = "RM_CAPS_INVALID"
+RM_CAPS_ZERO = "RM_CAPS_ZERO"
+RM_CAP_PROFILE_DISABLED = "RM_CAP_PROFILE_DISABLED"
+RM_CAP_BRANCH_DISABLED = "RM_CAP_BRANCH_DISABLED"
+RM_CAP_COMBO_EXCEEDED = "RM_CAP_COMBO_EXCEEDED"
+
+
+# --- Metrics (caps path hygiene) -------------------------------------------
+RM_CAPS_LEGACY_CALLS_TOTAL = get_counter(
+    "rm_caps_legacy_calls_total",
+    "Legacy opportunity-level caps/preemption path invocations",
+)
+RM_CAPS_BUNDLE_CALLS_TOTAL = get_counter(
+    "rm_caps_bundle_calls_total",
+    "Bundle-level caps/preemption path invocations",
+)
+
 
 # --- Helpers robusti per cast da ENV/config --------------------------------
 # --- Helpers robusti per cast da ENV/config (module-scope, no decorator) ---
@@ -1750,17 +1768,27 @@ class RiskManager:
         mais la décision « caps business vs backpressure Engine » se fait désormais
         au niveau bundle via caps_local.
         """
-        # Nouveau contrat bundle-centric : premier argument = bundle (dict)
+        # Nouveau contrat bundle-centric (chemin recommandé) : premier argument = bundle (dict)
         if args and isinstance(args[0], dict):
             bundle = args[0]
             caps_local = args[1] if len(args) > 1 else {}
             eligible = args[2] if len(args) > 2 else None
             profile = args[3] if len(args) > 3 else None
+            safe_inc(
+                RM_CAPS_BUNDLE_CALLS_TOTAL,
+                "rm_caps_bundle_calls_total",
+                "rm._apply_caps_and_preempt",
+            )
             return self._apply_caps_and_preempt_bundle(bundle, caps_local, eligible, profile)
 
         # Fallback : ancien contrat (strategy, ex, desired_notional)
         if len(args) >= 3:
             strategy, ex, desired_notional = args[0], args[1], args[2]
+            safe_inc(
+                RM_CAPS_LEGACY_CALLS_TOTAL,
+                "rm_caps_legacy_calls_total",
+                "rm._apply_caps_and_preempt",
+            )
         else:
             # Appel incohérent : on renvoie 0.0 pour rester conservateur.
             return 0.0
@@ -1773,6 +1801,9 @@ class RiskManager:
             desired_notional: float,
     ) -> float:
         """Legacy — cap notionnel par (stratégie,CEX) au niveau opportunité.
+
+        Chemin hérité (non enrichi) à conserver uniquement pour compatibilité
+        avec le flux Scanner→RM. Ne pas étendre avec de nouveaux caps.
 
         Comportement historique :
         - lecture de per_strategy_notional_cap,
@@ -1807,12 +1838,12 @@ class RiskManager:
         d'un pré-check très léger pour la traçabilité.
         """
         if not isinstance(caps_local, dict):
-            return False, "RM_CAPS_INVALID"
+            return False, RM_CAPS_INVALID
 
         inflight_cap = caps_local.get("inflight_cap")
         try:
             if isinstance(inflight_cap, (int, float)) and inflight_cap <= 0:
-                return False, "RM_CAPS_ZERO"
+                return False, RM_CAPS_ZERO
         except Exception:
             # On ne bloque pas si on ne sait pas interpréter le cap.
             pass

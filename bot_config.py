@@ -562,6 +562,8 @@ class EngineCfg:
     pacer_min_ms: int = 2
     pacer_max_ms: int = 25
     pacer_jitter_ms: int = 2
+    # Pacer : cibles régionales *strictement* bornées par les caps RM/Engine (down-clamp only).
+    # Le Pacer ne peut jamais élargir la capacité au-delà des plafonds inflight RM/Engine.
     pacer_targets: Dict[str,int] = field(default_factory=lambda: {"EU": 8, "EU_CB": 12, "US": 12})
 
     # Ticket 10 — capacités techniques Engine (workers / inflight par CEX)
