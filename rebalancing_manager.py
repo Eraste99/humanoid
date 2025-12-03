@@ -206,6 +206,25 @@ class RebalancingManager:
         self.rebal_max_ops_per_min: int = int(getattr(self.cfg, "rebal_max_ops_per_min", 6))
         self.rebal_priority: List[str] = list(getattr(self.cfg, "rebal_priority", ["CASH","CRYPTO","OVERLAY"]))
         self.rebal_hint_ttl_s: int = int(getattr(self.cfg, "rebal_hint_ttl_s", 120))
+        self._reb_slot_ttl_s: float = float(getattr(self.cfg, "rebal_slot_ttl_s", self.rebal_hint_ttl_s))
+        rm_cfg = getattr(self.cfg, "rm", None)
+        profile = str(getattr(getattr(self.cfg, "g", None), "capital_profile", "LARGE") or "LARGE").upper()
+        inflight_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) if rm_cfg else {}
+        self.rebal_inflight_cap: int = int((inflight_reb or {}).get(profile) or (inflight_reb or {}).get("LARGE") or 0)
+        combo_caps = getattr(rm_cfg, "combo_cap_usd_by_profile", {}) if rm_cfg else {}
+        base_combo_cap = float((combo_caps or {}).get(profile) or (combo_caps or {}).get("LARGE") or 0.0)
+        degraded_factor = 1.0
+        try:
+            degraded_factor = float(getattr(rm_cfg, "combo_ttl_degraded_factor", 1.0)) if rm_cfg else 1.0
+        except Exception:
+            degraded_factor = 1.0
+        degraded_factor = min(max(degraded_factor, 0.0), 1.0)
+        self.combo_cap_effective = base_combo_cap * degraded_factor if base_combo_cap > 0 else 0.0
+        self.rebal_ops_blocked_by_caps: int = 0
+        self.rebal_plan_clipped_by_caps: int = 0
+        self._last_combo_cap_ratio: Optional[float] = None
+        self._last_rebal_cap_status: Optional[str] = None
+        self._reb_active_slots: deque = deque(maxlen=512)
 
         # Snapshots ingérés par le RM
         # OB: latest_orderbooks[EX][SYMBOL] = {"bid":..., "ask":..., "ts": ...}
@@ -248,6 +267,14 @@ class RebalancingManager:
     def set_event_sink(self, sink: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
         self._event_sink = sink
 
+    @property
+    def rebal_ops_emitted_last_min(self) -> int:
+        return len(self._emit_ts)
+
+    @property
+    def inflight_rebal_current(self) -> int:
+        return len(self._reb_active_slots)
+
     def set_cost_function(self, fn: Optional[Callable[[Dict[str, Any]], float]]) -> None:
         """Permet au RM d'injecter la fonction de coût utilisée dans les plans."""
         self._reb_cost_fn = fn
@@ -261,6 +288,27 @@ class RebalancingManager:
             self._event_sink(evt)
         except Exception as exc:
             log.warning("event sink failed: %s", exc, exc_info=False)
+
+    def _prune_rebal_slots(self, now: float) -> None:
+        ttl = float(self._reb_slot_ttl_s or 0.0)
+        if ttl <= 0:
+            self._reb_active_slots.clear()
+            return
+        self._reb_active_slots = type(self._reb_active_slots)(
+            [t for t in self._reb_active_slots if (now - t) < ttl],
+            maxlen=self._reb_active_slots.maxlen,
+        )
+
+    def _estimate_plan_notional(self, operations: List[Dict[str, Any]]) -> float:
+        total = 0.0
+        for op in operations or []:
+            try:
+                amt = float(op.get("amount", 0.0) or 0.0)
+            except Exception:
+                amt = 0.0
+            if amt > 0:
+                total += amt
+        return total
 
         # -------------------------- Snapshots guards ----------------------------
 
@@ -731,9 +779,34 @@ class RebalancingManager:
         # rate limit glissant 60s
         now = _now()
         self._emit_ts = type(self._emit_ts)([t for t in self._emit_ts if (now - t) < 60.0], maxlen=self._emit_ts.maxlen)
-        budget = max(0, int(self.rebal_max_ops_per_min) - len(self._emit_ts))
+        self._prune_rebal_slots(now)
+        available_slots = max(0, int(self.rebal_inflight_cap) - len(self._reb_active_slots))
+        budget_rate = max(0, int(self.rebal_max_ops_per_min) - len(self._emit_ts))
+        budget = min(len(ordered), budget_rate, available_slots)
+        blocked_by_caps = 0
+        if available_slots <= 0:
+            blocked_by_caps = len(ordered)
+            self._last_rebal_cap_status = "REB_CAP_REACHED"
+        elif available_slots < len(ordered):
+            blocked_by_caps = len(ordered) - min(len(ordered), available_slots)
+            self._last_rebal_cap_status = "REB_CAP_REACHED"
+        else:
+            self._last_rebal_cap_status = "OK"
+
         selected = ordered[:budget] if budget < len(ordered) else list(ordered)
+        if blocked_by_caps > 0:
+            self.rebal_ops_blocked_by_caps += blocked_by_caps
+            self.rebal_plan_clipped_by_caps += 1
         self._emit_ts.extend([now] * len(selected))
+        self._reb_active_slots.extend([now] * len(selected))
+
+        plan_notional = self._estimate_plan_notional(selected)
+        self._last_combo_cap_ratio = None
+        if self.combo_cap_effective > 0:
+            try:
+                self._last_combo_cap_ratio = plan_notional / self.combo_cap_effective
+            except Exception:
+                self._last_combo_cap_ratio = None
 
         # Répartition (compat callbacks)
         def _take(src: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -755,6 +828,8 @@ class RebalancingManager:
             "bridge_pre": sel_bridge,  # compat (rarement non-None ici)
             "t_ms": (time.perf_counter_ns() - t0) / 1e6,
             "snapshots_age_s": ages,
+            "rebal_cap_status": self._last_rebal_cap_status or "OK",
+            "combo_cap_ratio_planned": self._last_combo_cap_ratio,
         }
         if callable(self._reb_cost_fn):
             plan["cost_fn"] = self._reb_cost_fn
@@ -990,6 +1065,16 @@ class RebalancingManager:
                 "rebal_max_ops_per_min": self.rebal_max_ops_per_min,
                 "rebal_priority": self.rebal_priority,
                 "rebal_hint_ttl_s": self.rebal_hint_ttl_s,
+            },
+            "rebal_caps": {
+                "inflight_cap": self.rebal_inflight_cap,
+                "inflight_current": self.inflight_rebal_current,
+                "ops_emitted_last_min": self.rebal_ops_emitted_last_min,
+                "ops_blocked_by_caps": self.rebal_ops_blocked_by_caps,
+                "plan_clipped_by_caps": self.rebal_plan_clipped_by_caps,
+                "combo_cap_effective": self.combo_cap_effective,
+                "combo_cap_ratio_planned": self._last_combo_cap_ratio,
+                "rebal_cap_status": self._last_rebal_cap_status,
             },
         }
 
