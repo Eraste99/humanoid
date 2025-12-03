@@ -40,6 +40,7 @@ from contextlib import asynccontextmanager
 from modules.engine_pacer import EnginePacer  # ensure import top-level
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.errors import EngineSubmitError, EngineCancelError, ExternalServiceError, NotReadyError
+from bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
 # --- deps async/http ---
 # aiohttp is optional in some envs; guard its import
@@ -95,6 +96,8 @@ ENGINE_SHALLOW_BOOK = "ENGINE_SHALLOW_BOOK"
 ENGINE_SUBMIT_TIMEOUT = "ENGINE_SUBMIT_TIMEOUT"
 ENGINE_NACK_429 = "ENGINE_NACK_429"
 ENGINE_NACK_5XX = "ENGINE_NACK_5XX"
+ENGINE_BAD_META_BRANCH = "ENGINE_BAD_META_BRANCH"
+ENGINE_BAD_META_PROFILE = "ENGINE_BAD_META_PROFILE"
 
 ENGINE_ALIAS_TTL_BLOCK = "ENGINE_ALIAS_TTL_BLOCK"
 ENGINE_MM_DISABLED_BY_CAPITAL = "ENGINE_MM_DISABLED_BY_CAPITAL"
@@ -2613,18 +2616,7 @@ class ExecutionEngine:
         # 2) Branch / profile + caps locaux pour métriques & backpressure
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
-        branch = str(
-            meta.get("branch")
-            or meta.get("kind")
-            or bundle.get("strategy")
-            or route.get("strategy")
-            or ""
-        ).upper() or "UNKNOWN"
-        profile = str(
-            meta.get("capital_profile")
-            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
-            or ""
-        ).upper()
+        branch, profile = self._require_branch_profile(meta)
 
         # Caps locaux: même contrat que le chemin async `submit`
         caps_local = bundle.get("caps") or {}
@@ -3346,6 +3338,38 @@ class ExecutionEngine:
             pass
         raise err
 
+    def _require_branch_profile(self, meta: dict) -> tuple[str, str]:
+        """Valide et extrait branch/capital_profile depuis meta (contrat Macro 6-B-1)."""
+        meta = meta or {}
+        branch = str(meta.get("branch") or "").upper()
+        profile = str(meta.get("capital_profile") or "").upper()
+
+        if not branch or branch not in ALLOWED_BRANCHES:
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: branch invalide dans meta (%s)",
+                    branch or "MISSING",
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BAD_META_BRANCH, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
+            )
+
+        if not profile or profile not in ALLOWED_CAPITAL_PROFILES:
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: capital_profile invalide dans meta (%s)",
+                    profile or "MISSING",
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BAD_META_PROFILE, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
+            )
+
+        return branch, profile
+
     async def submit(self, bundle: dict):
         """
         Soumission non-bloquante:
@@ -3383,17 +3407,7 @@ class ExecutionEngine:
         # 1-bis) Langage commun de capacité (branch / profil / caps_local)
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
-        branch = str(
-            meta.get("branch")
-            or meta.get("kind")
-            or bundle.get("strategy")
-            or route.get("strategy")
-            or ""
-        ).upper() or "UNKNOWN"
-        profile = str(
-            meta.get("capital_profile")
-            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
-        ).upper()
+        branch, profile = self._require_branch_profile(meta)
 
         # 1-ter) Garde technique alias / capital_mode (Ticket 4-ENG-1 / 4-ENG-2)
         capital_mode = str(meta.get("capital_mode") or "OK").upper()

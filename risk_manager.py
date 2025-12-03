@@ -81,22 +81,22 @@ import time
 
 # --- MM / Obs (ajouts légers) ---
 try:
-    from modules.obs_metrics import (INVENTORY_USD,
-                                     RM_DECISION_MS,
-                                     RM_FRAGMENT_PROFIT_MS,
-                                     RM_REVALIDATE_MS,
-                                     RM_PREFLIGHT_MS,
-                                     RM_DECISIONS_TOTAL,
-                                     RM_SKIPS_TOTAL,
-                                     RM_QUEUE_DEPTH,
-                                     RM_FINAL_DECISIONS_TOTAL,
-                                     RM_ADMITTED_TOTAL,
-                                     RM_DROPPED_TOTAL,
-                                     STALE_OPPORTUNITY_DROPPED_TOTAL,
-                                     PAIR_HEALTH_PENALTY_TOTAL,
-                                     POOL_GATE_THROTTLES_TOTAL,FEE_TOKEN_CHECK_ERRORS_TOTAL,
-                                     FEE_TOKEN_TOPUP_REQUESTED_TOTAL,)
-                                     # gauge inventaire par ex/quote
+from modules.obs_metrics import (INVENTORY_USD,
+                                 RM_DECISION_MS,
+                                 RM_FRAGMENT_PROFIT_MS,
+                                 RM_REVALIDATE_MS,
+                                 RM_PREFLIGHT_MS,
+                                 RM_DECISIONS_TOTAL,
+                                 RM_SKIPS_TOTAL,
+                                 RM_QUEUE_DEPTH,
+                                 RM_FINAL_DECISIONS_TOTAL,
+                                 RM_ADMITTED_TOTAL,
+                                 RM_DROPPED_TOTAL,
+                                 STALE_OPPORTUNITY_DROPPED_TOTAL,
+                                 PAIR_HEALTH_PENALTY_TOTAL,
+                                 POOL_GATE_THROTTLES_TOTAL,FEE_TOKEN_CHECK_ERRORS_TOTAL,
+                                 FEE_TOKEN_TOPUP_REQUESTED_TOTAL,)
+                                 # gauge inventaire par ex/quote
 except Exception:
     INVENTORY_USD = None  # tolérant si obs pas encore patché
 
@@ -105,6 +105,7 @@ from modules.obs_metrics import (
     mark_books_fresh, mark_balances_fresh, inc_rm_reject,
     set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL
 )
+from bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
 # --- Taxonomie commune des raisons (Ticket 12) -----------------------------
 # NB: Ces codes doivent rester synchrones avec ceux d'execution_engine.py
@@ -9106,7 +9107,7 @@ class RiskManager:
         pk = self._norm_pair(pair or "")
 
         route = {"buy_ex": buy_ex, "sell_ex": sell_ex, "pair": pair}
-        profile = getattr(self, "capital_profile", "LARGE")
+        profile = str(getattr(self, "capital_profile", "LARGE") or "LARGE").upper()
         tif = "IOC" if strategy in ("TT", "TM") else "GTC"
         client_id = getattr(self, "client_id", "default")
         notional = opp.get("notional_quote") or {"ccy": "USDC", "amount": float(opp.get("notional_usdc", 0) or 0)}
@@ -9334,9 +9335,31 @@ class RiskManager:
         # Optionnel: exposer _pre_cost dans le contexte/trace si tu le journalises
 
         # Caps par défaut (Ticket 10 : pilotés par BotConfig.RiskManagerCfg)
-        profile_name = str(profile).upper()
         rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
         strategy_u = str(strategy or "").upper()
+
+        # Validation stricte du contrat branch/profile (Macro 6-B-1)
+        if strategy_u not in ALLOWED_BRANCHES:
+            if getattr(self, "log", None):
+                self.log.error(
+                    "[RiskManager] _build_bundle: branche invalide %s (pair=%s route=%s)",
+                    strategy_u,
+                    pair,
+                    f"{buy_ex}->{sell_ex}",
+                )
+            return None
+
+        if profile not in ALLOWED_CAPITAL_PROFILES:
+            if getattr(self, "log", None):
+                self.log.error(
+                    "[RiskManager] _build_bundle: capital_profile invalide %s (pair=%s route=%s)",
+                    profile,
+                    pair,
+                    f"{buy_ex}->{sell_ex}",
+                )
+            return None
+
+        profile_name = profile
 
         # 1) Point d'override éventuel (cap_hint_tt/tm/mm/reb si fixé par Boot)
         inflight_cap = getattr(self, "cap_hint_" + strategy.lower(), None)
@@ -9387,7 +9410,7 @@ class RiskManager:
             mode=mode,
             tif=tif,
             notional_quote=notional,
-            branch=strategy,
+            branch=strategy_u,
             profile=profile,
             frag=frag_meta,
             caps=caps_local,

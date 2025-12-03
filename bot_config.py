@@ -21,6 +21,13 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Tuple, Optional, Union
 
 # ------------------------------
+# Taxonomie canonique (branches / profils capital)
+# ------------------------------
+# Utilisées comme référence unique par RiskManager, ExecutionEngine, etc.
+ALLOWED_BRANCHES = ("TT", "TM", "MM", "REB")
+ALLOWED_CAPITAL_PROFILES = ("NANO", "MICRO", "SMALL", "MID", "LARGE")
+
+# ------------------------------
 # Helpers de parsing d'env
 # ------------------------------
 
