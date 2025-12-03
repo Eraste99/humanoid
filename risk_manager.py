@@ -81,30 +81,32 @@ import time
 
 # --- MM / Obs (ajouts légers) ---
 try:
-    from modules.obs_metrics import (INVENTORY_USD,
-                                     RM_DECISION_MS,
-                                     RM_FRAGMENT_PROFIT_MS,
-                                     RM_REVALIDATE_MS,
-                                     RM_PREFLIGHT_MS,
-                                     RM_DECISIONS_TOTAL,
-                                     RM_SKIPS_TOTAL,
-                                     RM_QUEUE_DEPTH,
-                                     RM_FINAL_DECISIONS_TOTAL,
-                                     RM_ADMITTED_TOTAL,
-                                     RM_DROPPED_TOTAL,
-                                     STALE_OPPORTUNITY_DROPPED_TOTAL,
-                                     PAIR_HEALTH_PENALTY_TOTAL,
-                                     POOL_GATE_THROTTLES_TOTAL,FEE_TOKEN_CHECK_ERRORS_TOTAL,
-                                     FEE_TOKEN_TOPUP_REQUESTED_TOTAL,)
-                                     # gauge inventaire par ex/quote
+from modules.obs_metrics import (INVENTORY_USD,
+                                 RM_DECISION_MS,
+                                 RM_FRAGMENT_PROFIT_MS,
+                                 RM_REVALIDATE_MS,
+                                 RM_PREFLIGHT_MS,
+                                 RM_DECISIONS_TOTAL,
+                                 RM_SKIPS_TOTAL,
+                                 RM_QUEUE_DEPTH,
+                                 RM_FINAL_DECISIONS_TOTAL,
+                                 RM_ADMITTED_TOTAL,
+                                 RM_DROPPED_TOTAL,
+                                 STALE_OPPORTUNITY_DROPPED_TOTAL,
+                                 PAIR_HEALTH_PENALTY_TOTAL,
+                                 POOL_GATE_THROTTLES_TOTAL,FEE_TOKEN_CHECK_ERRORS_TOTAL,
+                                 FEE_TOKEN_TOPUP_REQUESTED_TOTAL,)
+                                 # gauge inventaire par ex/quote
 except Exception:
     INVENTORY_USD = None  # tolérant si obs pas encore patché
 
 
 from modules.obs_metrics import (
     mark_books_fresh, mark_balances_fresh, inc_rm_reject,
-    set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL
+    set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
+    get_counter, safe_inc,
 )
+from bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
 # --- Taxonomie commune des raisons (Ticket 12) -----------------------------
 # NB: Ces codes doivent rester synchrones avec ceux d'execution_engine.py
@@ -122,6 +124,24 @@ RM_ENGINE_NACK_TIMEOUT = "RM_ENGINE_NACK_TIMEOUT"
 RM_ENGINE_NACK_429 = "RM_ENGINE_NACK_429"
 RM_ENGINE_NACK_5XX = "RM_ENGINE_NACK_5XX"
 RM_ENGINE_NACK_REJECT = "RM_ENGINE_NACK_REJECT"
+
+# Famille RM_CAP_* : rejets caps métier (profil/branche/combo/disable)
+RM_CAPS_INVALID = "RM_CAPS_INVALID"
+RM_CAPS_ZERO = "RM_CAPS_ZERO"
+RM_CAP_PROFILE_DISABLED = "RM_CAP_PROFILE_DISABLED"
+RM_CAP_BRANCH_DISABLED = "RM_CAP_BRANCH_DISABLED"
+RM_CAP_COMBO_EXCEEDED = "RM_CAP_COMBO_EXCEEDED"
+
+
+# --- Metrics (caps path hygiene) -------------------------------------------
+RM_CAPS_LEGACY_CALLS_TOTAL = get_counter(
+    "rm_caps_legacy_calls_total",
+    "Legacy opportunity-level caps/preemption path invocations",
+)
+RM_CAPS_BUNDLE_CALLS_TOTAL = get_counter(
+    "rm_caps_bundle_calls_total",
+    "Bundle-level caps/preemption path invocations",
+)
 
 
 # --- Helpers robusti per cast da ENV/config --------------------------------
@@ -719,6 +739,10 @@ class RiskManager:
         self.cfg = base_cfg
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.history_logger = history_logger
+        self._combo_cap_window_s = float(
+            getattr(getattr(self.cfg, "rm", None), "combo_cap_window_s", 120.0) or 120.0
+        )
+        self._combo_inflight_notional: Dict[str, List[Tuple[float, float]]] = {}
         # --- Résumé des caps globaux par profil (Macro 3 / M3-A) ---
         # Best-effort uniquement, pour debug / observabilité. Aucune logique RM ne s'appuie
         # sur cette structure (les décisions restent basées sur caps_trading_by_profile,
@@ -1657,9 +1681,23 @@ class RiskManager:
             caps_local = {}
 
         # 1) inflight_cap : si absent, on reprend ta logique actuelle (profil × branche)
+        #    et on la claque à 0 si la branche est désactivée pour ce profil.
         if "inflight_cap" not in caps_local:
             inflight_cap = None
             try:
+                branch_enabled = True
+                try:
+                    if branch_u == "TT":
+                        branch_enabled = bool(getattr(self.cfg, "enable_tt", getattr(self, "enable_tt", True)))
+                    elif branch_u == "TM":
+                        branch_enabled = bool(getattr(self.cfg, "enable_tm", getattr(self, "enable_tm", True)))
+                    elif branch_u == "MM":
+                        branch_enabled = bool(getattr(self.cfg, "enable_mm", getattr(self, "enable_mm", False)))
+                    elif branch_u == "REB":
+                        branch_enabled = bool(getattr(self.cfg, "enable_reb", getattr(self, "enable_reb", True)))
+                except Exception:
+                    branch_enabled = True
+
                 if branch_u == "REB":
                     caps_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) or {}
                     inflight_cap = int((caps_reb.get(profile_u) or caps_reb.get("LARGE") or 0))
@@ -1667,6 +1705,8 @@ class RiskManager:
                     caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
                     prof_caps = caps_by_profile.get(profile_u) or caps_by_profile.get("LARGE", {})
                     inflight_cap = int(prof_caps.get(branch_u, 0) or 0)
+                if not branch_enabled:
+                    inflight_cap = 0
             except Exception:
                 inflight_cap = None
             caps_local["inflight_cap"] = inflight_cap
@@ -1689,6 +1729,7 @@ class RiskManager:
             if pacer_factor < 0.0:
                 pacer_factor = 0.0
 
+            # Formula: inflight_cap × pacer_factor(branch) × alias_cap_factor (tous ≤ 1.0)
             try:
                 bundle_concurrency = max(
                     0,
@@ -1728,17 +1769,27 @@ class RiskManager:
         mais la décision « caps business vs backpressure Engine » se fait désormais
         au niveau bundle via caps_local.
         """
-        # Nouveau contrat bundle-centric : premier argument = bundle (dict)
+        # Nouveau contrat bundle-centric (chemin recommandé) : premier argument = bundle (dict)
         if args and isinstance(args[0], dict):
             bundle = args[0]
             caps_local = args[1] if len(args) > 1 else {}
             eligible = args[2] if len(args) > 2 else None
             profile = args[3] if len(args) > 3 else None
+            safe_inc(
+                RM_CAPS_BUNDLE_CALLS_TOTAL,
+                "rm_caps_bundle_calls_total",
+                "rm._apply_caps_and_preempt",
+            )
             return self._apply_caps_and_preempt_bundle(bundle, caps_local, eligible, profile)
 
         # Fallback : ancien contrat (strategy, ex, desired_notional)
         if len(args) >= 3:
             strategy, ex, desired_notional = args[0], args[1], args[2]
+            safe_inc(
+                RM_CAPS_LEGACY_CALLS_TOTAL,
+                "rm_caps_legacy_calls_total",
+                "rm._apply_caps_and_preempt",
+            )
         else:
             # Appel incohérent : on renvoie 0.0 pour rester conservateur.
             return 0.0
@@ -1751,6 +1802,9 @@ class RiskManager:
             desired_notional: float,
     ) -> float:
         """Legacy — cap notionnel par (stratégie,CEX) au niveau opportunité.
+
+        Chemin hérité (non enrichi) à conserver uniquement pour compatibilité
+        avec le flux Scanner→RM. Ne pas étendre avec de nouveaux caps.
 
         Comportement historique :
         - lecture de per_strategy_notional_cap,
@@ -1785,12 +1839,12 @@ class RiskManager:
         d'un pré-check très léger pour la traçabilité.
         """
         if not isinstance(caps_local, dict):
-            return False, "RM_CAPS_INVALID"
+            return False, RM_CAPS_INVALID
 
         inflight_cap = caps_local.get("inflight_cap")
         try:
             if isinstance(inflight_cap, (int, float)) and inflight_cap <= 0:
-                return False, "RM_CAPS_ZERO"
+                return False, RM_CAPS_ZERO
         except Exception:
             # On ne bloque pas si on ne sait pas interpréter le cap.
             pass
@@ -2251,7 +2305,11 @@ class RiskManager:
         )
         if combo_cap_usd is not None and combo_cap_usd > 0.0:
             notional_usd = self._estimate_bundle_notional_usd(bundle)
-            if notional_usd > combo_cap_usd:
+            combo_key = self._get_combo_key_from_bundle(bundle) or ""
+            now_ts = time.time()
+            inflight_combo = self._get_combo_inflight_notional(combo_key, now_ts) if combo_key else 0.0
+            prospective_total = notional_usd + inflight_combo
+            if prospective_total > combo_cap_usd:
                 ttl_status = ""
                 try:
                     meta = bundle.get("meta") or {}
@@ -2261,11 +2319,10 @@ class RiskManager:
                         ttl_status = str(ttl_overlay.get("status") or "").upper()
                 except Exception:
                     ttl_status = ""
-
-                reason_combo = f"CAPS_COMBO:{notional_usd:.2f}>{combo_cap_usd:.2f}"
+                reason_combo = RM_CAP_COMBO_EXCEEDED
                 try:
                     self._obs_combo_cap_reject(
-                        combo_key=self._get_combo_key_from_bundle(bundle) or "NA",
+                        combo_key=combo_key or "NA",
                         branch=branch,
                         profile=profile,
                         ttl_status=ttl_status,
@@ -2275,13 +2332,14 @@ class RiskManager:
 
                 try:
                     logging.info(
-                        "RM: drop bundle for combo cap %s (branch=%s, profile=%s, quote=%s, trace_id=%s, ttl_status=%s, notional_usd=%.4f, combo_cap_usd=%.4f)",
-                        self._get_combo_key_from_bundle(bundle) or "NA",
+                        "RM: drop bundle for combo cap %s (branch=%s, profile=%s, quote=%s, trace_id=%s, ttl_status=%s, inflight_usd=%.4f, notional_usd=%.4f, combo_cap_usd=%.4f)",
+                        combo_key or "NA",
                         branch,
                         profile,
                         quote,
                         trace_id,
                         ttl_status,
+                        float(inflight_combo or 0.0),
                         float(notional_usd or 0.0),
                         float(combo_cap_usd or 0.0),
                     )
@@ -2291,6 +2349,9 @@ class RiskManager:
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason_combo)
                 return False
+
+            if combo_key and notional_usd > 0.0:
+                self._register_combo_inflight_notional(combo_key, notional_usd, now_ts)
 
         # 3.a bis) Soft caps par sub-compte (SC) — Rate limiting SC (Macro 10)
         if not self._should_bypass_sc_rl(bundle, branch):
@@ -2504,6 +2565,32 @@ class RiskManager:
             return None
 
         return f"{pair_key}|{buy_u}->{sell_u}"
+
+    def _get_combo_inflight_notional(self, combo_key: str, now: float) -> float:
+        entries = self._combo_inflight_notional.get(combo_key, [])
+        if not entries:
+            return 0.0
+        kept: List[Tuple[float, float]] = []
+        total = 0.0
+        for expiry, amt in entries:
+            if expiry > now:
+                kept.append((expiry, amt))
+                total += float(amt or 0.0)
+        if kept:
+            self._combo_inflight_notional[combo_key] = kept
+        else:
+            self._combo_inflight_notional.pop(combo_key, None)
+        return total
+
+    def _register_combo_inflight_notional(self, combo_key: str, amount: float, now: float) -> None:
+        if not combo_key:
+            return
+        if amount <= 0.0:
+            return
+        expiry = now + float(self._combo_cap_window_s or 0.0)
+        entries = self._combo_inflight_notional.get(combo_key, [])
+        entries.append((expiry, float(amount)))
+        self._combo_inflight_notional[combo_key] = entries
 
     def _estimate_bundle_notional_usd(self, bundle: Dict[str, Any]) -> float:
         """
@@ -9106,7 +9193,7 @@ class RiskManager:
         pk = self._norm_pair(pair or "")
 
         route = {"buy_ex": buy_ex, "sell_ex": sell_ex, "pair": pair}
-        profile = getattr(self, "capital_profile", "LARGE")
+        profile = str(getattr(self, "capital_profile", "LARGE") or "LARGE").upper()
         tif = "IOC" if strategy in ("TT", "TM") else "GTC"
         client_id = getattr(self, "client_id", "default")
         notional = opp.get("notional_quote") or {"ccy": "USDC", "amount": float(opp.get("notional_usdc", 0) or 0)}
@@ -9334,9 +9421,31 @@ class RiskManager:
         # Optionnel: exposer _pre_cost dans le contexte/trace si tu le journalises
 
         # Caps par défaut (Ticket 10 : pilotés par BotConfig.RiskManagerCfg)
-        profile_name = str(profile).upper()
         rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
         strategy_u = str(strategy or "").upper()
+
+        # Validation stricte du contrat branch/profile (Macro 6-B-1)
+        if strategy_u not in ALLOWED_BRANCHES:
+            if getattr(self, "log", None):
+                self.log.error(
+                    "[RiskManager] _build_bundle: branche invalide %s (pair=%s route=%s)",
+                    strategy_u,
+                    pair,
+                    f"{buy_ex}->{sell_ex}",
+                )
+            return None
+
+        if profile not in ALLOWED_CAPITAL_PROFILES:
+            if getattr(self, "log", None):
+                self.log.error(
+                    "[RiskManager] _build_bundle: capital_profile invalide %s (pair=%s route=%s)",
+                    profile,
+                    pair,
+                    f"{buy_ex}->{sell_ex}",
+                )
+            return None
+
+        profile_name = profile
 
         # 1) Point d'override éventuel (cap_hint_tt/tm/mm/reb si fixé par Boot)
         inflight_cap = getattr(self, "cap_hint_" + strategy.lower(), None)
@@ -9387,7 +9496,7 @@ class RiskManager:
             mode=mode,
             tif=tif,
             notional_quote=notional,
-            branch=strategy,
+            branch=strategy_u,
             profile=profile,
             frag=frag_meta,
             caps=caps_local,
@@ -9980,6 +10089,8 @@ class RiskManager:
             "engine_attached": getattr(self, "engine", None) is not None,
         }
 
+        rebal_status = getattr(self.rebalancing, "get_status", lambda: {})()
+
         return {
             "module": "RiskManager",
             "healthy": self._running,
@@ -10022,7 +10133,13 @@ class RiskManager:
                 "rebal_active_ttl_s": self.rebal_active_ttl_s,
                 "rebal_emit_cooldown_s": self.rebal_emit_cooldown_s,
                 "rebal_emit_next_allowed_in_s": max(0.0, self._rebal_emit_next_allowed - time.time()),
-                                "tm_policy": {
+                "rebal_caps": {
+                    "inflight_rebal_current": rebal_status.get("rebal_caps", {}).get("inflight_current"),
+                    "inflight_rebal_cap": rebal_status.get("rebal_caps", {}).get("inflight_cap"),
+                    "rebal_ops_emitted_last_min": rebal_status.get("rebal_caps", {}).get("ops_emitted_last_min"),
+                    "rebal_ops_blocked_by_caps": rebal_status.get("rebal_caps", {}).get("ops_blocked_by_caps"),
+                },
+                "tm_policy": {
                     "default_mode": getattr(self.cfg, "tm_default_mode", "NEUTRAL"),
                     # Clé canonique pour la hedge NEUTRAL
                     "neutral_hedge_ratio": getattr(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50),
@@ -10047,7 +10164,7 @@ class RiskManager:
             "submodules": {
                 "VolatilityManager": getattr(self.vol_manager, "get_status", lambda: {})(),
                 "SlippageAndFeesCollector": getattr(self.slip_collector, "get_status", lambda: {})(),
-                "RebalancingManager": getattr(self.rebalancing, "get_status", lambda: {})(),
+                "RebalancingManager": rebal_status,
             },
         }
 

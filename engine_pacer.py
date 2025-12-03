@@ -51,6 +51,8 @@ try:
         ENGINE_PACER_DELAY_MS,
         ENGINE_PACER_INFLIGHT_MAX,
         ENGINE_PACER_MODE,
+        PACER_STATE,
+        PACER_CLAMP_SECONDS,
     )
 except Exception:  # pragma: no cover
     class _NoOp:
@@ -63,6 +65,8 @@ except Exception:  # pragma: no cover
     ENGINE_PACER_DELAY_MS            = _NoOp()
     ENGINE_PACER_INFLIGHT_MAX        = _NoOp()
     ENGINE_PACER_MODE                = _NoOp()
+    PACER_STATE                      = _NoOp()
+    PACER_CLAMP_SECONDS              = _NoOp()
 
 
 # --------- Default regional targets ---------
@@ -506,6 +510,7 @@ class EnginePacer:
 
 
     def _policy_dict(self, rg: str, st: RegionState) -> Dict[str, Any]:
+        pacer_mode = self._derive_pacer_mode(st)
         return {
             "region": rg,
             "profile": self._profile,
@@ -513,6 +518,7 @@ class EnginePacer:
             "inflight_max": int(st.inflight_max),
             "flags": dict(st.flags),
             "mode": int(st.mode),  # 0=NORMAL,1=CONSTRAINED,2=SEVERE
+            "pacer_mode": pacer_mode,
             "state": st.state,
             "metrics": {
                 "ack_ms": round(st.ack_ms, 2),
@@ -531,5 +537,8 @@ class EnginePacer:
             ENGINE_PACER_DELAY_MS.labels(region=rg, profile=self._profile, mode=str(st.mode)).set(st.pacing_ms)
             ENGINE_PACER_INFLIGHT_MAX.labels(region=rg, profile=self._profile, mode=str(st.mode)).set(st.inflight_max)
             ENGINE_PACER_MODE.labels(region=rg, profile=self._profile).set(st.mode)
+            PACER_STATE.set(st.mode)
+            PACER_CLAMP_SECONDS.labels(kind="mm_frozen").set(1 if st.flags.get("mm_frozen") else 0)
+            PACER_CLAMP_SECONDS.labels(kind="ioc_only").set(1 if st.flags.get("ioc_only") else 0)
         except Exception:
             pass
