@@ -57,17 +57,21 @@ try:
 except Exception:  # pragma: no cover
     class _NoOp:
         def labels(self, *args, **kwargs): return self
-        def inc(self, *args, **kwargs): return None
-        def set(self, *args, **kwargs): return None
-        def observe(self, *args, **kwargs): return None
-    ENGINE_PACING_BACKPRESSURE_TOTAL = _NoOp()
-    ENGINE_DRAIN_LATENCY_MS          = _NoOp()
-    ENGINE_PACER_DELAY_MS            = _NoOp()
-    ENGINE_PACER_INFLIGHT_MAX        = _NoOp()
-    ENGINE_PACER_MODE                = _NoOp()
-    PACER_STATE                      = _NoOp()
-    PACER_CLAMP_SECONDS              = _NoOp()
 
+        def inc(self, *args, **kwargs): return None
+
+        def set(self, *args, **kwargs): return None
+
+        def observe(self, *args, **kwargs): return None
+
+
+    ENGINE_PACING_BACKPRESSURE_TOTAL = _NoOp()
+    ENGINE_DRAIN_LATENCY_MS = _NoOp()
+    ENGINE_PACER_DELAY_MS = _NoOp()
+    ENGINE_PACER_INFLIGHT_MAX = _NoOp()
+    ENGINE_PACER_MODE = _NoOp()
+    PACER_STATE = _NoOp()
+    PACER_CLAMP_SECONDS = _NoOp()
 
 # --------- Default regional targets ---------
 # Cibles (hautes/sévères) utilisées pour normaliser les gaps → score de sévérité S∈[0,1].

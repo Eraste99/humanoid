@@ -204,7 +204,7 @@ class RebalancingManager:
         # Politique anti-thrash (lue depuis cfg si dispo)
         self.rebal_quantum_min_quote: float = float(getattr(self.cfg, "rebal_quantum_min_quote", 50.0))
         self.rebal_max_ops_per_min: int = int(getattr(self.cfg, "rebal_max_ops_per_min", 6))
-        self.rebal_priority: List[str] = list(getattr(self.cfg, "rebal_priority", ["CASH","CRYPTO","OVERLAY"]))
+        self.rebal_priority: List[str] = list(getattr(self.cfg, "rebal_priority", ["CASH", "CRYPTO", "OVERLAY"]))
         self.rebal_hint_ttl_s: int = int(getattr(self.cfg, "rebal_hint_ttl_s", 120))
         self._reb_slot_ttl_s: float = float(getattr(self.cfg, "rebal_slot_ttl_s", self.rebal_hint_ttl_s))
         rm_cfg = getattr(self.cfg, "rm", None)
@@ -275,6 +275,7 @@ class RebalancingManager:
     def inflight_rebal_current(self) -> int:
         return len(self._reb_active_slots)
 
+
     def set_cost_function(self, fn: Optional[Callable[[Dict[str, Any]], float]]) -> None:
         """Permet au RM d'injecter la fonction de coût utilisée dans les plans."""
         self._reb_cost_fn = fn
@@ -309,6 +310,8 @@ class RebalancingManager:
             if amt > 0:
                 total += amt
         return total
+
+
 
         # -------------------------- Snapshots guards ----------------------------
 
@@ -773,7 +776,7 @@ class RebalancingManager:
             "OVERLAY": overlay_comp,
         }
         ordered: List[Dict[str, Any]] = []
-        for prio in (self.rebal_priority or ["CASH","CRYPTO","OVERLAY"]):
+        for prio in (self.rebal_priority or ["CASH", "CRYPTO", "OVERLAY"]):
             ordered.extend([op for op in buckets.get(prio, []) if op])
 
         # rate limit glissant 60s
@@ -813,6 +816,7 @@ class RebalancingManager:
             ids = set(map(id, selected))
             return [op for op in src if id(op) in ids]
 
+
         sel_overlay  = _take(overlay_comp)
         sel_wallet   = _take(wallet_transfers)
         sel_internal = _take(internal)
@@ -831,6 +835,7 @@ class RebalancingManager:
             "rebal_cap_status": self._last_rebal_cap_status or "OK",
             "combo_cap_ratio_planned": self._last_combo_cap_ratio,
         }
+
         if callable(self._reb_cost_fn):
             plan["cost_fn"] = self._reb_cost_fn
 

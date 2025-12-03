@@ -81,31 +81,34 @@ import time
 
 # --- MM / Obs (ajouts légers) ---
 try:
-from modules.obs_metrics import (INVENTORY_USD,
-                                 RM_DECISION_MS,
-                                 RM_FRAGMENT_PROFIT_MS,
-                                 RM_REVALIDATE_MS,
-                                 RM_PREFLIGHT_MS,
-                                 RM_DECISIONS_TOTAL,
-                                 RM_SKIPS_TOTAL,
-                                 RM_QUEUE_DEPTH,
-                                 RM_FINAL_DECISIONS_TOTAL,
-                                 RM_ADMITTED_TOTAL,
-                                 RM_DROPPED_TOTAL,
-                                 STALE_OPPORTUNITY_DROPPED_TOTAL,
-                                 PAIR_HEALTH_PENALTY_TOTAL,
-                                 POOL_GATE_THROTTLES_TOTAL,FEE_TOKEN_CHECK_ERRORS_TOTAL,
-                                 FEE_TOKEN_TOPUP_REQUESTED_TOTAL,)
-                                 # gauge inventaire par ex/quote
+    from modules.obs_metrics import (INVENTORY_USD,
+                                     RM_DECISION_MS,
+                                     RM_FRAGMENT_PROFIT_MS,
+                                     RM_REVALIDATE_MS,
+                                     RM_PREFLIGHT_MS,
+                                     RM_DECISIONS_TOTAL,
+                                     RM_SKIPS_TOTAL,
+                                     RM_QUEUE_DEPTH,
+                                     RM_FINAL_DECISIONS_TOTAL,
+                                     RM_ADMITTED_TOTAL,
+                                     RM_DROPPED_TOTAL,
+                                     STALE_OPPORTUNITY_DROPPED_TOTAL,
+                                     PAIR_HEALTH_PENALTY_TOTAL,
+                                     POOL_GATE_THROTTLES_TOTAL, FEE_TOKEN_CHECK_ERRORS_TOTAL,
+                                     FEE_TOKEN_TOPUP_REQUESTED_TOTAL, )
+
+    # gauge inventaire par ex/quote
 except Exception:
     INVENTORY_USD = None  # tolérant si obs pas encore patché
 
 
 from modules.obs_metrics import (
     mark_books_fresh, mark_balances_fresh, inc_rm_reject,
-    set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL
+    set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
+    get_counter, safe_inc,
 )
-from bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
+from modules.bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
+
 
 # --- Taxonomie commune des raisons (Ticket 12) -----------------------------
 # NB: Ces codes doivent rester synchrones avec ceux d'execution_engine.py
@@ -738,11 +741,7 @@ class RiskManager:
         self.cfg = base_cfg
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.history_logger = history_logger
-        self._combo_cap_window_s = float(
-            getattr(getattr(self.cfg, "rm", None), "combo_cap_window_s", 120.0) or 120.0
-        )
-        self._combo_inflight_notional: Dict[str, List[Tuple[float, float]]] = {}
-        # --- Résumé des caps globaux par profil (Macro 3 / M3-A) ---
+
         # Best-effort uniquement, pour debug / observabilité. Aucune logique RM ne s'appuie
         # sur cette structure (les décisions restent basées sur caps_trading_by_profile,
         # inflight_rebal_by_profile et combo_cap_usd_by_profile).
@@ -1728,17 +1727,18 @@ class RiskManager:
             if pacer_factor < 0.0:
                 pacer_factor = 0.0
 
-            # Formula: inflight_cap × pacer_factor(branch) × alias_cap_factor (tous ≤ 1.0)
-            try:
-                bundle_concurrency = max(
-                    0,
-                    int(round(float(inflight_cap_eff) * pacer_factor * alias_cap_factor)),
-                )
-            except Exception:
-                bundle_concurrency = max(
-                    0,
-                    int(float(inflight_cap_eff or 0) * alias_cap_factor),
-                )
+                # Formula: inflight_cap × pacer_factor(branch) × alias_cap_factor (tous ≤ 1.0)
+                try:
+                    bundle_concurrency = max(
+                        0,
+                        int(round(float(inflight_cap_eff) * pacer_factor * alias_cap_factor)),
+                    )
+                except Exception:
+                    bundle_concurrency = max(
+                        0,
+                        int(float(inflight_cap_eff or 0) * alias_cap_factor),
+                    )
+
 
             caps_local["bundle_concurrency"] = bundle_concurrency
 
@@ -2318,8 +2318,7 @@ class RiskManager:
                         ttl_status = str(ttl_overlay.get("status") or "").upper()
                 except Exception:
                     ttl_status = ""
-
-                reason_combo = "RM_CAP_COMBO_EXCEEDED"
+                reason_combo = RM_CAP_COMBO_EXCEEDED
                 try:
                     self._obs_combo_cap_reject(
                         combo_key=combo_key or "NA",
@@ -2352,6 +2351,7 @@ class RiskManager:
 
             if combo_key and notional_usd > 0.0:
                 self._register_combo_inflight_notional(combo_key, notional_usd, now_ts)
+
 
         # 3.a bis) Soft caps par sub-compte (SC) — Rate limiting SC (Macro 10)
         if not self._should_bypass_sc_rl(bundle, branch):
@@ -2591,6 +2591,7 @@ class RiskManager:
         entries = self._combo_inflight_notional.get(combo_key, [])
         entries.append((expiry, float(amount)))
         self._combo_inflight_notional[combo_key] = entries
+
 
     def _estimate_bundle_notional_usd(self, bundle: Dict[str, Any]) -> float:
         """
@@ -9496,7 +9497,7 @@ class RiskManager:
             mode=mode,
             tif=tif,
             notional_quote=notional,
-            branch=strategy_u,
+            branch=strategy,
             profile=profile,
             frag=frag_meta,
             caps=caps_local,
@@ -10129,7 +10130,7 @@ class RiskManager:
                 "max_book_age_s": self.max_book_age_s,
                 "max_clock_skew_ms": self.max_clock_skew_ms,
                 "trade_modes": {"TT": self.enable_tt, "TM": self.enable_tm},
-                "rebalancing_active": self.is_rebalancing_active(),
+                 "rebalancing_active": self.is_rebalancing_active(),
                 "rebal_active_ttl_s": self.rebal_active_ttl_s,
                 "rebal_emit_cooldown_s": self.rebal_emit_cooldown_s,
                 "rebal_emit_next_allowed_in_s": max(0.0, self._rebal_emit_next_allowed - time.time()),
@@ -10143,6 +10144,7 @@ class RiskManager:
                     "default_mode": getattr(self.cfg, "tm_default_mode", "NEUTRAL"),
                     # Clé canonique pour la hedge NEUTRAL
                     "neutral_hedge_ratio": getattr(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50),
+
                     # Alias éventuel pour compat legacy (peut être None si non configuré)
                     "legacy_neutral_hedge_ratio": getattr(self.cfg, "tm_neutral_hedge_ratio", None),
                     "nn_min_edge_bps": getattr(self.cfg, "tm_nn_min_edge_bps", 3.0),
