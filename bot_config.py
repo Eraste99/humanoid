@@ -21,6 +21,13 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Tuple, Optional, Union
 
 # ------------------------------
+# Taxonomie canonique (branches / profils capital)
+# ------------------------------
+# Utilisées comme référence unique par RiskManager, ExecutionEngine, etc.
+ALLOWED_BRANCHES = ("TT", "TM", "MM", "REB")
+ALLOWED_CAPITAL_PROFILES = ("NANO", "MICRO", "SMALL", "MID", "LARGE")
+
+# ------------------------------
 # Helpers de parsing d'env
 # ------------------------------
 
@@ -459,6 +466,8 @@ class RiskManagerCfg:
 
     # Ticket 6 — Cap notional global par combo (TT+TM+REB) par profil (en quote USDC/EUR)
     # Aligné sur la borne “tail-risk” (_profile_cap_notional dans le RM).
+    # Interprétation: cap notional max partagé par TT/TM/REB sur une combo
+    # (route + pair + quote) pour le profil capital considéré.
     combo_cap_usd_by_profile: Dict[str, float] = field(default_factory=lambda: {
         "NANO": 200.0,  # loss_budget 0.5€ / (25 bps tail)
         "MICRO": 400.0,  # 1€  / 0.0025
@@ -663,6 +672,8 @@ class PrivateWSHubCfg:
 @dataclass
 class RebalancingCfg:
     rebal_quantum_min_quote: float = 50.0
+    # Cadence REB max (opérations/min). Doit rester bornée par inflight_rebal
+    # multiplié par un ratio simple (cf. _sanity_check_rm_caps, ratio=3 par défaut).
     rebal_max_ops_per_min: int = 6
     rebal_priority: List[str] = field(default_factory=lambda: ["CASH","CRYPTO","OVERLAY"])
     rebal_hint_ttl_s: int = 120
@@ -1708,7 +1719,7 @@ class BotConfig:
 
         # --- Sanity checks RM / Desk REB ---
         cfg._sanity_check_rm_caps()
-
+        
         # --- Aliases & flatten ---
         cfg._init_aliases()
         cfg._rebuild_flat_cache()
@@ -1716,23 +1727,46 @@ class BotConfig:
 
     def _sanity_check_rm_caps(cfg: "BotConfig") -> None:
         """
-        Vérifications légères de cohérence RM :
-        - caps_trading_by_profile vs inflight_trading_by_profile
-        - budgets de branches par quote
-        - caps REB (inflight_rebal_by_profile / combo_cap_usd_by_profile)
-        Log en WARNING sans casser le boot.
+        Vérifications explicites des invariants de caps (RM/Engine/Pacer/REB).
+
+        - Invariants RM: somme TT/TM/MM <= inflight_trading, inflight_rebal <= inflight_trading,
+          combo_cap_usd_by_profile > 0, inflight_rebal borne par cap TM.
+        - Invariants Engine: somme des caps CEX par profil >= inflight_trading, workers compatibles
+          avec le cap (au moins 50% du plafond inflight RM), pacer_targets bornés par la capacité
+          technique agrégée de la région (via engine_pod_map) et par le total Engine.
+        - Invariants REB: inflight_rebal <= cap TM et rebal_max_ops_per_min dimensionné vs inflight REB.
+        - Sanity checks additionnels (budgets, capital ladder) en warning.
+
+        En PROD, les violations d'invariants peuvent refuser le boot (ValueError). En DRY_RUN, on logue
+        en WARNING/ERROR et on continue pour faciliter le debug.
         """
         log = logging.getLogger(__name__)
 
         rm = getattr(cfg, "rm", None)
         g = getattr(cfg, "g", None)
+        engine_cfg = getattr(cfg, "engine", None)
+        rebal_cfg = getattr(cfg, "rebal", None)
         if rm is None or g is None:
             return
 
-        # 1) caps trading vs inflight trading
+        mode = str(getattr(g, "mode", "DRY_RUN")).upper()
+        fail_hard = mode == "PROD"
+
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        def _err(msg: str) -> None:
+            errors.append(msg)
+
+        def _warn(msg: str) -> None:
+            warnings.append(msg)
+
+        # 1) Invariants RM : trading caps vs inflight + inflight REB borné
         try:
             inflight = getattr(rm, "inflight_trading_by_profile", {}) or {}
             caps = getattr(rm, "caps_trading_by_profile", {}) or {}
+            inflight_reb = getattr(rm, "inflight_rebal_by_profile", {}) or {}
+            combo_caps = getattr(rm, "combo_cap_usd_by_profile", {}) or {}
             for profile, inflight_total in inflight.items():
                 prof_caps = caps.get(profile) or {}
                 tt_cap = int(prof_caps.get("TT", 0) or 0)
@@ -1740,16 +1774,31 @@ class BotConfig:
                 mm_cap = int(prof_caps.get("MM", 0) or 0)
                 total_caps = tt_cap + tm_cap + mm_cap
                 if total_caps > int(inflight_total):
-                    log.warning(
-                        "BotConfig: caps_trading_by_profile[%s] (TT+TM+MM=%s) > inflight_trading_by_profile=%s",
-                        profile,
-                        total_caps,
-                        inflight_total,
+                    _err(
+                        f"caps_trading_by_profile[{profile}] (TT+TM+MM={total_caps}) > inflight_trading_by_profile={inflight_total}"
+                    )
+                reb_cap = int(inflight_reb.get(profile, 0) or 0)
+                if reb_cap > int(inflight_total):
+                    _err(
+                        f"inflight_rebal_by_profile[{profile}]={reb_cap} > inflight_trading_by_profile={inflight_total}"
+                    )
+                if reb_cap > tm_cap:
+                    _err(
+                        f"inflight_rebal_by_profile[{profile}]={reb_cap} > caps_trading_by_profile[{profile}].TM={tm_cap} (REB consomme TM)"
+                    )
+                combo_cap = combo_caps.get(profile, 0)
+                try:
+                    combo_val = float(combo_cap)
+                except Exception:
+                    combo_val = 0.0
+                if combo_val <= 0:
+                    _err(
+                        f"combo_cap_usd_by_profile[{profile}]={combo_cap} <= 0 (REB effectivement désactivé pour ce profil)"
                     )
         except Exception as exc:
-            log.warning("BotConfig: unable to sanity-check RM trading caps: %s", exc)
+            _warn(f"unable to sanity-check RM trading/REB caps: {exc}")
 
-        # 2) budgets branches par quote
+        # 2) budgets branches par quote (warning seulement)
         try:
             budgets = getattr(g, "branch_budgets_quote", {}) or {}
             for quote, per_branch in budgets.items():
@@ -1760,65 +1809,87 @@ class BotConfig:
                     except Exception:
                         continue
                 if total > 1.0001:
-                    log.warning(
-                        "BotConfig: BRANCH_BUDGETS_QUOTE[%s] total=%.3f > 1.0 (TT+TM+MM+REB)",
-                        quote,
-                        total,
+                    _warn(
+                        f"BRANCH_BUDGETS_QUOTE[{quote}] total={total:.3f} > 1.0 (TT+TM+MM+REB)"
                     )
         except Exception as exc:
-            log.warning("BotConfig: unable to sanity-check branch_budgets_quote: %s", exc)
+            _warn(f"unable to sanity-check branch_budgets_quote: {exc}")
 
-        # 3) caps REB par profil
-        try:
-            combo_caps = getattr(rm, "combo_cap_usd_by_profile", {}) or {}
-            inflight_reb = getattr(rm, "inflight_rebal_by_profile", {}) or {}
-            for profile, combo_cap in combo_caps.items():
-                if combo_cap <= 0:
-                    log.warning(
-                        "BotConfig: combo_cap_usd_by_profile[%s]=%.3f <= 0 (REB effectivement désactivé pour ce profil)",
-                        profile,
-                        combo_cap,
-                    )
-            for profile, cap in inflight_reb.items():
-                if int(cap) < 0:
-                    log.warning(
-                        "BotConfig: inflight_rebal_by_profile[%s]=%r < 0 (corrige la config)",
-                        profile,
-                        cap,
-                    )
-        except Exception as exc:
-            log.warning("BotConfig: unable to sanity-check REB caps: %s", exc)
-        # 5) caps Engine par CEX vs inflight trading RM (vue globale)
+        # 3) Invariants Engine vs RM
         try:
             inflight = getattr(rm, "inflight_trading_by_profile", {}) or {}
-            engine_cfg = getattr(cfg, "engine", None)
-            if engine_cfg is not None:
-                engine_caps = getattr(engine_cfg, "inflight_max_by_exchange_by_profile", {}) or {}
-                for profile, inflight_total in inflight.items():
-                    per_venue = engine_caps.get(profile) or {}
-                    total_engine_cap = 0
-                    for v in (per_venue or {}).values():
-                        try:
-                            total_engine_cap += int(v or 0)
-                        except Exception:
-                            continue
-                    # Si la somme des caps techniques Engine est < plafond RM,
-                    # le profil sera mécaniquement bridé (capacité < budget business).
-                    if total_engine_cap < int(inflight_total):
-                        log.warning(
-                            "BotConfig: ENGINE inflight_max_by_exchange_by_profile[%s] total=%s "
-                            "< inflight_trading_by_profile=%s (profil potentiellement bridé par les caps Engine)",
-                            profile,
-                            total_engine_cap,
-                            inflight_total,
+            engine_caps = getattr(engine_cfg, "inflight_max_by_exchange_by_profile", {}) or {}
+            workers = getattr(engine_cfg, "workers_by_profile", {}) or {}
+            pod_map = {k: str(v).upper() for k, v in (getattr(g, "engine_pod_map", {}) or {}).items()}
+            pacer_targets = getattr(engine_cfg, "pacer_targets", {}) or {}
+            # Règle simple pour les workers : au moins 50% du plafond inflight RM (ratio documenté).
+            worker_ratio = 0.5
+            for profile, inflight_total in inflight.items():
+                per_venue = engine_caps.get(profile) or {}
+                total_engine_cap = 0
+                for v in (per_venue or {}).values():
+                    try:
+                        total_engine_cap += int(v or 0)
+                    except Exception:
+                        continue
+                if total_engine_cap < int(inflight_total):
+                    _err(
+                        f"ENGINE inflight_max_by_exchange_by_profile[{profile}] total={total_engine_cap} < inflight_trading_by_profile={inflight_total}"
+                    )
+                min_workers = max(1, int(int(inflight_total) * worker_ratio))
+                worker_count = int(workers.get(profile, 0) or 0)
+                if worker_count < min_workers:
+                    _err(
+                        f"ENGINE workers_by_profile[{profile}]={worker_count} < {worker_ratio:.0%} du plafond inflight_trading_by_profile={inflight_total}"
+                    )
+
+                # Pacer: chaque target région <= capacité technique agrégée de la région ET <= capacité totale Engine.
+                total_cap_all = total_engine_cap
+                for region, target in (pacer_targets or {}).items():
+                    try:
+                        tgt_val = int(target)
+                    except Exception:
+                        continue
+                    region_cap = 0
+                    for ex, ex_region in pod_map.items():
+                        if ex_region == str(region).upper():
+                            try:
+                                region_cap += int((per_venue or {}).get(ex, 0) or 0)
+                            except Exception:
+                                continue
+                    # Si aucune brique régionale trouvée, on borne simplement par la capacité totale Engine.
+                    max_cap = total_cap_all if region_cap == 0 else min(region_cap, total_cap_all)
+                    if tgt_val > max_cap:
+                        _err(
+                            f"pacer_targets[{region}]={tgt_val} > capacité Engine régionale estimée={max_cap} (profil={profile})"
                         )
         except Exception as exc:
-            log.warning(
-                "BotConfig: unable to sanity-check engine inflight caps vs RM inflight_trading_by_profile: %s",
-                exc,
+            _warn(
+                f"unable to sanity-check engine inflight caps / workers / pacer vs RM inflight_trading_by_profile: {exc}"
             )
 
-        # 4) policy Capital Ladder
+        # 4) Invariants REB vs cadence
+        try:
+            inflight_reb = getattr(rm, "inflight_rebal_by_profile", {}) or {}
+            if inflight_reb and rebal_cfg is not None:
+                max_reb_inflight = max(int(v or 0) for v in inflight_reb.values())
+                ops_per_min = int(getattr(rebal_cfg, "rebal_max_ops_per_min", 0) or 0)
+                # Règle simple : cadence REB bornée par inflight_rebal * ratio (par défaut 3).
+                ratio = float(getattr(rebal_cfg, "rebal_ops_per_min_ratio", 3.0) or 3.0)
+                max_allowed = int(max_reb_inflight * ratio)
+                if ops_per_min > max_allowed:
+                    _err(
+                        f"rebal_max_ops_per_min={ops_per_min} > inflight_rebal_by_profile max={max_reb_inflight}"
+                        f" * ratio={ratio}"
+                    )
+                if max_reb_inflight > 0 and ops_per_min <= 0:
+                    _err(
+                        "rebal_max_ops_per_min doit être > 0 quand inflight_rebal est non nul"
+                    )
+        except Exception as exc:
+            _warn(f"unable to sanity-check REB cadence: {exc}")
+
+        # 5) policy Capital Ladder (warning seulement)
         try:
             ladder_cfg = getattr(rm, "capital_ladder_cfg", {}) or {}
             if ladder_cfg:
@@ -1830,21 +1901,30 @@ class BotConfig:
                     except Exception:
                         continue
                     if min_cap < 0:
-                        log.warning(
-                            "BotConfig: capital_ladder_cfg[%s].min_capital_per_sc=%.3f < 0 (corrige la config)",
-                            profile,
-                            min_cap,
+                        _warn(
+                            f"capital_ladder_cfg[{profile}].min_capital_per_sc={min_cap:.3f} < 0 (corrige la config)"
                         )
                     if last_min is not None and min_cap < last_min:
-                        log.warning(
-                            "BotConfig: capital_ladder_cfg[%s].min_capital_per_sc=%.3f < précédent=%.3f (ordre ladder incohérent NANO→...→LARGE)",
-                            profile,
-                            min_cap,
-                            last_min,
+                        _warn(
+                            f"capital_ladder_cfg[{profile}].min_capital_per_sc={min_cap:.3f} < précédent={last_min:.3f} (ordre ladder incohérent NANO→...→LARGE)"
                         )
                     last_min = min_cap
         except Exception as exc:
-            log.warning("BotConfig: unable to sanity-check capital_ladder_cfg: %s", exc)
+            _warn(f"unable to sanity-check capital_ladder_cfg: {exc}")
+
+        # Publication des résultats (warnings toujours logués, erreurs loguées puis éventuellement levées en PROD)
+        for msg in warnings:
+            log.warning("BotConfig: %s", msg)
+        for msg in errors:
+            if fail_hard:
+                log.error("BotConfig: %s", msg)
+            else:
+                log.warning("BotConfig: %s", msg)
+
+        if errors and fail_hard:
+            raise ValueError(
+                f"BotConfig invariants violés ({len(errors)}) en mode PROD. Exemple: {errors[0]}"
+            )
 
 
 

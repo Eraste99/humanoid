@@ -40,6 +40,7 @@ from contextlib import asynccontextmanager
 from modules.engine_pacer import EnginePacer  # ensure import top-level
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.errors import EngineSubmitError, EngineCancelError, ExternalServiceError, NotReadyError
+from bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
 # --- deps async/http ---
 # aiohttp is optional in some envs; guard its import
@@ -95,6 +96,8 @@ ENGINE_SHALLOW_BOOK = "ENGINE_SHALLOW_BOOK"
 ENGINE_SUBMIT_TIMEOUT = "ENGINE_SUBMIT_TIMEOUT"
 ENGINE_NACK_429 = "ENGINE_NACK_429"
 ENGINE_NACK_5XX = "ENGINE_NACK_5XX"
+ENGINE_BAD_META_BRANCH = "ENGINE_BAD_META_BRANCH"
+ENGINE_BAD_META_PROFILE = "ENGINE_BAD_META_PROFILE"
 
 ENGINE_ALIAS_TTL_BLOCK = "ENGINE_ALIAS_TTL_BLOCK"
 ENGINE_MM_DISABLED_BY_CAPITAL = "ENGINE_MM_DISABLED_BY_CAPITAL"
@@ -1238,9 +1241,8 @@ class ExecutionEngine:
             engine_cfg = None
 
         # Plafond d'inflight global recommandé par le RM (Macro M2-2).
-        # On part de cfg.rm.caps_trading_by_profile = {PROFILE: {TT/TM/MM/REB: inflight_cap, ...}}
-        # et on prend le max TT/TM/MM pour ce profil comme plafond "business"
-        # que le PACER ne devra pas dépasser (down-clamp seulement).
+        # Source unique = inflight_trading_by_profile : plafond métier total pour le profil.
+        # Il sert uniquement de garde haute pour le pacer (down-clamp only).
         self._pacer_inflight_ceiling = None
         rm_cfg = None
         try:
@@ -1250,16 +1252,12 @@ class ExecutionEngine:
 
         if rm_cfg is not None:
             try:
-                caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
-                prof_caps = caps_by_profile.get(self._capital_profile, {}) or \
-                            caps_by_profile.get("LARGE", {}) or {}
-                # TT/TM/MM/REB inclus, on garde le max pour ne jamais sur-capper une branche
-                # par rapport aux caps RM.
-                if prof_caps:
-                    self._pacer_inflight_ceiling = max(
-                        int(v) for v in prof_caps.values()
-                        if v is not None
-                    )
+                inflight_totals = getattr(rm_cfg, "inflight_trading_by_profile", {}) or {}
+                total_cap = inflight_totals.get(self._capital_profile)
+                if total_cap is None:
+                    total_cap = inflight_totals.get("LARGE")
+                if total_cap:
+                    self._pacer_inflight_ceiling = max(1, int(total_cap))
             except Exception:
                 self._pacer_inflight_ceiling = None
 
@@ -1425,6 +1423,9 @@ class ExecutionEngine:
         # Reality-gap observabilité (Engine ne modifie jamais min_required_bps)
         # Stocke, à des fins métriques uniquement, le dernier écart expected_vs_realized par pair_key.
         self._reality_gap_bps: Dict[str, float] = {}
+
+        # Concurrence effective par branche/profil (queue + workers)
+        self._active_bundle_counts: dict[tuple[str, str], int] = collections.defaultdict(int)
 
 
         # Knobs price-band vol-aware
@@ -2613,18 +2614,7 @@ class ExecutionEngine:
         # 2) Branch / profile + caps locaux pour métriques & backpressure
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
-        branch = str(
-            meta.get("branch")
-            or meta.get("kind")
-            or bundle.get("strategy")
-            or route.get("strategy")
-            or ""
-        ).upper() or "UNKNOWN"
-        profile = str(
-            meta.get("capital_profile")
-            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
-            or ""
-        ).upper()
+        branch, profile = self._require_branch_profile(meta)
 
         # Caps locaux: même contrat que le chemin async `submit`
         caps_local = bundle.get("caps") or {}
@@ -2706,6 +2696,17 @@ class ExecutionEngine:
         except Exception:
             branch_depth = 0
 
+        branch_active = self._active_bundle_count(branch, profile)
+        eff_cap = self._effective_bundle_cap(bundle_concurrency, headroom_min)
+
+        try:
+            if hasattr(self, "obs_hist"):
+                self.obs_hist("engine_branch_active", float(branch_active))
+                if inflight_cap is not None:
+                    self.obs_hist("rm_inflight_cap", float(inflight_cap))
+        except Exception:
+            pass
+
         # Observabilité capacité (queue globale + branche)
         try:
             if hasattr(self, "obs_hist"):
@@ -2716,24 +2717,23 @@ class ExecutionEngine:
                         0.0, min(100.0, 100.0 * float(depth) / float(queue_max))
                     )
                     self.obs_hist("engine_queue_util_pct", util_pct)
-                if bundle_concurrency and branch_depth is not None:
+                if bundle_concurrency and eff_cap is not None and eff_cap > 0:
                     try:
-                        eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
                         br_util_pct = max(
                             0.0,
-                            min(100.0, 100.0 * float(branch_depth) / float(eff_cap)),
+                            min(100.0, 100.0 * float(branch_active) / float(eff_cap)),
                         )
                         self.obs_hist("engine_branch_capacity_util_pct", br_util_pct)
                     except Exception:
                         pass
-                if inflight_cap and branch_depth is not None:
+                if inflight_cap:
                     try:
                         eff_inflight_cap = max(1, int(inflight_cap))
                         inflight_util = max(
                             0.0,
                             min(
                                 100.0,
-                                100.0 * float(branch_depth) / float(eff_inflight_cap),
+                                100.0 * float(branch_active) / float(eff_inflight_cap),
                             ),
                         )
                         self.obs_hist("engine_branch_inflight_util_pct", inflight_util)
@@ -2764,30 +2764,14 @@ class ExecutionEngine:
             )
 
         # 3-b) Hard backpressure: caps_local par branche (optionnel)
-        if bundle_concurrency is not None and branch_depth is not None:
-            try:
-                eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
-            except Exception:
-                eff_cap = None
-            if eff_cap and branch_depth >= eff_cap:
-                try:
-                    logger.info(
-                        "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH (execute_bundle) "
-                        "branch=%s profile=%s depth=%s eff_cap=%s",
-                        branch,
-                        profile,
-                        branch_depth,
-                        eff_cap,
-                    )
-                except Exception:
-                    pass
-                try:
-                    self._engine_backpressure_metric("CAP_BRANCH", branch=branch, profile=profile)
-                except Exception:
-                    pass
-                self._raise_engine_submit_error(
-                    ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile
-                )
+        if bundle_concurrency is not None:
+            self._branch_concurrency_guard(
+                branch=branch,
+                profile=profile,
+                bundle_concurrency=bundle_concurrency,
+                headroom_min=headroom_min,
+                origin="execute_bundle",
+            )
 
         # 3-c) Soft backpressure: high watermark
         # Priorité business TT/TM > MM : en cas de high watermark, on coupe d'abord la
@@ -2843,6 +2827,7 @@ class ExecutionEngine:
         if cid is not None:
             job["cid"] = cid
         try:
+            self._increment_active_bundle(branch, profile)
             self.order_queue.put_nowait(job)
         except asyncio.QueueFull:
             # Mise à jour des gauges best-effort
@@ -2858,9 +2843,13 @@ class ExecutionEngine:
             except Exception:
                 pass
             # Map sur le namespace Engine
+            self._decrement_active_bundle(branch, profile)
             self._raise_engine_submit_error(
                 ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile
             )
+        except Exception:
+            self._decrement_active_bundle(branch, profile)
+            raise
 
         # 5) Mise à jour des gauges en succès + mémorisation CID
         try:
@@ -3346,6 +3335,117 @@ class ExecutionEngine:
             pass
         raise err
 
+    def _branch_profile_key(self, branch: str | None, profile: str | None) -> tuple[str, str]:
+        return (str(branch or "UNKNOWN").upper(), str(profile or "UNKNOWN").upper())
+
+    def _active_bundle_count(self, branch: str, profile: str) -> int:
+        try:
+            return int(self._active_bundle_counts.get(self._branch_profile_key(branch, profile), 0))
+        except Exception:
+            return 0
+
+    def _increment_active_bundle(self, branch: str, profile: str) -> None:
+        try:
+            key = self._branch_profile_key(branch, profile)
+            self._active_bundle_counts[key] = int(self._active_bundle_counts.get(key, 0)) + 1
+        except Exception:
+            pass
+
+    def _decrement_active_bundle(self, branch: str, profile: str) -> None:
+        try:
+            key = self._branch_profile_key(branch, profile)
+            cur = int(self._active_bundle_counts.get(key, 0))
+            if cur <= 1:
+                self._active_bundle_counts.pop(key, None)
+            else:
+                self._active_bundle_counts[key] = cur - 1
+        except Exception:
+            pass
+
+    def _effective_bundle_cap(self, bundle_concurrency: Any, headroom_min: int) -> Optional[int]:
+        try:
+            return max(max(int(bundle_concurrency), 0) - max(0, int(headroom_min)), 0)
+        except Exception:
+            return None
+
+    def _branch_concurrency_guard(
+        self,
+        *,
+        branch: str,
+        profile: str,
+        bundle_concurrency: Any,
+        headroom_min: int,
+        origin: str,
+    ) -> tuple[Optional[int], int]:
+        active_count = self._active_bundle_count(branch, profile)
+        eff_cap = self._effective_bundle_cap(bundle_concurrency, headroom_min)
+
+        if eff_cap is not None and active_count >= eff_cap:
+            try:
+                logger.info(
+                    "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH (%s) branch=%s profile=%s active=%s eff_cap=%s",
+                    origin,
+                    branch,
+                    profile,
+                    active_count,
+                    eff_cap,
+                )
+            except Exception:
+                pass
+            try:
+                self._engine_backpressure_metric("CAP_BRANCH", branch=branch, profile=profile)
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile
+            )
+
+        return eff_cap, active_count
+
+    def _release_active_bundle(self, payload: dict) -> None:
+        try:
+            if (payload or {}).get("type") not in {"bundle", "rebalancing"}:
+                return
+            meta = (payload or {}).get("meta") or {}
+            branch = str(meta.get("branch") or "").upper()
+            profile = str(meta.get("capital_profile") or "").upper()
+            if branch and profile:
+                self._decrement_active_bundle(branch, profile)
+        except Exception:
+            pass
+
+    def _require_branch_profile(self, meta: dict) -> tuple[str, str]:
+        """Valide et extrait branch/capital_profile depuis meta (contrat Macro 6-B-1)."""
+        meta = meta or {}
+        branch = str(meta.get("branch") or "").upper()
+        profile = str(meta.get("capital_profile") or "").upper()
+
+        if not branch or branch not in ALLOWED_BRANCHES:
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: branch invalide dans meta (%s)",
+                    branch or "MISSING",
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BAD_META_BRANCH, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
+            )
+
+        if not profile or profile not in ALLOWED_CAPITAL_PROFILES:
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: capital_profile invalide dans meta (%s)",
+                    profile or "MISSING",
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BAD_META_PROFILE, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
+            )
+
+        return branch, profile
+
     async def submit(self, bundle: dict):
         """
         Soumission non-bloquante:
@@ -3383,17 +3483,7 @@ class ExecutionEngine:
         # 1-bis) Langage commun de capacité (branch / profil / caps_local)
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
-        branch = str(
-            meta.get("branch")
-            or meta.get("kind")
-            or bundle.get("strategy")
-            or route.get("strategy")
-            or ""
-        ).upper() or "UNKNOWN"
-        profile = str(
-            meta.get("capital_profile")
-            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
-        ).upper()
+        branch, profile = self._require_branch_profile(meta)
 
         # 1-ter) Garde technique alias / capital_mode (Ticket 4-ENG-1 / 4-ENG-2)
         capital_mode = str(meta.get("capital_mode") or "OK").upper()
@@ -3552,14 +3642,25 @@ class ExecutionEngine:
         except Exception:
             branch_depth = 0
 
+        branch_active = self._active_bundle_count(branch, profile)
+        eff_cap = self._effective_bundle_cap(bundle_concurrency, headroom_min)
+
+        try:
+            if hasattr(self, "obs_hist"):
+                self.obs_hist("engine_branch_active", float(branch_active))
+                if inflight_cap is not None:
+                    self.obs_hist("rm_inflight_cap", float(inflight_cap))
+        except Exception:
+            pass
+
         # Observabilité business: ratio profondeur / inflight_cap si fourni par RM
         try:
-            if inflight_cap and branch_depth is not None and hasattr(self, "obs_hist"):
+            if inflight_cap and hasattr(self, "obs_hist"):
                 try:
                     eff_inflight_cap = max(1, int(inflight_cap))
                     inflight_util = max(
                         0.0,
-                        min(100.0, 100.0 * float(branch_depth) / float(eff_inflight_cap)),
+                        min(100.0, 100.0 * float(branch_active) / float(eff_inflight_cap)),
                     )
                     self.obs_hist("engine_branch_inflight_util_pct", inflight_util)
                 except Exception:
@@ -3576,10 +3677,9 @@ class ExecutionEngine:
                 if queue_max:
                     util_pct = max(0.0, min(100.0, 100.0 * float(depth) / float(queue_max)))
                     self.obs_hist("engine_queue_util_pct", util_pct)
-                if bundle_concurrency and branch_depth is not None:
+                if bundle_concurrency and eff_cap is not None and eff_cap > 0:
                     try:
-                        eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
-                        br_util_pct = max(0.0, min(100.0, 100.0 * float(branch_depth) / float(eff_cap)))
+                        br_util_pct = max(0.0, min(100.0, 100.0 * float(branch_active) / float(eff_cap)))
                         self.obs_hist("engine_branch_capacity_util_pct", br_util_pct)
                     except Exception:
                         pass
@@ -3609,21 +3709,14 @@ class ExecutionEngine:
                 self._raise_engine_submit_error(ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile)
 
                 # 2-b) Hard backpressure: caps_local par branche (optionnel)
-        if bundle_concurrency is not None and branch_depth is not None:
-            try:
-                eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
-            except Exception:
-                eff_cap = None
-            if eff_cap and branch_depth >= eff_cap:
-                try:
-                    logger.info(
-                                      "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH branch=%s profile=%s depth=%s eff_cap=%s",
-                        branch, profile, branch_depth, eff_cap,
-                    )
-                except Exception:
-                    pass
-                self._engine_backpressure_metric("CAP_BRANCH", branch=branch, profile=profile)
-                self._raise_engine_submit_error(ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile)
+        if bundle_concurrency is not None:
+            self._branch_concurrency_guard(
+                branch=branch,
+                profile=profile,
+                bundle_concurrency=bundle_concurrency,
+                headroom_min=headroom_min,
+                origin="submit",
+            )
 
         # 2-c) Soft backpressure: high watermark
         # Priorité business TT/TM > MM : en cas de high watermark, on coupe d'abord la
@@ -3678,8 +3771,13 @@ class ExecutionEngine:
         job.setdefault("type", "bundle")
         job["cid"] = cid
 
-        await self.order_queue.put(job)
-        self._seen_cids[cid] = now
+        self._increment_active_bundle(branch, profile)
+        try:
+            await self.order_queue.put(job)
+            self._seen_cids[cid] = now
+        except Exception:
+            self._decrement_active_bundle(branch, profile)
+            raise
 
         try:
             if hasattr(self, "obs_hist"):
@@ -3886,6 +3984,10 @@ class ExecutionEngine:
         self._submit_ts_ns.clear()
         self._ack_marked.clear()
         self._ack_ring.clear()
+        try:
+            self._active_bundle_counts.clear()
+        except Exception:
+            pass
 
         logger.info("[ExecutionEngine] 🛑 Stoppé.")
         set_engine_running(False)
@@ -3901,6 +4003,7 @@ class ExecutionEngine:
     async def _worker_loop(self, wid: int):
         try:
             while self.running:
+                payload = None
                 try:
                     payload = await asyncio.wait_for(self.order_queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
@@ -3944,6 +4047,11 @@ class ExecutionEngine:
                     self.stats.execution_latency = time.time() - t0
                     self.stats.last_trade_time = time.time()
                     observe_engine_latency(self.stats.execution_latency)
+                    try:
+                        if payload is not None:
+                            self._release_active_bundle(payload)
+                    except Exception:
+                        pass
                     self.order_queue.task_done()
         except asyncio.CancelledError:
             logger.info(f"[ExecutionEngine/W{wid}] annulé.")
