@@ -55,7 +55,7 @@ Unités
 - spread_bps : base points (10 bps = 10.0). Équivalent fraction = bps / 10_000.
 - min_bps_boost : fraction (5 bps = 0.0005).
 """
-
+import math
 import time
 from collections import deque, defaultdict
 from statistics import median
@@ -176,91 +176,171 @@ class VolatilityManager:
         except Exception as exc:
             log.warning("volatility event sink failed: %s", exc, exc_info=False)
 
-    def get_current_metrics(self, pair: str) -> dict:
+    def get_current_metrics(self, pair: Optional[str]) -> Dict[str, Any]:
         """
-        Retourne un snapshot lisible par le RM (zéro I/O):
-          { 'pair':..., 'ewma_bps':float, 'p95_bps':float, 'band':'normal|modere|eleve',
-            'last_spread_bps':float, 'last_ts':float, 'age_s':float, 'samples':int }
-        Tolérant aux différentes implémentations internes (historiques/caches).
+        Snapshot lisible des métriques de volatilité.
+
+        Retourne un dict avec au moins :
+            {
+                "pair": str | None,
+                "ewma_bps": float,
+                "p95_bps": float,
+                "band": "normal" | "modere" | "eleve",
+                "last_spread_bps": float,
+                "last_ts": float | None,
+                "age_s": float,
+                "samples": int,
+                "ewma_vol_bps": float,
+                "p95_vol_bps": float,
+                "last_age_s": float,
+            }
+
+        - Si `pair` est fourni : snapshot pour cette paire.
+          On privilégie `_pair_metrics_cache` (alimenté par step()), puis on retombe
+          sur `_aggregate_pair_metrics` si nécessaire.
+        - Si `pair` est None : vue globale basée sur le cache (agrégation des paires connues).
         """
-        pk = _norm_pair(pair)
         now = _now()
 
-        # Historiques potentiels
-        hist = None
-        for cand in ("history_by_pair", "_pair_history", "_hist_by_pair", "_history"):
-            hist = getattr(self, cand, {}).get(pk) if hasattr(self, cand) else None
-            if hist:
-                break
+        # --- 1) Vue globale (pair=None) ---
+        if pair is None:
+            cache = self._pair_metrics_cache or {}
+            if not cache:
+                return {
+                    "pair": None,
+                    "ewma_bps": 0.0,
+                    "p95_bps": 0.0,
+                    "band": "normal",
+                    "last_spread_bps": 0.0,
+                    "last_ts": None,
+                    "age_s": float("inf"),
+                    "samples": 0,
+                    "ewma_vol_bps": 0.0,
+                    "p95_vol_bps": 0.0,
+                    "last_age_s": float("inf"),
+                }
 
-        # EWMA/P95 potentiels
-        ewma = None
-        for cand in ("ewma_by_pair", "_ewma_by_pair", "_ewma"):
-            d = getattr(self, cand, None)
-            if isinstance(d, dict):
-                ewma = d.get(pk)
-                if ewma is not None:
-                    break
+            def _collect_float(key: str) -> list[float]:
+                vals: list[float] = []
+                for rec in cache.values():
+                    v = rec.get(key)
+                    if v is None:
+                        continue
+                    try:
+                        vals.append(float(v))
+                    except (TypeError, ValueError):
+                        continue
+                return vals
 
-        p95 = None
-        for cand in ("p95_by_pair", "_p95_by_pair", "_p95"):
-            d = getattr(self, cand, None)
-            if isinstance(d, dict):
-                p95 = d.get(pk)
-                if p95 is not None:
-                    break
+            ewma_list = _collect_float("ewma_bps")
+            p95_list = _collect_float("p95_bps")
 
-        # Dernier point & âge
-        last_spread = None
-        last_ts = None
-        if hist:
-            try:
-                item = hist[-1] if isinstance(hist, (list, tuple)) else list(hist)[-1]
-                last_spread = float(item.get("spread_bps", item.get("bps", 0.0)))
-                last_ts = float(item.get("ts", 0.0))
-            except Exception:
-                pass
+            last_ts_list: list[float] = []
+            for rec in cache.values():
+                ts = rec.get("last_ts")
+                if isinstance(ts, (int, float)):
+                    last_ts_list.append(float(ts))
 
-        # Prudence via API existante si dispo
+            if last_ts_list:
+                last_ts = max(last_ts_list)
+                age_s = max(0.0, now - last_ts)
+            else:
+                last_ts = None
+                age_s = float("inf")
+
+            bands = {str(rec.get("band") or "").lower() for rec in cache.values()}
+            if "eleve" in bands:
+                band = "eleve"
+            elif "modere" in bands:
+                band = "modere"
+            else:
+                band = "normal"
+
+            samples = 0
+            for rec in cache.values():
+                v = rec.get("samples")
+                try:
+                    samples += int(v)
+                except (TypeError, ValueError):
+                    continue
+
+            return {
+                "pair": None,
+                "ewma_bps": median(ewma_list) if ewma_list else 0.0,
+                "p95_bps": median(p95_list) if p95_list else 0.0,
+                "band": band,
+                "last_spread_bps": 0.0,
+                "last_ts": last_ts,
+                "age_s": age_s,
+                "samples": samples,
+                "ewma_vol_bps": median(ewma_list) if ewma_list else 0.0,
+                "p95_vol_bps": median(p95_list) if p95_list else 0.0,
+                "last_age_s": age_s,
+            }
+
+        # --- 2) Vue par paire ---
+        pk = _norm_pair(pair)
+
+        # 2a) D'abord le cache instantané
+        cached = self._pair_metrics_cache.get(pk)
+        if isinstance(cached, dict) and cached:
+            out = dict(cached)
+            out.setdefault("pair", pk)
+
+            # Normalise quelques champs et recalcule l'âge si possible
+            ts = out.get("last_ts")
+            if isinstance(ts, (int, float)):
+                try:
+                    age_s = max(0.0, now - float(ts))
+                    out["age_s"] = age_s
+                    out["last_age_s"] = age_s
+                except Exception:
+                    pass
+            else:
+                out.setdefault("age_s", float("inf"))
+                out.setdefault("last_age_s", out.get("age_s", float("inf")))
+
+            # Alias cohérents
+            out.setdefault("ewma_vol_bps", float(out.get("ewma_bps", 0.0)))
+            out.setdefault("p95_vol_bps", float(out.get("p95_bps", 0.0)))
+            if "last_spread_bps" not in out and "last_bps" in out:
+                out["last_spread_bps"] = float(out.get("last_bps", 0.0))
+            out.setdefault("samples", int(out.get("n_samples", 0)))
+
+            # Prudence FR si absente
+            out.setdefault("band", self.get_prudence(pk))
+            return out
+
+        # 2b) Fallback : agrégation par pair via l'état interne moderne
+        met = self._aggregate_pair_metrics(pk)
+
+        last_age_s = float(met.get("last_age_s", float("inf")))
+        if math.isfinite(last_age_s):
+            last_ts = now - last_age_s
+        else:
+            last_ts = 0.0
+
         try:
-            band = self.get_prudence(pk)  # "normal" | "modere" | "eleve"
+            band = self.get_prudence(pk)
         except Exception:
             band = "normal"
 
-        # Fallbacks : si pas d’ewma/p95 en cache, recalcule vite sur les N derniers
-        if (ewma is None or p95 is None) and hist:
-            vals = []
-            for it in (hist if len(hist) <= 240 else hist[-240:]):
-                try:
-                    vals.append(float(it.get("spread_bps", it.get("bps", 0.0))))
-                except Exception:
-                    pass
-            if vals:
-                if ewma is None:
-                    a = getattr_float(self, "ewma_alpha", 0.18)
-                    e = 0.0
-                    for v in vals:
-                        e = a * v + (1 - a) * e
-                    ewma = e
-                if p95 is None:
-                    vals_sorted = sorted(vals)
-                    idx = max(0, min(len(vals_sorted) - 1, int(0.95 * (len(vals_sorted) - 1))))
-                    p95 = vals_sorted[idx]
-
-        age_s = (now - last_ts) if last_ts else float("inf")
-        snapshot = {
+        snapshot: Dict[str, Any] = {
             "pair": pk,
-            "ewma_bps": float(ewma or 0.0),
-            "p95_bps": float(p95 or 0.0),
+            "ewma_bps": float(met.get("ewma_bps", 0.0)),
+            "p95_bps": float(met.get("p95_bps", 0.0)),
             "band": str(band or "normal"),
-            "last_spread_bps": float(last_spread or 0.0),
-            "last_ts": float(last_ts or 0.0),
-            "age_s": float(age_s),
-            "samples": int(len(hist) if hist is not None else 0),
-            "ewma_vol_bps": float(ewma or 0.0),
-            "p95_vol_bps": float(p95 or 0.0),
-            "last_age_s": float(age_s),
+            "last_spread_bps": float(met.get("last_bps", 0.0)),
+            "last_ts": float(last_ts),
+            "age_s": float(last_age_s),
+            "samples": int(met.get("n_samples", 0)),
+            "ewma_vol_bps": float(met.get("ewma_bps", 0.0)),
+            "p95_vol_bps": float(met.get("p95_bps", 0.0)),
+            "last_age_s": float(last_age_s),
         }
+
+        # On met à jour le cache pour les prochains appels
+        self._pair_metrics_cache[pk] = dict(snapshot)
         return snapshot
 
 
@@ -471,6 +551,77 @@ class VolatilityManager:
         État de prudence courant ("normal" | "modere" | "eleve").
         """
         return self._pair_prudence.get(_norm_pair(pair), "normal")
+
+    def get_prudence_key(self, pair: str) -> str:
+        """
+        Variante "clé de config" de get_prudence().
+
+        Retourne une valeur normalisée pour la configuration :
+            - "NORMAL"
+            - "CAREFUL"
+            - "ALERT"
+
+        En cas d'erreur ou de valeur inattendue, retourne "NORMAL".
+        """
+        pk = _norm_pair(pair)
+        fr_state = self.get_prudence(pk)
+        try:
+            key = self._prudence_key_for_cfg(fr_state)
+        except Exception:
+            # Défensif : on ne laisse jamais passer une valeur exotique.
+            key = "NORMAL"
+
+        key = str(key or "").upper()
+        if key not in ("NORMAL", "CAREFUL", "ALERT"):
+            return "NORMAL"
+        return key
+
+    def last_age_seconds(self, _opp: Optional[Any] = None) -> float:
+        """
+        Age (en secondes) de la dernière observation de volatilité/spread.
+
+        L'argument est volontairement ignoré pour l'instant : on renvoie une vue
+        globale via get_current_metrics(pair=None), ce qui suffit à la garde TTL
+        du RiskManager (pipeline vol frais / pas frais).
+
+        Retourne +inf s'il n'y a aucune donnée.
+        """
+        try:
+            metrics = self.get_current_metrics(pair=None)
+        except Exception:
+            return float("inf")
+
+        try:
+            return float(metrics.get("last_age_s", metrics.get("age_s", float("inf"))))
+        except Exception:
+            return float("inf")
+
+
+    def get_p95_bps(self, pair: str) -> float:
+        """
+        Retourne la volatilité p95 en bps pour `pair`.
+
+        - Source principale : cache `_pair_metrics_cache` alimenté par `step()`.
+        - Fallback : recalcul via `_aggregate_pair_metrics(pair)` si le cache est vide
+          ou incohérent.
+
+        :param pair: symbole logique (ex: "ETHUSDC").
+        :return: p95_bps (float, base points).
+        """
+        pk = _norm_pair(pair)
+
+        # 1) Essaie d'abord le cache instantané
+        met = self._pair_metrics_cache.get(pk)
+        if not isinstance(met, dict):
+            # 2) Fallback : agrégation directe sur les historiques
+            met = self._aggregate_pair_metrics(pk)
+            # On met à jour le cache pour les prochains appels
+            self._pair_metrics_cache[pk] = dict(met)
+
+        try:
+            return float(met.get("p95_bps", 0.0))
+        except Exception:
+            return 0.0
 
     # ---------------------------- API principale ------------------------------
 

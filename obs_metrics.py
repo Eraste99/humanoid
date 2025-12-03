@@ -678,10 +678,84 @@ ENGINE_RETRIES_TOTAL = _metric(Counter, 'engine_retries_total', 'Engine retries'
 ENGINE_QUEUEPOS_BLOCKED_TOTAL = _metric(Counter, 'engine_queuepos_blocked_total', 'Engine TM queuepos blocked', ['exchange', 'pair'])
 ENGINE_SUBMIT_QUEUE_DEPTH = _metric(Gauge, 'engine_submit_queue_depth', 'Engine submit queue depth')
 INFLIGHT_GAUGE = _metric(Gauge, 'engine_inflight', 'Engine inflight orders')
+
+# --- PnL live (Engine → Prometheus) ---
+# PNL_LIVE_DAY_USD :
+#   - Somme du net_profit réalisé pour la journée locale courante,
+#     exprimée dans la devise PnL canonique (USDC/EUR) définie côté config.
+#   - La "journée" est définie par région (EU/US/UTC) via la logique
+#     de PnLAggregator (_now_local_day / reset par région).
+#   - Vue live / best-effort de monitoring : la vérité PnL "comptable"
+#     reste la DB SQLite gérée par LogWriter.
+
 PNL_LIVE_DAY_USD = _metric(Gauge, 'pnl_live_day_usd', 'Live PnL for the current local day (USD)', ['region', 'branch', 'mode'])
+
+# TRADES_LIVE_DAY_TOTAL :
+#   - Compteur de trades du jour classés par résultat "win" / "loss" / "flat",
+#     selon le signe de net_profit ou, à défaut, de net_profit_sign.
+
 TRADES_LIVE_DAY_TOTAL = _metric(Counter, 'trades_live_day_total', 'Trades live day total', ['result'])
+# DERIVED_NET_PROFIT_SIGN_TOTAL :
+#   - Compteur de trades pour lesquels seul le signe net_profit_sign a été utilisé
+#     (net_profit manquant ou jugé peu exploitable) pour classer win / loss / flat.
+
 DERIVED_NET_PROFIT_SIGN_TOTAL = _metric(Counter, 'derived_net_profit_sign_total', 'Derived net profit sign (fallback)', ['reason'])
+
 MISSING_NET_PROFIT_TOTAL = _metric(Counter, 'missing_net_profit_total', 'Missing net profit values', ['stage'])
+# MISSING_NET_PROFIT_TOTAL :
+#   - Compteur de trades pour lesquels aucun PnL exploitable n'était disponible
+#     au moment de l'agrégation live (ni net_profit ni net_profit_sign utilisable).
+
+# --- PnL reconciliation CEX ↔ DB (M5-D-2) ----------------------
+# Ces métriques sont alimentées par LoggerHistoriqueManager lorsqu'il
+# exécute une reco PnL pour une journée donnée:
+#   - PNL_RECO_LAST_RUN_TS_SECONDS:
+#       timestamp (epoch seconds) du dernier run réussi pour la région.
+#   - PNL_RECO_STATE:
+#       état de la reco pour (region, exchange, account_alias):
+#       0 = OK, 1 = WARN, 2 = CRIT.
+#   - PNL_RECO_ABS_DIFF_QUOTE:
+#       |PnL_CEX - PnL_DB| exprimé dans la devise PnL canonique (ex. USDC).
+#   - PNL_RECO_MISMATCH_TOTAL:
+#       compteur de mismatches classés par niveau ("WARN"/"CRIT").
+#   - PNL_RECO_ERRORS_TOTAL:
+#       erreurs rencontrées pendant la reco (CEX unreachable, DB error, ...).
+
+PNL_RECO_LAST_RUN_TS_SECONDS = _metric(
+    Gauge,
+    'pnl_reco_last_run_ts_seconds',
+    'Last PnL reconciliation run (epoch seconds)',
+    ['region'],
+)
+
+PNL_RECO_STATE = _metric(
+    Gauge,
+    'pnl_reco_state',
+    'PnL reconciliation state (0=OK,1=WARN,2=CRIT)',
+    ['region', 'exchange', 'account_alias'],
+)
+
+PNL_RECO_ABS_DIFF_QUOTE = _metric(
+    Gauge,
+    'pnl_reco_abs_diff_quote',
+    'Absolute PnL diff between CEX and DB (quote currency)',
+    ['region', 'exchange', 'account_alias'],
+)
+
+PNL_RECO_MISMATCH_TOTAL = _metric(
+    Counter,
+    'pnl_reco_mismatch_total',
+    'PnL reconciliation mismatches by severity',
+    ['region', 'exchange', 'account_alias', 'level'],
+)
+
+PNL_RECO_ERRORS_TOTAL = _metric(
+    Counter,
+    'pnl_reco_errors_total',
+    'PnL reconciliation errors',
+    ['region', 'exchange', 'account_alias', 'kind'],
+)
+
 
 ENGINE_PACER_DELAY_MS = _metric(
     Gauge,
@@ -1063,6 +1137,82 @@ LOGGERH_JSONL_BYTES = _metric(Gauge, 'loggerh_jsonl_bytes', 'Total size of JSONL
 LOGGERH_DB_STALLS_TOTAL = _metric(Counter, 'loggerh_db_stalls_total', 'DB stalls detected (write delays/backpressure)')
 LOGGERH_DB_FILE_BYTES = _metric(Gauge, 'loggerh_db_file_bytes', 'LoggerHistorique DB file size (bytes)')
 LHM_JSONL_QUEUE_CAP = _metric(Gauge, 'lhm_jsonl_queue_cap', 'Configured JSONL queue capacity (records)')
+
+# --- [LHM SLO] Cibles & lag pipeline LHM (M5-B3) ------------------------------
+
+LHM_PIPELINE_LAG_SECONDS = _metric(
+    Gauge,
+    'lhm_pipeline_lag_seconds',
+    'Approximate end-to-end lag of LHM pipeline (seconds, event→JSONL/DB)',
+)
+
+LHM_SLO_WRITE_MS_P95_TARGET = _metric(
+    Gauge,
+    'lhm_slo_write_ms_p95_target',
+    'Target p95 write latency (ms) for LHM JSONL pipeline',
+)
+
+LHM_SLO_QUEUE_DEPTH_MAX_TARGET = _metric(
+    Gauge,
+    'lhm_slo_queue_depth_max_target',
+    'Target max JSONL queue depth (records) for CRIT/WARN SLO',
+)
+
+LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET = _metric(
+    Gauge,
+    'lhm_slo_pipeline_lag_max_seconds_target',
+    'Target max allowed LHM pipeline lag (seconds)',
+)
+
+LHM_SLO_DROPPED_TRADES_BUDGET = _metric(
+    Gauge,
+    'lhm_slo_dropped_trades_budget',
+    'Budget of dropped JSONL trade records per observation window',
+)
+
+
+def lhm_set_pipeline_lag(seconds: float) -> None:
+    """
+    Helper best-effort pour mettre à jour le lag pipeline LHM (event→JSONL/DB).
+
+    Appelé côté LoggerHistoriqueManager quand on connaît un lag end-to-end
+    approximatif (ex: now - last_db_flush_ts ou similar).
+    """
+    try:
+        LHM_PIPELINE_LAG_SECONDS.set(max(0.0, float(seconds)))
+    except Exception:
+        # Observabilité best-effort, ne casse jamais le flux métier
+        pass
+
+
+def _load_lhm_slo_targets_from_env() -> None:
+    """
+    Initialise les cibles SLO LHM depuis l'environnement.
+
+    Ces valeurs sont exposées comme "targets" uniquement :
+    - le calcul p95/violations se fait côté Prometheus ou CentralWatchdog.
+    """
+    try:
+        write_ms = float(_os.getenv('LHM_SLO_WRITE_MS_P95_TARGET', '250.0'))
+        queue_max = float(_os.getenv('LHM_SLO_QUEUE_DEPTH_MAX_TARGET', '2000'))
+        lag_max = float(_os.getenv('LHM_SLO_LAG_SECONDS_MAX_TARGET', '5.0'))
+        dropped_budget = float(_os.getenv('LHM_SLO_DROPPED_TRADES_BUDGET', '0.0'))
+    except Exception:
+        # ENV invalide → on n'écrase rien, on ne casse pas l'import
+        return
+    try:
+        LHM_SLO_WRITE_MS_P95_TARGET.set(write_ms)
+        LHM_SLO_QUEUE_DEPTH_MAX_TARGET.set(queue_max)
+        LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET.set(lag_max)
+        LHM_SLO_DROPPED_TRADES_BUDGET.set(dropped_budget)
+    except Exception:
+        # Best-effort
+        pass
+
+
+# Initialisation one-shot des SLO (M5-B3)
+_load_lhm_slo_targets_from_env()
+
 
 def loggerh_observe_write_ms(dt_ms: float) -> None:
     try:
@@ -2290,4 +2440,24 @@ __all__ += [
     'RM_CAPITAL_MOVE_VISIBILITY_TOTAL',
     'RM_CAPITAL_MOVE_TOTAL',
     'RM_CAPITAL_MOVE_NOTIONAL_USD',
+# --- nouveaux exports M5-B3 (LHM SLO) ---
+    'LHM_PIPELINE_LAG_SECONDS',
+    'LHM_SLO_WRITE_MS_P95_TARGET',
+    'LHM_SLO_QUEUE_DEPTH_MAX_TARGET',
+    'LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET',
+    'LHM_SLO_DROPPED_TRADES_BUDGET',
+    'lhm_set_pipeline_lag',
+    "VOL_PRICE_VOL_MICRO",
+    "VOL_SPREAD_VOL_MICRO",
+    "VOL_PRICE_PCTL",
+    "VOL_SPREAD_PCTL",
+    "VOL_ANOMALY_TOTAL",
+    "VOL_SIGNAL_STATE",
+    "VOL_BAND_TOTAL",
+    "VOL_AGE_SECONDS",
+    "SLIP_AGE_SECONDS",
+    "set_vol_age_seconds",
+    "set_slip_age_seconds",
+    "FEE_SNAPSHOT_AGE_SECONDS",
+    "TOTAL_COST_BPS",
 ]

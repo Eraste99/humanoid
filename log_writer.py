@@ -3,6 +3,12 @@ from __future__ import annotations
 """
 LogWriter — writer SQLite avec rotation quotidienne + schéma étendu (tri-CEX).
 
+Rôle dans la chaîne LHM (M5-B2-1):
+- La base SQLite gérée par LogWriter est la **source de vérité PnL / comptable**.
+  → Toutes les vues PnL online, funnels et dashboards doivent s’appuyer sur cette DB.
+- Les fichiers JSONL gérés par LoggerHistoriqueManager sont complémentaires (forensic/replay),
+  mais ne doivent pas être utilisés comme base de calcul PnL “officielle”.
+
 Points clés:
 - Colonnes supplémentaires trades: trade_mode, account_alias, sub_account_id, IDs, latences,
   scores, **route/buy_ex/sell_ex/leg_role** (tri-CEX).
@@ -80,10 +86,83 @@ logger = logging.getLogger("LogWriter")
 
 class LogWriter:
     """
-    - Rotation quotidienne par fichier: logs/trades_log_YYYY-MM-DD.db
-    - Tables: trades, pair_history, opportunities, alerts, latency
-    - Ajout de colonnes manquantes via ALTER TABLE (idempotent)
-    - PRAGMA WAL + busy_timeout pour meilleure concurrence
+    LogWriter — writer SQLite avec rotation quotidienne + schéma étendu (tri-CEX).
+
+    Points clés:
+- Tous les agrégats PnL "sérieux" (jour, rolling, par dimension) doivent être calculés
+    à partir de cette base, via des requêtes SQL centralisées dans ce module.
+    → Les autres composants (RiskManager, dashboards, outils de reco) doivent consommer
+    ces vues agrégées plutôt que recalculer un PnL ad hoc sur les JSONL ou sur des
+    streams en mémoire.
+-   Les colonnes PnL et qualité PnL de la table `trades` (net_profit, fees,
+    net_profit_sign, pnl_missing, pnl_derived_from_bps, etc.) constituent le contrat
+    canonique pour la ligne PnL : toute logique de PnL doit s'appuyer sur ces champs.
+    - Colonnes supplémentaires trades: trade_mode, account_alias, sub_account_id, IDs, latences,
+      scores, **route/buy_ex/sell_ex/leg_role** (tri-CEX).
+    - Tables additionnelles: opportunities (avec trade_mode/route_id), alerts, pair_history (+ latency_ms_avg),
+      **latency** (pipeline scanner→engine→ack→fills).
+    - Idempotence via _ensure_columns (ALTER TABLE ADD COLUMN si manquants).
+    - Rotation quotidienne par date (un fichier trades_log_YYYY-MM-DD.db par db_dir / région),
+      complétée par une rotation size/age via rotate_if_needed(max_bytes,max_age_s) (M5-B2-2).
+    - Les rotations sont atomiques: wal_checkpoint(TRUNCATE) + move + (optionnel) compression gzip,
+      ce qui garantit qu’aucune ligne validée n’est perdue lors d’un rollover.
+    - **Nouveaux utilitaires**: `wal_checkpoint(mode)` et `optimize()`; checkpoint avant backup/rotation.
+
+    Points clés:
+- Colonnes supplémentaires trades: trade_mode, account_alias, sub_account_id, IDs, latences,
+  scores, **route/buy_ex/sell_ex/leg_role** (tri-CEX).
+- Tables additionnelles: opportunities (avec trade_mode/route_id), alerts, pair_history (+ latency_ms_avg),
+  **latency** (pipeline scanner→engine→ack→fills).
+- Tous les agrégats PnL "sérieux" (jour, rolling, par dimension) doivent être calculés
+  à partir de cette base, via des requêtes SQL centralisées dans ce module. Les autres
+  composants (RiskManager, dashboards, outils de reco) consomment les vues agrégées
+  exposées ici, plutôt que de recalculer du PnL ad hoc.
+- Vues PnL multi-dimensions (M5-C v2-B) — contrat cible `pnl_multiview`:
+  {
+    "component": "pnl_multiview",
+    "base_currency": "USDC" | "EUR",
+    "window": {"since_ms": int, "until_ms": int},
+    "as_of_ts": float,
+    "pnl_global": PnlRow,
+    "pnl_by_exchange": [PnlRow, ...],
+    "pnl_by_account": [PnlRow, ...],
+    "pnl_by_branch": [PnlRow, ...],
+    "quality_global": {
+      "trades": int,
+      "pnl_missing": int,
+      "pnl_missing_share": float,
+      "derived_from_bps": int,
+      "derived_share": float,
+    },
+  }
+
+  Où chaque `PnlRow` a la forme:
+  {
+    "dimensions": {...},   # ex: {}, {"exchange": "BINANCE"}, {"exchange": "BINANCE","account_alias": "EU_TT_01"}, {"branch": "TT","exchange": "BYBIT"}
+    "pnl": {
+      "net_profit": float,      # somme net_profit sur la fenêtre (base_currency)
+      "fees": float,            # somme fees
+      "turnover_quote": float,  # somme abs(notional_quote) si dispo, sinon 0.0
+      "trades": int,
+      "wins": int,
+      "losses": int,
+      "win_rate": float,        # wins / max(1, wins+losses)
+    },
+    "quality": {
+      "pnl_missing": int,       # trades sans PnL exploitable
+      "pnl_missing_share": float,   # pnl_missing / trades si trades>0, sinon 0.0
+      "derived_from_bps": int,      # trades avec pnl_derived_from_bps=1
+      "derived_share": float,       # derived_from_bps / trades si trades>0, sinon 0.0
+    },
+  }
+
+  Vues prévues:
+  - pnl_global      → 1 ligne agrégée (dimensions = {}).
+  - pnl_by_exchange → 1 ligne par exchange (dimensions = {"exchange": "<CEX>"}).
+  - pnl_by_account  → 1 ligne par (exchange, account_alias).
+  - pnl_by_branch   → 1 ligne par (branch, exchange), branch dérivé de trade_mode (TT/TM/MM/REB…).
+
+
     """
 
     # ---------------------- utils canon ----------------------
@@ -168,6 +247,15 @@ class LogWriter:
 
 
     def _daily_db_path(self) -> str:
+        """
+               Retourne le chemin DB “du jour” pour ce db_dir.
+
+               Convention M5-B2-2:
+               - db_dir est attendu spécifique à une région/pod (ex: /var/lib/bot/EU/loggerh),
+               - le nom du fichier encode la date: trades_log_YYYY-MM-DD.db.
+               Plusieurs rotations intra-journalières peuvent exister via rotate_now()
+               (suffixe timestamp + .gz), mais ce chemin représente toujours la DB courante.
+               """
         return os.path.join(self.db_dir, f"trades_log_{self._current_date.isoformat()}.db")
 
 
@@ -198,19 +286,13 @@ class LogWriter:
                 for k, v in tf.items():
                     payload.setdefault(k, v)
 
-                # 4) net_profit_sign si absent (on ne calcule PAS net_profit ici)
-                if "net_profit_sign" not in payload or payload["net_profit_sign"] is None:
-                    try:
-                        np = payload.get("net_profit")
-                        if isinstance(np, (int, float)) and np != 0:
-                            payload["net_profit_sign"] = 1 if np > 0 else -1
-                        else:
-                            # fallback par bps si dispo
-                            nbps = payload.get("net_bps") or payload.get("spread_net_final_bps")
-                            if isinstance(nbps, (int, float)) and nbps != 0:
-                                payload["net_profit_sign"] = 1 if nbps > 0 else -1
-                    except Exception:
-                        pass  # best-effort
+                # 4) net_profit_sign : supposé déjà dérivé côté LHM
+                #    (fallback centralisé dans LoggerHistoriqueManager._fallback_net_profit_sign)
+                #    Ici on ne fait que passer la valeur telle quelle jusqu'à la DB.
+                #    Si net_profit_sign est absent, le trade sera visible comme “PnL incomplet”
+                #    dans les analyses, ce qui est voulu (pas de dérivation locale).
+
+
                 # 5) Filtrage colonnes connues
                 payload = {k: v for k, v in payload.items() if k in cols}
 
@@ -511,12 +593,16 @@ class LogWriter:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_latency_ts ON latency(t_scanner_ms);")
 
         conn.commit()
-        # [PATCH-SCHEMA] Tags SPLIT / profil / pacer (idempotent)
+        # [PATCH-SCHEMA] Tags SPLIT / profil / pacer + qualité PnL (idempotent)
         self._ensure_columns(conn, "trades", {
             "deployment_mode": "TEXT",
             "pod_region": "TEXT",
             "capital_profile": "TEXT",
             "pacer_mode": "TEXT",
+            # [M5-A3-5] Qualité PnL centralisée par le LHM
+            "net_profit_sign": "INTEGER",
+            "pnl_missing": "INTEGER",
+            "pnl_derived_from_bps": "INTEGER",
         })
 
         self._ensure_columns(conn, "opportunities", {
@@ -845,6 +931,623 @@ class LogWriter:
                     out["latency"]["by_stage"]["e2e"] = _avg("t_all_filled_ms - t_scanner_ms")
 
         return out
+
+    def compute_pnl_views(self, since_ms: int | None = None, until_ms: int | None = None) -> dict:
+        """
+        Agrégats PnL multi-vues sur la fenêtre [since_ms, until_ms].
+
+        Implémentation B2-1/B2-2 :
+          - construit un conteneur "pnl_multiview" complet,
+          - renseigne la vue globale (`pnl_global`) et `quality_global`,
+          - construit également les vues par exchange / account / branch lorsque
+            les colonnes nécessaires sont disponibles dans la table `trades`.
+
+        Logique :
+          - filtre les lignes de `trades` sur ts_ms si la colonne est disponible,
+          - agrège net_profit, fees, executed_volume_usdc, net_profit_sign,
+            pnl_missing, pnl_derived_from_bps,
+          - calcule wins / losses / win_rate et les ratios de qualité.
+        """
+        import time
+        import sqlite3
+
+        now_ms = int(time.time() * 1000)
+        if since_ms is None:
+            since_ms = now_ms - 24 * 3600 * 1000
+        if until_ms is None:
+            until_ms = now_ms
+
+        # Conteneur de sortie "canonique" (M5-C v2-B)
+        out: dict[str, Any] = {
+            "component": "pnl_multiview",
+            # Devise PnL canonique ; pourra être rendue configurable plus tard
+            "base_currency": "USDC",
+            "window": {"since_ms": int(since_ms), "until_ms": int(until_ms)},
+            "as_of_ts": time.time(),
+            "pnl_global": {
+                "dimensions": {},
+                "pnl": {
+                    "net_profit": 0.0,
+                    "fees": 0.0,
+                    "turnover_quote": 0.0,
+                    "trades": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "win_rate": 0.0,
+                },
+                "quality": {
+                    "pnl_missing": 0,
+                    "pnl_missing_share": 0.0,
+                    "derived_from_bps": 0,
+                    "derived_share": 0.0,
+                },
+            },
+            "pnl_by_exchange": [],
+            "pnl_by_account": [],
+            "pnl_by_branch": [],
+            "quality_global": {
+                "trades": 0,
+                "pnl_missing": 0,
+                "pnl_missing_share": 0.0,
+                "derived_from_bps": 0,
+                "derived_share": 0.0,
+            },
+        }
+
+        try:
+            with sqlite3.connect(self.db_path, timeout=10) as conn:
+                cur = conn.cursor()
+                # Vérifie la présence de la table trades
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='trades';")
+                if not cur.fetchone():
+                    return out
+
+                # Colonnes disponibles
+                cur.execute("PRAGMA table_info(trades);")
+                cols = {row[1] for row in cur.fetchall()}
+
+                # Clause WHERE temporelle best-effort
+                if "ts_ms" in cols:
+                    where = "WHERE ts_ms BETWEEN ? AND ?"
+                    args = (since_ms, until_ms)
+                else:
+                    where = ""
+                    args = tuple()
+
+                # Nombre total de trades
+                cur.execute(f"SELECT COUNT(1) FROM trades {where};", args)
+                total_trades_row = cur.fetchone()
+                try:
+                    total_trades = int(total_trades_row[0] if total_trades_row else 0)
+                except Exception:
+                    total_trades = 0
+
+                pnl_global = out["pnl_global"]["pnl"]
+                quality_global = out["quality_global"]
+
+                pnl_global["trades"] = total_trades
+                quality_global["trades"] = total_trades
+
+                # Si aucun trade, on retourne le squelette
+                if total_trades == 0:
+                    return out
+
+                metric_cols = [
+                    "net_profit",
+                    "fees",
+                    "executed_volume_usdc",
+                    "net_profit_sign",
+                    "pnl_missing",
+                    "pnl_derived_from_bps",
+                ]
+                dim_cols = ["exchange", "account_alias", "trade_mode"]
+
+                available_metric_cols = [name for name in metric_cols if name in cols]
+                if not available_metric_cols:
+                    return out
+
+                select_cols = list(available_metric_cols)
+                for d in dim_cols:
+                    if d in cols and d not in select_cols:
+                        select_cols.append(d)
+
+                select_clause = ", ".join(select_cols)
+                cur.execute(f"SELECT {select_clause} FROM trades {where};", args)
+
+                sum_net_profit = 0.0
+                sum_fees = 0.0
+                sum_turnover = 0.0
+                wins = 0
+                losses = 0
+                pnl_missing_count = 0
+                derived_from_bps_count = 0
+
+                # Agrégats par dimension
+                by_exchange: dict[str, dict] = {}
+                by_account: dict[tuple[str, str], dict] = {}
+                by_branch: dict[tuple[str, str], dict] = {}
+
+                def _ensure_bucket(store: dict, key):
+                    b = store.get(key)
+                    if b is None:
+                        b = {
+                            "trades": 0,
+                            "net_profit": 0.0,
+                            "fees": 0.0,
+                            "turnover": 0.0,
+                            "wins": 0,
+                            "losses": 0,
+                            "pnl_missing": 0,
+                            "derived_from_bps": 0,
+                        }
+                        store[key] = b
+                    return b
+
+                rows = cur.fetchall()
+                for row in rows:
+                    rec = dict(zip(select_cols, row))
+
+                    # net_profit / fees / turnover
+                    np_raw = rec.get("net_profit")
+                    fee_raw = rec.get("fees")
+                    vol_raw = rec.get("executed_volume_usdc")
+
+                    np_val = None
+                    if np_raw is not None:
+                        try:
+                            np_val = float(np_raw)
+                            sum_net_profit += np_val
+                        except Exception:
+                            np_val = None
+
+                    if fee_raw is not None:
+                        try:
+                            sum_fees += float(fee_raw)
+                        except Exception:
+                            pass
+
+                    vol_val = None
+                    if vol_raw is not None:
+                        try:
+                            vol_val = float(vol_raw)
+                            sum_turnover += abs(vol_val)
+                        except Exception:
+                            vol_val = None
+
+                    # wins / losses (priorité au net_profit_sign si présent)
+                    sign_val = rec.get("net_profit_sign")
+                    sign_int = None
+                    if sign_val is not None:
+                        try:
+                            sign_int = int(sign_val)
+                        except Exception:
+                            sign_int = None
+
+                    # Compteurs globaux wins/losses
+                    if sign_int is not None:
+                        if sign_int > 0:
+                            wins += 1
+                        elif sign_int < 0:
+                            losses += 1
+                    elif np_val is not None:
+                        if np_val > 0:
+                            wins += 1
+                        elif np_val < 0:
+                            losses += 1
+
+                    # Qualité PnL globale
+                    missing_flag = False
+                    if "pnl_missing" in rec:
+                        try:
+                            if int(rec.get("pnl_missing") or 0) != 0:
+                                pnl_missing_count += 1
+                                missing_flag = True
+                        except Exception:
+                            pass
+
+                    derived_flag = False
+                    if "pnl_derived_from_bps" in rec:
+                        try:
+                            if int(rec.get("pnl_derived_from_bps") or 0) != 0:
+                                derived_from_bps_count += 1
+                                derived_flag = True
+                        except Exception:
+                            pass
+
+                    # --- Agrégats par dimension (best-effort) ---
+                    ex = rec.get("exchange")
+                    alias = rec.get("account_alias")
+                    branch = rec.get("trade_mode")
+
+                    # Par exchange
+                    if ex is not None:
+                        b_ex = _ensure_bucket(by_exchange, str(ex))
+                        b_ex["trades"] += 1
+                        if np_val is not None:
+                            b_ex["net_profit"] += np_val
+                        if fee_raw is not None:
+                            try:
+                                b_ex["fees"] += float(fee_raw)
+                            except Exception:
+                                pass
+                        if vol_val is not None:
+                            b_ex["turnover"] += abs(vol_val)
+                        if sign_int is not None:
+                            if sign_int > 0:
+                                b_ex["wins"] += 1
+                            elif sign_int < 0:
+                                b_ex["losses"] += 1
+                        elif np_val is not None:
+                            if np_val > 0:
+                                b_ex["wins"] += 1
+                            elif np_val < 0:
+                                b_ex["losses"] += 1
+                        if missing_flag:
+                            b_ex["pnl_missing"] += 1
+                        if derived_flag:
+                            b_ex["derived_from_bps"] += 1
+
+                    # Par (exchange, account_alias)
+                    if ex is not None and alias is not None:
+                        key_acc = (str(ex), str(alias))
+                        b_acc = _ensure_bucket(by_account, key_acc)
+                        b_acc["trades"] += 1
+                        if np_val is not None:
+                            b_acc["net_profit"] += np_val
+                        if fee_raw is not None:
+                            try:
+                                b_acc["fees"] += float(fee_raw)
+                            except Exception:
+                                pass
+                        if vol_val is not None:
+                            b_acc["turnover"] += abs(vol_val)
+                        if sign_int is not None:
+                            if sign_int > 0:
+                                b_acc["wins"] += 1
+                            elif sign_int < 0:
+                                b_acc["losses"] += 1
+                        elif np_val is not None:
+                            if np_val > 0:
+                                b_acc["wins"] += 1
+                            elif np_val < 0:
+                                b_acc["losses"] += 1
+                        if missing_flag:
+                            b_acc["pnl_missing"] += 1
+                        if derived_flag:
+                            b_acc["derived_from_bps"] += 1
+
+                    # Par (branch, exchange)
+                    if branch is not None and ex is not None:
+                        key_br = (str(branch), str(ex))
+                        b_br = _ensure_bucket(by_branch, key_br)
+                        b_br["trades"] += 1
+                        if np_val is not None:
+                            b_br["net_profit"] += np_val
+                        if fee_raw is not None:
+                            try:
+                                b_br["fees"] += float(fee_raw)
+                            except Exception:
+                                pass
+                        if vol_val is not None:
+                            b_br["turnover"] += abs(vol_val)
+                        if sign_int is not None:
+                            if sign_int > 0:
+                                b_br["wins"] += 1
+                            elif sign_int < 0:
+                                b_br["losses"] += 1
+                        elif np_val is not None:
+                            if np_val > 0:
+                                b_br["wins"] += 1
+                            elif np_val < 0:
+                                b_br["losses"] += 1
+                        if missing_flag:
+                            b_br["pnl_missing"] += 1
+                        if derived_flag:
+                            b_br["derived_from_bps"] += 1
+
+                # Remplissage des champs globaux
+                pnl_global["net_profit"] = float(sum_net_profit)
+                pnl_global["fees"] = float(sum_fees)
+                pnl_global["turnover_quote"] = float(sum_turnover)
+                pnl_global["wins"] = int(wins)
+                pnl_global["losses"] = int(losses)
+
+                denom = max(1, wins + losses)
+                pnl_global["win_rate"] = float(wins) / float(denom)
+
+                quality = out["pnl_global"]["quality"]
+                quality["pnl_missing"] = int(pnl_missing_count)
+                quality["derived_from_bps"] = int(derived_from_bps_count)
+
+                if total_trades > 0:
+                    quality["pnl_missing_share"] = float(pnl_missing_count) / float(total_trades)
+                    quality["derived_share"] = float(derived_from_bps_count) / float(total_trades)
+                    quality_global["pnl_missing_share"] = quality["pnl_missing_share"]
+                    quality_global["derived_share"] = quality["derived_share"]
+                else:
+                    quality["pnl_missing_share"] = 0.0
+                    quality["derived_share"] = 0.0
+                    quality_global["pnl_missing_share"] = 0.0
+                    quality_global["derived_share"] = 0.0
+
+                quality_global["pnl_missing"] = int(pnl_missing_count)
+                quality_global["derived_from_bps"] = int(derived_from_bps_count)
+
+                # --- Construction des vues multi-dimensions à partir des buckets ---
+
+                def _bucket_to_pnl_row(dimensions: dict, agg: dict) -> dict:
+                    trades_b = int(agg.get("trades") or 0)
+                    wins_b = int(agg.get("wins") or 0)
+                    losses_b = int(agg.get("losses") or 0)
+                    denom_b = max(1, wins_b + losses_b)
+                    win_rate_b = float(wins_b) / float(denom_b)
+                    pnl_missing_b = int(agg.get("pnl_missing") or 0)
+                    derived_b = int(agg.get("derived_from_bps") or 0)
+                    if trades_b > 0:
+                        missing_share_b = float(pnl_missing_b) / float(trades_b)
+                        derived_share_b = float(derived_b) / float(trades_b)
+                    else:
+                        missing_share_b = 0.0
+                        derived_share_b = 0.0
+                    return {
+                        "dimensions": dimensions,
+                        "pnl": {
+                            "net_profit": float(agg.get("net_profit") or 0.0),
+                            "fees": float(agg.get("fees") or 0.0),
+                            "turnover_quote": float(agg.get("turnover") or 0.0),
+                            "trades": trades_b,
+                            "wins": wins_b,
+                            "losses": losses_b,
+                            "win_rate": win_rate_b,
+                        },
+                        "quality": {
+                            "pnl_missing": pnl_missing_b,
+                            "pnl_missing_share": missing_share_b,
+                            "derived_from_bps": derived_b,
+                            "derived_share": derived_share_b,
+                        },
+                    }
+
+                # by_exchange
+                rows_ex = []
+                for ex, agg in by_exchange.items():
+                    dims = {"exchange": ex}
+                    rows_ex.append(_bucket_to_pnl_row(dims, agg))
+                out["pnl_by_exchange"] = rows_ex
+
+                # by_account (exchange, account_alias)
+                rows_acc = []
+                for (ex, alias), agg in by_account.items():
+                    dims = {"exchange": ex, "account_alias": alias}
+                    rows_acc.append(_bucket_to_pnl_row(dims, agg))
+                out["pnl_by_account"] = rows_acc
+
+                # by_branch (branch, exchange)
+                rows_br = []
+                for (branch, ex), agg in by_branch.items():
+                    dims = {"branch": branch, "exchange": ex}
+                    rows_br.append(_bucket_to_pnl_row(dims, agg))
+                out["pnl_by_branch"] = rows_br
+
+        except Exception:
+            # Best-effort : ne doit jamais casser le pipeline appelant
+            logger.exception("compute_pnl_views failed")
+        return out
+
+    def compute_pnl_views_for_local_day(
+        self,
+        local_day: str | None = None,
+        pod_region: str | None = None,
+    ) -> dict:
+        """Agrégats PnL multi-vues pour une journée calendaire locale.
+
+        Cette méthode résout une fenêtre [since_ms, until_ms] correspondant à un
+        `local_day` donné dans la timezone associée à `pod_region` (EU/US, etc.),
+        puis délègue le calcul des agrégats à :meth:`compute_pnl_views`.
+
+        Paramètres
+        ----------
+        local_day:
+            Jour local au format ``'YYYY-MM-DD'`` dans la timezone de
+            ``pod_region``. Si None, utilise la date locale du jour courant.
+        pod_region:
+            Région logique du pod ("EU", "US", ...). Si None, on utilise le
+            même fallback que `_derive_time_fields` (EU → Europe/Rome).
+
+        Retour
+        ------
+        dict
+            Structure "pnl_multiview" identique à :meth:`compute_pnl_views`,
+            mais avec la fenêtre temporelle calée sur la journée locale.
+        """  # noqa: E501
+        from datetime import datetime, timezone, timedelta
+        import time
+
+        # Résolution robuste de la timezone locale à partir de pod_region
+        region = (pod_region or "EU").upper()
+        tz_name = _REGION_TZ.get(region, "Europe/Rome")
+
+        # Choix du jour local à couvrir
+        try:
+            if local_day:
+                local_day_str = str(local_day).strip()
+            else:
+                # Date locale "aujourd'hui" dans la timezone du pod
+                if ZoneInfo is not None:
+                    dt_loc_now = datetime.now(ZoneInfo(tz_name))
+                else:
+                    dt_loc_now = datetime.now()
+                local_day_str = dt_loc_now.strftime("%Y-%m-%d")
+
+            # Construction du début/fin de journée locale
+            dt_start_loc = datetime.strptime(local_day_str, "%Y-%m-%d")
+            if ZoneInfo is not None:
+                dt_start_loc = dt_start_loc.replace(tzinfo=ZoneInfo(tz_name))
+            else:
+                # Fallback: on suppose que dt_start_loc est déjà en UTC
+                dt_start_loc = dt_start_loc.replace(tzinfo=timezone.utc)
+
+            dt_end_loc = dt_start_loc + timedelta(days=1)
+
+            dt_start_utc = dt_start_loc.astimezone(timezone.utc)
+            dt_end_utc = dt_end_loc.astimezone(timezone.utc)
+
+            since_ms = int(dt_start_utc.timestamp() * 1000)
+            # Fenêtre [start, next_day) → on enlève 1 ms pour rester inclusif
+            until_ms = int(dt_end_utc.timestamp() * 1000) - 1
+        except Exception:
+            # Fallback best-effort : 24h glissantes
+            now_ms = int(time.time() * 1000)
+            since_ms = now_ms - 24 * 3600 * 1000
+            until_ms = now_ms
+
+        return self.compute_pnl_views(since_ms=since_ms, until_ms=until_ms)
+
+
+    def compute_pnl_summary(self, since_ms: int | None = None, until_ms: int | None = None) -> dict:
+        """
+        Petits agrégats PnL "comptables" sur la fenêtre [since_ms, until_ms].
+
+        Basé exclusivement sur la table `trades`:
+        - somme net_profit (quote),
+        - somme fees (quote),
+        - nombre total de trades,
+        - gains/pertes (wins/losses),
+        - compteurs de qualité PnL (pnl_missing, pnl_derived_from_bps).
+
+        Best-effort: si la table/colonnes n'existent pas, retourne des zéros sans lever d'exception.
+        """
+        import sqlite3, time
+
+        now_ms = int(time.time() * 1000)
+        if since_ms is None:
+            since_ms = now_ms - 24 * 3600 * 1000
+        if until_ms is None:
+            until_ms = now_ms
+
+        out = {
+            "window": {"since_ms": since_ms, "until_ms": until_ms},
+            "pnl": {
+                "net_profit": 0.0,
+                "fees": 0.0,
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "pnl_missing": 0,
+                "derived_from_bps": 0,
+            },
+        }
+
+        # Si la DB n'existe pas encore, on retourne les valeurs par défaut.
+        if not os.path.exists(self.db_path):
+            return out
+
+        def _has_cols(conn, table: str, names: set[str]) -> set[str]:
+            cur = conn.cursor()
+            cur.execute(f"PRAGMA table_info({table});")
+            cols = {r[1] for r in cur.fetchall()}
+            return names & cols
+
+        with sqlite3.connect(self.db_path, timeout=10) as conn:
+            cur = conn.cursor()
+
+            needed = {"ts_ms", "net_profit", "fees", "net_profit_sign", "pnl_missing", "pnl_derived_from_bps"}
+            cols = _has_cols(conn, "trades", needed)
+
+            # Si la table trades n'existe pas ou ne contient aucune des colonnes attendues,
+            # on retourne simplement la structure par défaut.
+            if not cols:
+                return out
+
+            where = ""
+            params: tuple = ()
+            if "ts_ms" in cols:
+                where = " WHERE ts_ms BETWEEN ? AND ?"
+                params = (since_ms, until_ms)
+
+            # net_profit + nombre total de trades
+            try:
+                if "net_profit" in cols:
+                    cur.execute(f"SELECT COALESCE(SUM(net_profit), 0.0), COUNT(1) FROM trades{where};", params)
+                else:
+                    cur.execute(f"SELECT 0.0, COUNT(1) FROM trades{where};", params)
+                row = cur.fetchone() or (0.0, 0)
+                net_profit_sum = float(row[0] or 0.0)
+                trades_count = int(row[1] or 0)
+            except Exception:
+                # best-effort: en cas d'erreur, on préfère retourner l'out partiel
+                return out
+
+            # fees
+            fees_sum = 0.0
+            if "fees" in cols:
+                try:
+                    cur.execute(f"SELECT COALESCE(SUM(fees), 0.0) FROM trades{where};", params)
+                    fees_row = cur.fetchone() or (0.0,)
+                    fees_sum = float(fees_row[0] or 0.0)
+                except Exception:
+                    fees_sum = 0.0
+
+            # wins / losses
+            wins = losses = 0
+            try:
+                if "net_profit_sign" in cols:
+                    cur.execute(
+                        f"""SELECT
+                        SUM(CASE WHEN net_profit_sign > 0 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN net_profit_sign < 0 THEN 1 ELSE 0 END)
+                        FROM trades{where};""",
+                        params,
+                    )
+                elif "net_profit" in cols:
+                    cur.execute(
+                        f"""SELECT
+                        SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN net_profit < 0 THEN 1 ELSE 0 END)
+                        FROM trades{where};""",
+                        params,
+                    )
+                row = cur.fetchone() or (0, 0)
+                wins = int(row[0] or 0)
+                losses = int(row[1] or 0)
+            except Exception:
+                wins = losses = 0
+
+            # flags de qualité PnL
+            pnl_missing = 0
+            if "pnl_missing" in cols:
+                try:
+                    cur.execute(
+                        f"SELECT SUM(CASE WHEN pnl_missing THEN 1 ELSE 0 END) FROM trades{where};",
+                        params,
+                    )
+                    row = cur.fetchone() or (0,)
+                    pnl_missing = int(row[0] or 0)
+                except Exception:
+                    pnl_missing = 0
+
+            derived_from_bps = 0
+            if "pnl_derived_from_bps" in cols:
+                try:
+                    cur.execute(
+                        f"SELECT SUM(CASE WHEN pnl_derived_from_bps THEN 1 ELSE 0 END) FROM trades{where};",
+                        params,
+                    )
+                    row = cur.fetchone() or (0,)
+                    derived_from_bps = int(row[0] or 0)
+                except Exception:
+                    derived_from_bps = 0
+
+        out["pnl"]["net_profit"] = net_profit_sum
+        out["pnl"]["fees"] = fees_sum
+        out["pnl"]["trades"] = trades_count
+        out["pnl"]["wins"] = wins
+        out["pnl"]["losses"] = losses
+        out["pnl"]["pnl_missing"] = pnl_missing
+        out["pnl"]["derived_from_bps"] = derived_from_bps
+
+        return out
+
 
     def insert_opportunity(self, **opp):
         """

@@ -369,10 +369,26 @@ class BaseTradeLogger:
 
         vwap_buy = self._to_float(trade.get("vwap_buy"))
         vwap_sell = self._to_float(trade.get("vwap_sell"))
-        spread_net_final = self._to_float(self._first(trade.get("spread_net_final"), trade.get("net_bps")))
+
+        # [M5-A3-3] net_bps canonique (on normalise ici la source bps)
+        net_bps = self._to_float(
+            self._first(
+                trade.get("net_bps"),
+                trade.get("spread_net_final"),
+                trade.get("spread_net_final_bps"),
+            )
+        )
+        # On conserve spread_net_final pour compatibilité, en le mirroring sur net_bps
+        spread_net_final = net_bps
+
         slippage = self._to_float(trade.get("slippage"))
+        # NB: fees est supposé être déjà agrégé en QUOTE (USDC/EUR). Aucune recomposition ici.
         fees = self._to_float(trade.get("fees"))
-        net_profit = self._to_float(trade.get("net_profit")) or 0.0
+
+        # [M5-A3-3] Surtout NE PAS forcer net_profit à 0.0 :
+        #   - None = "PnL non calculé"
+        #   - 0.0  = "trade réellement flat"
+        net_profit = self._to_float(trade.get("net_profit"))
 
         pair_score = self._to_float(trade.get("pair_score"))
         pair_rank = self._to_int(trade.get("pair_rank"))
@@ -460,6 +476,8 @@ class BaseTradeLogger:
             "vwap_buy": vwap_buy,
             "vwap_sell": vwap_sell,
             "spread_net_final": spread_net_final,
+            # [M5-A3-3] champs canonique en bps pour toute la chaîne LHM/DB/PnL
+            "net_bps": net_bps,
 
             "route": route,
             "buy_ex": buy_ex,

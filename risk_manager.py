@@ -660,8 +660,11 @@ class RiskManager:
         • **Seuil dynamique** min_required_bps basé sur la vol (télémétrie set_dynamic_min).
         • **Fast-path** (spread, frais+slip, fraîcheur OB) et modes TT/TM.
         • **TM**: helpers maker/taker, profondeur, bascule NON_NEUTRAL.
-        • **Simu dual parallèle** si supportée: `simulate_both_parallel()`.
+        •         • **Simu dual parallèle** si supportée: `simulate_both_parallel()`.
         • **Verrou d’exécution** par (exchange, alias, pair) côté Engine.
+        • **Pacer infra partagé**: EnginePacer comme source unique des signaux infra
+          (pacer_mode, pacing_ms, inflight_max), consommés par le RM via set_pacer_mode()
+          pour dériver trade_mode (rm_mode × pacer_mode).
         • **Pipeline transferts internes** (wallet / sous-comptes).
 
     NOTE: toutes les quantités « volume_usdc » sont interprétées comme **notionnels en devise de cotation**
@@ -707,7 +710,7 @@ class RiskManager:
             transfer_clients: Optional[Dict[str, Any]] = None,
             # Readiness (nouveau)
             ready_event: asyncio.Event | None = None,
-
+            history_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
 
         base_cfg = bot_cfg or config
@@ -715,6 +718,45 @@ class RiskManager:
         self.config = base_cfg  # alias explicite conservé
         self.cfg = base_cfg
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
+        self.history_logger = history_logger
+        # --- Résumé des caps globaux par profil (Macro 3 / M3-A) ---
+        # Best-effort uniquement, pour debug / observabilité. Aucune logique RM ne s'appuie
+        # sur cette structure (les décisions restent basées sur caps_trading_by_profile,
+        # inflight_rebal_by_profile et combo_cap_usd_by_profile).
+        self._profile_caps_summary: Dict[str, Dict[str, float | int]] = {}
+        try:
+            rm_cfg = getattr(self.cfg, "rm", None)
+            if rm_cfg is not None:
+                inflight = getattr(rm_cfg, "inflight_trading_by_profile", {}) or {}
+                caps = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
+                reb_inflight = getattr(rm_cfg, "inflight_rebal_by_profile", {}) or {}
+                combo_caps = getattr(rm_cfg, "combo_cap_usd_by_profile", {}) or {}
+
+                for prof, inflight_total in (inflight or {}).items():
+                    prof_u = str(prof).upper()
+                    prof_caps = (
+                            caps.get(prof_u)
+                            or caps.get(prof)
+                            or {}
+                    )
+                    tt = int(prof_caps.get("TT") or 0)
+                    tm = int(prof_caps.get("TM") or 0)
+                    mm = int(prof_caps.get("MM") or 0)
+                    reb = int(reb_inflight.get(prof_u) or reb_inflight.get(prof) or 0)
+                    combo = float(combo_caps.get(prof_u) or combo_caps.get(prof) or 0.0)
+
+                    self._profile_caps_summary[prof_u] = {
+                        "inflight_trading": int(inflight_total),
+                        "caps_tt": tt,
+                        "caps_tm": tm,
+                        "caps_mm": mm,
+                        "caps_trading_sum": tt + tm + mm,
+                        "inflight_rebal": reb,
+                        "combo_cap_usd": combo,
+                    }
+        except Exception:
+            # Purement décoratif : ne doit jamais casser l'init du RM
+            self._profile_caps_summary = {}
 
         self.inventory_cap_quote = _cfg_float(
             self.cfg, "inventory_cap_quote",
@@ -739,10 +781,27 @@ class RiskManager:
         self.tm_exposure_ttl_hedge_ratio = _cfg_float(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50)
         self.tm_nn_hedge_ratio = _cfg_float(self.cfg, "tm_nn_hedge_ratio", 0.65)
 
+        # --- TM TTL & hedge policy (source unique pour l'Engine) ---
+        # Ces champs sont les SEULES sources de vérité pour TM :
+        # - tm_exposure_ttl_ms : TTL d'exposition TM (ms)
+        # - tm_exposure_ttl_hedge_ratio : ratio hedge en mode NEUTRAL
+        # - tm_nn_hedge_ratio : ratio hedge cible en mode NON_NEUTRAL
+        self.tm_exposure_ttl_ms = _cfg_int(self.cfg, "tm_exposure_ttl_ms", 2500)
+        self.tm_exposure_ttl_hedge_ratio = _cfg_float(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50)
+        self.tm_nn_hedge_ratio = _cfg_float(self.cfg, "tm_nn_hedge_ratio", 0.65)
+
         # Sink optionnel pour les drops de bundles (shadow, simu, recorder…)
         # Horizon métier maximum d'exposition TM NON_NEUTRAL (secondes).
         # Utilisé pour alimenter meta["tm"]["max_exposure_s"] sur les bundles TM/REB.
         self.tm_nn_max_exposure_s = _cfg_float(self.cfg, "tm_nn_max_exposure_s", 3.0)
+
+        # Queue-position TM (ahead en QUOTE/USD) + ETA max (ms)
+        # Ces valeurs servent de fallback canonique pour tm_controls envoyés à l'Engine.
+        rm_cfg = getattr(self.cfg, "rm", self.cfg)
+        self.tm_queuepos_max_ahead_usd = _cfg_float(rm_cfg, "tm_queuepos_max_ahead_usd", 25000.0)
+        self.tm_queuepos_max_eta_ms = _cfg_int(rm_cfg, "tm_queuepos_max_eta_ms", 0)
+        # Alias "absolu" (aujourd'hui = ahead) pour compat tm_controls["queuepos_max_usd"].
+        self.tm_queuepos_max_usd = self.tm_queuepos_max_ahead_usd
 
         self._shadow = None
 
@@ -1277,11 +1336,24 @@ class RiskManager:
 
     def _get_pnl_day_pct(self) -> float:
         """
-        Source flexible:
-          - si self.pnl_guard_provider est défini (callable) => l’utiliser,
-          - sinon, fallback sur self.pnl_day_pct (si exposé ailleurs),
-          - sinon 0.0 (guard inactif).
-        """
+               Retourne le PnL réalisé du jour sous forme de fraction du capital
+               de référence (ex: 0.01 = +1 %, -0.005 = -0.5 %).
+
+               Contrat :
+                 - Si `self.pnl_guard_provider` est défini et callable, il est utilisé
+                   comme source principale. Il doit être de la forme Callable[[], float]
+                   et renvoyer un PnL jour en pourcentage, idéalement calculé à partir
+                   des agrégats PnL de la DB (LogWriter / LoggerHistoriqueManager).
+                   Le provider doit être non bloquant (pas d'I/O lourde) et ne pas lever
+                   d'exception ; en cas de problème, il doit retourner une valeur neutre.
+                 - Sinon, on se rabat sur `self.pnl_day_pct` si cet attribut est exposé
+                   ailleurs, avec la même convention de signe.
+                 - En dernier recours, cette méthode retourne 0.0 (guard inactif) en cas
+                   d'absence de source ou d'erreur.
+
+               NB : cette méthode ne calcule pas elle-même le PnL ; elle délègue à un
+               provider externe ou à un champ déjà mis à jour par une autre boucle.
+               """
         try:
             prov = getattr(self, "pnl_guard_provider", None)
             if callable(prov):
@@ -1725,35 +1797,142 @@ class RiskManager:
 
         return True, ""
 
-    def _record_engine_backpressure(self, reason: str) -> None:
+    def _record_mm_disabled(
+        self,
+        by: str,
+        *,
+        branch: str | None = None,
+        profile: str | None = None,
+    ) -> None:
         """
-        Compteur dédié aux rejets Engine (namespace rm_engine_reject_total) et hook pacer.
-        Dégrade le pacer si des BACKPRESSURE Queue/Cap se répètent.
+        Observabilité RM — savoir qui a coupé MM (RM / PACER / CAPITAL).
+
+        `by` doit être l'un de "RM", "PACER", "CAPITAL" (fallback "UNKNOWN").
         """
-        code = str(reason or "").upper()
+        try:
+            by_label = str(by or "UNKNOWN").upper()
+            if by_label not in ("RM", "PACER", "CAPITAL"):
+                by_label = "UNKNOWN"
+
+            branch_label = str(branch or "MM").upper() or "MM"
+            profile_label = str(profile or "UNKNOWN").upper() or "UNKNOWN"
+
+            if hasattr(self, "obs_inc"):
+                self.obs_inc(
+                    "rm_mm_disabled_total",
+                    by=by_label,
+                    branch=branch_label,
+                    profile=profile_label,
+                )
+        except Exception:
+            # Pure obs : jamais bloquant
+            pass
+
+
+    def _record_engine_backpressure(
+            self,
+            reason: str,
+            branch: str | None = None,
+            profile: str | None = None,
+    ) -> None:
+        """
+        Compteur dédié aux rejets Engine (backpressure) + hook Pacer.
+
+        - Normalise les raisons (alias courts → constantes ENGINE_BACKPRESSURE_*).
+        - Compte les occurrences par code interne (ENGINE_BACKPRESSURE_*).
+        - Dégrade le Pacer si des BACKPRESSURE Queue/Cap se répètent.
+        - Publie un compteur spécifique rm_engine_backpressure_total{type, branch, profile}
+          + un compteur générique via inc_blocked (obs légère).
+        """
+        # Normalisation basique des alias (robustesse aux sources hétérogènes)
+        raw = str(reason or "").upper().strip()
+        alias_map = {
+            # Alias courts éventuels
+            "QUEUE_FULL": ENGINE_BACKPRESSURE_QUEUE_FULL,
+            "CAP_BRANCH": ENGINE_BACKPRESSURE_CAP_BRANCH,
+            "HIGH_WM": ENGINE_BACKPRESSURE_HIGH_WM,
+            "MM_HIGH_WM": ENGINE_BACKPRESSURE_HIGH_WM,
+            # Codes Engine canoniques
+            ENGINE_BACKPRESSURE_QUEUE_FULL: ENGINE_BACKPRESSURE_QUEUE_FULL,
+            ENGINE_BACKPRESSURE_CAP_BRANCH: ENGINE_BACKPRESSURE_CAP_BRANCH,
+            ENGINE_BACKPRESSURE_HIGH_WM: ENGINE_BACKPRESSURE_HIGH_WM,
+        }
+        code = alias_map.get(raw, raw)
+
+        # Type canonique pour les métriques RM (vue agrégée)
+        # NOTE: ENGINE_BACKPRESSURE_HIGH_WM est utilisé pour les rejets MM_HIGH_WM
+        # dans l'Engine (branche MM), on le mappe donc sur "MM_HIGH_WM".
+        bp_type = "OTHER"
+        if code == ENGINE_BACKPRESSURE_QUEUE_FULL or raw == "QUEUE_FULL":
+            bp_type = "QUEUE_FULL"
+        elif code == ENGINE_BACKPRESSURE_CAP_BRANCH or raw == "CAP_BRANCH":
+            bp_type = "CAP_BRANCH"
+        elif code == ENGINE_BACKPRESSURE_HIGH_WM:
+            bp_type = "MM_HIGH_WM"
+
+        # Compteur interne par code (best-effort)
         try:
             if not hasattr(self, "_engine_backpressure_counts"):
                 self._engine_backpressure_counts = defaultdict(int)
             self._engine_backpressure_counts[code] += 1
         except Exception:
+            # Si on ne peut pas compter proprement, on ne fait rien de plus.
             return
 
+        # Observabilité dédiée côté RM: rm_engine_backpressure_total{type, branch, profile}
+        try:
+            branch_label = (str(branch or "") or "UNKNOWN").upper()
+            profile_label = (str(profile or "") or "UNKNOWN").upper()
+            if hasattr(self, "obs_inc"):
+                self.obs_inc(
+                    "rm_engine_backpressure_total",
+                    type=bp_type,
+                    branch=branch_label,
+                    profile=profile_label,
+                )
+        except Exception:
+            # L'obs ne doit jamais casser la logique de backpressure
+            pass
+
+        # Observabilité légère via inc_blocked (ne casse jamais)
+        try:
+            # category="rm", reason="engine_backpressure", detail=code
+            inc_blocked("rm", "engine_backpressure", code)
+        except Exception:
+            pass
+
+        # Dégradation du Pacer si backpressure dur récurrent
         threshold = int(getattr(self, "engine_backpressure_degrade_threshold", 3) or 3)
         if code in {ENGINE_BACKPRESSURE_QUEUE_FULL, ENGINE_BACKPRESSURE_CAP_BRANCH} and \
                 self._engine_backpressure_counts[code] >= threshold:
             try:
                 logger.warning(
-                    "[RiskManager] pacer degrade source=engine_backpressure reason=%s count=%s", code,
-                    self._engine_backpressure_counts[code]
+                    "[RiskManager] pacer degrade source=engine_backpressure reason=%s count=%s",
+                    code,
+                    self._engine_backpressure_counts[code],
                 )
             except Exception:
                 pass
+            # Macro 7-D : observabilité des dégradations Pacer déclenchées par le RM
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc(
+                        "rm_pacer_degrade_total",
+                        reason=str(code),
+                        source="engine_backpressure",
+                    )
+            except Exception:
+                # L'observabilité ne doit pas empêcher la dégradation Pacer
+                pass
+
             try:
                 if hasattr(self, "pacer") and hasattr(self.pacer, "degrade"):
                     self.pacer.degrade(source="engine_backpressure")
             except Exception:
                 pass
+            # Reset du compteur pour ce code après action
             self._engine_backpressure_counts[code] = 0
+
 
     def _can_reserve_quote(self, ex: str, alias: str, quote: str, usd: float) -> bool:
         """
@@ -1799,18 +1978,27 @@ class RiskManager:
         if getattr(self, "global_kill_switch", False):
             return False, "GLOBAL_KILL_SWITCH"
 
-        # 2) Branch MM désactivée par config.
+        # 2) Branch MM désactivée par config (enable_mm=False).
         if b == "MM" and not bool(getattr(self, "enable_mm", False)):
+            # MM coupé côté RM par simple policy (pas de Pacer / capital ici)
+            try:
+                self._record_mm_disabled("RM", branch=b, profile=p)
+            except Exception:
+                pass
             return False, "MM_DISABLED"
 
         # 3) Mode SEVERE (PnL guard) : MM = 0, les autres branches passent encore.
         mode = str(getattr(self, "rm_mode", "NORMAL") or "NORMAL").upper()
         if mode == "SEVERE" and b == "MM":
+            # MM coupé par le mode SEVERE (PnL-guard)
+            try:
+                self._record_mm_disabled("RM", branch=b, profile=p)
+            except Exception:
+                pass
             return False, "RM_MODE_SEVERE_MM_OFF"
 
         # Hooks futurs : mute par branche/profil, netfloor global, etc.
         return True, ""
-
 
 
     def engine_enqueue_bundle(self, bundle: Dict[str, Any]) -> bool:
@@ -1875,6 +2063,37 @@ class RiskManager:
         trace_id = meta.get("trace_id") or bundle.get("trace_id") or "NA"
         quote = str(meta.get("quote") or "USDC").upper()
 
+        # Macro 7-C — Contexte RM / Engine / Pacer attaché au bundle pour debug
+        try:
+            rm_mode = str(getattr(self, "rm_mode", "NORMAL") or "NORMAL").upper()
+        except Exception:
+            rm_mode = "NORMAL"
+
+        try:
+            pacer_mode = str(getattr(self, "pacer_mode", "UNKNOWN") or "UNKNOWN").upper()
+        except Exception:
+            pacer_mode = "UNKNOWN"
+
+        try:
+            trade_mode = str(getattr(self, "trade_mode", "NORMAL") or "NORMAL").upper()
+        except Exception:
+            trade_mode = "NORMAL"
+
+        ctx = meta.get("rm_engine_pacer_ctx") or {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+
+        # On ne surcharge jamais ce que l'appelant aurait éventuellement posé.
+        ctx.setdefault("rm_mode", rm_mode)
+        ctx.setdefault("trade_mode", trade_mode)
+        ctx.setdefault("pacer_mode", pacer_mode)
+        ctx.setdefault("capital_mode", meta.get("capital_mode", "UNKNOWN"))
+        ctx.setdefault("branch", branch)
+        ctx.setdefault("profile", profile)
+        ctx.setdefault("quote", quote)
+
+        meta["rm_engine_pacer_ctx"] = ctx
+        bundle["meta"] = meta
 
         # 1) Éligibilités de base (branch / profile / pacer / draws / netfloor…)
         eligible, reason = self._is_branch_eligible(branch, profile)
@@ -2116,8 +2335,6 @@ class RiskManager:
         meta["mode_overrides"] = mode_overrides
         bundle["meta"] = meta
 
-
-
         # 4) Passage au moteur
         try:
             accepted = self.engine.execute_bundle(bundle)
@@ -2128,7 +2345,23 @@ class RiskManager:
                     self.obs_inc("rm_engine_reject_total", reason=reason)
             except Exception:
                 pass
-            self._record_engine_backpressure(reason)
+
+            # MM coupé par le plane capital (vu côté Engine)
+            try:
+                reason_u = reason.upper()
+            except Exception:
+                reason_u = str(reason or "").upper()
+
+            if "ENGINE_MM_DISABLED_BY_CAPITAL" in reason_u:
+                try:
+                    self._record_mm_disabled("CAPITAL", branch=branch, profile=profile)
+                except Exception:
+                    pass
+
+            # Backpressure Engine (Queue / Caps / High WM...)
+            # (dépend du patch M7-A : _record_engine_backpressure(reason, branch, profile))
+            self._record_engine_backpressure(reason, branch=branch, profile=profile)
+
             if self._shadow:
                 self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
             return False
@@ -3972,14 +4205,46 @@ class RiskManager:
         return str(abs(hash(base)))
 
     def _current_prudence(self, pair: str) -> str:
-        # Volatility monitor -> RM -> VM : on reste compatible, on essaie de lire l’état courant si dispo
+        """
+        Vue RiskManager de la prudence VM.
+
+        Retourne la clé normalisée "NORMAL" / "CAREFUL" / "ALERT" pour la paire,
+        en s'appuyant sur VolatilityManager si présent. En cas d'erreur ou de VM
+        absent, retourne toujours "NORMAL".
+        """
+        vm = getattr(self, "vol_manager", None)
+        if vm is None:
+            return "NORMAL"
+
         try:
-            vm = getattr(self, "vol_manager", None)
-            if vm and hasattr(vm, "get_prudence_for_pair"):
-                return str(vm.get_prudence_for_pair(pair) or "NORMAL")
+            # API moderne : VolatilityManager vP1+
+            if hasattr(vm, "get_prudence_key"):
+                key = vm.get_prudence_key(pair)
+            else:
+                # Compat : anciennes signatures renvoyant l'état FR.
+                if hasattr(vm, "get_prudence_for_pair"):
+                    fr_state = vm.get_prudence_for_pair(pair)
+                elif hasattr(vm, "get_prudence"):
+                    fr_state = vm.get_prudence(pair)
+                else:
+                    return "NORMAL"
+
+                # Si le VM expose le helper interne, on l'utilise,
+                # sinon on fait un best-effort.
+                if hasattr(vm, "_prudence_key_for_cfg"):
+                    key = vm._prudence_key_for_cfg(fr_state)
+                else:
+                    key = str(fr_state).upper()
+
+            key = str(key or "").upper()
+            if key not in ("NORMAL", "CAREFUL", "ALERT"):
+                return "NORMAL"
+            return key
+
         except Exception:
-            pass
-        return "NORMAL"
+            logging.debug("RM: unable to fetch prudence", exc_info=False)
+            return "NORMAL"
+
 
     def _maybe_reset_daily_budget(self) -> None:
         interval = max(1.0, float(getattr(self, "_budget_reset_interval_s", 86400.0)))
@@ -4300,10 +4565,77 @@ class RiskManager:
             except Exception:
                 # Never break decision path for obs
                 pass
+            # --- Emission LHM: RM → historique unifié (M5-B1-3-A) ---
+            try:
+                self._hist_rm_event(
+                    "rm.decision",
+                    {
+                        "ts_ns": now_ns,
+                        "status": str(status or "").upper(),
+                        "reason": str(reason or ""),
+                        "pair": pair,
+                        "buy_exchange": buy_ex,
+                        "sell_exchange": sell_ex,
+                        "prudence": prudence,
+                        "slippage_kind": slippage_kind,
+                        "strategy": strategy,
+                        "branch": branch,
+                        "profile": profile,
+                        # Tags de contexte utiles pour PnL/audit
+                        "rm_mode": getattr(self, "mode", None),
+                        "pacer_mode": getattr(self, "pacer_mode", None),
+                        "ctx": ctx or None,
+                    },
+                )
+            except Exception:
+                # Jamais de blocage décisionnel à cause de l'historique
+                pass
 
         except Exception:
             # Sécurité maximale : jamais d'exception qui remonte
             logger.exception("[RM] _emit_decision_record failed", exc_info=False)
+
+
+    def _hist_rm_event(self, kind: str, payload: Dict[str, Any]) -> None:
+        """
+        [M5-B1-3-A] Émission best-effort d'un event RiskManager vers l'historique (LHM).
+
+        - kind: étiquette logique (ex: "rm.decision", "reb.detected", "fees.reality_check").
+        - payload: dict déjà structuré par l'appelant.
+
+        Invariants:
+        - Jamais bloquant: si history_logger est absent ou plante, on ignore.
+        - N'ajoute que quelques pivots (module/_kind/ts_ms) si possible.
+        """
+        try:
+            sink = getattr(self, "history_logger", None)
+            if not callable(sink):
+                return
+
+            event = dict(payload or {})
+            # source/module par défaut
+            event.setdefault("module", "RM")
+            event.setdefault("_kind", str(kind))
+
+            # ts_ms: si on a ts_ns, on dérive un pivot ms
+            ts_ns = event.get("ts_ns")
+            if ts_ns is not None and "ts_ms" not in event:
+                try:
+                    event["ts_ms"] = int(int(ts_ns) / 1_000_000)
+                except Exception:
+                    pass
+
+            # stream/log_type pivots génériques — seront recanonisés côté LHM
+            event.setdefault("log_type", "rm")
+            event.setdefault("stream", "rm")
+
+            sink(event)
+        except Exception:
+            # Jamais d'escalade depuis la voie historique
+            try:
+                logger.exception("[RM] _hist_rm_event failed", exc_info=False)
+            except Exception:
+                pass
 
 
     # ==== [ADD THIS METHOD INSIDE class RiskManager] =============================
@@ -4472,6 +4804,55 @@ class RiskManager:
     # ------------------------------------------------------------------
     # Internal event hub (submodules -> RiskManager -> outside)
     # ------------------------------------------------------------------
+    def on_mbf_event(self, event: Dict[str, Any]) -> None:
+        """
+        [M5-B1-3-B] Point d'entrée dédié pour les évènements MultiBalanceFetcher.
+
+        Hypothèse:
+        - Boot appelle MultiBalanceFetcher.set_event_sink(self.on_mbf_event)
+          via _wire_mbf_event_sink().
+
+        Event attendu (capital_refresh):
+          {
+            "type": "capital_refresh",
+            "exchange": "...",
+            "alias": "...",
+            "source": "...",
+            "ts": <float seconds>,
+          }
+        """
+        try:
+            ev_type = str(event.get("type") or "").lower()
+            if ev_type != "capital_refresh":
+                # Pour l'instant on ignore les autres évènements MBF
+                return
+
+            ex = str(event.get("exchange") or "NA").upper()
+            alias = str(event.get("alias") or "NA").upper()
+            source = str(event.get("source") or "unknown")
+            ts = float(event.get("ts") or time.time())
+            ts_ns = int(ts * 1e9)
+
+            payload = {
+                "ts_ns": ts_ns,
+                "module": "MBF",
+                "event": ev_type,
+                "exchange": ex,
+                "alias": alias,
+                "source": source,
+                # On garde la forme brute pour forensic
+                "mbf_event": dict(event or {}),
+            }
+
+            # Event LHM canonicalisé : balance.capital_refresh
+            self._hist_rm_event("balance.capital_refresh", payload)
+        except Exception:
+            try:
+                logger.exception("[RM] on_mbf_event failed", exc_info=False)
+            except Exception:
+                pass
+
+
     def _submodule_event(self, event: Dict[str, Any]) -> None:
         """
         Point d’entrée unique des sous-modules (VOL/SFC/REB/Sim).
@@ -4508,11 +4889,39 @@ class RiskManager:
                         REBAL_DETECTED_TOTAL.labels("detected").inc()
                     except Exception:
                         pass
+                    # [M5-B1-3-A] Mirror REB.detected vers LHM (reb.detected)
+                    try:
+                        self._hist_rm_event(
+                            "reb.detected",
+                            {
+                                "ts_ns": event.get("ts_ns"),
+                                "pair": pair,
+                                "quote": str(event.get("quote") or "NA").upper(),
+                                "status": "DETECTED",
+                            },
+                        )
+                    except Exception:
+                        pass
+
                 elif ev == "planned":
                     q = str(event.get("quote") or "NA").upper()
                     quantum = float(event.get("quantum_quote") or 0.0)
                     try:
                         REBAL_PLAN_QUANTUM_QUOTE.labels(q).set(quantum)
+                    except Exception:
+                        pass
+                    # [M5-B1-3-A] Mirror REB.planned vers LHM (reb.planned)
+                    try:
+                        self._hist_rm_event(
+                            "reb.planned",
+                            {
+                                "ts_ns": event.get("ts_ns"),
+                                "pair": pair,
+                                "quote": q,
+                                "quantum_quote": quantum,
+                                "status": "PLANNED",
+                            },
+                        )
                     except Exception:
                         pass
 
@@ -4533,6 +4942,37 @@ class RiskManager:
                         FEE_MISMATCH_TOTAL.labels(ex, alias, side).inc()
                     except Exception:
                         pass
+            # --- Emission LHM pour les évènements SFC (M5-B1-3) ---
+            try:
+                ts_ns = int(time.time_ns())
+                base_payload = {
+                    "ts_ns": ts_ns,
+                    "module": "SFC",
+                    "event": ev,
+                    # event brut pour forensic / audit
+                    "sfc_event": dict(event or {}),
+                }
+                if ev == "fee_sync_done":
+                    base_payload.update(
+                        {
+                            "exchange": str(event.get("exchange") or "NA").upper(),
+                            "alias": str(event.get("alias") or "NA").upper(),
+                            "last_refresh_ts": float(event.get("last_refresh_ts") or time.time()),
+                        }
+                    )
+                    self._hist_rm_event("feesync.done", base_payload)
+                elif ev == "reality_check_exceeded":
+                    base_payload.update(
+                        {
+                            "exchange": str(event.get("exchange") or "NA").upper(),
+                            "alias": str(event.get("alias") or "NA").upper(),
+                            "side": str(event.get("side") or "NA").upper(),
+                        }
+                    )
+                    self._hist_rm_event("fees.reality_check_exceeded", base_payload)
+            except Exception:
+                # Historique = best-effort, jamais bloquant
+                pass
 
             # VOL: la boucle _loop_volatility publie déjà VOL_* → no-op ici.
 
@@ -4920,6 +5360,21 @@ class RiskManager:
           • SEVERE: PnL-guard ou pacer SEVERE → caps réduits, ioc_only=True, mm_enabled=False.
           • OPPORTUNISTE: rm_mode opportuniste & pacer NORMAL → min_bps ajustés selon sous-mode, caps ≤ profil, mm_enabled policy.
         Côté Engine, TIF doit respecter mode_overrides["ioc_only"] et les jambes maker ne sont créées que si mode_overrides["mm_enabled"] est True.
+                    Structure exposée dans bundle.meta.mode_overrides (snapshot RM "brut") :
+
+              {
+                  "ioc_only": bool,
+                  "mm_enabled": bool,
+                  "rm_mode": rm_mode courant (NORMAL / OPP_VOLUME / OPP_VOL / SEVERE),
+                  "trade_mode": trade_mode courant (NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE),
+                  "stage": "rm_raw",
+                  # optionnel : "submode" pour distinguer OPP_VOLUME vs OPP_VOL
+              }
+
+            L'Engine lira cette structure, appliquera les flags du PACER (mm_frozen,
+            ioc_only infra) et pourra écrire une vue fusionnée avec stage="engine_fused"
+            à des fins d'observabilité.
+
         """
         # Profil capital (fallback safe)
         prof = getattr(self, "capital_profile", None) \
@@ -4974,13 +5429,18 @@ class RiskManager:
                 pass
 
         # Hint pour l'Engine (TM en IOC si nécessaire)
+        # Hint pour l'Engine (TM en IOC si nécessaire)
         self._ioc_only = bool(trade_ov.get("ioc_only", False))
         self._current_mode_overrides = {
             "ioc_only": self._ioc_only,
             "mm_enabled": bool(self.enable_mm),
+            "rm_mode": str(self.rm_mode or "NORMAL").upper(),
+            "trade_mode": str(self.trade_mode or "NORMAL").upper(),
+            "stage": "rm_raw",
         }
         if self.trade_mode == "OPPORTUNISTE" and self.rm_mode in ("OPP_VOLUME", "OPP_VOL"):
             self._current_mode_overrides["submode"] = self.rm_mode
+
         self._last_applied_trade_mode = self.trade_mode
 
     def _latest_book_age_s(self) -> float:
@@ -5062,6 +5522,59 @@ class RiskManager:
         pws_bad = not bool(getattr(self, "private_ws_healthy", True))
 
         return bool(vol_bad or stale_bad or pws_bad)
+
+    def set_pacer_mode(self, mode: str, *, source: str = "engine_pacer") -> None:
+        """
+        Bridge explicite PACER -> RM (Macro 5 / Macro 7-D).
+
+        - Appelé par l'ExecutionEngine / EnginePacer pour pousser un pacer_mode canonique.
+        - N'accepte que: "NORMAL", "CONSTRAINED", "SEVERE" (tout le reste est ramené à "NORMAL").
+        - Ne déclenche PAS la FSM complète ici : _update_trade_mode() reste le point
+          unique de consolidation rm_mode × pacer_mode, appelé dans le tick ou juste
+          avant l'émission d'un bundle.
+
+        Ce contrat évite les setattr sauvages sur le RM et documente clairement le flux
+        PACER → RM.
+        """
+        try:
+            raw = str(mode or "NORMAL").upper()
+        except Exception:
+            raw = "NORMAL"
+
+        if raw not in ("NORMAL", "CONSTRAINED", "SEVERE"):
+            raw = "NORMAL"
+
+        # Valeur précédente pour l'observabilité
+        try:
+            prev = str(getattr(self, "pacer_mode", "NORMAL") or "NORMAL").upper()
+        except Exception:
+            prev = "NORMAL"
+
+        # Mise à jour du pacer_mode consommé par _compute_trade_mode()
+        self.pacer_mode = raw
+
+        # Macro 7-D : observabilité des changements de mode Pacer
+        if prev != raw:
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc(
+                        "rm_pacer_mode_changes_total",
+                        prev=prev,
+                        new=raw,
+                        source=str(source or "engine_pacer"),
+                    )
+            except Exception:
+                # L'observabilité ne doit jamais casser le flux RM
+                pass
+
+        # Best-effort de traçabilité pour le debug/obs
+        try:
+            import time
+            self._last_pacer_mode_ts = float(time.time())
+            self._last_pacer_mode_source = str(source or "engine_pacer")
+        except Exception:
+            pass
+
 
     def _compute_trade_mode(self) -> str:
         """
@@ -5407,12 +5920,6 @@ class RiskManager:
                 self._last_trade_mode_obs = self.trade_mode
 
             self._obs_set_mode_gauges(self.rm_mode, self.trade_mode)
-
-        # ---- Appliquer les overlays du mode courant ----
-        self._apply_mode_overrides()
-        # Tick SPLIT/EU_ONLY auto-fallback après application des overlays
-        self._split_auto_fallback_tick()
-
 
         # ---- Appliquer les overlays du mode courant ----
         self._apply_mode_overrides()
@@ -5781,13 +6288,24 @@ class RiskManager:
         """
         if self.vol_manager is None:
             raise RuntimeError("VolatilityManager non inizializzato")
+
         pk = self._norm_pair(pair)
         ex = str(exchange).upper().strip()
         vb = float(vol_bps)
 
+        # Conversione del timestamp: il RM riceve ts_ns (nanosecondi),
+        # il VolatilityManager lavora in secondi (time.time()).
+        ts: float | None = None
+        if ts_ns is not None:
+            try:
+                ts = float(ts_ns) / 1e9
+            except Exception:
+                # En cas de valeur bizarroïde, on laisse ts=None → VM utilisera _now()
+                ts = None
+
         # Interfaccia hard del VM (già presente nel modulo): ingest_spread_bps(exchange, pair, spread_bps, ts)
-        # vedi definizione in volatility_manager.py【turn23file1:L35-L37】
-        self.vol_manager.ingest_spread_bps(ex, pk, vb, ts=ts_ns)
+        # vedi definizione in volatility_manager.py
+        self.vol_manager.ingest_spread_bps(ex, pk, vb, ts=ts)
 
     def ingest_slippage_bps(self, pair: str, exchange: str, side: str,
                             qty: float, slip_bps: float, ts_ns: int | None = None) -> None:
@@ -6934,16 +7452,25 @@ class RiskManager:
 
         # Giallo (attività degradata esplicita, nessun valore inventato)
         if fee_age <= fee_ttl_tol and vol_age <= vol_ttl_tol:
+            qpos_usd = int(getattr(cfg, "TM_QUEUEPOS_MAX_AHEAD_USD", 25000))
+            qpos_eta_ms = int(getattr(cfg, "TM_QUEUEPOS_MAX_ETA_MS", 0))
+
             return {
                 "reason": "JAUNE_FEE" if fee_age > fee_ttl_strict else "JAUNE_VOL",
                 "tm_controls": {
                     "hedge_ratio": float(
-                        getattr(cfg, "DEGRADED_HEDGE_RATIO", 0.75)) if vol_age > vol_ttl_strict else None,
+                        getattr(cfg, "DEGRADED_HEDGE_RATIO", 0.75)
+                    ) if vol_age > fee_ttl_strict else None,
                     "ttl_ms": int(getattr(cfg, "TM_EXPOSURE_TTL_MS", 2500)),
-                    "queuepos_max_usd": int(getattr(cfg, "TM_QUEUEPOS_MAX_AHEAD_USD", 25000)),
+                    # Canon : ahead_usd ; alias queuepos_max_usd pour compat Engine
+                    "queuepos_max_ahead_usd": qpos_usd,
+                    "queuepos_max_usd": qpos_usd,
+                    "queuepos_max_eta_ms": qpos_eta_ms,
                     "ioc_only": bool(vol_age > vol_ttl_strict),
                 },
-                "caps": {"size_factor": float(getattr(cfg, "DEGRADED_SIZE_FACTOR", 0.7))},
+                "caps": {
+                    "size_factor": float(getattr(cfg, "DEGRADED_SIZE_FACTOR", 0.7))
+                },
                 "min_bps_lift_bps": float(
                     getattr(cfg, "DEGRADED_MIN_BPS_LIFT", 4.0)) if vol_age > vol_ttl_strict else 0.0,
                 "cost_penalty_bps": float(
@@ -7177,6 +7704,94 @@ class RiskManager:
         # clamp industry-like
         size_factor = max(0.30, min(size_factor, 1.00))
         return boost_bps, size_factor, hedge_ratio
+
+    def get_vm_adjustments(self, pair_key: str) -> Dict[str, Any]:
+        """
+        Helper PUBLIC (read-only) pour exposer le "desk vol" canonique basé sur le VolatilityManager.
+
+        Retourne un dict lisible, destiné aux consommateurs externes (Scanner, Obs, dashboards, watchdogs):
+
+            {
+                "pair": <pair normalisée>,
+                "boost_min_required_bps": <float>,   # bps à ajouter au min_required_bps
+                "size_factor": <float>,              # multiplicateur de taille (soft)
+                "neutral_hedge_ratio": <float>,      # hedge ratio neutre dynamique (0.0..1.0)
+                "prudence": "normal|modere|eleve",   # bande de prudence VM
+                "p95_vol_bps": <float>,              # vol micro p95 VM, en bps
+                "ewma_vol_bps": <float>,             # vol micro EWMA VM, en bps
+                "age_s": <float>,                    # âge des données de vol
+            }
+
+        En cas de problème, on retourne une vue neutre:
+            boost_min_required_bps = 0.0, size_factor = 1.0, neutral_hedge_ratio = cfg.tm_exposure_ttl_hedge_ratio.
+        """
+        pk = self._norm_pair(pair_key)
+
+        # Defaults "neutres"
+        boost_bps: float = 0.0
+        size_factor: float = 1.0
+        neutral_hr: float = float(getattr(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50))
+        prudence: str = "normal"
+        p95_vol_bps: float = 0.0
+        ewma_vol_bps: float = 0.0
+        age_s: float = float("inf")
+
+        # 1) Ajustements VM (boost / size / hedge)
+        try:
+            bps_boost, sf, hr = self._vm_adjustments(pk)
+            boost_bps = float(bps_boost)
+            size_factor = float(sf)
+            neutral_hr = float(hr)
+        except Exception:
+            # best-effort: on garde les defaults
+            pass
+
+        # 2) Snapshot des métriques de vol issues du VM (si disponible)
+        vm = getattr(self, "vol_manager", None)
+        if vm is not None and hasattr(vm, "get_current_metrics"):
+            try:
+                met = vm.get_current_metrics(pk) or {}
+                prudence = str(met.get("band", prudence) or prudence)
+                p95_vol_bps = float(met.get("p95_vol_bps", met.get("p95_bps", p95_vol_bps)))
+                ewma_vol_bps = float(met.get("ewma_vol_bps", met.get("ewma_bps", ewma_vol_bps)))
+                age_s = float(met.get("age_s", met.get("last_age_s", age_s)))
+            except Exception:
+                # on ne fait pas échouer l'appel pour des métriques
+                pass
+
+        return {
+            "pair": pk,
+            "boost_min_required_bps": boost_bps,
+            "size_factor": size_factor,
+            "neutral_hedge_ratio": neutral_hr,
+            "prudence": prudence,
+            "p95_vol_bps": p95_vol_bps,
+            "ewma_vol_bps": ewma_vol_bps,
+            "age_s": age_s,
+        }
+
+    def get_volatility_bps(self, pair_key: str) -> float:
+        """
+        Helper PUBLIC minimal pour exposer une vol micro canonique en bps depuis le VolatilityManager.
+
+        Pensé comme hook léger pour des hints Scanner / Obs:
+
+            - retourne p95_vol_bps (ou p95_bps) telle que vue par le VM,
+            - en cas de problème ou si VM absent => 0.0.
+
+        NB: cette vol est en **bps micro (spread L1)**, pas la vol "statistique" du VolatilityMonitor.
+        """
+        pk = self._norm_pair(pair_key)
+        vm = getattr(self, "vol_manager", None)
+        if vm is None or not hasattr(vm, "get_current_metrics"):
+            return 0.0
+
+        try:
+            met = vm.get_current_metrics(pk) or {}
+            return float(met.get("p95_vol_bps", met.get("p95_bps", 0.0)))
+        except Exception:
+            return 0.0
+
 
     def revalidate_arbitrage(
             self,
@@ -7774,6 +8389,19 @@ class RiskManager:
         except Exception:
             neutral_max_exposure_s = nn_max_exposure_s
 
+        # M4-A : override éventuel du hedge NEUTRAL par le VolatilityManager.
+        # On ne fait que serrer/adapter le ratio neutre en fonction de la prudence
+        # (NORMAL/CAREFUL/ALERT). En cas de problème ou si le VM est absent,
+        # on reste sur la valeur canonique.
+        try:
+            _, _, neutral_hr_dyn = self._vm_adjustments(pair_key)
+            if neutral_hr_dyn is not None:
+                neutral_hr = float(neutral_hr_dyn)
+        except Exception:
+            # Best-effort uniquement : pas de hard-fail sur le VM.
+            pass
+
+
         # Edge brut en bps, tel qu'évalué lors du scan / pricing.
         e_sell = float(getattr(self, "last_edge_bps_sell", 0.0))
         e_buy = float(getattr(self, "last_edge_bps_buy", 0.0))
@@ -8197,6 +8825,15 @@ class RiskManager:
         vol_age_s = None
         slip_src = "none"
         vol_src = "none"
+        # TTL strict pour slip/vol (source unique : BotConfig.slip/vol.ttl_s)
+        try:
+            slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s", 2.0))
+        except Exception:
+            slip_ttl_s = 2.0
+        try:
+            vol_ttl_s = float(getattr(getattr(self.bot_cfg, "vol", None), "ttl_s", 5.0))
+        except Exception:
+            vol_ttl_s = 5.0
 
         # Slippage TTL (2s)
         slip_col = getattr(self, "slip_collector", None)
@@ -8217,7 +8854,7 @@ class RiskManager:
                     slip_age_s = None
 
         if slip_age_s is not None:
-            slip_age_ok = slip_age_s <= 2.0
+            slip_age_ok = slip_age_s <= slip_ttl_s
 
         # Volatilité TTL (5s)
         vol_getter = getattr(self, "vol_monitor", None)
@@ -8238,7 +8875,7 @@ class RiskManager:
                     vol_age_s = None
 
         if vol_age_s is not None:
-            vol_age_ok = vol_age_s <= 5.0
+            vol_age_ok = vol_age_s <= vol_ttl_s
 
         if not (slip_age_ok and vol_age_ok):
             if getattr(self, "log", None):
@@ -8527,6 +9164,19 @@ class RiskManager:
         tm_meta: Optional[Dict[str, Any]] = None
 
         # Paramètres d'horizon TM utilisés comme fallback si le RM n'a pas encore posé max_exposure_s.
+        # TTL canonique configuré, éventuellement modulé par prudence VM (down-clamp only).
+        ttl_ms_cfg = int(getattr(self, "tm_exposure_ttl_ms", 2500))
+        ttl_ms_effective = ttl_ms_cfg
+        try:
+            prud = self._current_prudence(pk)
+        except Exception:
+            prud = "NORMAL"
+        prud = str(prud or "NORMAL").upper()
+        if prud == "CAREFUL":
+            ttl_ms_effective = max(400, int(ttl_ms_cfg * 0.75))
+        elif prud == "ALERT":
+            ttl_ms_effective = max(300, int(ttl_ms_cfg * 0.50))
+
         tm_nn_max_exposure_s = float(
             getattr(
                 self,
@@ -8535,9 +9185,7 @@ class RiskManager:
             )
         )
         try:
-            tm_neutral_max_exposure_s = float(
-                getattr(self, "tm_exposure_ttl_ms", 2500)
-            ) / 1000.0
+            tm_neutral_max_exposure_s = float(ttl_ms_effective) / 1000.0
         except Exception:
             tm_neutral_max_exposure_s = tm_nn_max_exposure_s
 
@@ -8603,13 +9251,9 @@ class RiskManager:
                 tm_meta["maker_side"] = "SELL"
             else:
                 tm_meta["maker_side"] = str(tm_meta["maker_side"]).upper()
-                tm_meta["hedge_ratio"] = float(
-                    getattr(
-                        self,
-                        "tm_exposure_ttl_hedge_ratio",
-                        getattr(self, "tm_neutral_hedge_ratio", 0.50),
-                    )
-                )
+            # NB: on ne touche PAS à hedge_ratio ici : il reste celui décidé par decide_tm_mode
+            #     ou par la VM (override neutre). Le fallback canonique est déjà géré plus haut.
+
 
         # Fragmentation suggérée par le Simulateur (industry-grade)
         frag_meta = None
@@ -8632,6 +9276,7 @@ class RiskManager:
                 frag_meta = None
 
         # Contrôles TM (queuepos/TTL/hedge) en meta additifs (facultatifs)
+        # Contrôles TM (queuepos/TTL/hedge) en meta additifs (facultatifs)
         tm_controls = None
         if mode == "TM":
             # Hedge ratio décisionnel = celui du RM dans tm_meta, sinon fallback neutre
@@ -8650,11 +9295,20 @@ class RiskManager:
                     )
                 )
 
+            # Canon : queuepos_max_ahead_usd + ttl_ms
+            # On expose aussi queuepos_max_usd pour compat avec l'Engine existant.
+            qpos = float(getattr(self, "tm_queuepos_max_ahead_usd", 25_000.0))
+            ttl_ms = int(getattr(self, "tm_exposure_ttl_ms", 2500))
+            eta_ms = int(getattr(self, "tm_queuepos_max_eta_ms", 0))
+
             tm_controls = {
-                "queuepos_max_usd": getattr(self, "tm_queuepos_max_usd", 25000),
-                "ttl_ms": getattr(self, "tm_exposure_ttl_ms", 2500),
+                "queuepos_max_ahead_usd": qpos,
+                "queuepos_max_usd": qpos,  # alias legacy
+                "queuepos_max_eta_ms": eta_ms,
+                "ttl_ms": ttl_ms,
                 "hedge_ratio": base_hr,
             }
+
 
         # Merge overrides degraded (si présents)
         if degraded and isinstance(degraded.get("tm_controls"), dict):
@@ -9282,8 +9936,8 @@ class RiskManager:
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
             raise RMError(RM_STALE_VOL)
 
-        # 2) Prudence et source de slippage
-        prudence = vm.get_prudence(pair).upper() if hasattr(vm, "get_prudence") else "UNKNOWN"
+        # 2) Prudence (clé) et source de slippage
+        prudence = self._current_prudence(pair)
         slip_kind = getattr(self, "slippage_source", "ewma")
 
         # 3) Coût total via collecteur unique (SFC)

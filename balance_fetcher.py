@@ -1467,3 +1467,74 @@ class MultiBalanceFetcher:
             FEE_TOKEN_BALANCE.labels(exu, alu, fee_ccy).set(wallet.get(fee_ccy, 0.0))
         except Exception:
             pass
+
+
+class PnlRecoCexAdapter:
+    """
+    Adaptateur PnL pour la réconciliation CEX ↔ DB (M5-D-2 / M5-E-1).
+
+    Rôle:
+    - Réutiliser la config et, si possible, les mêmes clients que BalanceFetcher
+      pour reconstruire un PnL "jour local" par (exchange, account_alias).
+    - Fournir une méthode `fetch_pnl_for_day(...)` compatible avec le runner EOD.
+
+    ⚠️ IMPORTANT:
+    - Cette classe N'ENVOIE AUCUN ORDRE.
+    - Elle ne fait que lire des trades / fills / PnL auprès des CEX.
+    """
+
+    def __init__(self, cfg, balance_fetcher=None):
+        """
+        Paramètres
+        ----------
+        cfg:
+            BotConfig (ou sous-ensemble) déjà utilisé par le BalanceFetcher.
+        balance_fetcher:
+            Instance existante de BalanceFetcher (optionnel). Si None,
+            l'adaptateur peut en instancier une pour réutiliser ses clients.
+            Pour une première version, on peut laisser ce paramètre inutilisé
+            et simplement construire ses propres clients par CEX.
+        """
+        self.cfg = cfg
+        self._bf = balance_fetcher  # facultatif: hook si tu veux réutiliser les clients existants
+
+        # TODO (quand tu voudras): initialiser ici les clients REST/HTTP
+        # par CEX pour récupérer les trades/fills du jour.
+
+    async def fetch_pnl_for_day(
+        self,
+        exchange: str,
+        account_alias: str,
+        local_day: str,
+        region: str,
+    ):
+        """
+        Calcule un PnL jour côté CEX pour (exchange,account_alias).
+
+        Contrat de sortie:
+            {
+                "net_profit_quote": float,
+                "fees_quote": float,
+                "turnover_quote": float,
+                "trades": int,
+            }
+
+        Implémentation minimale attendue (à faire quand tu seras prêt):
+        - Résoudre la fenêtre temporelle [start_of_day, end_of_day] dans
+          la timezone de `region` (EU/US).
+        - Appeler les endpoints trades/fills de la CEX pour cet account_alias.
+        - Rejouer les trades pour calculer:
+            * net_profit_quote (dans la quote canonique, ex. USDC),
+            * fees_quote,
+            * turnover_quote,
+            * trades (compte de fills / executions).
+        - Retourner ce dict.
+
+        Pour l'instant, on laisse un NotImplementedError pour ne pas
+        inventer de logique CEX-specific ici.
+        """
+        raise NotImplementedError(
+            "PnlRecoCexAdapter.fetch_pnl_for_day() doit être "
+            "implémenté pour chaque CEX (Binance/Bybit/Coinbase) en s'appuyant "
+            "sur leurs endpoints de trades/fills."
+        )

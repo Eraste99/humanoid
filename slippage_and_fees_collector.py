@@ -177,6 +177,9 @@ class SlippageAndFeesCollector:
         # Callbacks on-change (optionnel)
         self._on_change: Optional[Callable[[str,str,FeeSnapshot,FeeSnapshot], None]] = None
         self._fee_token_targets: Dict[str, Dict[str, float]] = defaultdict(dict)  # ex -> {token: target_pct}
+        # Fraîcheur globale du dernier refresh fees (toutes venues/aliases confondues)
+        self.last_fee_sync_ts: float = 0.0
+
 
     # --------------------------- Slippage (minimal) ---------------------------
 
@@ -391,6 +394,45 @@ class SlippageAndFeesCollector:
             except Exception:
                 pass
 
+    def ingest_slippage_bps(self,
+                            pair: str,
+                            exchange: str,
+                            side: str,
+                            qty: float,
+                            slip_bps: float,
+                            ts_ns: Optional[int] = None) -> None:
+        """
+        API compat appelée par le RiskManager.
+
+        - slip_bps : slippage en basis points (ex: 12.0 = 12 bps).
+        - ts_ns    : timestamp en nanosecondes (ex: time.time_ns()).
+        - qty      : actuellement ignorée (conservée pour compat), pourra être utilisée plus tard.
+        """
+        # Normalisation basique
+        exu = _norm_ex(exchange)
+        pk = _norm_pair(pair)
+        sd = "buy" if (side or "").lower().startswith("b") else "sell"
+
+        # Conversion bps -> fraction (1 bps = 1e-4)
+        try:
+            frac = float(slip_bps) / 1e4
+        except Exception:
+            return
+
+        # Conversion ns -> secondes, cohérente avec observe_slippage()
+        ts: Optional[float]
+        if ts_ns is not None:
+            try:
+                ts = float(ts_ns) / 1e9
+            except Exception:
+                ts = None
+        else:
+            ts = None
+
+        # On délègue à l’API interne qui gère les buffers / EWMA
+        self.observe_slippage(exu, pk, sd, frac, ts=ts)
+
+
     def observe_slippage(self, ex: str, pair: str, side: str, frac: float, ts: Optional[float]=None) -> None:
         exu, pk, sd = _norm_ex(ex), _norm_pair(pair), ("buy" if (side or "").lower().startswith("b") else "sell")
         if frac is None: return
@@ -542,6 +584,15 @@ class SlippageAndFeesCollector:
         for ex, per in (mapping or {}).items():
             self._fee_clients[_norm_ex(ex)].update(per or {})
 
+    def set_fee_sync_clients(self, mapping: Dict[str, Dict[str, Any]]) -> None:
+        """
+        Alias compat utilisé par RiskManager.connect_fee_sync_clients(...).
+
+        mapping: {"BINANCE":{"TT": client_tt, "TM": client_tm}, ...}
+        """
+        self.connect_fee_clients(mapping)
+
+
     def set_volume_provider(self, exchange: str, alias: str,
                             provider: Callable[[], Awaitable[float]]) -> None:
         """
@@ -656,6 +707,12 @@ class SlippageAndFeesCollector:
                 SFC_FEE_EFFECTIVE_PCT.labels(ex, alias, "taker", "pair", p).set(ft.get("taker", snap_new.taker_effective))
         except Exception:
             pass
+        # Met à jour le timestamp global du dernier refresh réussi (toutes venues/aliases)
+        try:
+            self.last_fee_sync_ts = float(time.time())
+        except Exception:
+            pass
+
         self._emit(
             "INFO", "fee_sync_done",
             exchange=ex, alias=alias,
@@ -833,6 +890,7 @@ class SlippageAndFeesCollector:
             return mk, tk
         return snap.effective_for("maker", pair), snap.effective_for("taker", pair)
 
+
     def export_effective_fee_map(self) -> Dict[str, Dict[str, float]]:
         """Retourne une carte {EX:{maker: frac, taker: frac}} conservatrice (min alias)."""
         out: Dict[str, Dict[str, float]] = {}
@@ -850,6 +908,43 @@ class SlippageAndFeesCollector:
                     "taker": min(taker_vals) if taker_vals else 0.0,
                 }
         return out
+
+    def get_fee_pct(self,
+                    exchange: str,
+                    pair: Optional[str],
+                    role: str = "taker") -> float:
+        """
+        Retourne un fee EFFECTIF en fraction (0.001 = 10 bps) pour (exchange, pair, role).
+
+        - Agrège sur tous les aliases de l'exchange.
+        - Si des snapshots "frais" existent, utilise leurs fees effectifs.
+        - Sinon, fallback sur les bases.
+        """
+        exn = _norm_ex(exchange)
+        snaps = self._snapshots.get(exn, {})
+        if not snaps:
+            return 0.0
+
+        pair_norm = _norm_pair(pair) if pair else None
+        now = time.time()
+        fresh_vals: List[float] = []
+        stale_vals: List[float] = []
+
+        for snap in snaps.values():
+            if not snap:
+                continue
+            val = float(snap.effective_for(role, pair_norm))
+            if snap.is_fresh(now):
+                fresh_vals.append(val)
+            else:
+                stale_vals.append(val)
+
+        if fresh_vals:
+            return min(fresh_vals)
+        if stale_vals:
+            return min(stale_vals)
+        return 0.0
+
     # ---------------------------- Coût total ----------------------------------
 
     def leg_fee_pct(self, ex: str, alias: str, *, pair: Optional[str], role: str) -> float:
@@ -862,6 +957,46 @@ class SlippageAndFeesCollector:
         slip = self.get_slippage(ex, pair, side, kind=k, default=default_slippage)
         fee  = self.leg_fee_pct(ex, alias, pair=pair, role=role)
         return float(max(0.0, slip) + max(0.0, fee))
+
+    def last_age_seconds(self, _opp: Optional[Any] = None) -> float:
+        """
+        Age (en secondes) de la dernière observation de slippage connue.
+
+        Pour l’instant on renvoie une vue globale (toutes paires confondues),
+        car le RiskManager s’en sert comme garde TTL « pipeline slip frais / pas frais ».
+
+        Retourne +inf s'il n'y a jamais eu de mesure.
+        """
+        now = time.time()
+        last_ts: Optional[float] = None
+
+        for dq in self._hist.values():
+            if not dq:
+                continue
+            try:
+                ts, _ = dq[-1]
+            except Exception:
+                continue
+
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+
+        if last_ts is None:
+            return float("inf")
+
+        age = now - float(last_ts or 0.0)
+        return float(max(0.0, age))
+
+    def get_fee_clients(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Vue en lecture seule des fee clients enregistrés.
+
+        Clés : exchange -> alias -> client (opaque pour l'appelant).
+        """
+        # On renvoie une copie superficielle pour éviter les modifications externes.
+        return {ex: dict(per_alias) for ex, per_alias in self._fee_clients.items()}
+
+
 
     def get_total_cost_pct(
             self,

@@ -350,7 +350,12 @@ class ScannerCfg:
     scanner_eval_hz_sandbox: float = 2.0
     scanner_global_eval_hz: float = 200.0
 
-    # MM / hints publics
+    # MM / hints publics (Scanner = couche "soft" pour le MM)
+    # - mm_depth_min_quote / mm_qpos_max_ahead_quote : filtres de profondeur / queue pour les hints MM
+    # - mm_min_net_bps / mm_hedge_cost_bps         : net bps minimal pour considérer un setup MM
+    # - mm_vol_bps_max                             : seuil de vol (en bps Monitor) au-dessus duquel
+    #   le Scanner désactive les opportunités MM côté hints (le RM reste la couche "hard").
+
     enable_mm_hints: bool = True
     binance_depth_level: int = 50
     mm_rotation_enabled: bool = False
@@ -493,7 +498,12 @@ class RiskManagerCfg:
     mm_min_p_both: float = 0.0
     mm_min_net_bps: float = 0.0005
     mm_hedge_cost_bps: float = 5.0
-    mm_vol_bps_max: float = 6.0
+    # Seuil MM côté RM (non utilisé pour l’instant) :
+    # - Scanner.mm_vol_bps_max = couche soft : coupe les hints MM en vol élevée.
+    # - RiskManager.mm_vol_bps_max = garde-fou hard éventuel (par profil / VM) si on
+    #   veut, plus tard, empêcher le RM d’admettre du MM au-delà d’une certaine vol.
+    #   Default aligné sur Scanner pour éviter les surprises quand on l’activera.
+    mm_vol_bps_max: float = 40.0
 
     global_kill_switch: bool = False
     daily_strategy_budget_quote: Dict[str, float] = field(default_factory=dict)
@@ -727,11 +737,18 @@ class VolatilityCfg:
         "CAREFUL": 0.55,
         "ALERT": 0.65,
     })
+    # Seuils de prudence pour le VolatilityManager (sur p95_vol_bps "micro")
+    # - normal → modere si p95 >= NORMAL_TO_CAREFUL
+    # - modere → eleve si p95 >= CAREFUL_TO_ALERT
+    # - eleve → modere si p95 <= ALERT_TO_CAREFUL
+    # - modere → normal si p95 <= CAREFUL_TO_NORMAL
     vm_prudence_thresholds_bps: Dict[str, float] = field(default_factory=lambda: {
-        "NORMAL": 40.0,
-        "CAREFUL": 80.0,
-        "ALERT": 120.0,
+        "NORMAL_TO_CAREFUL": 8.0,  # p95 >=  8 bps → CAREFUL
+        "CAREFUL_TO_ALERT": 15.0,  # p95 >= 15 bps → ALERT
+        "ALERT_TO_CAREFUL": 12.0,  # p95 <= 12 bps → CAREFUL
+        "CAREFUL_TO_NORMAL": 6.0,  # p95 <=  6 bps → NORMAL
     })
+
     vm_maker_pad_ticks_map: Dict[str, int] = field(default_factory=lambda: {
         "NORMAL": 0,
         "CAREFUL": 1,
@@ -1771,6 +1788,36 @@ class BotConfig:
                     )
         except Exception as exc:
             log.warning("BotConfig: unable to sanity-check REB caps: %s", exc)
+        # 5) caps Engine par CEX vs inflight trading RM (vue globale)
+        try:
+            inflight = getattr(rm, "inflight_trading_by_profile", {}) or {}
+            engine_cfg = getattr(cfg, "engine", None)
+            if engine_cfg is not None:
+                engine_caps = getattr(engine_cfg, "inflight_max_by_exchange_by_profile", {}) or {}
+                for profile, inflight_total in inflight.items():
+                    per_venue = engine_caps.get(profile) or {}
+                    total_engine_cap = 0
+                    for v in (per_venue or {}).values():
+                        try:
+                            total_engine_cap += int(v or 0)
+                        except Exception:
+                            continue
+                    # Si la somme des caps techniques Engine est < plafond RM,
+                    # le profil sera mécaniquement bridé (capacité < budget business).
+                    if total_engine_cap < int(inflight_total):
+                        log.warning(
+                            "BotConfig: ENGINE inflight_max_by_exchange_by_profile[%s] total=%s "
+                            "< inflight_trading_by_profile=%s (profil potentiellement bridé par les caps Engine)",
+                            profile,
+                            total_engine_cap,
+                            inflight_total,
+                        )
+        except Exception as exc:
+            log.warning(
+                "BotConfig: unable to sanity-check engine inflight caps vs RM inflight_trading_by_profile: %s",
+                exc,
+            )
+
         # 4) policy Capital Ladder
         try:
             ladder_cfg = getattr(rm, "capital_ladder_cfg", {}) or {}

@@ -651,7 +651,9 @@ class OpportunityScanner:
         # agrège sur les CEX connus (max) ; autre stratégie possible (p95, avg)
         vals = []
         now = time.time()
-        ttl = float(ttl_s or getattr(self, "vol_ttl_s", 5.0))
+        # TTL vol : priorité à l'argument, sinon cache interne, sinon cfg.vol.ttl_s
+        ttl = float(ttl_s or getattr(self, "_vol_ttl_s", float(self.cfg.vol.ttl_s)))
+
         for (ex, p), v in list(self._vol_ema.items()):
             if p != pk:
                 continue
@@ -1146,8 +1148,12 @@ class OpportunityScanner:
 
         net_bps = _expected_net_bps_mm(maker_px_a, maker_px_b)
 
-        # Éligibilité dure (vol, profondeur minimale, queue ahead maximale)
-        if vol_ema > float(getattr(cfg, "mm_vol_bps_max", 6.0)):
+        # Éligibilité dure (vol, profondeur minimale, queue ahead maximale).
+        # Scanner = couche "soft" : on coupe les opportunités MM si la vol EMA dépasse
+        # un seuil dédié (cfg.mm_vol_bps_max), mais le RM garde la main sur la décision
+        # finale et les caps par profil.
+        mm_vol_max = float(getattr(cfg, "mm_vol_bps_max", self.vol_soft_cap_bps))
+        if vol_ema > mm_vol_max:
             eligible = False
         elif dA < depth_min_quote or dB < depth_min_quote:
             eligible = False

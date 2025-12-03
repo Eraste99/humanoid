@@ -133,6 +133,9 @@ class Boot:
         self.ctx = BootContext(cfg)
         self._started = False
         self._private_health_task: Optional[asyncio.Task] = None
+        # Moniteur santé pipeline PnL (LHM/JSONL/DB)
+        self._pnl_pipeline_task: Optional[asyncio.Task] = None
+        self._pnl_unhealthy_since: Optional[float] = None
 
 
     # ------------------------------- Public API ----------------------------
@@ -210,6 +213,15 @@ class Boot:
                 t.cancel()
                 await asyncio.wait_for(t, timeout=timeout_s)
             self._private_health_task = None
+
+        # Moniteur santé pipeline PnL (LHM/JSONL/DB)
+        with contextlib.suppress(Exception):
+            t = getattr(self, "_pnl_pipeline_task", None)
+            if t:
+                t.cancel()
+                await asyncio.wait_for(t, timeout=timeout_s)
+            self._pnl_pipeline_task = None
+
 
 
         # 1) RPC
@@ -420,7 +432,14 @@ class Boot:
         self._mark_stage("lhm_started")
         self.log.info("[Boot] LHM prêt (out_dir=%s)", out_dir)
 
-        # 5) (Optionnel) Brancher les sinks si présents
+        # 5) Démarrer la surveillance du pipeline PnL (LHM/JSONL/DB)
+        try:
+            self._ensure_pnl_pipeline_health_task()
+        except Exception:
+            self.log.exception("[Boot][LHM] impossible de démarrer le moniteur santé PnL")
+
+
+        # 6) (Optionnel) Brancher les sinks si présents
         try:
             if getattr(self.ctx, "engine", None) and hasattr(self.ctx.engine, "set_history_logger"):
                 self.ctx.engine.set_history_logger(self.ctx.lhm.sink)
@@ -620,6 +639,7 @@ class Boot:
             "balance_fetcher": balances,
             "simulator": simulator,
             "execution_engine": getattr(self.ctx, "engine", None),
+            "history_logger": getattr(getattr(self.ctx, "lhm", None), "sink", None),
         }
         rm_kwargs["exchanges"] = list(
             getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"]))
@@ -1003,6 +1023,93 @@ class Boot:
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             return
+
+    def _ensure_pnl_pipeline_health_task(self) -> None:
+        """
+        Démarre un petit moniteur périodique qui observe l'état du pipeline PnL
+        (flags exposés par le LHM) et publie un status vers le status_sink
+        (typiquement CentralWatchdog).
+        """
+        if self._pnl_pipeline_task or not self._running:
+            return
+
+        boot_cfg = getattr(self.cfg, "boot", object())
+        interval = float(getattr(boot_cfg, "pnl_pipeline_health_interval_s", 10.0))
+        if interval <= 0:
+            return
+
+        try:
+            self._pnl_pipeline_task = asyncio.create_task(
+                self._monitor_pnl_pipeline_health(interval),
+                name="boot-pnl-pipeline-health",
+            )
+        except Exception:
+            self.log.exception("[Boot] unable to start PnL pipeline health monitor")
+
+    async def _monitor_pnl_pipeline_health(self, interval: float) -> None:
+        """
+        Boucle simple :
+        - lit les flags du LHM (get_pnl_pipeline_flags si disponible),
+        - maintient depuis quand c'est "unhealthy",
+        - envoie un status 'pnl_pipeline' vers le status_sink (CentralWatchdog).
+        """
+        try:
+            while self._running:
+                lhm = getattr(self.ctx, "lhm", None)
+                flags: Dict[str, Any] = {}
+
+                if lhm is not None:
+                    get_flags = getattr(lhm, "get_pnl_pipeline_flags", None)
+                    if callable(get_flags):
+                        try:
+                            flags = get_flags() or {}
+                        except Exception:
+                            self.log.exception("[Boot] get_pnl_pipeline_flags a échoué")
+                            flags = {}
+                # Flags connus (définis côté LHM dans M5-B4)
+                critical = bool(flags.get("critical_drop_seen"))
+                storage = bool(flags.get("storage_error_seen"))
+                healthy = not (critical or storage)
+
+                now = time.time()
+                if healthy:
+                    self._pnl_unhealthy_since = None
+                else:
+                    if self._pnl_unhealthy_since is None:
+                        self._pnl_unhealthy_since = now
+
+                unhealthy_for = 0.0
+                if self._pnl_unhealthy_since is not None:
+                    unhealthy_for = max(0.0, now - self._pnl_unhealthy_since)
+
+                # On projette aussi dans self.state pour le /status ou debug
+                try:
+                    self.state.setdefault("pnl_pipeline", {})
+                    self.state["pnl_pipeline"].update(
+                        {
+                            "healthy": healthy,
+                            "critical_drop_seen": critical,
+                            "storage_error_seen": storage,
+                            "unhealthy_since": self._pnl_unhealthy_since,
+                            "unhealthy_for_s": unhealthy_for,
+                        }
+                    )
+                except Exception:
+                    # ne doit jamais casser la boucle
+                    pass
+
+                # Envoie vers CentralWatchdog (ou autre status_sink)
+                status = "healthy" if healthy else "unhealthy"
+                payload = dict(flags)
+                payload["healthy"] = healthy
+                payload["unhealthy_for_s"] = unhealthy_for
+                self._send_status("pnl_pipeline", status, payload)
+
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            self.log.exception("[Boot] PnL pipeline health monitor crashed")
 
 
     # ------------------------------- Gates ----------------------------------

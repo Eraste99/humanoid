@@ -39,7 +39,8 @@ from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
 from modules.engine_pacer import EnginePacer  # ensure import top-level
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
-from contracts.errors import EngineSubmitError, EngineCancelError, ExternalServiceError
+from contracts.errors import EngineSubmitError, EngineCancelError, ExternalServiceError, NotReadyError
+
 # --- deps async/http ---
 # aiohttp is optional in some envs; guard its import
 try:
@@ -100,6 +101,24 @@ ENGINE_MM_DISABLED_BY_CAPITAL = "ENGINE_MM_DISABLED_BY_CAPITAL"
 
 
 class PnLAggregator:
+    """
+        Agrégateur de PnL *live* côté Engine.
+
+        Rôle :
+          - consommer les enregistrements `rec` envoyés au `history_sink`,
+          - mettre à jour les métriques Prometheus PnL live :
+              * PNL_LIVE_DAY_USD{region, branch, mode}
+              * TRADES_LIVE_DAY_TOTAL{result, region, branch, mode}
+              * DERIVED_NET_PROFIT_SIGN_TOTAL{region, branch, mode}
+              * MISSING_NET_PROFIT_TOTAL{region, branch, mode}.
+
+        Ce composant :
+          - ne persiste rien et ne lit pas la DB,
+          - ne reconstruit jamais un PnL à partir de bps ou de volumes,
+          - ne doit pas être utilisé comme source de vérité comptable ni directement
+            dans la logique de RiskManager (qui doit s'appuyer sur la DB via
+            LoggerHistoriqueManager / LogWriter).
+        """
     def __init__(self):
         self._last_local_day = {"EU": None, "US": None, "UTC": None}
 
@@ -132,10 +151,25 @@ class PnLAggregator:
 
     def on_trade_event(self, rec: dict) -> None:
         """
-        Consomme un enregistrement (celui envoyé au history_sink).
-        Attend au mieux: trade_mode (branch), deployment_mode, pod_region, net_profit (ou sign).
-        Ne persiste rien: métriques uniquement.
-        """
+                Consomme un enregistrement (celui envoyé au `history_sink`) et met à jour
+                les métriques de PnL live.
+
+                Champs attendus dans `rec` (best-effort) :
+                  - status : string ; les statuts REJECTED / CANCELED / ERROR sont ignorés
+                    pour le PnL.
+                  - trade_mode : string → branche logique {TT, TM, MM, REB}.
+                  - deployment_mode : string → mode de déploiement {EU_ONLY, SPLIT}.
+                  - pod_region : string → région {EU, US, UTC} utilisée pour le reset
+                    journalier des métriques.
+                  - net_profit : float, PnL réalisé dans la devise PnL canonique (USDC/EUR).
+                  - net_profit_sign : int ∈ {-1, 0, 1} utilisé comme fallback lorsque
+                    `net_profit` est absent ou jugé trop bruité.
+
+                Aucun PnL n'est dérivé ici à partir de bps ou de volumes : cette méthode
+                consomme uniquement des champs déjà calculés par les couches amont et
+                expose des métriques Prometheus à des fins de monitoring live (non
+                comptable).
+                """
         self._ensure_resets()
         try:
             from obs_metrics import PNL_LIVE_DAY_USD, TRADES_LIVE_DAY_TOTAL, DERIVED_NET_PROFIT_SIGN_TOTAL, MISSING_NET_PROFIT_TOTAL
@@ -150,24 +184,20 @@ class PnLAggregator:
         mode = str(rec.get("deployment_mode") or "").upper() or "EU_ONLY"
         region = str(rec.get("pod_region") or "").upper() or "EU"
 
-        # 2) Profit: priorité au net_profit
+        # 2) Profit: priorité au net_profit, fallback sur net_profit_sign UNIQUEMENT
         profit = rec.get("net_profit")
         sign = None
+
         if isinstance(profit, (int, float)) and profit != 0:
+            # PnL explicite fourni
             sign = 1 if profit > 0 else -1
         else:
-            # fallback sur sign; sinon par bps
+            # Fallback sur net_profit_sign (déjà dérivé côté LHM si besoin)
             s = rec.get("net_profit_sign")
-            if s in (1, -1): sign = int(s)
-            else:
-                nbps = rec.get("net_bps") or rec.get("spread_net_final_bps")
-                if isinstance(nbps, (int, float)) and nbps != 0:
-                    sign = 1 if nbps > 0 else -1
-                    try: DERIVED_NET_PROFIT_SIGN_TOTAL.labels(module="ENGINE").inc()
-                    except Exception: pass
-                else:
-                    try: MISSING_NET_PROFIT_TOTAL.labels(module="ENGINE", branch=branch).inc()
-                    except Exception: pass
+            if s in (1, -1):
+                sign = int(s)
+        # → Pas de dérivation bps côté Engine, ni de métriques "missing/derived" ici.
+        #   Toute la logique de fallback et les compteurs associés sont centralisés dans le LHM.
 
         # 3) Montant à incrémenter (live): si on n’a que le signe, on incrémente les compteurs; le montant reste 0
         inc_amount = float(profit) if isinstance(profit, (int, float)) else 0.0
@@ -725,6 +755,7 @@ try:
         report_nonfatal,
         set_engine_queue,
         set_engine_running,
+        ENGINE_RM_OVERRIDES_TOTAL,
     )
 except Exception:
     # on garde les stubs déclarés plus haut
@@ -1104,15 +1135,21 @@ class ExecutionEngine:
                     except Exception:
                         pacer_mode = "NORMAL"
 
-                    # Push vers le RM (FSM Macro 5) + copie locale Engine
+                    # Push vers le RM (FSM Macro 5) via contrat explicite + copie locale Engine
                     try:
-                        setattr(rm, "pacer_mode", pacer_mode)
+                        if hasattr(rm, "set_pacer_mode"):
+                            rm.set_pacer_mode(pacer_mode, source="engine_pacer")
+                        else:
+                            # Fallback compat : ancien comportement (ne jamais casser le flux)
+                            setattr(rm, "pacer_mode", pacer_mode)
                     except Exception:
+                        # Défensif : ne jamais casser le tick Pacer → Engine → RM
                         pass
                     try:
                         self.pacer_mode = pacer_mode
                     except Exception:
                         pass
+
             except Exception:
                 # Le bridge Pacer -> RM ne doit jamais bloquer le PACER
                 pass
@@ -1590,14 +1627,23 @@ class ExecutionEngine:
         self._wiring_checked = True
         log.info("[ExecutionEngine] Hub wiring OK (engine + rm branchés)")
 
-
     async def submit_maker_or_delay(self, order: dict, meta: dict) -> Optional[str]:
         """
         Tente de réserver une bande de prix (anti-crossing) avant soumission du maker.
         - Convertit ac.price_band_bps -> ticks selon tick_size & px.
         - Si conflit: applique ac.on_violation (cancel|skip|widen).
         - Retourne order_id si envoyé, None sinon.
+
+        Macro 7-E : on instrumente les cas de skip / widen pour savoir
+        combien de makers sont:
+          - skippés par l'anti-crossing (MAKER_SKIP_ANTICROSS_*),
+          - élargis pour éviter le self-trade (MAKER_WIDEN_ANTICROSS).
         """
+        # Contexte best-effort pour les métriques (peut être absent)
+        meta = dict(meta or {})
+        branch = str(meta.get("branch") or "").upper() or "UNKNOWN"
+        profile = str(meta.get("profile") or "").upper() or "UNKNOWN"
+
         if not self._ac_enabled or not self._is_maker(order):
             return await self._send_order_real(order, meta)
 
@@ -1606,30 +1652,68 @@ class ExecutionEngine:
         band_px = (self._ac_bps / 10_000.0) * px
         band_ticks = max(1, int(round(band_px / max(1e-12, tick))))
 
-        ok = await self._ac_reserve(pair=order["symbol"], side=order["side"],
-                                    price=px, band_ticks=band_ticks, ttl_ms=self._ac_ttl_ms)
+        ok = await self._ac_reserve(
+            pair=order["symbol"],
+            side=order["side"],
+            price=px,
+            band_ticks=band_ticks,
+            ttl_ms=self._ac_ttl_ms,
+        )
         if not ok:
-            if self._ac_action == "skip":
+            action = (self._ac_action or "skip").lower()
+
+            if action == "skip":
+                # Maker skippé proprement par anti-crossing
+                try:
+                    self._engine_maker_skip_metric(
+                        "MAKER_SKIP_ANTICROSS_SKIP",
+                        branch=branch,
+                        profile=profile,
+                    )
+                except Exception:
+                    pass
                 return None
-            if self._ac_action == "widen":
-                # élargir légèrement de 1 tick
+
+            if action == "widen":
+                # Élargar légèrement de 1 tick pour éviter le self-trade
+                try:
+                    self._engine_maker_skip_metric(
+                        "MAKER_WIDEN_ANTICROSS",
+                        branch=branch,
+                        profile=profile,
+                    )
+                except Exception:
+                    pass
                 order = dict(order)
-                order["price"] = px - tick if order["side"] == "sell" else px + tick
-            # "cancel" -> on ne soumet pas
-            if self._ac_action == "cancel":
+                if str(order["side"]).lower() == "sell":
+                    order["price"] = px - tick
+                else:
+                    order["price"] = px + tick
+
+            elif action == "cancel":
+                # Cancel net: le maker n'est pas envoyé
+                try:
+                    self._engine_maker_skip_metric(
+                        "MAKER_SKIP_ANTICROSS_CANCEL",
+                        branch=branch,
+                        profile=profile,
+                    )
+                except Exception:
+                    pass
                 return None
 
         return await self._send_order_real(order, meta)
 
     async def _ac_reserve(self, pair: str, side: str, price: float, band_ticks: int, ttl_ms: int) -> bool:
-        """
-        Réserve une bande de prix pour éviter maker×maker.
-        Scope "pod": garde en mémoire locale.
-        Scope "cluster": utilise un coord (Redis/RPC) si self._ac_backend est fourni.
+        """Réserve une bande de prix pour éviter maker×maker.
+
+        Scope "pod" : garde en mémoire locale.
+        Scope "cluster" : utilise un coord (Redis/RPC) si self._ac_backend est fourni.
         """
         key = f"{self._ac_namespace}:{pair}:{side}"
-        low = price - band_ticks * self._tick_size_simple(pair)
-        high = price + band_ticks * self._tick_size_simple(pair)
+        tick = self._tick_size_simple(pair)
+        low = price - band_ticks * tick
+        high = price + band_ticks * tick
 
         if self._ac_scope == "cluster" and self._ac_backend:
             # TODO: implémenter SETNX + PEXPIRE (Redis) ou RPC équivalent
@@ -1647,11 +1731,17 @@ class ExecutionEngine:
 
         # Conflit ?
         cur = self._ac_local.get(key)
-        if cur and cur["low"] <= price <= cur["high"] and cur["expires_at"] >= now:
+        if cur and not (price < cur["low"] or price > cur["high"]):
             return False
 
-        self._ac_local[key] = {"low": low, "high": high, "expires_at": now + ttl_ms}
+        # Réserve la nouvelle bande
+        self._ac_local[key] = {
+            "low": low,
+            "high": high,
+            "expires_at": now + ttl_ms,
+        }
         return True
+
 
     # execution_engine.py — dans class ExecutionEngine
     def _rm_ioc_mm_overrides(
@@ -1669,15 +1759,18 @@ class ExecutionEngine:
         Retourne (tif_effectif, maker_effectif, post_only_effectif, skip_maker_leg).
 
         Source de vérité principale (Ticket 11/14 + Macro 5) :
-        - bundle.meta.mode_overrides = {
-              "ioc_only": ...,
-              "mm_enabled": ...,
-              "rm_mode": ...,
-              # enrichi côté Engine par:
-              #   - PACER: mm_frozen  => mm_enabled=False (clamp infra)
-              #   - PACER: ioc_only   => ioc_only=True si le RM n'a rien fixé
-          }
-        - bundle.meta.mode = trade_mode (NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE)
+            - bundle.meta.mode_overrides (snapshot RM brut) = {
+                  "ioc_only": ...,
+                  "mm_enabled": ...,
+                  "rm_mode": ...,
+                  "trade_mode": ...,
+                  "stage": "rm_raw",
+                  # enrichi côté Engine par:
+                  #   - PACER: mm_frozen  => mm_enabled=False (clamp infra)
+                  #   - PACER: ioc_only   => ioc_only=True si le RM n'a rien fixé
+                  # et ré-écrit avec stage="engine_fused" pour l'obs.
+              }
+            - bundle.meta.mode = trade_mode (NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE)
 
         Règles de priorité :
         - Le RM est owner de l'intention métier (mode / ioc_only / mm_enabled).
@@ -1726,6 +1819,9 @@ class ExecutionEngine:
                 except Exception:
                     trade_mode = None
 
+        # Flags PACER enrichis côté Engine (fusion stage="engine_fused")
+        pacer_mm_frozen = bool(mode_overrides.get("pacer_mm_frozen", False))
+
         # Application des overrides
         original_tif = str(tif or "").upper()
         tif_u = original_tif
@@ -1749,15 +1845,30 @@ class ExecutionEngine:
                     strategy=strategy,
                 )
 
-        # 2) MM désactivé : on loggue seulement si l’overlay a explicitement coupé MM
+        # 2) MM désactivé : on loggue seulement si l’overlay (RM ou PACER) a explicitement coupé MM
         if (mm_enabled is False) and maker:
             skip = True
             maker_flag = False
             post_only_flag = False
 
-            if raw_mm_enabled is not None:
+            # Détermination de la source pour l'obs : RM vs PACER
+            mm_source = "RM"
+
+            # Si le RM laisse MM actif au global mais que le PACER a figé les makers,
+            # on attribue la désactivation au PACER.
+            try:
+                rm_mm_global = None
+                if rm is not None and hasattr(rm, "enable_mm"):
+                    rm_mm_global = bool(getattr(rm, "enable_mm", False))
+            except Exception:
+                rm_mm_global = None
+
+            if pacer_mm_frozen and rm_mm_global:
+                mm_source = "PACER"
+
+            if raw_mm_enabled is not None or pacer_mm_frozen:
                 self._engine_rm_overrides_metric(
-                    "MM_DISABLED",
+                    f"MM_DISABLED_BY_{mm_source}",
                     rm_mode=rm_mode,
                     trade_mode=trade_mode,
                     exchange=exchange,
@@ -1766,7 +1877,6 @@ class ExecutionEngine:
                 )
 
         return tif_u, maker_flag, post_only_flag, skip
-
 
     # Helpers simplifiés
     def _is_maker(self, order: dict) -> bool:
@@ -2463,6 +2573,312 @@ class ExecutionEngine:
         self._update_submit_queue_gauge()
         return {"accepted": True}
 
+    def execute_bundle(self, bundle: Dict[str, Any]) -> bool:
+        """Interface synchrone utilisée par le RiskManager.
+
+        Objectifs Volet B (Macro 1):
+        - garder un contrat extrêmement simple côté RM (bool ou EngineSubmitError),
+        - rapprocher le chemin RM -> Engine de la logique avancée de `submit`:
+          * même déduplication CID,
+          * même lecture des caps locaux (bundle_concurrency / inflight_cap / headroom_min),
+          * mêmes signaux de backpressure (QUEUE_FULL / CAP_BRANCH / HIGH_WM, MM_HIGH_WM),
+        - ne jamais bloquer le RM (pas de sleep / await ici).
+
+        Retourne True si le bundle a été accepté par la file Engine.
+        En cas de rejet technique, lève EngineSubmitError avec un `reason`
+        cohérent avec le chemin async `submit`.
+        """
+        # 0) Readiness: on mappe NotReadyError -> EngineSubmitError homogène pour le RM
+        try:
+            self._ensure_ready()
+        except NotReadyError as e:
+            try:
+                # Observabilité Engine côté RM (RM_ENGINE_NOT_READY)
+                self._engine_reject_metric(RM_ENGINE_NOT_READY, branch=None, profile=None)
+            except Exception:
+                pass
+            err = EngineSubmitError(RM_ENGINE_NOT_READY)
+            try:
+                err.reason = RM_ENGINE_NOT_READY
+            except Exception:
+                pass
+            raise err from e
+
+        # 1) Enrichissement trace (semblable à execute / submit)
+        now_ms = int(time.time() * 1000)
+        trace = bundle.setdefault("trace", {})
+        trace.setdefault("trace_id", str(uuid.uuid4()))
+        trace.setdefault("t_engine_submit_ms", now_ms)
+
+        # 2) Branch / profile + caps locaux pour métriques & backpressure
+        meta = bundle.get("meta") or {}
+        route = bundle.get("route") or {}
+        branch = str(
+            meta.get("branch")
+            or meta.get("kind")
+            or bundle.get("strategy")
+            or route.get("strategy")
+            or ""
+        ).upper() or "UNKNOWN"
+        profile = str(
+            meta.get("capital_profile")
+            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
+            or ""
+        ).upper()
+
+        # Caps locaux: même contrat que le chemin async `submit`
+        caps_local = bundle.get("caps") or {}
+        if not isinstance(caps_local, dict):
+            caps_local = {}
+        bundle_concurrency = caps_local.get("bundle_concurrency")
+        inflight_cap = caps_local.get("inflight_cap")
+        headroom_min = int(caps_local.get("headroom_min") or 0)
+
+        # 2-bis) Idempotence via CID (mêmes règles que submit)
+        cid = None
+        try:
+            cid = self._bundle_cid_for_dedupe(bundle)
+            now = time.time()
+            self._prune_seen_cids(now)
+            if cid in self._seen_cids:
+                # Idempotence: le bundle (logique) est déjà en file; on no-op mais on
+                # considère que l'appel RM est "accepté" pour rester simple côté desk.
+                try:
+                    logger.info(
+                        "[ExecutionEngine] execute_bundle: bundle déjà vu (cid=%s) — no-op",
+                        cid,
+                    )
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            # Défensif: si la déduplication casse, on ne bloque jamais le RM.
+            cid = None
+
+        # 3) Contexte backpressure (queue globale + profondeur par branche + high watermark)
+        queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
+        queue_max = getattr(self.order_queue, "maxsize", 0) or queue_max_cfg or 0
+        depth = int(self.order_queue.qsize())
+        overflow_policy = str(
+            getattr(self.config, "engine_enqueue_overflow_policy", "defer")
+        ).lower()
+        high_wm = 0
+        mm_high_wm = 0
+        if queue_max:
+            high_wm_ratio = float(getattr(self.config, "engine_queue_high_wm_ratio", 0.85))
+            high_wm = int(
+                getattr(self.config, "engine_queue_high_wm", int(queue_max * high_wm_ratio))
+            )
+            # Seuil spécifique MM (citoyen de 2e classe) si présent, sinon fallback sur high_wm.
+            mm_high_wm_ratio = float(
+                getattr(
+                    self.config,
+                    "engine_mm_queue_high_wm_ratio",
+                    getattr(self.config, "engine_queue_high_wm_ratio", 0.85),
+                )
+            )
+            mm_high_wm = int(
+                getattr(
+                    self.config,
+                    "engine_mm_queue_high_wm",
+                    int(queue_max * mm_high_wm_ratio),
+                )
+            )
+
+
+        # Profondeur de file par branche (alignée sur submit)
+        branch_depth = 0
+        try:
+            q = getattr(self.order_queue, "_queue", None)
+            if q is not None and branch != "UNKNOWN":
+                for item in list(q):
+                    if not isinstance(item, dict):
+                        continue
+                    imeta = item.get("meta") or {}
+                    ibranch = str(
+                        imeta.get("branch")
+                        or imeta.get("kind")
+                        or item.get("strategy")
+                        or ""
+                    ).upper()
+                    if ibranch == branch:
+                        branch_depth += 1
+        except Exception:
+            branch_depth = 0
+
+        # Observabilité capacité (queue globale + branche)
+        try:
+            if hasattr(self, "obs_hist"):
+                # profondeur brute
+                self.obs_hist("engine_queue_depth", float(depth))
+                if queue_max:
+                    util_pct = max(
+                        0.0, min(100.0, 100.0 * float(depth) / float(queue_max))
+                    )
+                    self.obs_hist("engine_queue_util_pct", util_pct)
+                if bundle_concurrency and branch_depth is not None:
+                    try:
+                        eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
+                        br_util_pct = max(
+                            0.0,
+                            min(100.0, 100.0 * float(branch_depth) / float(eff_cap)),
+                        )
+                        self.obs_hist("engine_branch_capacity_util_pct", br_util_pct)
+                    except Exception:
+                        pass
+                if inflight_cap and branch_depth is not None:
+                    try:
+                        eff_inflight_cap = max(1, int(inflight_cap))
+                        inflight_util = max(
+                            0.0,
+                            min(
+                                100.0,
+                                100.0 * float(branch_depth) / float(eff_inflight_cap),
+                            ),
+                        )
+                        self.obs_hist("engine_branch_inflight_util_pct", inflight_util)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 3-a) Hard backpressure: queue pleine
+        if queue_max and depth >= queue_max:
+            try:
+                logger.warning(
+                    "[ExecutionEngine] BACKPRESSURE_QUEUE_FULL (execute_bundle) "
+                    "branch=%s profile=%s depth=%s max=%s",
+                    branch,
+                    profile,
+                    depth,
+                    queue_max,
+                )
+            except Exception:
+                pass
+            try:
+                self._engine_backpressure_metric("QUEUE_FULL", branch=branch, profile=profile)
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile
+            )
+
+        # 3-b) Hard backpressure: caps_local par branche (optionnel)
+        if bundle_concurrency is not None and branch_depth is not None:
+            try:
+                eff_cap = max(1, int(bundle_concurrency) - max(0, headroom_min))
+            except Exception:
+                eff_cap = None
+            if eff_cap and branch_depth >= eff_cap:
+                try:
+                    logger.info(
+                        "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH (execute_bundle) "
+                        "branch=%s profile=%s depth=%s eff_cap=%s",
+                        branch,
+                        profile,
+                        branch_depth,
+                        eff_cap,
+                    )
+                except Exception:
+                    pass
+                try:
+                    self._engine_backpressure_metric("CAP_BRANCH", branch=branch, profile=profile)
+                except Exception:
+                    pass
+                self._raise_engine_submit_error(
+                    ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile
+                )
+
+        # 3-c) Soft backpressure: high watermark
+        # Priorité business TT/TM > MM : en cas de high watermark, on coupe d'abord la
+        # branche MM au lieu de ralentir tout le monde. Ici, comme on ne peut pas
+        # faire de sleep(), on renvoie un signal explicite au RM.
+        if queue_max and mm_high_wm and depth >= mm_high_wm and str(branch or "").upper() == "MM":
+            try:
+                logger.info(
+                    "[ExecutionEngine] BACKPRESSURE_MM_HIGH_WM (execute_bundle) "
+                    "branch=%s profile=%s depth=%s mm_high_wm=%s",
+                    branch,
+                    profile,
+                    depth,
+                    mm_high_wm,
+                )
+            except Exception:
+                pass
+            try:
+                self._engine_backpressure_metric("MM_HIGH_WM", branch=branch, profile=profile)
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile
+            )
+
+        if queue_max and high_wm and depth >= high_wm and overflow_policy in ("defer", "reject"):
+            # Ici on ne "déferre" pas (pas de sleep synchrone) : on choisit
+            # volontairement un signal explicite pour le RM afin qu'il ajuste
+            # ses caps/pacer, plutôt que de bloquer.
+            try:
+                logger.warning(
+                    "[ExecutionEngine] BACKPRESSURE_HIGH_WM (execute_bundle) "
+                    "branch=%s profile=%s depth=%s high_wm=%s policy=%s",
+                    branch,
+                    profile,
+                    depth,
+                    high_wm,
+                    overflow_policy,
+                )
+            except Exception:
+                pass
+            try:
+                self._engine_backpressure_metric("HIGH_WM", branch=branch, profile=profile)
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile
+            )
+
+        # 4) Construction du job & enqueue non bloquant
+        job = dict(bundle)
+        job.setdefault("type", "bundle")
+        if cid is not None:
+            job["cid"] = cid
+        try:
+            self.order_queue.put_nowait(job)
+        except asyncio.QueueFull:
+            # Mise à jour des gauges best-effort
+            try:
+                self.stats.queue_length = self.order_queue.qsize()
+                if hasattr(self, "_update_submit_queue_gauge"):
+                    self._update_submit_queue_gauge()
+            except Exception:
+                pass
+            # Backpressure explicite vers le RM
+            try:
+                self._engine_backpressure_metric("QUEUE_FULL", branch=branch, profile=profile)
+            except Exception:
+                pass
+            # Map sur le namespace Engine
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile
+            )
+
+        # 5) Mise à jour des gauges en succès + mémorisation CID
+        try:
+            self.stats.queue_length = self.order_queue.qsize()
+            if hasattr(self, "_update_submit_queue_gauge"):
+                self._update_submit_queue_gauge()
+        except Exception:
+            pass
+        try:
+            if cid is not None:
+                # On mémorise le CID une fois qu'on sait que le bundle est bien en file.
+                self._seen_cids[cid] = time.time()
+        except Exception:
+            pass
+
+        return True
+
+
     async def place_two_makers_with_hedge(self, bundle: dict):
         """
         MM: 2 makers en // (A & B) + hedge progressif côté manquant.
@@ -2873,6 +3289,53 @@ class ExecutionEngine:
             # Observabilité best-effort : ne jamais bloquer le flux métier
             pass
 
+    def _engine_maker_skip_metric(self, reason: str, *, branch: str | None = None,
+                                  profile: str | None = None) -> None:
+        """Observabilité Engine — makers skippés ou modifiés (anti-crossing / overlays).
+
+        Labels:
+          - reason:     cause spécifique
+                        (MAKER_SKIP_ANTICROSS_SKIP / MAKER_SKIP_ANTICROSS_CANCEL /
+                         MAKER_WIDEN_ANTICROSS / MM_DISABLED_BY_...)
+          - branch:     stratégie/branche (TT / TM / MM / REB...)
+          - profile:    profil capital (NANO / MICRO / SMALL / MID / LARGE...)
+          - rm_mode:    mode global RM (NORMAL / OPP_VOLUME / OPP_VOL / SEVERE...)
+          - trade_mode: mode de trading (NORMAL / CONSTRAINED / SEVERE / OPPORTUNISTE...)
+
+        Permet d'isoler les effets de l'anti-crossing et des overlays MM
+        sans polluer engine_reject_total.
+        """
+        try:
+            if not hasattr(self, "obs_inc"):
+                return
+
+            # Contexte RM best-effort
+            rm = getattr(self, "risk_manager", None)
+            if rm is not None:
+                try:
+                    rm_mode = str(getattr(rm, "rm_mode", "NORMAL") or "").upper()
+                except Exception:
+                    rm_mode = "UNKNOWN"
+                try:
+                    trade_mode = str(getattr(rm, "trade_mode", "NORMAL") or "").upper()
+                except Exception:
+                    trade_mode = "UNKNOWN"
+            else:
+                rm_mode = "UNKNOWN"
+                trade_mode = "UNKNOWN"
+
+            self.obs_inc(
+                "engine_maker_skip_total",
+                reason=str(reason or "").upper(),
+                branch=str(branch or "").upper() or "UNKNOWN",
+                profile=str(profile or "").upper() or "UNKNOWN",
+                rm_mode=rm_mode,
+                trade_mode=trade_mode,
+            )
+        except Exception:
+            # Observabilité best-effort : jamais bloquant
+            pass
+
 
     def _raise_engine_submit_error(self, reason: str, *, branch: str | None = None, profile: str | None = None):
         self._engine_reject_metric(reason, branch=branch, profile=profile)
@@ -2901,26 +3364,18 @@ class ExecutionEngine:
                 raise RuntimeError("ENGINE_NOT_READY")
 
         # 1) Idempotence via CID stable
-        if not hasattr(self, "_seen_cids"):
-            self._seen_cids = {}
-
-        h = hashlib.sha256()
-        try:
-            h.update(json.dumps(bundle, sort_keys=True, default=str).encode("utf-8"))
-        except Exception:
-            # fallback très conservateur: on ne déduplique pas mais on logge
-            try:
-                logger.warning("[ExecutionEngine] submit: impossible de sérialiser le bundle pour CID")
-            except Exception:
-                pass
-        cid = h.hexdigest()[:16]
+        # 1) Idempotence via CID stable (bundle canonique)
+        cid = self._bundle_cid_for_dedupe(bundle)
         now = time.time()
         self._prune_seen_cids(now)
         if cid in self._seen_cids:
-            # Idempotence: on court-circuite silencieusement (même bundle récemment vu)
+            # Idempotence: on court-circuite silencieusement (même bundle logique vu récemment)
             # Compat: on ne renvoie pas d'exception pour ne pas surprendre le RM
             try:
-                logger.info("[ExecutionEngine] submit: bundle déjà vu (cid=%s) — no-op", cid)
+                logger.info(
+                    "[ExecutionEngine] submit: bundle déjà vu (cid=%s) — no-op",
+                    cid,
+                )
             except Exception:
                 pass
             return
@@ -3019,6 +3474,32 @@ class ExecutionEngine:
         inflight_cap = caps_local.get("inflight_cap")
         headroom_min = int(caps_local.get("headroom_min") or 0)
 
+        # --- Macro 3 (Caps business vs capacité technique) ---
+        # Hiérarchie des plafonds appliqués au bundle courant:
+        #
+        #   1) RM (desk de risque) calcule caps_local:
+        #        - inflight_cap : plafond business par profil / branche (Ticket 10).
+        #        - bundle_concurrency : dérivé de inflight_cap × pacer_factor(branch) × alias_cap_factor.
+        #      Le RM décide donc combien de bundles il ESSAIE d'envoyer par branche.
+        #
+        #   2) PACER (infra) applique un factor ≤ 1.0 par branche, jamais > 1.0:
+        #        - il peut uniquement *resserrer* la concurrence vs caps business,
+        #          jamais l'augmenter.
+        #
+        #   3) ENGINE applique ses propres caps techniques:
+        #        - taille de file globale (order_queue.maxsize) + high watermark
+        #          (engine_queue_high_wm),
+        #        - caps par CEX/profil (inflight_max_by_exchange_by_profile) via
+        #          les sémaphores d'inflight par venue.
+        #
+        #   4) En cas de dépassement technique, l'Engine renvoie un code de backpressure:
+        #        - ENGINE_BACKPRESSURE_QUEUE_FULL / HIGH_WM / CAP_BRANCH
+        #      Le RM ne voit donc jamais plus d'ordres exécutés que ce que ses caps
+        #      business autorisent; l'Engine ne fait que protéger la capacité.
+        #
+        # Ce bloc n'introduit aucune décision économique nouvelle: il implémente
+        # uniquement la "garde technique" sur la queue et les plafonds d'inflight.
+
 
         # 2) Backpressure technique: queue globale et éventuelle concurrence par branche
 
@@ -3027,12 +3508,28 @@ class ExecutionEngine:
         depth = int(self.order_queue.qsize())
         overflow_policy = str(getattr(self.config, "engine_enqueue_overflow_policy", "defer")).lower()
         high_wm = 0
+        mm_high_wm = 0
         if queue_max:
             high_wm_ratio = float(
                 getattr(self.config, "engine_queue_high_wm_ratio", 0.85)
             )
             high_wm = int(
                 getattr(self.config, "engine_queue_high_wm", int(queue_max * high_wm_ratio))
+            )
+            # Seuil spécifique MM si présent, sinon fallback sur high_wm.
+            mm_high_wm_ratio = float(
+                getattr(
+                    self.config,
+                    "engine_mm_queue_high_wm_ratio",
+                    getattr(self.config, "engine_queue_high_wm_ratio", 0.85),
+                )
+            )
+            mm_high_wm = int(
+                getattr(
+                    self.config,
+                    "engine_mm_queue_high_wm",
+                    int(queue_max * mm_high_wm_ratio),
+                )
             )
 
         # Profondeur de file par branche (meilleur alignement caps_local → Engine)
@@ -3131,11 +3628,11 @@ class ExecutionEngine:
         # 2-c) Soft backpressure: high watermark
         # Priorité business TT/TM > MM : en cas de high watermark, on coupe d'abord la
         # branche MM au lieu de ralentir tout le monde.
-        if queue_max and high_wm and depth >= high_wm and str(branch or "").upper() == "MM":
+        if queue_max and mm_high_wm and depth >= mm_high_wm and str(branch or "").upper() == "MM":
             try:
                 logger.info(
-                    "[ExecutionEngine] BACKPRESSURE_MM_HIGH_WM branch=%s profile=%s depth=%s high_wm=%s",
-                    branch, profile, depth, high_wm,
+                    "[ExecutionEngine] BACKPRESSURE_MM_HIGH_WM branch=%s profile=%s depth=%s mm_high_wm=%s",
+                    branch, profile, depth, mm_high_wm,
                 )
             except Exception:
                 pass
@@ -3201,6 +3698,47 @@ class ExecutionEngine:
             self.stats.queue_length = self.order_queue.qsize()
         except Exception:
             pass
+
+    def _bundle_cid_for_dedupe(self, bundle: dict) -> str:
+        """
+        Calcule un CID déterministe pour la déduplication des bundles Engine.
+
+        On exclut les champs de trace très volatils (timestamps internes) pour
+        que les retry du RM restent idempotents, mais on garde le reste du
+        payload (route, meta, legs...) pour que le CID reflète bien la logique.
+        """
+        if not hasattr(self, "_seen_cids"):
+            self._seen_cids = {}
+
+        # On travaille sur une copie "canonique" best-effort
+        try:
+            canonical = dict(bundle)
+            trace = dict(canonical.get("trace") or {})
+            # Champs de trace très volatils à ignorer pour le CID
+            for k in (
+                "t_engine_submit_ms",
+                "t_rm_decision_ms",
+                "t_rm_recv_ms",
+                "t_rm_emit_ms",
+            ):
+                trace.pop(k, None)
+            canonical["trace"] = trace
+        except Exception:
+            canonical = bundle
+
+        h = hashlib.sha256()
+        try:
+            h.update(json.dumps(canonical, sort_keys=True, default=str).encode("utf-8"))
+        except Exception:
+            # fallback très conservateur: on ne casse jamais l'appelant
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit/execute_bundle: "
+                    "impossible de sérialiser le bundle pour CID"
+                )
+            except Exception:
+                pass
+        return h.hexdigest()[:16]
 
 
     def _prune_seen_cids(self, now: Optional[float] = None) -> None:
@@ -4010,19 +4548,67 @@ class ExecutionEngine:
     def _apply_tm_controls_and_caps(self, bundle: dict) -> None:
         tmc = bundle.get("tm_controls") or {}
         caps = bundle.get("caps") or {}
-        if "queuepos_max_usd" in tmc and tmc["queuepos_max_usd"] is not None:
-            self.tm_queuepos_max_ahead_usd = int(tmc["queuepos_max_usd"])
+
+        # --- Queue-position max (ahead en QUOTE/USD) -------------------------
+        qpos = None
+        if "queuepos_max_ahead_usd" in tmc and tmc["queuepos_max_ahead_usd"] is not None:
+            qpos = tmc["queuepos_max_ahead_usd"]
+        elif "queuepos_max_usd" in tmc and tmc["queuepos_max_usd"] is not None:
+            qpos = tmc["queuepos_max_usd"]
+
+        if qpos is not None:
+            try:
+                v = float(qpos)
+            except Exception:
+                v = float(
+                    getattr(
+                        self,
+                        "tm_queuepos_max_ahead_quote",
+                        getattr(self, "tm_queuepos_max_ahead_usd", 25_000.0),
+                    )
+                )
+            # On aligne les deux alias internes sur la même valeur en QUOTE.
+            self.tm_queuepos_max_ahead_quote = v
+            self.tm_queuepos_max_ahead_usd = v
+
+        # --- Queue-position ETA max (ms) ------------------------------------
+        if "queuepos_max_eta_ms" in tmc and tmc["queuepos_max_eta_ms"] is not None:
+            try:
+                self.tm_queuepos_max_eta_ms = int(tmc["queuepos_max_eta_ms"])
+            except Exception:
+                pass
+
+        # --- TTL d'exposition TM (ms) ---------------------------------------
         if "ttl_ms" in tmc and tmc["ttl_ms"] is not None:
-            self.tm_exposure_ttl_ms = int(tmc["ttl_ms"])
+            try:
+                self.tm_exposure_ttl_ms = int(tmc["ttl_ms"])
+            except Exception:
+                pass
+
+        # --- Hedge ratio NEUTRAL fourni par le RM ---------------------------
         if "hedge_ratio" in tmc and tmc["hedge_ratio"] is not None:
-            self.tm_exposure_ttl_hedge_ratio = float(tmc["hedge_ratio"])
+            try:
+                self.tm_exposure_ttl_hedge_ratio = float(tmc["hedge_ratio"])
+            except Exception:
+                pass
+
+        # --- Forçage IOC éventuel sur les ordres TM -------------------------
         if tmc.get("ioc_only", False):
             for o in bundle.get("orders", []):
                 o["tif"] = "IOC"
+
+        # --- Caps additifs (size_factor, bundle_concurrency_delta) ----------
         if "size_factor" in caps and caps["size_factor"] is not None:
-            self.current_size_factor = float(caps["size_factor"])
+            try:
+                self.current_size_factor = float(caps["size_factor"])
+            except Exception:
+                pass
+
         if "bundle_concurrency_delta" in bundle and bundle["bundle_concurrency_delta"] is not None:
-            self.adjust_bundle_concurrency(int(bundle["bundle_concurrency_delta"]))
+            try:
+                self.adjust_bundle_concurrency(int(bundle["bundle_concurrency_delta"]))
+            except Exception:
+                pass
 
 
 
@@ -5075,6 +5661,16 @@ class ExecutionEngine:
         bundle_id = payload.get("bundle_id") or f"BND-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
         frag_count, frag_avg = self._extract_sim_fragments(payload)
 
+        # Application des contrôles TM envoyés par le RM (Macro 4)
+        try:
+            self._apply_tm_controls_and_caps(payload)
+        except Exception:
+            logger.debug(
+                "[ExecutionEngine] tm_controls_apply_failed",
+                exc_info=True,
+                extra={"pair": pair_key, "bundle_id": bundle_id},
+            )
+
         # Pipelines
         if strategy == "TM":
             async with self._sem_tm_pairs:
@@ -5092,6 +5688,7 @@ class ExecutionEngine:
                     sim_frag_count=frag_count,
                     sim_frag_avg_usdc=frag_avg,
                 )
+
         else:
             async with self._sem_tt_pairs:
                 await self._run_pipeline_tt(
@@ -5437,18 +6034,21 @@ class ExecutionEngine:
                 return False
 
             ok_b, ok_s = await _dual_submit(order_buy, order_sell, max_skew_ms=self.tt_max_skew_ms)
-            if ok_b and ok_s and self.history_sink:
-                self.history_sink({
-                    "pair": pair_key,
-                    "timestamp": time.time(),
-                    "executed_volume_usdc": float(usdc_amt),
-                    "status": "executed",
-                    "trade_mode": "TT",
-                    "buy_ex": buy_leg["exchange"],
-                    "sell_ex": sell_leg["exchange"],
-                    "route": f"BUY:{buy_leg['exchange']}→SELL:{sell_leg['exchange']}",
-                    "trade_id": slice_tag,
-                })
+            if ok_b and ok_s:
+                await self._hist(
+                    "trade",
+                    {
+                        "pair": pair_key,
+                        "timestamp": time.time(),
+                        "executed_volume_usdc": float(usdc_amt),
+                        "status": "executed",
+                        "trade_mode": "TT",
+                        "buy_ex": buy_leg["exchange"],
+                        "sell_ex": buy_leg["exchange"],
+                        "route": f"BUY:{buy_leg['exchange']}→SELL:{sell_leg['exchange']}",
+                        "trade_id": slice_tag,
+                    },
+                )
 
             # Panic-hedge si une jambe échoue
             if (not ok_b) and ok_s:
@@ -6397,6 +6997,14 @@ class ExecutionEngine:
                     mode_overrides["ioc_only"] = True
 
             if mode_overrides:
+                try:
+                    # Stage enrichi côté Engine
+                    mode_overrides["stage"] = "engine_fused"
+                    # Pour le debug infra : flags PACER applicables
+                    mode_overrides["pacer_mm_frozen"] = bool(mm_frozen)
+                    mode_overrides["pacer_ioc_only"] = bool(ioc_flag)
+                except Exception:
+                    pass
                 meta["mode_overrides"] = mode_overrides
         except Exception:
             # Observabilité uniquement, ne jamais casser un envoi pour un problème de PACER.
@@ -6437,11 +7045,12 @@ class ExecutionEngine:
         else:
             order.pop("post_only", None)
 
+
         # 4) Envoi de l'ordre (avec anti-crossing éventuel)
         oid: Optional[str] = None
         # Le contrôle de capacité in-flight est assuré par les sémaphores / caps en amont.
         if maker_flag and getattr(self, "_ac_enabled", False):
-            oid = await self._send_order_with_anti_crossing(order, meta)
+            oid = await self.submit_maker_or_delay(order, meta)
         else:
             oid = await self._send_order_real(order, meta)
 

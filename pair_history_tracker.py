@@ -407,26 +407,39 @@ class PairHistoryTracker:
     def _win_rate_24h(self, pair: str, now: float) -> Tuple[float, int]:
         thr = now - 86400
         wins = losses = 0
+
         for t in self.trades_by_pair.get(pair, []):
-            if t.get("ts", 0) >= thr:
-                np = t.get("net_profit")
-                if isinstance(np, (int, float)) and np != 0:
-                    if np > 0:
-                        wins += 1
-                    else:
-                        losses += 1
+            # fenêtre glissante 24h
+            if t.get("ts", 0) < thr:
+                continue
+
+            # [M5-A3-4] Si le trade est marqué comme PnL manquant, on l'ignore pour le win-rate
+            if t.get("pnl_missing") is True:
+                continue
+
+            np = t.get("net_profit")
+            if isinstance(np, (int, float)) and np != 0:
+                # PnL explicite : on se base dessus
+                if np > 0:
+                    wins += 1
                 else:
-                    sign = t.get("net_profit_sign")
-                    if sign in (1, -1):
-                        if sign > 0:
-                            wins += 1
-                        else:
-                            losses += 1
-                    else:
-                        # on ignore proprement (option: métrique côté LHM déjà renseignée)
-                        pass
+                    losses += 1
+                continue
+
+            # Fallback sur le signe dérivé par le LHM
+            sign = t.get("net_profit_sign")
+            if sign in (1, -1):
+                if sign > 0:
+                    wins += 1
+                else:
+                    losses += 1
+            else:
+                # on ignore proprement (métriques LHM déjà là pour suivre ces cas)
+                pass
+
         tot = wins + losses
         return ((wins / tot) if tot else 0.0, tot)
+
 
     def _latency_penalty(self, pair: str) -> float:
         obj = self.lat_ema_by_pair.get(pair)
@@ -770,21 +783,35 @@ class PairHistoryTracker:
 
     def wr_ignored_trades_total(self, since_s: Optional[float] = None) -> int:
         """
-        Compte les trades sans net_profit ET sans net_profit_sign.
+        [M5-A3-4] Compte les trades marqués comme PnL manquant (pnl_missing=True).
+        Fallback rétro-compatible :
+        - si le flag n'est pas présent, on revient à l'ancien test
+          "sans net_profit ET sans net_profit_sign".
         Optionnel: borne temporelle depuis since_s (en secondes unix).
         """
         cutoff = float(since_s) if since_s is not None else None
         total = 0
+
         for pair, dq in self.trades_by_pair.items():
             for t in dq:
-                ts = float(_to_float(t.get("ts_s"), 0.0))  # ts_s si présent, sinon 0
+                ts = float(_to_float(t.get("ts_s") or t.get("ts"), 0.0))  # ts_s si présent, sinon ts/0
                 if cutoff is not None and ts and ts < cutoff:
                     continue
-                npv = t.get("net_profit", None)
-                nps = t.get("net_profit_sign", None)
-                if (npv is None) and (nps is None):
+
+                # 1) Priorité au flag explicite posé par le LHM
+                if t.get("pnl_missing") is True:
                     total += 1
+                    continue
+
+                # 2) Rétro-compat si flag absent
+                if "pnl_missing" not in t:
+                    npv = t.get("net_profit", None)
+                    nps = t.get("net_profit_sign", None)
+                    if (npv is None) and (nps is None):
+                        total += 1
+
         return total
+
 
     def get_status_enriched(self) -> Dict[str, Any]:
         st = dict(self.get_status() or {})
