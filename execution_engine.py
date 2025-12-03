@@ -1240,13 +1240,11 @@ class ExecutionEngine:
         except Exception:
             engine_cfg = None
 
-        # Plafond d'inflight global recommandé par le RM (Macro M2-2) :
-        # plafond métier total pour le profil, borné par la capacité technique Engine.
+        # Plafond d'inflight global recommandé par le RM (Macro M2-2).
+        # Source unique = inflight_trading_by_profile : plafond métier total pour le profil.
         # Il sert uniquement de garde haute pour le pacer (down-clamp only).
         self._pacer_inflight_ceiling = None
         rm_cfg = None
-        rm_cap = None
-        engine_cap_total = None
         try:
             rm_cfg = getattr(root_cfg, "rm", None) if root_cfg is not None else None
         except Exception:
@@ -1259,31 +1257,9 @@ class ExecutionEngine:
                 if total_cap is None:
                     total_cap = inflight_totals.get("LARGE")
                 if total_cap:
-                    rm_cap = max(1, int(total_cap))
+                    self._pacer_inflight_ceiling = max(1, int(total_cap))
             except Exception:
-                rm_cap = None
-
-        if engine_cfg is not None:
-            try:
-                per_profile_caps = getattr(engine_cfg, "inflight_max_by_exchange_by_profile", {}) or {}
-                per_venue = per_profile_caps.get(self._capital_profile) or per_profile_caps.get("LARGE") or {}
-                total_engine_cap = 0
-                for v in (per_venue or {}).values():
-                    try:
-                        total_engine_cap += int(v or 0)
-                    except Exception:
-                        continue
-                if total_engine_cap > 0:
-                    engine_cap_total = max(1, int(total_engine_cap))
-            except Exception:
-                engine_cap_total = None
-
-        if rm_cap is not None and engine_cap_total is not None:
-            self._pacer_inflight_ceiling = max(1, min(rm_cap, engine_cap_total))
-        elif rm_cap is not None:
-            self._pacer_inflight_ceiling = rm_cap
-        elif engine_cap_total is not None:
-            self._pacer_inflight_ceiling = engine_cap_total
+                self._pacer_inflight_ceiling = None
 
         # sinon grille workers_by_profile, sinon fallback legacy.
         workers_from_profile = None
@@ -1447,6 +1423,9 @@ class ExecutionEngine:
         # Reality-gap observabilité (Engine ne modifie jamais min_required_bps)
         # Stocke, à des fins métriques uniquement, le dernier écart expected_vs_realized par pair_key.
         self._reality_gap_bps: Dict[str, float] = {}
+
+        # Concurrence effective par branche/profil (queue + workers)
+        self._active_bundle_counts: dict[tuple[str, str], int] = collections.defaultdict(int)
 
         # Concurrence effective par branche/profil (queue + workers)
         self._active_bundle_counts: dict[tuple[str, str], int] = collections.defaultdict(int)
@@ -2731,6 +2710,17 @@ class ExecutionEngine:
         except Exception:
             pass
 
+        branch_active = self._active_bundle_count(branch, profile)
+        eff_cap = self._effective_bundle_cap(bundle_concurrency, headroom_min)
+
+        try:
+            if hasattr(self, "obs_hist"):
+                self.obs_hist("engine_branch_active", float(branch_active))
+                if inflight_cap is not None:
+                    self.obs_hist("rm_inflight_cap", float(inflight_cap))
+        except Exception:
+            pass
+
         # Observabilité capacité (queue globale + branche)
         try:
             if hasattr(self, "obs_hist"):
@@ -3470,6 +3460,117 @@ class ExecutionEngine:
 
         return branch, profile
 
+    def _branch_profile_key(self, branch: str | None, profile: str | None) -> tuple[str, str]:
+        return (str(branch or "UNKNOWN").upper(), str(profile or "UNKNOWN").upper())
+
+    def _active_bundle_count(self, branch: str, profile: str) -> int:
+        try:
+            return int(self._active_bundle_counts.get(self._branch_profile_key(branch, profile), 0))
+        except Exception:
+            return 0
+
+    def _increment_active_bundle(self, branch: str, profile: str) -> None:
+        try:
+            key = self._branch_profile_key(branch, profile)
+            self._active_bundle_counts[key] = int(self._active_bundle_counts.get(key, 0)) + 1
+        except Exception:
+            pass
+
+    def _decrement_active_bundle(self, branch: str, profile: str) -> None:
+        try:
+            key = self._branch_profile_key(branch, profile)
+            cur = int(self._active_bundle_counts.get(key, 0))
+            if cur <= 1:
+                self._active_bundle_counts.pop(key, None)
+            else:
+                self._active_bundle_counts[key] = cur - 1
+        except Exception:
+            pass
+
+    def _effective_bundle_cap(self, bundle_concurrency: Any, headroom_min: int) -> Optional[int]:
+        try:
+            return max(max(int(bundle_concurrency), 0) - max(0, int(headroom_min)), 0)
+        except Exception:
+            return None
+
+    def _branch_concurrency_guard(
+        self,
+        *,
+        branch: str,
+        profile: str,
+        bundle_concurrency: Any,
+        headroom_min: int,
+        origin: str,
+    ) -> tuple[Optional[int], int]:
+        active_count = self._active_bundle_count(branch, profile)
+        eff_cap = self._effective_bundle_cap(bundle_concurrency, headroom_min)
+
+        if eff_cap is not None and active_count >= eff_cap:
+            try:
+                logger.info(
+                    "[ExecutionEngine] BACKPRESSURE_CAP_BRANCH (%s) branch=%s profile=%s active=%s eff_cap=%s",
+                    origin,
+                    branch,
+                    profile,
+                    active_count,
+                    eff_cap,
+                )
+            except Exception:
+                pass
+            try:
+                self._engine_backpressure_metric("CAP_BRANCH", branch=branch, profile=profile)
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_CAP_BRANCH, branch=branch, profile=profile
+            )
+
+        return eff_cap, active_count
+
+    def _release_active_bundle(self, payload: dict) -> None:
+        try:
+            if (payload or {}).get("type") not in {"bundle", "rebalancing"}:
+                return
+            meta = (payload or {}).get("meta") or {}
+            branch = str(meta.get("branch") or "").upper()
+            profile = str(meta.get("capital_profile") or "").upper()
+            if branch and profile:
+                self._decrement_active_bundle(branch, profile)
+        except Exception:
+            pass
+
+    def _require_branch_profile(self, meta: dict) -> tuple[str, str]:
+        """Valide et extrait branch/capital_profile depuis meta (contrat Macro 6-B-1)."""
+        meta = meta or {}
+        branch = str(meta.get("branch") or "").upper()
+        profile = str(meta.get("capital_profile") or "").upper()
+
+        if not branch or branch not in ALLOWED_BRANCHES:
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: branch invalide dans meta (%s)",
+                    branch or "MISSING",
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BAD_META_BRANCH, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
+            )
+
+        if not profile or profile not in ALLOWED_CAPITAL_PROFILES:
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: capital_profile invalide dans meta (%s)",
+                    profile or "MISSING",
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(
+                ENGINE_BAD_META_PROFILE, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
+            )
+
+        return branch, profile
+
     async def submit(self, bundle: dict):
         """
         Soumission non-bloquante:
@@ -3665,6 +3766,17 @@ class ExecutionEngine:
                         branch_depth += 1
         except Exception:
             branch_depth = 0
+
+        branch_active = self._active_bundle_count(branch, profile)
+        eff_cap = self._effective_bundle_cap(bundle_concurrency, headroom_min)
+
+        try:
+            if hasattr(self, "obs_hist"):
+                self.obs_hist("engine_branch_active", float(branch_active))
+                if inflight_cap is not None:
+                    self.obs_hist("rm_inflight_cap", float(inflight_cap))
+        except Exception:
+            pass
 
         branch_active = self._active_bundle_count(branch, profile)
         eff_cap = self._effective_bundle_cap(bundle_concurrency, headroom_min)

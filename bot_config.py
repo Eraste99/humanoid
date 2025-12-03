@@ -1861,12 +1861,6 @@ class BotConfig:
                                 continue
                     # Si aucune brique régionale trouvée, on borne simplement par la capacité totale Engine.
                     max_cap = total_cap_all if region_cap == 0 else min(region_cap, total_cap_all)
-                    rm_cap = int(inflight_total)
-                    # Pacer = overlay infra uniquement : borné par RM et par l'estimation Engine.
-                    if tgt_val > rm_cap:
-                        _err(
-                            f"pacer_targets[{region}]={tgt_val} > plafond RM inflight_trading_by_profile={rm_cap} (profil={profile})"
-                        )
                     if tgt_val > max_cap:
                         _err(
                             f"pacer_targets[{region}]={tgt_val} > capacité Engine régionale estimée={max_cap} (profil={profile})"

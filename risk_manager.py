@@ -103,8 +103,7 @@ except Exception:
 
 from modules.obs_metrics import (
     mark_books_fresh, mark_balances_fresh, inc_rm_reject,
-    set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
-    get_counter, safe_inc,
+    set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL
 )
 from bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
@@ -2319,7 +2318,8 @@ class RiskManager:
                         ttl_status = str(ttl_overlay.get("status") or "").upper()
                 except Exception:
                     ttl_status = ""
-                reason_combo = RM_CAP_COMBO_EXCEEDED
+
+                reason_combo = "RM_CAP_COMBO_EXCEEDED"
                 try:
                     self._obs_combo_cap_reject(
                         combo_key=combo_key or "NA",
