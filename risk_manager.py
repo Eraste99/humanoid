@@ -41,6 +41,8 @@ from modules.obs_metrics import TIME_SKEW_MS
 from contracts.payloads import make_submit_bundle, submit_leg_from_intent
 from dataclasses import dataclass, asdict
 import json
+from contracts import payloads as fraglib
+
 from typing import Any, Dict, List, Optional, Callable, Tuple, Set,Iterable
 import math, random
 
@@ -133,7 +135,6 @@ RM_CAPS_ZERO = "RM_CAPS_ZERO"
 RM_CAP_PROFILE_DISABLED = "RM_CAP_PROFILE_DISABLED"
 RM_CAP_BRANCH_DISABLED = "RM_CAP_BRANCH_DISABLED"
 RM_CAP_COMBO_EXCEEDED = "RM_CAP_COMBO_EXCEEDED"
-
 
 # --- Metrics (caps path hygiene) -------------------------------------------
 RM_CAPS_LEGACY_CALLS_TOTAL = get_counter(
@@ -741,7 +742,11 @@ class RiskManager:
         self.cfg = base_cfg
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.history_logger = history_logger
-
+        self._combo_cap_window_s = float(
+            getattr(getattr(self.cfg, "rm", None), "combo_cap_window_s", 120.0) or 120.0
+        )
+        self._combo_inflight_notional: Dict[str, List[Tuple[float, float]]] = {}
+        # --- Résumé des caps globaux par profil (Macro 3 / M3-A) ---
         # Best-effort uniquement, pour debug / observabilité. Aucune logique RM ne s'appuie
         # sur cette structure (les décisions restent basées sur caps_trading_by_profile,
         # inflight_rebal_by_profile et combo_cap_usd_by_profile).
@@ -1057,11 +1062,12 @@ class RiskManager:
             self.seed_virtual_balances(self._virtual_balances, overwrite=True)
 
         # Fragmentation (alignement Engine)
-        self.min_fragment_usdc = _cfg_float(self.cfg,"min_fragment_usdc", 200.0)
+        self.min_fragment_usdc = _cfg_float(self.cfg, "min_fragment_usdc", 200.0)
         self.max_fragments = _cfg_int(self.cfg, "max_fragments", 5)
-        self.fragment_safety_pad = _cfg_float(self.cfg,"fragment_safety_pad", 0.9)
-        self.target_ladder_participation = _cfg_float(self.cfg,"target_ladder_participation", 0.25)
+        self.fragment_safety_pad = _cfg_float(self.cfg, "fragment_safety_pad", 0.9)
+        self.target_ladder_participation = _cfg_float(self.cfg, "target_ladder_participation", 0.25)
         self.frontload_weights: List[float] = _cfg_list_upper(self.cfg, "frontload_weights", [0.5, 0.35, 0.15])
+        self.frontload_group_size = _cfg_int(self.cfg, "frontload_group_size", 3)
 
         # PATCH (bridge Scanner)
         self._scanner_ref = None  # référence optionnelle au Scanner
@@ -2591,7 +2597,6 @@ class RiskManager:
         entries = self._combo_inflight_notional.get(combo_key, [])
         entries.append((expiry, float(amount)))
         self._combo_inflight_notional[combo_key] = entries
-
 
     def _estimate_bundle_notional_usd(self, bundle: Dict[str, Any]) -> float:
         """
@@ -9949,8 +9954,15 @@ class RiskManager:
         """
         pk = self._norm_pair(pair_key)
         total = float(max(0.0, total_usdc))
+        source = "SIM"
         if total <= 0:
-            return {"amounts": [], "groups": [], "avg_fragment_usdc": 0.0, "auto": True}
+            return {
+                "amounts": [],
+                "groups": [],
+                "avg_fragment_usdc": 0.0,
+                "auto": True,
+                "source": source,
+            }
 
         # ---- VM : prudence -> réduction douce des tailles ---------------------------
         try:
@@ -9962,71 +9974,66 @@ class RiskManager:
 
         asks, bids = self.get_orderbook_depth(buy_ex, pk)
         if not asks or not bids:
-            return {"amounts": [total], "groups": ["G1"], "avg_fragment_usdc": total, "auto": False}
+            validated = fraglib.validate_fragment_plan(
+                [total], ["G1"], total_usdc=total, min_fragment_usdc=float(self.min_fragment_usdc)
+            )
+            validated["auto"] = False
+            validated["source"] = "FALLBACK"
+            return validated
 
+        cnt: Optional[int] = None
+        avg: Optional[float] = None
+        auto = True
         try:
             plan = self.simulator.suggest_slices(
-                budget_usdc=total, asks=asks, bids=bids,
+                budget_usdc=total,
+                asks=asks,
+                bids=bids,
                 target_participation=float(self.target_ladder_participation),
                 max_frags=int(self.max_fragments),
                 min_frag_usdc=float(self.min_fragment_usdc),
                 safety_pad=float(self.fragment_safety_pad),
             )
-            cnt = int(max(1, plan.get("count", 1)))
-            avg = float(plan.get("fragment_usdc", total)) if cnt > 0 else total
-            auto = bool(plan.get("auto", True))
+            cnt = int(max(1, plan.get("count", 1))) if plan else None
+            avg = float(plan.get("fragment_usdc", total)) if cnt else None
+            auto = bool(plan.get("auto", True)) if plan is not None else auto
+            source = "SIM"
         except Exception:
-            min_frag = float(self.min_fragment_usdc)
-            max_frags = int(self.max_fragments)
-            cnt = int(max(1, min(max_frags, round(total / max(min_frag, 1.0)))))
-            avg = total / cnt
+            cnt = None
+            avg = None
             auto = False
+            source = "FALLBACK"
 
-        try:
-            raw_weights = self.frontload_weights or [0.5, 0.35, 0.15]
-            weights = [float(w) for w in raw_weights]
-        except Exception:
-            weights = [0.5, 0.35, 0.15]
-        if sum(weights) <= 0:
-            weights = [1.0, 0.0, 0.0]
-        s = sum(weights)
-        weights = [w / s for w in weights]
-
-        amounts: List[float] = []
-        groups: List[str] = []
-        if cnt <= 3:
-            base = max(avg, float(self.min_fragment_usdc))
-            for i in range(cnt):
-                left = total - sum(amounts)
-                amt = base if i < (cnt - 1) else max(0.0, left)
-                amounts.append(min(amt, max(0.0, left)))
-                groups.append("G1")
-        else:
-            g1n = max(1, min(cnt, 3))
-            g2n = max(0, min(cnt - g1n, 3))
-            g3n = max(0, cnt - g1n - g2n)
-            gns = [g1n, g2n, g3n]
-            labels = ["G1", "G2", "G3"]
-            for label, w, n in zip(labels, weights, gns):
-                if n <= 0:
-                    continue
-                target = total * w
-                slice_amt = max(1.0, target / n)
-                for i in range(n):
-                    left = total - sum(amounts)
-                    amt = slice_amt if i < (n - 1) else max(0.0, left)
-                    amounts.append(min(amt, max(0.0, left)))
-                    groups.append(label)
-            diff = total - sum(amounts)
-            if abs(diff) > 1e-6:
-                amounts[-1] = max(0.0, amounts[-1] + diff)
-
-        return {
-            "amounts": amounts,
-            "groups": groups,
-            "avg_fragment_usdc": (sum(amounts) / max(1, len(amounts))),
-            "auto": auto,
-        }
+        weights = fraglib.normalize_frontload_weights(getattr(self, "frontload_weights", None))
+        group_size = int(getattr(self, "frontload_group_size", 3) or 3)
+        plan = fraglib.build_fragment_plan(
+            total,
+            weights=weights,
+            min_fragment_usdc=float(self.min_fragment_usdc),
+            max_fragments=int(self.max_fragments),
+            desired_count=cnt,
+            avg_fragment_usdc=avg,
+            group_size=group_size,
+        )
+        validated = fraglib.validate_fragment_plan(
+            plan.get("amounts", []),
+            plan.get("groups", []),
+            total_usdc=total,
+            min_fragment_usdc=float(self.min_fragment_usdc),
+            max_fragments=int(self.max_fragments),
+        )
+        if not validated.get("valid", True):
+            source = "FALLBACK"
+            validated = fraglib.validate_fragment_plan(
+                [total],
+                ["G1"],
+                total_usdc=total,
+                min_fragment_usdc=float(self.min_fragment_usdc),
+                max_fragments=int(self.max_fragments),
+            )
+        validated["auto"] = auto
+        validated["source"] = source
+        return validated
 
     # --- [ADD INSIDE class RiskManager] -----------------------------------------
     def _prebundle_guard(self, *, pair: str, route: dict, side: str, notional_quote: float) -> float:
@@ -10144,7 +10151,6 @@ class RiskManager:
                     "default_mode": getattr(self.cfg, "tm_default_mode", "NEUTRAL"),
                     # Clé canonique pour la hedge NEUTRAL
                     "neutral_hedge_ratio": getattr(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50),
-
                     # Alias éventuel pour compat legacy (peut être None si non configuré)
                     "legacy_neutral_hedge_ratio": getattr(self.cfg, "tm_neutral_hedge_ratio", None),
                     "nn_min_edge_bps": getattr(self.cfg, "tm_nn_min_edge_bps", 3.0),
@@ -10155,12 +10161,14 @@ class RiskManager:
                     "nn_max_exposure_s": getattr(self.cfg, "tm_nn_max_exposure_s", 3.0),
                 },
 
-                "fragmentation": {
+                 "fragmentation": {
                     "min_fragment_usdc": self.min_fragment_usdc,
                     "max_fragments": self.max_fragments,
+                    "fragment_sim_margin_bps": getattr(self, "fragment_sim_margin_bps", None),
                     "fragment_safety_pad": self.fragment_safety_pad,
                     "target_ladder_participation": self.target_ladder_participation,
                     "frontload_weights": list(self.frontload_weights or []),
+                    "frontload_group_size": getattr(self, "frontload_group_size", 3),
                 },
             },
             "submodules": {

@@ -534,8 +534,6 @@ class EnginePacer:
             "ts": st.last_update_ts,
         }
 
-
-
     def _export_metrics(self, rg: str, st: RegionState) -> None:
         try:
             ENGINE_PACER_DELAY_MS.labels(region=rg, profile=self._profile, mode=str(st.mode)).set(st.pacing_ms)

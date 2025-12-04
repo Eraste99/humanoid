@@ -24,6 +24,7 @@ Patchs demandés (inclus)
 
 from __future__ import annotations
 import enum
+import math
 import time
 import uuid
 from typing import Any, Dict, List, Optional
@@ -181,6 +182,151 @@ def _pos(v: Any, name: str) -> float:
     if f <= 0:
         raise ValueError(f"{name} must be > 0")
     return f
+
+# -----------------------------------------------------------------------------
+# Fragmentation helpers (front-load canonique G1/G2/G3)
+# -----------------------------------------------------------------------------
+FRAGMENT_GROUPS = ("G1", "G2", "G3")
+
+
+def normalize_frontload_weights(raw: Optional[List[float]], default: Optional[List[float]] = None) -> List[float]:
+    """
+    Normalise les poids de front-load (fallback [0.50,0.35,0.15]).
+    - padding à 3 entrées, clamp >=0, somme = 1.0
+    """
+    base = list(raw or []) or list(default or [0.50, 0.35, 0.15])
+    # pad / trim à 3
+    if len(base) < 3:
+        base = (base + [0.0, 0.0, 0.0])[:3]
+    else:
+        base = base[:3]
+    safe = []
+    for w in base:
+        try:
+            safe.append(max(0.0, float(w)))
+        except Exception:
+            safe.append(0.0)
+    s = sum(safe)
+    if s <= 0:
+        safe = [1.0, 0.0, 0.0]
+        s = 1.0
+    return [w / s for w in safe]
+
+
+def build_fragment_plan(
+    total_usdc: float,
+    *,
+    weights: Optional[List[float]] = None,
+    min_fragment_usdc: float,
+    max_fragments: Optional[int] = None,
+    desired_count: Optional[int] = None,
+    avg_fragment_usdc: Optional[float] = None,
+    group_size: int = 3,
+) -> Dict[str, Any]:
+    """Génère un plan front-load (amounts + groups cohorte G1/G2/G3)."""
+    total = max(0.0, float(total_usdc))
+    if total <= 0:
+        return {"amounts": [], "groups": [], "avg_fragment_usdc": 0.0}
+
+    group_size = max(1, int(group_size))
+    if desired_count and desired_count > 0:
+        count = int(desired_count)
+    elif avg_fragment_usdc and avg_fragment_usdc > 0:
+        count = max(1, int(round(total / float(avg_fragment_usdc))))
+    else:
+        count = max(1, int(round(total / max(min_fragment_usdc, 1.0))))
+    if max_fragments:
+        try:
+            count = min(count, int(max_fragments))
+        except Exception:
+            pass
+    count = max(1, min(64, count))
+
+    g1 = min(group_size, count)
+    rem_after_g1 = count - g1
+    g2 = min(group_size, rem_after_g1) if rem_after_g1 > 0 else 0
+    rem_after_g2 = rem_after_g1 - g2
+    g3 = max(0, rem_after_g2)
+
+    norm_weights = normalize_frontload_weights(weights)
+    cohorts = []
+    if g1 > 0:
+        cohorts.append(("G1", g1, norm_weights[0]))
+    if g2 > 0:
+        cohorts.append(("G2", g2, norm_weights[1]))
+    if g3 > 0:
+        cohorts.append(("G3", g3, norm_weights[2]))
+    s = sum(w for _, _, w in cohorts) or 1.0
+    cohorts = [(label, size, w / s) for (label, size, w) in cohorts]
+
+    amounts: List[float] = []
+    groups: List[str] = []
+    for label, size, weight in cohorts:
+        budget = total * weight
+        if label == cohorts[-1][0]:
+            budget = max(0.0, total - sum(amounts))
+        if size <= 0 or budget <= 0:
+            continue
+        per_slice = budget / size
+        if per_slice < min_fragment_usdc and size > 1:
+            size = max(1, int(min(size, math.ceil(budget / max(min_fragment_usdc, 1.0)))))
+            per_slice = budget / size
+        for _i in range(size):
+            amt = per_slice
+            amounts.append(amt)
+            groups.append(label)
+
+    diff = total - sum(amounts)
+    if amounts and abs(diff) > 1e-6:
+        amounts[-1] = max(0.0, amounts[-1] + diff)
+
+    # Fusionner une queue trop petite avec l'avant-dernière tranche
+    if len(amounts) >= 2 and amounts[-1] < (min_fragment_usdc * 0.5):
+        merged = amounts[-1] + amounts[-2]
+        amounts[-2] = merged
+        amounts.pop()
+        if groups:
+            groups.pop()
+
+    avg = (sum(amounts) / max(1, len(amounts))) if amounts else 0.0
+    return {"amounts": amounts, "groups": groups, "avg_fragment_usdc": avg}
+
+
+def validate_fragment_plan(
+    amounts: List[float],
+    groups: List[str],
+    *,
+    total_usdc: float,
+    min_fragment_usdc: float,
+    max_fragments: Optional[int] = None,
+    tol: float = 1e-3,
+) -> Dict[str, Any]:
+    """Valide/normalise un plan de fragments (fallback → tranche unique G1)."""
+    total = max(0.0, float(total_usdc))
+    amts = [float(a) for a in (amounts or []) if float(a) > 0]
+    grps = list(groups or [])
+    valid = True
+
+    if max_fragments and max_fragments > 0:
+        amts = amts[: max_fragments]
+        grps = grps[: len(amts)]
+
+    if len(amts) != len(grps) or not amts:
+        valid = False
+    if any(a < min_fragment_usdc for a in amts):
+        valid = False
+    if any(g not in FRAGMENT_GROUPS for g in grps):
+        valid = False
+    if total > 0:
+        if abs(sum(amts) - total) > max(tol, tol * max(1.0, total)):
+            valid = False
+
+    if not valid:
+        amts = [total] if total > 0 else []
+        grps = ["G1"] if total > 0 else []
+
+    avg = (sum(amts) / max(1, len(amts))) if amts else 0.0
+    return {"amounts": amts, "groups": grps, "avg_fragment_usdc": avg, "valid": valid}
 
 # -----------------------------------------------------------------------------
 # Sous-modèles typés (riches)
@@ -665,4 +811,6 @@ __all__ = [
     "validate_fill_normalized_lite", "validate_order_intent_lite", "make_submit_bundle",
     # >>> PATCH #3 — helpers publics
     "norm_symbol", "pair_key",
+    # Fragmentation helpers
+    "normalize_frontload_weights", "build_fragment_plan", "validate_fragment_plan",
 ]

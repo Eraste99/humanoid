@@ -180,6 +180,7 @@ class Globals:
     })
 
     frontload_weights: List[float] = field(default_factory=lambda: [0.50,0.35,0.15])
+    frontload_group_size: int = 3
     min_fragment_quote: Dict[str, float] = field(default_factory=lambda: {"USDC":200.0, "EUR":200.0})
     guards: Dict[str, float] = field(default_factory=lambda: {
         "anchor_max_staleness_ms": 1200,
@@ -488,6 +489,7 @@ class RiskManagerCfg:
     fragment_safety_pad: float = 0.10
     target_ladder_participation: float = 0.5
     frontload_weights: List[float] = field(default_factory=lambda: [0.50,0.35,0.15])
+    frontload_group_size: int = 3
 
     max_book_age_s: float = 1.2
     max_clock_skew_ms: int = 120
@@ -626,6 +628,7 @@ class EngineCfg:
     tm_max_open_makers: int = 3
 
     frontload_weights: List[float] = field(default_factory=lambda: [0.50,0.35,0.15])
+    frontload_group_size: int = 3
     min_fragment_quote: Dict[str,float] = field(default_factory=lambda: {"USDC":200.0, "EUR":200.0})
 
     anchor_max_staleness_ms: int = 1200
@@ -1934,66 +1937,6 @@ class BotConfig:
             raise ValueError(
                 f"BotConfig invariants violés ({len(errors)}) en mode PROD. Exemple: {errors[0]}"
             )
-
-            # 5) caps Engine par CEX vs inflight trading RM (vue globale)
-        try:
-            inflight = getattr(rm, "inflight_trading_by_profile", {}) or {}
-            engine_cfg = getattr(cfg, "engine", None)
-            if engine_cfg is not None:
-                engine_caps = getattr(engine_cfg, "inflight_max_by_exchange_by_profile", {}) or {}
-                for profile, inflight_total in inflight.items():
-                    per_venue = engine_caps.get(profile) or {}
-                    total_engine_cap = 0
-                    for v in (per_venue or {}).values():
-                        try:
-                            total_engine_cap += int(v or 0)
-                        except Exception:
-                            continue
-                    # Si la somme des caps techniques Engine est < plafond RM,
-                    # le profil sera mécaniquement bridé (capacité < budget business).
-                    if total_engine_cap < int(inflight_total):
-                        log.warning(
-                            "BotConfig: ENGINE inflight_max_by_exchange_by_profile[%s] total=%s "
-                            "< inflight_trading_by_profile=%s (profil potentiellement bridé par les caps Engine)",
-                            profile,
-                            total_engine_cap,
-                            inflight_total,
-                        )
-        except Exception as exc:
-            log.warning(
-                "BotConfig: unable to sanity-check engine inflight caps vs RM inflight_trading_by_profile: %s",
-                exc,
-            )
-
-        # 4) policy Capital Ladder
-        try:
-            ladder_cfg = getattr(rm, "capital_ladder_cfg", {}) or {}
-            if ladder_cfg:
-                last_min = None
-                for profile, policy in ladder_cfg.items():
-                    policy = policy or {}
-                    try:
-                        min_cap = float(policy.get("min_capital_per_sc", 0.0) or 0.0)
-                    except Exception:
-                        continue
-                    if min_cap < 0:
-                        log.warning(
-                            "BotConfig: capital_ladder_cfg[%s].min_capital_per_sc=%.3f < 0 (corrige la config)",
-                            profile,
-                            min_cap,
-                        )
-                    if last_min is not None and min_cap < last_min:
-                        log.warning(
-                            "BotConfig: capital_ladder_cfg[%s].min_capital_per_sc=%.3f < précédent=%.3f (ordre ladder incohérent NANO→...→LARGE)",
-                            profile,
-                            min_cap,
-                            last_min,
-                        )
-                    last_min = min_cap
-        except Exception as exc:
-            log.warning("BotConfig: unable to sanity-check capital_ladder_cfg: %s", exc)
-
-
 
 
 

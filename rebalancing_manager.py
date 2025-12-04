@@ -207,6 +207,19 @@ class RebalancingManager:
         self.rebal_priority: List[str] = list(getattr(self.cfg, "rebal_priority", ["CASH", "CRYPTO", "OVERLAY"]))
         self.rebal_hint_ttl_s: int = int(getattr(self.cfg, "rebal_hint_ttl_s", 120))
         self._reb_slot_ttl_s: float = float(getattr(self.cfg, "rebal_slot_ttl_s", self.rebal_hint_ttl_s))
+        cfg_min_frag = getattr(self.cfg, "min_fragment_usdc", None)
+        cfg_min_map = getattr(self.cfg, "min_fragment_quote", None) or {}
+        derived_min = max(cfg_min_map.get(q, 0.0) for q in self.quote_currencies) if cfg_min_map else 0.0
+        try:
+            derived_min = float(derived_min)
+        except Exception:
+            derived_min = 0.0
+        base_min_frag = 0.0
+        try:
+            base_min_frag = float(cfg_min_frag) if cfg_min_frag is not None else 0.0
+        except Exception:
+            base_min_frag = 0.0
+        self.rebal_fragment_min_quote = max(self.rebal_quantum_min_quote, base_min_frag, derived_min)
         rm_cfg = getattr(self.cfg, "rm", None)
         profile = str(getattr(getattr(self.cfg, "g", None), "capital_profile", "LARGE") or "LARGE").upper()
         inflight_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) if rm_cfg else {}
@@ -225,6 +238,7 @@ class RebalancingManager:
         self._last_combo_cap_ratio: Optional[float] = None
         self._last_rebal_cap_status: Optional[str] = None
         self._reb_active_slots: deque = deque(maxlen=512)
+
 
         # Snapshots ingérés par le RM
         # OB: latest_orderbooks[EX][SYMBOL] = {"bid":..., "ask":..., "ts": ...}
@@ -311,9 +325,7 @@ class RebalancingManager:
                 total += amt
         return total
 
-
-
-        # -------------------------- Snapshots guards ----------------------------
+# -------------------------- Snapshots guards ----------------------------
 
     def _has_balances_snapshot(self) -> bool:
         for per_alias in (self.latest_balances or {}).values():
@@ -757,7 +769,7 @@ class RebalancingManager:
         # ----------------- Anti-thrash: quantum & rate-limit ------------------
         def _apply_quantum(ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             out = []
-            qmin = float(self.rebal_quantum_min_quote)
+            qmin = float(self.rebal_fragment_min_quote)
             for op in (ops or []):
                 amt = _to_f(op.get("amount", 0.0))
                 if amt and amt < qmin:

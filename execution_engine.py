@@ -37,10 +37,13 @@ log = logging.getLogger(__name__)
 import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
+from contracts import payloads as fraglib
+
 from modules.engine_pacer import EnginePacer  # ensure import top-level
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.errors import EngineSubmitError, EngineCancelError, ExternalServiceError, NotReadyError
-from bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
+from modules.bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
+
 
 # --- deps async/http ---
 # aiohttp is optional in some envs; guard its import
@@ -2876,6 +2879,7 @@ class ExecutionEngine:
             self._decrement_active_bundle(branch, profile)
             raise
 
+
         # 5) Mise à jour des gauges en succès + mémorisation CID
         try:
             self.stats.queue_length = self.order_queue.qsize()
@@ -4969,71 +4973,60 @@ class ExecutionEngine:
             avg = None
         return cnt, avg
 
+    def _plan_to_slices(
+        self,
+        *,
+        amounts: List[float],
+        groups: List[str],
+        total_usdc: float,
+        min_fragment_usdc: float,
+        max_fragments: Optional[int] = None,
+    ) -> Tuple[List[Tuple[float, str, int, float]], bool]:
+        validated = fraglib.validate_fragment_plan(
+            amounts,
+            groups,
+            total_usdc=total_usdc,
+            min_fragment_usdc=min_fragment_usdc,
+            max_fragments=max_fragments,
+        )
+        slices: List[Tuple[float, str, int, float]] = []
+        counters = collections.defaultdict(int)
+        total = float(total_usdc)
+        for amt, label in zip(validated.get("amounts", []), validated.get("groups", [])):
+            idx = counters[label]
+            counters[label] += 1
+            weight = (amt / total) if total > 0 else 0.0
+            slices.append((float(amt), str(label), idx, weight))
+        return slices, bool(validated.get("valid", True))
+
     def _build_frontloaded_slices(
         self, total_usdc: float, desired_count: Optional[int], avg_fragment_usdc: Optional[float]
     ) -> List[Tuple[float, str, int, float]]:
         total = max(0.0, float(total_usdc))
         if total <= 0:
             return []
-        if desired_count and desired_count > 0:
-            N = int(desired_count)
-        elif avg_fragment_usdc and avg_fragment_usdc > 0:
-            N = max(1, int(round(total / float(avg_fragment_usdc))))
-        else:
-            N = max(1, int(round(total / max(self.min_fragment_usdc, 1.0))))
-        N = max(1, min(64, N))
-        group_size = max(1, int(self.frontload_group_size))
-        g1 = min(group_size, N)
-        rem_after_g1 = N - g1
-        g2 = min(group_size, rem_after_g1) if rem_after_g1 > 0 else 0
-        rem_after_g2 = rem_after_g1 - g2
-        g3 = max(0, rem_after_g2)
-        w = list(self.frontload_weights or [0.5, 0.35, 0.15])
-        if len(w) < 3:
-            w = (w + [0.0, 0.0, 0.0])[:3]
-        active = []
-        if g1 > 0:
-            active.append(("G1", g1, w[0]))
-        if g2 > 0:
-            active.append(("G2", g2, w[1]))
-        if g3 > 0:
-            active.append(("G3", g3, w[2]))
-        s = sum(x[2] for x in active) or 1.0
-        active = [(label, size, weight / s) for (label, size, weight) in active]
 
-        slices: List[Tuple[float, str, int, float]] = []
-        allocated = 0.0
-        for label, size, w_cohort in active:
-            budget = total * float(w_cohort)
-            if label == active[-1][0]:
-                budget = max(0.0, total - allocated)
-            if size <= 0 or budget <= 0:
-                continue
-            per_slice = budget / size
-            if per_slice < self.min_fragment_usdc and size > 1:
-                size = max(1, int(min(size, ceil(budget / self.min_fragment_usdc))))
-                per_slice = budget / size
-            for i in range(size):
-                amt = per_slice
-                slices.append((amt, label, i, amt / total))
-                allocated += amt
-        diff = total - sum(a for a, _, _, _ in slices)
-        if abs(diff) >= 1e-6 and slices:
-            last = slices[-1]
-            slices[-1] = (
-                max(0.0, last[0] + diff),
-                last[1],
-                last[2],
-                max(0.0, (last[0] + diff) / total),
-            )
-        if len(slices) >= 2 and slices[-1][0] < (self.min_fragment_usdc * 0.5):
-            new_last_amt = slices[-1][0] + slices[-2][0]
-            new_w = new_last_amt / total
-            label = slices[-2][1]
-            idx = slices[-2][2]
-            slices[-2] = (new_last_amt, label, idx, new_w)
-            slices.pop()
+        min_frag = float(getattr(self, "min_fragment_usdc", getattr(self, "min_fragment_quote", 0.0)))
+        weights = fraglib.normalize_frontload_weights(self.frontload_weights or [0.5, 0.35, 0.15])
+        group_size = int(getattr(self, "frontload_group_size", 3) or 3)
+        plan = fraglib.build_fragment_plan(
+            total,
+            weights=weights,
+            min_fragment_usdc=min_frag,
+            max_fragments=desired_count,
+            desired_count=desired_count,
+            avg_fragment_usdc=avg_fragment_usdc,
+            group_size=group_size,
+        )
+        slices, _ = self._plan_to_slices(
+            amounts=plan.get("amounts", []),
+            groups=plan.get("groups", []),
+            total_usdc=total,
+            min_fragment_usdc=min_frag,
+            max_fragments=desired_count,
+        )
         return slices
+
 
     async def _cancel_bg_tasks(self, *, timeout: float = 2.0) -> None:
         tasks = [t for t in getattr(self, "_bg_tasks", set()) if not t.done()]
@@ -5892,21 +5885,28 @@ class ExecutionEngine:
                 plan = None
 
             if plan and (plan.get("amounts") or []):
-                amts = [float(a) for a in plan.get("amounts", []) if float(a) > 0]
-                grps = list(plan.get("groups", []))
-                for i, a in enumerate(amts):
-                    g = grps[i] if i < len(grps) else "G1"
-                    slices.append((a, g, i, a / total_usdc))
-                frag_source = "RM_PLAN"
-            else:
+                slices, ok = self._plan_to_slices(
+                    amounts=plan.get("amounts", []),
+                    groups=plan.get("groups", []),
+                    total_usdc=total_usdc,
+                    min_fragment_usdc=float(
+                        getattr(self, "min_fragment_usdc", getattr(self, "min_fragment_quote", 0.0))),
+                )
+                if ok and slices:
+                    frag_source = "RM_PLAN"
+                else:
+                    slices = []
+
+            if not slices:
                 # 3) Fallback full Engine (frontload interne)
                 slices = self._build_frontloaded_slices(total_usdc, None, None)
                 frag_source = "FALLBACK"
 
-        if not slices:
-            # Dernier filet de sécurité : un seul tir G1 plein pot
-            slices = [(total_usdc, "G1", 0, 1.0)]
-            frag_source = "SINGLE"
+            if not slices:
+                # Dernier filet de sécurité : un seul tir G1 plein pot
+                slices = [(total_usdc, "G1", 0, 1.0)]
+                frag_source = "SINGLE"
+
 
         # Cap business sur le nombre de fragments TT effectifs
         try:
@@ -5947,6 +5947,7 @@ class ExecutionEngine:
                 "frag_g1": len(cohorts.get("G1", [])),
                 "frag_g2": len(cohorts.get("G2", [])),
                 "frag_g3": len(cohorts.get("G3", [])),
+                "frag_avg_usdc": float(sum(a for a, _, _, _ in slices) / max(1, len(slices))),
                 "sim_frag_count": int(sim_frag_count or 0),
                 "sim_frag_avg_usdc": float(sim_frag_avg_usdc or 0.0),
                 "is_rebalancing": bool(is_rebalancing),
@@ -6427,6 +6428,7 @@ class ExecutionEngine:
 
         if desired or (avg and avg > 0):
             slices = self._build_frontloaded_slices(total_usdc, desired, avg)
+            frag_source = "SIM"
         else:
             plan = None
             try:
@@ -6435,29 +6437,40 @@ class ExecutionEngine:
                     buy_ex=buy_leg["exchange"],
                     sell_ex=sell_leg["exchange"],
                     total_usdc=total_usdc,
-                    strategy="TM",
+                    strategy="REB" if is_rebalancing else "TM",
                     regime=regime,
                 )
             except Exception:
                 plan = None
             if plan and (plan.get("amounts") or []):
-                amts = [float(a) for a in plan.get("amounts", []) if float(a) > 0]
-                grps = list(plan.get("groups", []))
-                for i, a in enumerate(amts[: self.tm_max_open_makers]):
-                    g = grps[i] if i < len(grps) else "G1"
-                    slices.append((a, g, i, a / total_usdc))
-            else:
+                slices, ok = self._plan_to_slices(
+                    amounts=plan.get("amounts", []),
+                    groups=plan.get("groups", []),
+                    total_usdc=total_usdc,
+                    min_fragment_usdc=float(
+                        getattr(self, "min_fragment_usdc", getattr(self, "min_fragment_quote", 0.0))),
+                    max_fragments=self.tm_max_open_makers,
+                )
+                if ok and slices:
+                    frag_source = "RM_PLAN"
+                else:
+                    slices = []
+
+            if not slices:
                 if self.frontload_enabled:
                     slices = self._build_frontloaded_slices(total_usdc, self.tm_max_open_makers, None)
+                    frag_source = "FALLBACK"
                 else:
                     weights = self.tm_weights if (self.tm_weights and sum(self.tm_weights) > 0) else [1.0]
                     weights = weights[: self.tm_max_open_makers]
                     s = sum(weights) or 1.0
                     weights = [w / s for w in weights]
                     slices = [(total_usdc * w, "G1", i, w) for i, w in enumerate(weights)]
+                    frag_source = "SINGLE"
 
         if not slices:
             slices = [(total_usdc, "G1", 0, 1.0)]
+
 
         # TOB maker
         get_tob = getattr(self.risk_manager, "get_top_of_book", None)
