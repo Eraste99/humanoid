@@ -763,6 +763,7 @@ try:
         set_engine_queue,
         set_engine_running,
         ENGINE_RM_OVERRIDES_TOTAL,
+        get_counter,
     )
 except Exception:
     # on garde les stubs déclarés plus haut
@@ -781,6 +782,23 @@ try:
     REBAL_CROSS_TOO_EXPENSIVE_TOTAL
 except NameError:
     REBAL_CROSS_TOO_EXPENSIVE_TOTAL = _NoopMetric()
+
+try:
+    get_counter
+except NameError:
+    def get_counter(*_, **__):
+        return _NoopMetric()
+
+ENGINE_FRAG_FALLBACK_TOTAL = get_counter(
+    "engine_frag_fallback_total",
+    "Engine fallback/repair fragment plans",
+    ["strategy", "reason"],
+)
+ENGINE_FRAG_INVARIANT_FAILED_TOTAL = get_counter(
+    "engine_frag_invariant_failed_total",
+    "Engine invariants failed for fragment plan",
+    ["strategy"],
+)
 
 
 logger = logging.getLogger("ExecutionEngine")
@@ -1432,6 +1450,9 @@ class ExecutionEngine:
             getattr(self.config, "mm_use_progressive_hedge", True)
         )
 
+        # Charte MM v1 : pas de hedge automatique par défaut (mono-CEX maker-only)
+        self.mm_allow_auto_hedge = bool(getattr(self.config, "mm_allow_auto_hedge", False))
+
         # Ratio cible de couverture à l'échéance (panic hedge).
         # 1.0 = couverture complète du notional initial côté maker non rempli.
         self.mm_hedge_final_ratio = float(
@@ -1443,6 +1464,8 @@ class ExecutionEngine:
             getattr(self.config, "frontload_weights", [0.6, 0.3, 0.1])
         )
         self.min_fragment_quote = float(getattr(self.config, "min_fragment_quote", 200.0))
+        self.min_fragment_usdc = float(getattr(self, "min_fragment_usdc", self.min_fragment_quote))
+        self.frontload_group_size = int(getattr(self.config, "frontload_group_size", 3))
 
         # ==== SAFE DEFAULTS / STATE ====
         self._mm_scaled_until: Dict[str, float] = {}
@@ -1465,6 +1488,14 @@ class ExecutionEngine:
         self.mm_hysteresis_ms = int(getattr(self.config, "mm_hysteresis_ms", 2000))
         self.mm_scale_on_tt_tm = float(getattr(self.config, "mm_scale_on_tt_tm", 0.6))
         self.mm_pad_boost_on_tt_tm = int(getattr(self.config, "mm_pad_boost_on_tt_tm", 1))
+
+        # Throttles MM (placement / cancel) — best-effort, par (exchange, pair)
+        self.mm_place_rate_limit_per_pair = int(getattr(self.config, "mm_place_rate_limit_per_pair", 10))
+        self.mm_cancel_rate_limit_per_pair = int(getattr(self.config, "mm_cancel_rate_limit_per_pair", 20))
+        self._mm_place_buckets: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
+        self._mm_cancel_buckets: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
+        self._mm_active_by_pair: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
+        self._mm_expiry_by_cid: dict[str, tuple[str, str, float]] = {}
 
         # ==== Concurrence / pacing global par branche ====
         self.max_parallel_pairs_tt = int(getattr(self.config, "max_parallel_pairs_tt", 2))
@@ -2879,7 +2910,6 @@ class ExecutionEngine:
             self._decrement_active_bundle(branch, profile)
             raise
 
-
         # 5) Mise à jour des gauges en succès + mémorisation CID
         try:
             self.stats.queue_length = self.order_queue.qsize()
@@ -2990,9 +3020,9 @@ class ExecutionEngine:
 
             # 1) Place makers
             sell_cid = await self._mm_place_maker(pair_key=pair, exchange=sell_ex, side="SELL",
-                                                  amount_quote=amt_sell, bundle_id=bundle_id)
+                                                  amount_quote=amt_sell, bundle_id=bundle_id, ttl_ms=ttl_ms)
             buy_cid = await self._mm_place_maker(pair_key=pair, exchange=buy_ex, side="BUY",
-                                                 amount_quote=amt_buy, bundle_id=bundle_id)
+                                                 amount_quote=amt_buy, bundle_id=bundle_id, ttl_ms=ttl_ms)
 
             # --- Contrat MM (RM -> Engine) ---
             # Entrée attendue côté RM (branch == "MM") :
@@ -3007,13 +3037,7 @@ class ExecutionEngine:
             #   - placer les 2 makers GTC/PostOnly via `_mm_place_maker`
             #   - NE PAS appliquer de filtre économique supplémentaire
             #       (min_required_bps, edge, vol, etc. restent 100% côté RM)
-            #   - gérer uniquement la mécanique de hedging :
-            #       * boucle d'attente jusqu'à `mm_ttl_ms`
-            #       * si asymétrie de fills :
-            #           - hedging progressif optionnel si `mm_use_progressive_hedge` est True,
-            #             suivant `mm_hedge_schedule`
-            #           - panic hedge final en IOC jusqu'à `mm_hedge_final_ratio`
-            #   - historiser tout le cycle via `_hist(..., _hist_kind="MM", ...)` et
+            #    - gérer uniquement la mécanique de hedging lorsque explicitement autorisée            #   - historiser tout le cycle via `_hist(..., _hist_kind="MM", ...)` et
             #     les métriques Prometheus (MM_FILLS_BOTH, MM_SINGLE_FILL_HEDGED, MM_PANIC_HEDGE_TOTAL).
             #
             # Côté business : le RM reste owner du "GO/NO-GO" et des caps.
@@ -3033,7 +3057,11 @@ class ExecutionEngine:
                 except Exception:
                     ttl_ms = 2300
 
-
+            # Charte MM v1 : pas de hedge auto par défaut → on laisse vivre les quotes puis cancel TTL
+            if not self.mm_allow_auto_hedge:
+                await asyncio.sleep(max(0.0, ttl_ms / 1000.0))
+                await self._mm_cancel_open_makers([sell_cid, buy_cid], reason="ttl")
+                return
             deadline = time.monotonic() + (ttl_ms / 1000.0)
             is_dry = bool(getattr(self.config, "dry_run", True))
             progressive_task = None
@@ -4856,6 +4884,71 @@ class ExecutionEngine:
     def _mm_new_client_id(self, prefix: str = "MM") -> str:
         return f"{prefix}{int(time.time() * 1000)}{uuid.uuid4().hex[:6]}"
 
+    def _mm_throttle(self, *, exchange: str, pair_key: str, kind: str) -> bool:
+        """Simple token bucket 1s pour MM place/cancel.
+
+        Retourne True si la limite est dépassée et que l'action doit être bloquée.
+        """
+        now = time.time()
+        bucket_map = self._mm_place_buckets if kind == "place" else self._mm_cancel_buckets
+        limit = self.mm_place_rate_limit_per_pair if kind == "place" else self.mm_cancel_rate_limit_per_pair
+        key = (exchange.upper(), pair_key.upper())
+        window = bucket_map[key]
+        # purge < now-1s
+        while window and window[0] < now - 1.0:
+            window.pop(0)
+        if limit > 0 and len(window) >= limit:
+            try:
+                from obs_metrics import MM_THROTTLED_TOTAL
+
+                MM_THROTTLED_TOTAL.labels(reason=kind, exchange=exchange.upper(), pair=pair_key.upper()).inc()
+            except Exception:
+                pass
+            try:
+                logger.info(
+                    "[ExecutionEngine] MM throttle %s hit exchange=%s pair=%s count=%s limit=%s",
+                    kind,
+                    exchange,
+                    pair_key,
+                    len(window),
+                    limit,
+                )
+            except Exception:
+                pass
+            return True
+        window.append(now)
+        return False
+
+    def _mm_register(self, *, client_id: str, exchange: str, pair_key: str, ttl_ms: int,
+                     bundle_id: str | None = None) -> None:
+        """Track MM makers for TTL & preemption."""
+        key = (exchange.upper(), pair_key.upper())
+        self._mm_active_by_pair[key].add(client_id)
+        expiry = time.time() + max(0.0, ttl_ms) / 1000.0
+        self._mm_expiry_by_cid[client_id] = (exchange.upper(), pair_key.upper(), expiry)
+        if ttl_ms > 0:
+            self._spawn(self._mm_cancel_on_ttl(client_id, expiry, bundle_id=bundle_id), name=f"mm-ttl-{client_id[-6:]}")
+
+    async def _mm_cancel_on_ttl(self, client_id: str, expiry: float, bundle_id: str | None = None) -> None:
+        delay = max(0.0, expiry - time.time())
+        if delay:
+            await asyncio.sleep(delay)
+        info = self._mm_expiry_by_cid.get(client_id)
+        if not info:
+            return
+        ex, pair_key, _ = info
+        # cancel if still active
+        await self._mm_cancel_open_makers([client_id], reason="ttl")
+        try:
+            from obs_metrics import MM_MAKERS_EXPIRED_TTL_TOTAL
+
+            MM_MAKERS_EXPIRED_TTL_TOTAL.labels(exchange=ex, pair=pair_key).inc()
+        except Exception:
+            pass
+        await self._hist("trade",
+                         {"_hist_kind": "MM", "pair": pair_key, "status": "ttl_expired", "bundle_id": bundle_id,
+                          "client_id": client_id, "timestamp": time.time()})
+
     def _mm_quote(self, pair_key: str) -> str:
         _, q = SymbolUtils.split_base_quote(pair_key)
         return q
@@ -4872,6 +4965,8 @@ class ExecutionEngine:
         """
         ex = self._norm_ex(exchange)
         sym = pair_key.replace("-", "").upper()
+        if self._mm_throttle(exchange=ex, pair_key=sym, kind="place"):
+            raise EngineSubmitError("MM_THROTTLED_PLACE")
         best, ts = self._best_price_from_rm(ex, sym, side)
         # fallback minimal si pas d'ancre
         price = float(best or 0.0)
@@ -4902,6 +4997,11 @@ class ExecutionEngine:
             },
         }
         await self._exec_single(order)  # passe par la file + guards existants
+        try:
+            ttl_override = int(ttl_ms) if ttl_ms is not None else int(getattr(self, "mm_ttl_ms", 0))
+            self._mm_register(client_id=clid, exchange=ex, pair_key=sym, ttl_ms=ttl_override, bundle_id=bundle_id)
+        except Exception:
+            pass
         return clid
 
     async def _mm_panic_hedge_ioc(self, *, pair_key: str, exchange: str, side: str,
@@ -4936,6 +5036,9 @@ class ExecutionEngine:
         }
         await self._exec_single(order)
 
+    def _mm_active_for(self, exchange: str, pair_key: str) -> list[str]:
+        return list(self._mm_active_by_pair.get((exchange.upper(), pair_key.upper()), set()))
+
     async def _mm_cancel_open_makers(self, client_ids: list[str]) -> None:
         """
         Annule proprement les makers restants (NEW/ACK/PARTIAL) par client_id.
@@ -4946,12 +5049,37 @@ class ExecutionEngine:
                 continue
             ex, sym = self._client_symbol_map.get(cid, (None, None))
             if ex and sym:
+                key = (ex, sym)
+                if self._mm_throttle(exchange=ex, pair_key=sym, kind="cancel"):
+                    continue
+
                 try:
                     await self._cancel_order(ex, sym, cid)
+                    try:
+                        from obs_metrics import MM_MAKERS_CANCELED_TOTAL
+
+                        MM_MAKERS_CANCELED_TOTAL.labels(reason=reason, exchange=ex, pair=sym).inc()
+                    except Exception:
+                        pass
                 except Exception:
-                  report_nonfatal("ExecutionEngine", "cancel_open_maker_failed", None,
+                    report_nonfatal("ExecutionEngine", "cancel_open_maker_failed", None,
                                                          phase="_mm_cancel_open_makers")
-                  logging.exception("Unhandled exception")
+                    logging.exception("Unhandled exception")
+                finally:
+                    # cleanup tracking if present
+                    self._mm_active_by_pair.get(key, set()).discard(cid)
+                    self._mm_expiry_by_cid.pop(cid, None)
+
+    async def _preempt_mm_for_pair(self, exchanges: list[str], pair_key: str, by: str) -> None:
+        """Cancel MM makers on the given pair/venues when a higher priority branch executes."""
+        for ex in exchanges:
+            active = self._mm_active_for(ex, pair_key)
+            if not active:
+                continue
+            try:
+                await self._mm_cancel_open_makers(active, reason=f"preempt_{by.lower()}")
+            except Exception:
+                logging.exception("Unhandled exception preempting MM makers")
 
     # ========================================================================
 
@@ -4973,20 +5101,25 @@ class ExecutionEngine:
             avg = None
         return cnt, avg
 
+    def _extract_bundle_fragment_plan(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        frag = payload.get("frag") or (payload.get("meta") or {}).get("frag") or {}
+        if isinstance(frag, dict):
+            plan = frag.get("plan") if isinstance(frag.get("plan"), dict) else frag
+            return plan or {}
+        return {}
+
     def _plan_to_slices(
         self,
         *,
-        amounts: List[float],
-        groups: List[str],
+        plan: Dict[str, Any],
         total_usdc: float,
         min_fragment_usdc: float,
         max_fragments: Optional[int] = None,
     ) -> Tuple[List[Tuple[float, str, int, float]], bool]:
         validated = fraglib.validate_fragment_plan(
-            amounts,
-            groups,
-            total_usdc=total_usdc,
-            min_fragment_usdc=min_fragment_usdc,
+            plan,
+            total_quote=total_usdc,
+            min_fragment_quote=min_fragment_usdc,
             max_fragments=max_fragments,
         )
         slices: List[Tuple[float, str, int, float]] = []
@@ -5010,17 +5143,17 @@ class ExecutionEngine:
         weights = fraglib.normalize_frontload_weights(self.frontload_weights or [0.5, 0.35, 0.15])
         group_size = int(getattr(self, "frontload_group_size", 3) or 3)
         plan = fraglib.build_fragment_plan(
-            total,
-            weights=weights,
-            min_fragment_usdc=min_frag,
-            max_fragments=desired_count,
+            total_quote=total,
             desired_count=desired_count,
-            avg_fragment_usdc=avg_fragment_usdc,
+            weights=weights,
+            max_fragments=desired_count,
+            min_fragment_quote=min_frag,
             group_size=group_size,
+            source="ENGINE_FALLBACK",
+            avg_fragment_quote=avg_fragment_usdc,
         )
         slices, _ = self._plan_to_slices(
-            amounts=plan.get("amounts", []),
-            groups=plan.get("groups", []),
+            plan=plan,
             total_usdc=total,
             min_fragment_usdc=min_frag,
             max_fragments=desired_count,
@@ -5603,6 +5736,16 @@ class ExecutionEngine:
         if strategy not in {"TM", "TT"}:
             strategy = "TT"
 
+            # Préemption MM : TT/TM/REB ont priorité et annulent les quotes MM actives sur le pair
+            try:
+                await self._preempt_mm_for_pair(
+                    [buy_leg["exchange"], sell_leg["exchange"]],
+                    pair_key,
+                    "REB" if is_rebal else strategy,
+                )
+            except Exception:
+                logging.exception("Unhandled exception while preempting MM before bundle execution")
+
         # REB = TM only : pas de fallback TT
         if not self.enable_taker_maker and strategy == "TM":
             if is_rebal:
@@ -5786,6 +5929,7 @@ class ExecutionEngine:
         # Bundle ID + fragments (simu/stats)
         bundle_id = payload.get("bundle_id") or f"BND-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
         frag_count, frag_avg = self._extract_sim_fragments(payload)
+        bundle_plan = self._extract_bundle_fragment_plan(payload)
 
         # Application des contrôles TM envoyés par le RM (Macro 4)
         try:
@@ -5813,6 +5957,7 @@ class ExecutionEngine:
                     is_rebalancing=is_rebal,
                     sim_frag_count=frag_count,
                     sim_frag_avg_usdc=frag_avg,
+                    bundle_frag_plan=bundle_plan,
                 )
 
         else:
@@ -5830,6 +5975,7 @@ class ExecutionEngine:
                     is_rebalancing=is_rebal,
                     sim_frag_count=frag_count,
                     sim_frag_avg_usdc=frag_avg,
+                    bundle_frag_plan=bundle_plan,
                 )
 
     # --------------------------- TT (taker/taker) ---------------------------
@@ -5848,6 +5994,7 @@ class ExecutionEngine:
             is_rebalancing: bool,
             sim_frag_count: Optional[int],
             sim_frag_avg_usdc: Optional[float],
+            bundle_frag_plan: Dict[str, Any],
     ):
         # READINESS GUARD
         self._ensure_ready()
@@ -5862,51 +6009,63 @@ class ExecutionEngine:
         slices: List[Tuple[float, str, int, float]] = []
         frag_source = "UNKNOWN"
 
-        desired = sim_frag_count if self.frontload_enabled else None
-        avg = sim_frag_avg_usdc if self.frontload_enabled else None
+        min_frag = float(getattr(self, "min_fragment_usdc", getattr(self, "min_fragment_quote", 0.0)))
+        max_plan_frags = int(getattr(self, "max_fragments", 0) or 0) or None
+        validated_plan: Dict[str, Any] = {}
 
-        # 1) Plan Simulateur (si fourni et frontload activé)
-        if (desired and desired > 0) or (avg and avg > 0):
-            slices = self._build_frontloaded_slices(total_usdc, desired, avg)
-            frag_source = "SIM"
+        if bundle_frag_plan:
+            validated_plan = fraglib.validate_fragment_plan(
+                bundle_frag_plan,
+                total_quote=total_usdc,
+                min_fragment_quote=min_frag,
+                max_fragments=max_plan_frags,
+            )
+            slices, ok = self._plan_to_slices(
+                plan=validated_plan,
+                total_usdc=total_usdc,
+                min_fragment_usdc=min_frag,
+                max_fragments=max_plan_frags,
+            )
+            if ok and slices:
+                frag_source = bundle_frag_plan.get("source", "RM")
+            else:
+                slices = []
+                frag_source = "ENGINE_REPAIR"
+                ENGINE_FRAG_FALLBACK_TOTAL.labels(strategy="TT", reason="INVALID_META").inc()
         else:
-            # 2) Plan RM (plan_fragments) si disponible
-            plan = None
-            try:
-                plan = self.risk_manager.plan_fragments(
-                    pair_key=pair_key,
-                    buy_ex=buy_leg["exchange"],
-                    sell_ex=sell_leg["exchange"],
-                    total_usdc=total_usdc,
-                    strategy="TT",
-                    regime=regime,
-                )
-            except Exception:
-                plan = None
-
-            if plan and (plan.get("amounts") or []):
-                slices, ok = self._plan_to_slices(
-                    amounts=plan.get("amounts", []),
-                    groups=plan.get("groups", []),
-                    total_usdc=total_usdc,
-                    min_fragment_usdc=float(
-                        getattr(self, "min_fragment_usdc", getattr(self, "min_fragment_quote", 0.0))),
-                )
-                if ok and slices:
-                    frag_source = "RM_PLAN"
-                else:
-                    slices = []
-
+            ENGINE_FRAG_FALLBACK_TOTAL.labels(strategy="TT", reason="MISSING_META").inc()
             if not slices:
-                # 3) Fallback full Engine (frontload interne)
-                slices = self._build_frontloaded_slices(total_usdc, None, None)
-                frag_source = "FALLBACK"
-
-            if not slices:
-                # Dernier filet de sécurité : un seul tir G1 plein pot
-                slices = [(total_usdc, "G1", 0, 1.0)]
-                frag_source = "SINGLE"
-
+                desired = sim_frag_count if self.frontload_enabled else None
+                avg = sim_frag_avg_usdc if self.frontload_enabled else None
+                weights = fraglib.normalize_frontload_weights(self.frontload_weights or [0.5, 0.35, 0.15],
+                                                              max_fragments=max_plan_frags)
+                group_size = int(getattr(self, "frontload_group_size", 3) or 3)
+                fallback_plan = fraglib.build_fragment_plan(
+                    total_quote=total_usdc,
+                    desired_count=desired,
+                    weights=weights,
+                    min_fragment_quote=min_frag,
+                    max_fragments=max_plan_frags,
+                    group_size=group_size,
+                    source=frag_source if frag_source != "UNKNOWN" else "ENGINE_FALLBACK",
+                    avg_fragment_quote=avg,
+                )
+                validated_plan = fraglib.validate_fragment_plan(
+                    fallback_plan,
+                    total_quote=total_usdc,
+                    min_fragment_quote=min_frag,
+                    max_fragments=max_plan_frags,
+                )
+                slices, _ = self._plan_to_slices(
+                    plan=validated_plan,
+                    total_usdc=total_usdc,
+                    min_fragment_usdc=min_frag,
+                    max_fragments=max_plan_frags,
+                )
+                frag_source = fallback_plan.get("source", "ENGINE_FALLBACK")
+        if not slices:
+            slices = [(total_usdc, "G1", 0, 1.0)]
+            frag_source = "ENGINE_MONO"
 
         # Cap business sur le nombre de fragments TT effectifs
         try:
@@ -5929,10 +6088,26 @@ class ExecutionEngine:
                         new_slices[-1] = (merged, last_label, last_idx, merged / total_usdc)
             slices = new_slices
 
+        tol = max(1e-3, total_usdc * 1e-3)
+        invariant_fail = False
+        if abs(sum(a for a, _, _, _ in slices) - total_usdc) > tol:
+            invariant_fail = True
+        if any(g not in fraglib.FRAGMENT_GROUPS for _, g, _, _ in slices):
+            invariant_fail = True
+        if max_slices > 0 and len(slices) > max_slices:
+            invariant_fail = True
+        if invariant_fail:
+            ENGINE_FRAG_INVARIANT_FAILED_TOTAL.labels(strategy="TT").inc()
+            slices = [(total_usdc, "G1", 0, 1.0)]
+            frag_source = "ENGINE_MONO"
+
 
         cohorts: Dict[str, List[Tuple[int, float, float]]] = {"G1": [], "G2": [], "G3": []}
         for global_idx, (amt, label, _idx_in_group, w) in enumerate(slices):
             cohorts.setdefault(str(label), []).append((global_idx, float(amt), float(w)))
+        notional_by_group = {
+            g: float(sum(a for a, lbl, _, _ in slices if lbl == g)) for g in fraglib.FRAGMENT_GROUPS
+        }
 
         # Observabilité fragmentation TT (source + structure G1/G2/G3)
         try:
@@ -5948,6 +6123,7 @@ class ExecutionEngine:
                 "frag_g2": len(cohorts.get("G2", [])),
                 "frag_g3": len(cohorts.get("G3", [])),
                 "frag_avg_usdc": float(sum(a for a, _, _, _ in slices) / max(1, len(slices))),
+                "notional_by_group": notional_by_group,
                 "sim_frag_count": int(sim_frag_count or 0),
                 "sim_frag_avg_usdc": float(sim_frag_avg_usdc or 0.0),
                 "is_rebalancing": bool(is_rebalancing),
@@ -6273,6 +6449,7 @@ class ExecutionEngine:
             is_rebalancing: bool,
             sim_frag_count: Optional[int],
             sim_frag_avg_usdc: Optional[float],
+            bundle_frag_plan: Dict[str, Any],
     ):
         # READINESS GUARD
         self._ensure_ready()
@@ -6420,56 +6597,97 @@ class ExecutionEngine:
 
         # ===== Plan fragments (Simulation > RM > fallback) =====
         slices: List[Tuple[float, str, int, float]] = []
-        desired = None
-        if self.frontload_enabled:
-            if sim_frag_count and sim_frag_count > 0:
-                desired = min(max(1, sim_frag_count), self.tm_max_open_makers)
-        avg = sim_frag_avg_usdc if self.frontload_enabled else None
+        frag_source = "UNKNOWN"
+        strategy_label = "REB" if is_rebalancing else "TM"
+        min_frag = float(getattr(self, "min_fragment_usdc", getattr(self, "min_fragment_quote", 0.0)))
+        max_plan_frags = int(self.tm_max_open_makers or 0) or None
 
-        if desired or (avg and avg > 0):
-            slices = self._build_frontloaded_slices(total_usdc, desired, avg)
-            frag_source = "SIM"
+        if bundle_frag_plan:
+            validated_plan = fraglib.validate_fragment_plan(
+                bundle_frag_plan,
+                total_quote=total_usdc,
+                min_fragment_quote=min_frag,
+                max_fragments=max_plan_frags,
+            )
+            slices, ok = self._plan_to_slices(
+                plan=validated_plan,
+                total_usdc=total_usdc,
+                min_fragment_usdc=min_frag,
+                max_fragments=max_plan_frags,
+            )
+            if ok and slices:
+                frag_source = bundle_frag_plan.get("source", "RM")
+            else:
+                slices = []
+                frag_source = "ENGINE_REPAIR"
+                ENGINE_FRAG_FALLBACK_TOTAL.labels(strategy=strategy_label, reason="INVALID_META").inc()
         else:
-            plan = None
-            try:
-                plan = self.risk_manager.plan_fragments(
-                    pair_key=pair_key,
-                    buy_ex=buy_leg["exchange"],
-                    sell_ex=sell_leg["exchange"],
-                    total_usdc=total_usdc,
-                    strategy="REB" if is_rebalancing else "TM",
-                    regime=regime,
-                )
-            except Exception:
-                plan = None
-            if plan and (plan.get("amounts") or []):
-                slices, ok = self._plan_to_slices(
-                    amounts=plan.get("amounts", []),
-                    groups=plan.get("groups", []),
-                    total_usdc=total_usdc,
-                    min_fragment_usdc=float(
-                        getattr(self, "min_fragment_usdc", getattr(self, "min_fragment_quote", 0.0))),
-                    max_fragments=self.tm_max_open_makers,
-                )
-                if ok and slices:
-                    frag_source = "RM_PLAN"
-                else:
-                    slices = []
+            ENGINE_FRAG_FALLBACK_TOTAL.labels(strategy=strategy_label, reason="MISSING_META").inc()
 
-            if not slices:
-                if self.frontload_enabled:
-                    slices = self._build_frontloaded_slices(total_usdc, self.tm_max_open_makers, None)
-                    frag_source = "FALLBACK"
-                else:
-                    weights = self.tm_weights if (self.tm_weights and sum(self.tm_weights) > 0) else [1.0]
-                    weights = weights[: self.tm_max_open_makers]
-                    s = sum(weights) or 1.0
-                    weights = [w / s for w in weights]
-                    slices = [(total_usdc * w, "G1", i, w) for i, w in enumerate(weights)]
-                    frag_source = "SINGLE"
+        if not slices:
+            desired = None
+            if self.frontload_enabled and sim_frag_count and sim_frag_count > 0:
+                desired = min(max(1, sim_frag_count), self.tm_max_open_makers)
+            avg = sim_frag_avg_usdc if self.frontload_enabled else None
+            weights = fraglib.normalize_frontload_weights(self.frontload_weights or [0.5, 0.35, 0.15],
+                                                          max_fragments=max_plan_frags)
+            group_size = int(getattr(self, "frontload_group_size", 3) or 3)
+            fallback_plan = fraglib.build_fragment_plan(
+                total_quote=total_usdc,
+                desired_count=desired,
+                weights=weights,
+                min_fragment_quote=min_frag,
+                max_fragments=max_plan_frags,
+                group_size=group_size,
+                source=frag_source if frag_source != "UNKNOWN" else "ENGINE_FALLBACK",
+                avg_fragment_quote=avg,
+            )
+            validated_plan = fraglib.validate_fragment_plan(
+                fallback_plan,
+                total_quote=total_usdc,
+                min_fragment_quote=min_frag,
+                max_fragments=max_plan_frags,
+            )
+            slices, _ = self._plan_to_slices(
+                plan=validated_plan,
+                total_usdc=total_usdc,
+                min_fragment_usdc=min_frag,
+                max_fragments=max_plan_frags,
+            )
+            frag_source = fallback_plan.get("source", "ENGINE_FALLBACK")
 
         if not slices:
             slices = [(total_usdc, "G1", 0, 1.0)]
+            frag_source = "ENGINE_MONO"
+        try:
+            max_tm_frag = int(self.tm_max_open_makers or 0)
+        except Exception:
+            max_tm_frag = 0
+        if max_tm_frag > 0 and len(slices) > max_tm_frag:
+            new_slices: List[Tuple[float, str, int, float]] = []
+            for idx, (amt, label, idx_in_group, _w) in enumerate(slices):
+                if idx < max_tm_frag - 1:
+                    new_slices.append((amt, label, idx_in_group, amt / total_usdc))
+                else:
+                    if not new_slices:
+                        new_slices.append((amt, label, idx_in_group, amt / total_usdc))
+                    else:
+                        last_amt, last_label, last_idx, _last_w = new_slices[-1]
+                        merged = last_amt + amt
+                        new_slices[-1] = (merged, last_label, last_idx, merged / total_usdc)
+            slices = new_slices
+        tol_tm = max(1e-3, total_usdc * 1e-3)
+        invariant_fail_tm = False
+        if abs(sum(a for a, _, _, _ in slices) - total_usdc) > tol_tm:
+            invariant_fail_tm = True
+        if any(g not in fraglib.FRAGMENT_GROUPS for _, g, _, _ in slices):
+            invariant_fail_tm = True
+        if max_tm_frag > 0 and len(slices) > max_tm_frag:
+            invariant_fail_tm = True
+        if invariant_fail_tm:
+            ENGINE_FRAG_INVARIANT_FAILED_TOTAL.labels(strategy=strategy_label).inc()
+            slices = [(total_usdc, "G1", 0, 1.0)]
+            frag_source = "ENGINE_MONO"
 
 
         # TOB maker
@@ -7463,6 +7681,203 @@ class ExecutionEngine:
             resp.raise_for_status()
             return await resp.json()
 
+        # execution_engine.py — dans class ExecutionEngine
+
+    async def mm_single_inventory(self, payload: dict) -> None:
+        """
+        MM inventaire: un seul maker sur un CEX, avec TTL + panic hedge côté opposé.
+
+        payload attendu:
+          - "pair" / "pair_key": ex "ETHUSDC" (avec ou sans '-')
+          - "exchange": "BINANCE" / "BYBIT" / "COINBASE" ...
+          - "side": "BUY" ou "SELL" (côté du maker)
+          - "amount_quote": notionnel en devise de cotation (USDC/EUR...)
+          - optionnel: "ttl_ms" (si absent → fallback self.mm_ttl_ms)
+          - optionnel: "bundle_id" (corrélation histo/metrics)
+        """
+        async with self._sem_mm_pairs:
+            pair = str(
+                payload.get("pair")
+                or payload.get("pair_key")
+                or ""
+            ).replace("-", "").upper()
+            ex = self._norm_ex(payload.get("exchange") or "")
+            side = str(payload.get("side") or "").upper()
+            try:
+                amt = float(
+                    payload.get("amount_quote")
+                    or payload.get("volume_usdc")
+                    or 0.0
+                )
+            except Exception:
+                amt = 0.0
+
+            if not pair or not ex or side not in ("BUY", "SELL") or amt <= 0.0:
+                # Rien de robuste à faire
+                return
+
+            # Identifiant logique (pour histo / debug)
+            bundle_id = (
+                    str(payload.get("bundle_id"))
+                    or f"MMINV-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+            )
+
+            # 0) Historisation du "plan"
+            try:
+                await self._hist("trade", {
+                    "_hist_kind": "MM_INV",
+                    "pair": pair,
+                    "status": "planning",
+                    "exchange": ex,
+                    "side": side,
+                    "amount_quote": float(amt),
+                    "bundle_id": bundle_id,
+                    "timestamp": time.time(),
+                })
+            except Exception:
+                pass
+
+            # 1) Place le maker via la brique existante
+            try:
+                maker_cid = await self._mm_place_maker(
+                    pair_key=pair,
+                    exchange=ex,
+                    side=side,
+                    amount_quote=amt,
+                    bundle_id=bundle_id,
+                )
+            except EngineSubmitError as exc:
+                # throttle / not ready / capital / etc.
+                try:
+                    await self._hist("trade", {
+                        "_hist_kind": "MM_INV",
+                        "pair": pair,
+                        "status": "place_failed",
+                        "exchange": ex,
+                        "side": side,
+                        "reason": str(exc),
+                        "bundle_id": bundle_id,
+                        "timestamp": time.time(),
+                    })
+                except Exception:
+                    pass
+                return
+
+            # 2) TTL d’exposition
+            try:
+                ttl_ms = int(payload.get("ttl_ms") or 0)
+            except Exception:
+                ttl_ms = 0
+
+            if ttl_ms <= 0:
+                try:
+                    ttl_ms = int(getattr(self, "mm_ttl_ms", 2300))
+                except Exception:
+                    ttl_ms = 2300
+
+            # Cas simple: pas de hedge auto → on laisse vivre puis cancel TTL
+            if not self.mm_allow_auto_hedge:
+                await asyncio.sleep(max(0.0, ttl_ms / 1000.0))
+                await self._mm_cancel_open_makers([maker_cid])
+                try:
+                    await self._hist("trade", {
+                        "_hist_kind": "MM_INV",
+                        "pair": pair,
+                        "status": "ttl_cancel",
+                        "exchange": ex,
+                        "side": side,
+                        "bundle_id": bundle_id,
+                        "timestamp": time.time(),
+                    })
+                except Exception:
+                    pass
+                return
+
+            # 3) Boucle d’attente + hedging progressif si tu veux
+            deadline = time.monotonic() + (ttl_ms / 1000.0)
+            is_dry = bool(getattr(self.config, "dry_run", True))
+            progressive_task = None
+            hedged_progress_usdc = 0.0
+            progressive_started = False
+
+            # TODO (optionnel) : progressive hedge sur inventaire
+            # Pour commencer simple, on peut ne PAS démarrer de hedge progressif
+            # et se contenter du panic hedge final (comme demandé).
+            #
+            # Si tu veux plus tard : démarrer self._mm_progressive_hedge(...)
+            # dans le sens opposé dès qu’il y a un fill partiel.
+
+            while time.monotonic() < deadline:
+                if is_dry:
+                    filled = True
+                else:
+                    filled = self._mm_is_filled(maker_cid)
+
+                if filled:
+                    # tout rempli: rien à hedger
+                    try:
+                        await self._hist("trade", {
+                            "_hist_kind": "MM_INV",
+                            "pair": pair,
+                            "status": "full_fill",
+                            "exchange": ex,
+                            "side": side,
+                            "bundle_id": bundle_id,
+                            "timestamp": time.time(),
+                        })
+                    except Exception:
+                        pass
+                    break
+
+                await asyncio.sleep(0.01)
+
+            # 4) Épilogue TTL : panic hedge si pas rempli
+            try:
+                filled = self._mm_is_filled(maker_cid) if not is_dry else True
+
+                if progressive_task:
+                    try:
+                        hedged_progress_usdc = await progressive_task
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        MM_PANIC_HEDGE_TOTAL.labels(pair).inc()
+
+                if not filled:
+                    # Hedge en face (sens inverse du maker)
+                    hedge_side = "BUY" if side == "SELL" else "SELL"
+                    final_usdc = max(
+                        0.0,
+                        self.mm_hedge_final_ratio * amt - hedged_progress_usdc,
+                    )
+                    if final_usdc > 0:
+                        await self._mm_panic_hedge_ioc(
+                            pair_key=pair,
+                            exchange=ex,
+                            side=hedge_side,
+                            amount_quote=final_usdc,
+                            bundle_id=bundle_id,
+                        )
+                    try:
+                        await self._hist("trade", {
+                            "_hist_kind": "MM_INV",
+                            "pair": pair,
+                            "status": "panic_hedge",
+                            "maker_side": side,
+                            "hedge_side": hedge_side,
+                            "topup_usdc": float(final_usdc),
+                            "bundle_id": bundle_id,
+                            "timestamp": time.time(),
+                        })
+                    except Exception:
+                        pass
+
+            except Exception:
+                MM_PANIC_HEDGE_TOTAL.labels(pair).inc()
+                raise
+            finally:
+                await self._mm_cancel_open_makers([maker_cid])
+
     async def _exec_single(self, order: Dict[str, Any]) -> bool:
         # READINESS GUARD
         self._ensure_ready()
@@ -7493,6 +7908,13 @@ class ExecutionEngine:
 
         pair_key = (meta.get("pair_key")
                     or str(symbol).replace("-", "").upper())
+
+        # Préemption MM si une jambe TT/TM/REB arrive sur la paire/venue
+        if not is_maker:
+            try:
+                await self._preempt_mm_for_pair([ex], pair_key, "TT")
+            except Exception:
+                logging.exception("Unhandled exception while preempting MM before single taker")
 
         # 1) Circuits (vol/profondeur/mutes)
         if not self._pre_trade_circuits(pair_key,
@@ -7786,6 +8208,7 @@ class ExecutionEngine:
 
         self._cleanup_client(client_id)
         return False
+
 
     def get_status(self) -> dict:
         """

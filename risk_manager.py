@@ -146,6 +146,24 @@ RM_CAPS_BUNDLE_CALLS_TOTAL = get_counter(
     "Bundle-level caps/preemption path invocations",
 )
 
+# --- MM obs: budgets, preemptions, wallet inventory ------------------------
+RM_MM_BUDGET_SPENT_QUOTE = get_counter(
+    "rm_mm_budget_spent_quote",
+    "Quote currency spent from MM virtual wallet",
+    labelnames=("profile", "exchange", "quote"),
+)
+RM_MM_BUDGET_EXHAUSTED_TOTAL = get_counter(
+    "rm_mm_budget_exhausted_total",
+    "MM opportunities blocked due to exhausted MM virtual wallet",
+    labelnames=("profile", "exchange", "quote"),
+)
+RM_MM_PREEMPTED_TOTAL = get_counter(
+    "rm_mm_preempted_total",
+    "MM liquidity preempted by higher-priority branches",
+    labelnames=("by",),
+)
+
+
 
 # --- Helpers robusti per cast da ENV/config --------------------------------
 # --- Helpers robusti per cast da ENV/config (module-scope, no decorator) ---
@@ -795,9 +813,31 @@ class RiskManager:
         self.min_buffer_quote = _cfg_float(self.cfg, "min_buffer_quote", 0.0)
 
         # --- MM toggles & budgets ---
+        self.mm_mode = str(getattr(self.bot_cfg, "mm_mode", "MONO") or "MONO").upper()
         self.enable_mm = bool(getattr(self.bot_cfg, "enable_maker_maker", False))
         self.mm_ttl_ms = _cfg_int(self.bot_cfg, "mm_ttl_ms", 2200)
         self.mm_alias = _cfg_str(self.bot_cfg, "mm_alias_name", "MM").upper()
+        if self.mm_mode == "OFF":
+            self.enable_mm = False
+
+        # --- MM MONO : conditions pour 2 côtés (BUY+SELL) ---
+        self.mm_dual_min_net_bps = _cfg_float(self.bot_cfg, "mm_dual_min_net_bps", 3.0)
+        self.mm_dual_min_depth_quote = _cfg_float(self.bot_cfg, "mm_dual_min_depth_quote", 0.0)
+        self.mm_dual_max_skew_pct = _cfg_float(self.bot_cfg, "mm_dual_max_skew_pct", 10.0)
+        self.mm_dual_guard_enabled = bool(getattr(self.bot_cfg, "mm_dual_guard_enabled", True))
+
+        # --- MM inventaire (single maker) ---
+        self.mm_inventory_enabled = bool(
+            getattr(self.bot_cfg, "mm_inventory_enabled", False)
+        )
+        # seuils très simples pour commencer
+        self.mm_inventory_max_skew_pct = float(
+            getattr(self.bot_cfg, "mm_inventory_max_skew_pct", 15.0)
+        )
+        self.mm_inventory_notional_usd = float(
+            getattr(self.bot_cfg, "mm_inventory_notional_usd", 500.0)
+        )
+
 
         # --- TM TTL & hedge policy (source unique pour l'Engine) ---
         # Ces champs sont les SEULES sources de vérité pour TM :
@@ -833,10 +873,6 @@ class RiskManager:
         self._shadow = None
 
         # ==== [ADD INSIDE __init__ RIGHT AFTER "MM toggles & budgets" BLOCK] =========
-
-
-        self.mm_alias = _cfg_str(self.bot_cfg, "mm_alias_name", "MM").upper()
-        # ==== [ADD INSIDE __init__ RIGHT AFTER "MM toggles & budgets" BLOCK] =========
         # Kill switch global + budgets (en mémoire, resetés par ton scheduler quotidien)
 
         self.global_kill_switch = bool(getattr(self.cfg, "global_kill_switch", False))
@@ -865,6 +901,7 @@ class RiskManager:
         # --- budgets virtuels par quote (USDC/EUR) ---
         # ex: {"BINANCE":{"USDC": 25000.0, "EUR": 0.0}, ...}
         self.virt_balances: dict[str, dict[str, float]] = {}
+        self.set_mm_budgets(_cfg_dict(self.bot_cfg, "mm_budget_by_exchange_quote", {}))
 
         # alias pratique vers la config si pas déjà présent
         self.cfg = getattr(self, "cfg", None) or config
@@ -1535,6 +1572,7 @@ class RiskManager:
         return q, _cfg_float(self.cfg, "default_notional", 0.0)
 
     def _choose_strategy(self, opp: dict) -> str:
+        """Deprecated: kept for compat, scheduler uses on_scanner_opportunity order."""
         exp = (opp.get("expected_net_bps") or {})
         # Garde-fous MM (hints calculés par le Scanner)
         mm = float(exp.get("MM", 0.0) or 0.0)
@@ -1561,6 +1599,10 @@ class RiskManager:
         Préempte la liquidité MM côté Engine (si supporté).
         Tolérant: no-op si la méthode n'existe pas.
         """
+        try:
+            RM_MM_PREEMPTED_TOTAL.labels(by=str(reason or "UNKNOWN").upper()).inc()
+        except Exception:
+            pass
         eng = getattr(self, "engine", None)
         if not eng:
             return
@@ -1696,7 +1738,7 @@ class RiskManager:
                     elif branch_u == "TM":
                         branch_enabled = bool(getattr(self.cfg, "enable_tm", getattr(self, "enable_tm", True)))
                     elif branch_u == "MM":
-                        branch_enabled = bool(getattr(self.cfg, "enable_mm", getattr(self, "enable_mm", False)))
+                        branch_enabled = bool(getattr(self, "enable_mm", False))
                     elif branch_u == "REB":
                         branch_enabled = bool(getattr(self.cfg, "enable_reb", getattr(self, "enable_reb", True)))
                 except Exception:
@@ -1799,6 +1841,84 @@ class RiskManager:
             # Appel incohérent : on renvoie 0.0 pour rester conservateur.
             return 0.0
         return self._apply_caps_and_preempt_legacy(strategy, ex, desired_notional)
+
+    def _maybe_fire_mm_inventory_single(self, opp: Dict[str, Any]) -> None:
+        """
+        MM inventaire: déclenche un seul maker (BUY ou SELL) sur un CEX
+        si l'exposition / skew dépasse un certain seuil.
+
+        Ce helper ne regarde PAS le spread scanner :
+        il est purement piloté par l'état d'inventaire.
+        """
+        if not getattr(self, "mm_inventory_enabled", False):
+            return
+
+        pair = opp.get("pair") or opp.get("symbol")
+        if not pair:
+            return
+        pk = self._norm_pair(pair)
+
+        # Choisir un exchange de référence pour l'inventaire MM
+        ex = (opp.get("buy_ex") or opp.get("sell_ex") or "").upper()
+        if not ex:
+            return
+
+        # Snapshot d'inventaire
+        snap = getattr(self, "balances", None) or {}
+        base = self._pair_base(pk)
+        quote = self._pair_quote(pk)
+
+        try:
+            base_pos = float((snap.get(ex, {}).get(base) or {}).get("free", 0.0))
+        except Exception:
+            base_pos = 0.0
+
+        # Convertir en USD approximatif via prix mid
+        bid, ask = getattr(self, "get_top_of_book", lambda *a: (0.0, 0.0))(ex, pk)
+        mid = (float(bid) + float(ask)) / 2.0 if (bid and ask) else 0.0
+        inv_usd = base_pos * mid
+
+        # Skew en % vs notional cible (grossier mais suffisant pour P0)
+        notional_target = float(getattr(self, "notional_usd", 0.0) or opp.get("notional_usdc") or 0.0)
+        if notional_target <= 0:
+            notional_target = abs(inv_usd)  # fallback
+
+        skew_pct = 0.0
+        if notional_target > 0:
+            skew_pct = 100.0 * inv_usd / notional_target
+
+        max_skew = float(getattr(self, "mm_inventory_max_skew_pct", 15.0) or 0.0)
+        min_notional = float(getattr(self, "mm_inventory_notional_usd", 0.0) or 0.0)
+
+        if abs(skew_pct) < max_skew or abs(inv_usd) < min_notional:
+            # rien à faire: l'inventaire n'est pas assez "déformé"
+            return
+
+        # Décider le sens du maker:
+        # - inv_usd > 0 → trop de base → on veut VENDRE base → maker SELL
+        # - inv_usd < 0 → trop short base → on veut ACHETER base → maker BUY
+        maker_side = "SELL" if inv_usd > 0 else "BUY"
+
+        amount_quote = abs(inv_usd)
+
+        payload = {
+            "pair": pk,
+            "exchange": ex,
+            "side": maker_side,
+            "amount_quote": amount_quote,
+            # On laisse le Engine choisir ttl_ms (mm_ttl_ms) pour P0
+        }
+
+        try:
+            # fire & forget: l'Engine gère TTL + panic hedge
+            self.engine._spawn(
+                self.engine.mm_single_inventory(payload),
+                name=f"mm-inv-{pk}-{ex}",
+            )
+        except Exception:
+            if getattr(self, "log", None):
+                self.log.exception("RM._maybe_fire_mm_inventory_single: failed")
+
 
     def _apply_caps_and_preempt_legacy(
             self,
@@ -2004,6 +2124,106 @@ class RiskManager:
         except Exception:
             return False
 
+    def _is_mm_admissible_from_hints(self, opp: Dict[str, Any]) -> tuple[bool, str]:
+        """
+        Lit les hints MM produits par le Scanner et applique les garde-fous RM.
+
+        Expects opp["hints"]["MM"] with depth/qpos/net_bps/p_both/vol/ttl and
+        opp["hints"]["expected_net_bps"]["MM"] (fallback opp["expected_net_bps"]["MM"]).
+        """
+        hints_mm = ((opp.get("hints") or {}).get("MM") or {})
+        exp_net = ((opp.get("hints") or {}).get("expected_net_bps") or {}).get("MM")
+        if exp_net is None:
+            exp_net = (opp.get("expected_net_bps") or {}).get("MM")
+
+        try:
+            net_bps = float(exp_net or hints_mm.get("net_bps") or 0.0)
+        except Exception:
+            net_bps = 0.0
+
+        # Paramètres de garde-fous (QUOTE)
+        cfg_root = getattr(self, "cfg", None)
+        mm_depth_min = float(getattr(cfg_root, "mm_depth_min_quote", getattr(cfg_root, "mm_depth_min_usd", 0.0)) or 0.0)
+        mm_qpos_max = float(
+            getattr(cfg_root, "mm_qpos_max_quote", getattr(cfg_root, "mm_qpos_max_ahead_usd", 1e12)) or 1e12)
+        mm_min_p_both = float(getattr(cfg_root, "mm_min_p_both", 0.0) or 0.0)
+        mm_vol_max = float(getattr(cfg_root, "mm_vol_max_bps_ema", 1e9) or 1e9)
+        mm_min_net_bps = float(getattr(cfg_root, "mm_min_net_bps", 0.0) or 0.0)
+
+        try:
+            depth = hints_mm.get("depth") or {}
+            depth_a = float(depth.get("A", 0.0))
+            depth_b = float(depth.get("B", 0.0))
+        except Exception:
+            depth_a = depth_b = 0.0
+
+        try:
+            qpos = hints_mm.get("qpos") or {}
+            qpos_a = float(qpos.get("A", 0.0))
+            qpos_b = float(qpos.get("B", 0.0))
+        except Exception:
+            qpos_a = qpos_b = 0.0
+
+        try:
+            p_both = float(hints_mm.get("p_both", 0.0))
+        except Exception:
+            p_both = 0.0
+
+        try:
+            vol_bps = float(hints_mm.get("vol_bps_ema", 0.0))
+        except Exception:
+            vol_bps = 0.0
+
+        if net_bps < mm_min_net_bps:
+            return False, "MM_HINTS_GUARD_NET_BPS"
+        if depth_a < mm_depth_min or depth_b < mm_depth_min:
+            return False, "MM_HINTS_GUARD_DEPTH"
+        if qpos_a > mm_qpos_max or qpos_b > mm_qpos_max:
+            return False, "MM_HINTS_GUARD_QPOS"
+        if p_both < mm_min_p_both:
+            return False, "MM_HINTS_GUARD_P_BOTH"
+        if vol_bps > mm_vol_max:
+            return False, "MM_HINTS_GUARD_VOL"
+        # ... garde-fous existants net_bps / depth / qpos / p_both / vol ...
+
+        if not getattr(self, "mm_dual_guard_enabled", True):
+            return True, ""
+
+        # Spread un peu plus strict pour autoriser BID+ASK simultanés
+        dual_min_net = float(getattr(self, "mm_dual_min_net_bps", mm_min_net_bps) or 0.0)
+        if net_bps < dual_min_net:
+            return False, "MM_DUAL_SPREAD_TOO_SMALL"
+
+        # Profondeur mini sur les deux côtés (en devise de cotation)
+        try:
+            depth = hints_mm.get("depth") or {}
+            depth_a = float(depth.get("A", 0.0))
+            depth_b = float(depth.get("B", 0.0))
+        except Exception:
+            depth_a = depth_b = 0.0
+
+        min_depth_dual = float(
+            getattr(self, "mm_dual_min_depth_quote", mm_depth_min) or 0.0
+        )
+        if min(depth_a, depth_b) < min_depth_dual:
+            return False, "MM_DUAL_DEPTH_TOO_SHALLOW"
+
+        # Inventaire : ne faire du 2-côtés que si le skew reste raisonnable
+        try:
+            snap = self._balances_snapshot()
+            base = self._pair_base(self._norm_pair(opp.get("pair") or opp.get("symbol") or ""))
+            skew_pct = self._skew_pct(snap, base, self._norm_pair(opp.get("pair") or opp.get("symbol") or ""))
+        except Exception:
+            skew_pct = 0.0
+
+        max_skew = float(getattr(self, "mm_dual_max_skew_pct", self.inventory_skew_max_pct) or 0.0)
+        if abs(skew_pct) > max_skew:
+            return False, "MM_DUAL_INVENTORY_SKEW_TOO_HIGH"
+
+        return True, ""
+
+        return True, ""
+
     # modules/risk_manager.py — class RiskManager
 
     # risk_manager.py — class RiskManager
@@ -2037,14 +2257,16 @@ class RiskManager:
         if getattr(self, "global_kill_switch", False):
             return False, "GLOBAL_KILL_SWITCH"
 
-        # 2) Branch MM désactivée par config (enable_mm=False).
+        # 2) Branch MM désactivée par config (enable_mm=False ou mm_mode=OFF).
         if b == "MM" and not bool(getattr(self, "enable_mm", False)):
-            # MM coupé côté RM par simple policy (pas de Pacer / capital ici)
+
             try:
                 self._record_mm_disabled("RM", branch=b, profile=p)
             except Exception:
                 pass
             return False, "MM_DISABLED"
+        if b == "MM" and str(getattr(self, "mm_mode", "MONO") or "MONO").upper() == "CROSS":
+            return False, "MM_MODE_CROSS_UNSUPPORTED"
 
         # 3) Mode SEVERE (PnL guard) : MM = 0, les autres branches passent encore.
         mode = str(getattr(self, "rm_mode", "NORMAL") or "NORMAL").upper()
@@ -9130,12 +9352,29 @@ class RiskManager:
             # On ne casse jamais la décision pour un problème de télémétrie
             pass
 
-
         # --- 4) Éligibilités de base ----------------------------------------------
         strategies: List[str] = []
-        if opp.get("tt_ok", True): strategies.append("TT")
-        if opp.get("tm_ok", True): strategies.append("TM")
-        if opp.get("mm_ok", True): strategies.append("MM")
+        if opp.get("tt_ok", True):
+            strategies.append("TT")
+        if opp.get("tm_ok", True):
+            strategies.append("TM")
+        if opp.get("mm_ok", True):
+            strategies.append("MM")
+
+        # Kill-switch MM unique + mode OFF/CROSS
+        if "MM" in strategies:
+            if not getattr(self, "enable_mm", False):
+                strategies.remove("MM")
+            elif str(getattr(self, "mm_mode", "MONO") or "MONO").upper() == "CROSS":
+                # MM cross-venue non supporté pour l’instant
+                strategies.remove("MM")
+                inc_rm_reject(reason="MM_MODE_CROSS_UNSUPPORTED")
+            else:
+                ok, why = self._is_mm_admissible_from_hints(opp)
+                if not ok:
+                    # Paire pas admissible pour MM (hints scanner / signaux)
+                    strategies.remove("MM")
+                    inc_rm_reject(reason=why)
 
         # --- 5) Caps notionnels par CEX & préemption MM ---------------------------
         def _desired_notional(opp: Dict[str, Any]) -> float:
@@ -9150,12 +9389,15 @@ class RiskManager:
 
         engine = getattr(self, "engine", None)
         sent_any = False
+        mm_dual_attempted = False
+        mm_dual_enqueued = False
 
         if not engine:
-            if getattr(self, "log", None): self.log.error("RM.on_scanner_opportunity sans engine attaché")
+            if getattr(self, "log", None):
+                self.log.error("RM.on_scanner_opportunity sans engine attaché")
             return
 
-        # 5.a) TT/TM: utilisation directe des caps TT/TM par profil
+        # 5.a) TT/TM: utilisation directe des caps TT/TM par profil (priorité TT > TM)
         for strat in ("TT", "TM"):
             if strat not in strategies:
                 continue
@@ -9170,17 +9412,35 @@ class RiskManager:
                     self._multicast_shadow(bundle)
                     sent_any = True
             except Exception:
-                if getattr(self, "log", None): self.log.exception(f"RM.on_scanner_opportunity: erreur sur {strat}")
+                if getattr(self, "log", None):
+                    self.log.exception(f"RM.on_scanner_opportunity: erreur sur {strat}")
 
-        # 5.b) MM: préemption si TT/TM encore “chargés”
+        # 5.b) MM dual : seulement si la paire est éligible et qu’aucun TT/TM n’a tiré
         if "MM" in strategies and caps.get("MM", 0) > 0 and not sent_any:
+            mm_dual_attempted = True
             try:
                 bundle = self._build_bundle(opp, strategy="MM")
                 if bundle:
                     self._multicast_shadow(bundle)
+                    mm_dual_enqueued = True
+                    sent_any = True
             except Exception:
-                if getattr(self, "log", None): self.log.exception("RM.on_scanner_opportunity: erreur sur MM")
+                if getattr(self, "log", None):
+                    self.log.exception("RM.on_scanner_opportunity: erreur sur MM")
 
+        # 5.c) Fallback MM inventaire (single-maker) :
+        # - on NE le déclenche que si MM dual a été tenté mais n'a pas fourni de bundle
+        # - si MM n'est pas éligible (pas dans strategies / caps=0 / mode=CROSS / hints KO), rien ne se passe
+        try:
+            if (
+                    getattr(self, "mm_inventory_enabled", False)
+                    and mm_dual_attempted
+                    and not mm_dual_enqueued
+            ):
+                self._maybe_fire_mm_inventory_single(opp)
+        except Exception:
+            if getattr(self, "log", None):
+                self.log.exception("RM.on_scanner_opportunity: mm_inventory_single failed")
 
     # ---------------------------------------------------------------------
     # REMPLACEMENT 2/3
@@ -9203,6 +9463,40 @@ class RiskManager:
         tif = "IOC" if strategy in ("TT", "TM") else "GTC"
         client_id = getattr(self, "client_id", "default")
         notional = opp.get("notional_quote") or {"ccy": "USDC", "amount": float(opp.get("notional_usdc", 0) or 0)}
+
+        strategy_u = str(strategy or "").upper()
+
+        if strategy_u == "MM":
+            ex_for_mm = (buy_ex or sell_ex or "").upper()
+            if buy_ex and sell_ex and str(buy_ex).upper() != str(sell_ex).upper():
+                inc_rm_reject(reason="MM_MODE_MONO_REQUIRED")
+                return None
+            mm_quote = str(
+                (notional or {}).get("ccy") or (notional or {}).get("quote") or _pair_quote(pair or "")).upper()
+            try:
+                mm_notional = float((notional or {}).get("amount") or opp.get("notional_usdc") or 0.0)
+            except Exception:
+                mm_notional = float(opp.get("notional_usdc") or 0.0)
+            if mm_notional <= 0.0:
+                inc_rm_reject(reason="MM_BUDGET_EXHAUSTED")
+                return None
+            if not self._reserve_quote(ex_for_mm, mm_quote, mm_notional):
+                try:
+                    RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc()
+                except Exception:
+                    pass
+                inc_rm_reject(reason="MM_BUDGET_EXHAUSTED")
+                return None
+            try:
+                RM_MM_BUDGET_SPENT_QUOTE.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc(mm_notional)
+            except Exception:
+                pass
+
+        try:
+            total = float((notional or {}).get("amount") or opp.get("notional_usdc") or 0.0)
+        except Exception:
+            total = float(opp.get("notional_usdc") or 0.0)
+
 
         degraded = self._rm_guard_or_raise(pair_key=pk, buy_ex=buy_ex, sell_ex=sell_ex)
 
@@ -9349,24 +9643,72 @@ class RiskManager:
 
 
         # Fragmentation suggérée par le Simulateur (industry-grade)
+
         frag_meta = None
+        sim_cnt: Optional[int] = None
+        sim_avg: Optional[float] = None
         simulator = getattr(self, "simulator", None)
         if simulator and hasattr(simulator, "suggest_slices"):
             try:
-                plan = simulator.suggest_slices(pair=pair,
-                                                notional_usdc=float(notional["amount"]),
-                                                volatility_hint=getattr(self, "volatility_hint_for_pair",
-                                                                        lambda p: None)(pair),
-                                                min_fragment_usdc=getattr(self, "min_fragment_usdc", 200),
-                                                frontload_weights=[0.50, 0.35, 0.15],
-                                                frontload_group_size=3)
-                frag_meta = {
-                    "cohort": "G1", "idx": 0, "total": int(plan.get("count", 1)),
-                    "weights": [0.50, 0.35, 0.15],
-                    "plan": plan
-                }
+                plan = simulator.suggest_slices(
+                    pair=pair,
+                    notional_usdc=float(notional["amount"]),
+                    volatility_hint=getattr(self, "volatility_hint_for_pair", lambda p: None)(pair),
+                    min_fragment_usdc=getattr(self, "min_fragment_usdc", 200),
+                    frontload_weights=getattr(self, "frontload_weights", [0.50, 0.35, 0.15]),
+                    frontload_group_size=int(getattr(self, "frontload_group_size", 3) or 3),
+                )
+                sim_cnt = int(plan.get("count", 1)) if plan else None
+                sim_avg = float(plan.get("fragment_usdc", 0.0)) if plan else None
             except Exception:
-                frag_meta = None
+                sim_cnt = None
+                sim_avg = None
+        quote_ccy = str((notional or {}).get("ccy") or "USDC").upper()
+        min_frag_map = getattr(self, "min_fragment_quote", {}) or {}
+        eff_min_frag = float(min_frag_map.get(quote_ccy, getattr(self, "min_fragment_usdc", 200.0)))
+        try:
+            self.min_fragment_usdc = eff_min_frag
+        except Exception:
+            pass
+
+        frag_plan = None
+        if strategy in {"TT", "TM", "REB"}:
+            desired = sim_cnt
+            avg_hint = sim_avg
+            if strategy == "TM" or strategy == "REB":
+                if total < (2 * eff_min_frag):
+                    desired = 1
+            try:
+                frag_plan = self.plan_fragments(
+                    pair_key=pk,
+                    buy_ex=buy_ex,
+                    sell_ex=sell_ex,
+                    total_usdc=total,
+                    strategy=strategy,
+                    regime=regime,
+                    desired_count=desired,
+                    avg_fragment_usdc=avg_hint,
+                    source="SIM" if sim_cnt or sim_avg else "STATIC",
+                )
+            except Exception:
+                frag_plan = None
+
+        if frag_plan and (frag_plan.get("amounts") or []):
+            amounts = frag_plan.get("amounts", [])
+            groups = frag_plan.get("groups", []) or ["G1"]
+            total_quote = float(frag_plan.get("total_quote", total) or total)
+            first = amounts[0] if amounts else total
+            frag_meta = {
+                "group": groups[0] if groups else "G1",
+                "cohort": groups[0] if groups else "G1",
+                "idx": 0,
+                "total": len(amounts),
+                "weight": (float(first) / total_quote) if total_quote > 0 and first else None,
+                "planned_notional_quote": float(first or total),
+                "plan": frag_plan,
+                "source": frag_plan.get("source", "STATIC"),
+            }
+
 
         # Contrôles TM (queuepos/TTL/hedge) en meta additifs (facultatifs)
         # Contrôles TM (queuepos/TTL/hedge) en meta additifs (facultatifs)
@@ -9521,9 +9863,11 @@ class RiskManager:
         if strategy_u == "MM":
             # TTL d'exposition pour MM : calculé côté RM, envoyé dans le bundle.
             # Priorité :
-            #   1) cfg.rm.mm_exposure_ttl_ms si présent
-            #   2) cfg.rm.tm_exposure_ttl_ms (fallback)
-            #   3) constante prudente 2500 ms
+            hints_mm = ((opp.get("hints") or {}).get("MM") or {})
+            try:
+                ttl_hint = int(hints_mm.get("ttl_ms") or 0)
+            except Exception:
+                ttl_hint = 0
             ttl_ms = None
             try:
                 cfg_root = getattr(self, "cfg", None)
@@ -9531,15 +9875,21 @@ class RiskManager:
             except Exception:
                 rm_cfg = None
 
-            if rm_cfg is not None:
-                ttl_ms = getattr(rm_cfg, "mm_exposure_ttl_ms", None)
-                if not ttl_ms:
-                    ttl_ms = getattr(rm_cfg, "tm_exposure_ttl_ms", None)
+            ttl_min = int(getattr(rm_cfg, "mm_ttl_min_ms", 300)) if rm_cfg else 300
+            ttl_max = int(getattr(rm_cfg, "mm_ttl_max_ms", 5000)) if rm_cfg else 5000
+            ttl_cfg = getattr(rm_cfg, "mm_exposure_ttl_ms", None) if rm_cfg else None
+            if ttl_cfg:
+                ttl_ms = ttl_cfg
+            elif ttl_hint > 0:
+                ttl_ms = ttl_hint
+            elif rm_cfg is not None:
+                ttl_ms = getattr(rm_cfg, "tm_exposure_ttl_ms", None)
 
             try:
                 ttl_ms = int(ttl_ms or 2500)
             except Exception:
                 ttl_ms = 2500
+            ttl_ms = max(ttl_min, min(ttl_ms, ttl_max))
 
             # On pose le TTL directement au niveau bundle, pour que l'Engine
             # puisse l'utiliser sans reconsulter la config.
@@ -9947,6 +10297,9 @@ class RiskManager:
         *,
         strategy: str = "TT",
         regime: Optional[str] = None,
+        desired_count: Optional[int] = None,
+        avg_fragment_usdc: Optional[float] = None,
+        source: str = "STATIC",
     ) -> Dict[str, Any]:
         """
         Renvoie un plan de fragments front-loaded, basé sur la profondeur actuelle.
@@ -9959,7 +10312,7 @@ class RiskManager:
             return {
                 "amounts": [],
                 "groups": [],
-                "avg_fragment_usdc": 0.0,
+                "avg_fragment_quote": 0.0,
                 "auto": True,
                 "source": source,
             }
@@ -9975,7 +10328,9 @@ class RiskManager:
         asks, bids = self.get_orderbook_depth(buy_ex, pk)
         if not asks or not bids:
             validated = fraglib.validate_fragment_plan(
-                [total], ["G1"], total_usdc=total, min_fragment_usdc=float(self.min_fragment_usdc)
+                {"amounts": [total], "groups": ["G1"], "source": "FALLBACK"},
+                total_quote=total,
+                min_fragment_quote=float(self.min_fragment_usdc),
             )
             validated["auto"] = False
             validated["source"] = "FALLBACK"
@@ -10004,35 +10359,40 @@ class RiskManager:
             auto = False
             source = "FALLBACK"
 
-        weights = fraglib.normalize_frontload_weights(getattr(self, "frontload_weights", None))
+        weights = fraglib.normalize_frontload_weights(
+            getattr(self, "frontload_weights", None), max_fragments=int(getattr(self, "max_fragments", 0) or 0)
+        )
         group_size = int(getattr(self, "frontload_group_size", 3) or 3)
         plan = fraglib.build_fragment_plan(
-            total,
-            weights=weights,
-            min_fragment_usdc=float(self.min_fragment_usdc),
-            max_fragments=int(self.max_fragments),
+            total_quote=total,
             desired_count=cnt,
-            avg_fragment_usdc=avg,
+            weights=weights,
+            min_fragment_quote=float(self.min_fragment_usdc),
+            max_fragments=int(self.max_fragments),
             group_size=group_size,
+            source=source,
+            avg_fragment_quote=avg,
         )
         validated = fraglib.validate_fragment_plan(
-            plan.get("amounts", []),
-            plan.get("groups", []),
-            total_usdc=total,
-            min_fragment_usdc=float(self.min_fragment_usdc),
+            plan,
+            total_quote=total,
+            min_fragment_quote=float(self.min_fragment_usdc),
             max_fragments=int(self.max_fragments),
         )
         if not validated.get("valid", True):
-            source = "FALLBACK"
+
             validated = fraglib.validate_fragment_plan(
-                [total],
-                ["G1"],
-                total_usdc=total,
-                min_fragment_usdc=float(self.min_fragment_usdc),
+                {
+                    "amounts": [total],
+                    "groups": ["G1"],
+                    "source": "FALLBACK",
+                },
+                total_quote=total,
+                min_fragment_quote=float(self.min_fragment_usdc),
                 max_fragments=int(self.max_fragments),
             )
         validated["auto"] = auto
-        validated["source"] = source
+        validated["source"] = validated.get("source", source)
         return validated
 
     # --- [ADD INSIDE class RiskManager] -----------------------------------------

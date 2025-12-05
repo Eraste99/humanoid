@@ -341,7 +341,9 @@ class OpportunityScanner:
         self._audition_ttl_min = int(getattr(s, "audition_ttl_min", 5))
         self._ban_ttl_min = int(getattr(s, "ban_ttl_min", 3))
         self._hysteresis_min = int(getattr(s, "hysteresis_min", 2))
-        self._enable_mm_hints = bool(getattr(s, "enable_mm_hints", False))
+        # Kill-switch MM unifié : alias direct de cfg.enable_maker_maker
+        self._enable_mm_hints = bool(getattr(self.cfg, "enable_maker_maker", False))
+        self.mm_mode = str(getattr(s, "mm_mode", "OFF") or "OFF").upper()
         self._binance_depth_level = int(getattr(s, "binance_depth_level", 10))
 
         # seuils/rythme (override possibles via cfg.scanner.*)
@@ -451,7 +453,13 @@ class OpportunityScanner:
         # throttles rotation MM (si activée côté RM/Engine)
         self._last_rotation_ts = 0.0
         self._rotation_period_s = 2.0
-
+        if bool(getattr(self.cfg, "mm_rotation_enabled", False)):
+            self._rot_mm = _Rotation(
+                primary_n=int(getattr(s, "mm_rotation_primary_n", 4)),
+                audition_m=int(getattr(s, "mm_rotation_audition_m", 4)),
+                hysteresis_min=int(getattr(s, "mm_rotation_hysteresis_min", 2)),
+                ban_ttl_min=int(getattr(s, "mm_rotation_ban_ttl_min", 3)),
+            )
         # ------------------------------------
         # 8) Feeds auxiliaires & caches
         # ------------------------------------
@@ -505,18 +513,41 @@ class OpportunityScanner:
 
     def _should_consider_mm_for_pair(self, pair: str) -> bool:
         """
-        Gating MM P0 : actif si `enable_maker_maker` est ON et
-        (paire seedée OU présente dans la rotation primaire/audition).
+        Détermine si la paire est éligible au MM:
+        - kill-switch global cfg.enable_maker_maker doit être ON,
+        - si pair dans mm_seed_pairs → toujours True,
+        - sinon tier de la paire doit appartenir à mm_allowed_tiers
+          (fallback CORE/PRIMARY) et ne pas être bannie par la rotation,
+        - si rotation activée, la paire doit être promue (primary/audition).
         """
-        p = _norm_pair(pair)
         cfg = self.cfg
         if not bool(getattr(cfg, "enable_maker_maker", False)):
             return False
-        if p in set(getattr(cfg, "mm_seed_pairs", [])):
+
+        p = _norm_pair(pair)
+        allowed_tiers = getattr(cfg, "mm_allowed_tiers", None) or ["CORE", "PRIMARY"]
+        allowed_tiers = [str(t).upper() for t in allowed_tiers]
+        seed_pairs = { _norm_pair(x) for x in (getattr(cfg, "mm_seed_pairs", []) or []) }
+        if p in seed_pairs:
             return True
-        if bool(getattr(cfg, "mm_rotation_enabled", False)):
-            return (p in getattr(self._rot_mm, "primary", [])) or (p in getattr(self._rot_mm, "audition", []))
-        return False
+
+        tier = "AUDITION"
+        if p in getattr(self, "_core_pairs", set()):
+            tier = "CORE"
+        elif p in getattr(self, "_primary_pairs", set()):
+            tier = "PRIMARY"
+        elif p in getattr(self, "_sandbox_pairs", set()):
+            tier = "SANDBOX"
+
+        if tier not in allowed_tiers:
+            return False
+
+        rot = getattr(self, "_rot_mm", None)
+        if rot:
+            if getattr(rot, "is_banned", lambda _p: False)(p):
+                return False
+            return (p in getattr(rot, "primary", [])) or (p in getattr(rot, "audition", []))
+        return True
 
     def _record_rejection(
         self,
@@ -927,6 +958,18 @@ class OpportunityScanner:
             self._evaluate_pair(buy_data, sell_data)
         if any_eval:
             self.last_scan_time = time.time()
+
+    def _evaluate_routes_for_pair(self, pair: str, ev: dict, enable_mm: bool) -> None:
+        """
+        Reconstruit les routes TT/TM à partir des snapshots synchronisés
+        pour une paire et évalue chaque combinaison via _evaluate_pair.
+        Respecte les filtres d'univers déjà appliqués dans la boucle principale.
+        """
+        _ = ev  # ev conservé pour compat éventuelle
+        pair_key = _norm_pair(pair)
+        for ex_buy, buy_data, ex_sell, sell_data in self._synced_snapshots_for_pair(pair_key):
+            self._evaluate_pair(buy_data, sell_data)
+
 
     # ---------- Pilotage de l'univers ----------
     def set_universe(self, *, mode: str,
@@ -2054,24 +2097,31 @@ class OpportunityScanner:
                 }
             }
 
-        # Hints MM (inchangé)
-        try:
-            if self._should_consider_mm_for_pair(pair):
-                ma = float((sell_data.get("best_ask") or 0.0))
-                mb = float((buy_data.get("best_bid") or 0.0))
-                score_mm, mm_hints = self._score_mm(a_ex=sell_ex, b_ex=buy_ex, pair=pair, maker_px_a=ma, maker_px_b=mb)
-                SC_STRATEGY_SCORE.labels(pair, "MM").set(score_mm)
-                SC_ELIGIBLE.labels(pair, "MM").set(1.0 if score_mm > -1e8 else 0.0)
-                hints["MM"] = mm_hints
-                hints["MM_score"] = float(score_mm)
-                hints.setdefault("expected_net_bps", {})
-                hints["expected_net_bps"]["TT"] = float(spread_net * 1e4)
-                hints["expected_net_bps"]["TM"] = float(tm_best_bps)
-                hints["expected_net_bps"]["MM"] = float(mm_hints.get("net_bps", float("nan")))
-            else:
-                SC_ELIGIBLE.labels(pair, "MM").set(0.0)
-        except Exception:
-            logging.exception("Unhandled exception")
+            # Hints MM (mode MONO seulement, indépendants du succès TT/TM)
+            try:
+                mm_mode = (self.mm_mode or "OFF").upper()
+                if mm_mode == "OFF":
+                    SC_ELIGIBLE.labels(pair, "MM").set(0.0)
+                elif mm_mode == "CROSS":
+                    self.logger.debug("[Scanner] MM CROSS non supporté (pair=%s)", pair)
+                    SC_ELIGIBLE.labels(pair, "MM").set(0.0)
+                elif self._should_consider_mm_for_pair(pair):
+                    ma = float((sell_data.get("best_ask") or 0.0))
+                    mb = float((buy_data.get("best_bid") or 0.0))
+                    score_mm, mm_hints = self._score_mm(a_ex=sell_ex, b_ex=buy_ex, pair=pair, maker_px_a=ma,
+                                                        maker_px_b=mb)
+                    SC_STRATEGY_SCORE.labels(pair, "MM").set(score_mm)
+                    SC_ELIGIBLE.labels(pair, "MM").set(1.0 if score_mm > -1e8 else 0.0)
+                    hints["MM"] = mm_hints
+                    hints["MM_score"] = float(score_mm)
+                    hints.setdefault("expected_net_bps", {})
+                    hints["expected_net_bps"]["TT"] = float(spread_net * 1e4)
+                    hints["expected_net_bps"]["TM"] = float(tm_best_bps)
+                    hints["expected_net_bps"]["MM"] = float(mm_hints.get("net_bps", float("nan")))
+                else:
+                    SC_ELIGIBLE.labels(pair, "MM").set(0.0)
+            except Exception:
+                logging.exception("Unhandled exception")
 
         # Score net (pénalité VOL douce) — pondéré par la taille effectivement sélectionnée
         vol_penalty_frac = D(vol_penalty_bps / 1e4) if vol_penalty_bps > 0 else D(0)
@@ -2378,13 +2428,21 @@ class OpportunityScanner:
         status["config"]["mm_rotation"] = {
             "primary": list(getattr(self._rot_mm, "primary", [])),
             "audition": list(getattr(self._rot_mm, "audition", [])),
+            "banned": list(getattr(getattr(self, "_rot_mm", None), "_banned_until", {}).keys()),
+            "seed": list(getattr(self.cfg, "mm_seed_pairs", []) or []),
+            "sizes": {
+                "primary": len(getattr(self._rot_mm, "primary", [])),
+                "audition": len(getattr(self._rot_mm, "audition", [])),
+                "banned": len(getattr(getattr(self, "_rot_mm", None), "_banned_until", {}) or {}),
+            },
         }
 
         # ---- AJOUT 2/2: mm_rotation à la RACINE ----
         status["mm_rotation"] = {
             "primary": list(getattr(self._rot_mm, "primary", [])),
             "audition": list(getattr(self._rot_mm, "audition", [])),
-
+            "banned": list(getattr(getattr(self, "_rot_mm", None), "_banned_until", {}).keys()),
+            "seed": list(getattr(self.cfg, "mm_seed_pairs", []) or []),
         }
 
         return status

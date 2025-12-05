@@ -189,17 +189,21 @@ def _pos(v: Any, name: str) -> float:
 FRAGMENT_GROUPS = ("G1", "G2", "G3")
 
 
-def normalize_frontload_weights(raw: Optional[List[float]], default: Optional[List[float]] = None) -> List[float]:
+def normalize_frontload_weights(weights: Optional[List[float]], max_fragments: Optional[int] = None) -> List[float]:
+    """Normalise les poids front-load (liste bornée aux cohortes G1/G2/G3).
+
+    - fallback : [0.50, 0.35, 0.15]
+    - clamp chaque poids à >= 0
+    - trim/pad à 3 entrées puis tronque au besoin si max_fragments < 3
+    - somme ≈ 1.0
     """
-    Normalise les poids de front-load (fallback [0.50,0.35,0.15]).
-    - padding à 3 entrées, clamp >=0, somme = 1.0
-    """
-    base = list(raw or []) or list(default or [0.50, 0.35, 0.15])
+    base = list(weights or []) or [0.50, 0.35, 0.15]
     # pad / trim à 3
     if len(base) < 3:
         base = (base + [0.0, 0.0, 0.0])[:3]
     else:
         base = base[:3]
+
     safe = []
     for w in base:
         try:
@@ -210,31 +214,52 @@ def normalize_frontload_weights(raw: Optional[List[float]], default: Optional[Li
     if s <= 0:
         safe = [1.0, 0.0, 0.0]
         s = 1.0
-    return [w / s for w in safe]
+    normed = [w / s for w in safe]
+
+    if max_fragments is not None and max_fragments < len(FRAGMENT_GROUPS):
+        max_groups = max(1, int(max_fragments))
+        normed = normed[:max_groups]
+        tail = sum(normed)
+        normed = [w / tail for w in normed] if tail > 0 else normed
+
+    return normed
 
 
 def build_fragment_plan(
-    total_usdc: float,
+    total_quote: float,
+    desired_count: Optional[int],
+    weights: Optional[List[float]],
+    min_fragment_quote: float,
+    max_fragments: Optional[int],
+    group_size: int,
     *,
-    weights: Optional[List[float]] = None,
-    min_fragment_usdc: float,
-    max_fragments: Optional[int] = None,
-    desired_count: Optional[int] = None,
-    avg_fragment_usdc: Optional[float] = None,
-    group_size: int = 3,
+    source: str,
+    avg_fragment_quote: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Génère un plan front-load (amounts + groups cohorte G1/G2/G3)."""
-    total = max(0.0, float(total_usdc))
+    """Construit un plan de fragmentation canonique (amounts + groups).
+
+    La planification reste pure : aucun accès au RiskManager/Engine, uniquement
+    des calculs déterministes basés sur le notional cible et la config.
+    """
+    total = max(0.0, float(total_quote))
     if total <= 0:
-        return {"amounts": [], "groups": [], "avg_fragment_usdc": 0.0}
+        return {
+            "amounts": [],
+            "groups": [],
+            "avg_fragment_quote": 0.0,
+            "total_quote": total,
+            "source": source,
+            "valid": False,
+        }
 
     group_size = max(1, int(group_size))
     if desired_count and desired_count > 0:
         count = int(desired_count)
-    elif avg_fragment_usdc and avg_fragment_usdc > 0:
-        count = max(1, int(round(total / float(avg_fragment_usdc))))
+    elif avg_fragment_quote and avg_fragment_quote > 0:
+        count = max(1, int(round(total / float(avg_fragment_quote))))
     else:
-        count = max(1, int(round(total / max(min_fragment_usdc, 1.0))))
+        count = max(1, int(round(total / max(min_fragment_quote, 1.0))))
+
     if max_fragments:
         try:
             count = min(count, int(max_fragments))
@@ -248,13 +273,13 @@ def build_fragment_plan(
     rem_after_g2 = rem_after_g1 - g2
     g3 = max(0, rem_after_g2)
 
-    norm_weights = normalize_frontload_weights(weights)
+    norm_weights = normalize_frontload_weights(weights, max_fragments=count)
     cohorts = []
     if g1 > 0:
         cohorts.append(("G1", g1, norm_weights[0]))
-    if g2 > 0:
+    if g2 > 0 and len(norm_weights) > 1:
         cohorts.append(("G2", g2, norm_weights[1]))
-    if g3 > 0:
+    if g3 > 0 and len(norm_weights) > 2:
         cohorts.append(("G3", g3, norm_weights[2]))
     s = sum(w for _, _, w in cohorts) or 1.0
     cohorts = [(label, size, w / s) for (label, size, w) in cohorts]
@@ -268,8 +293,8 @@ def build_fragment_plan(
         if size <= 0 or budget <= 0:
             continue
         per_slice = budget / size
-        if per_slice < min_fragment_usdc and size > 1:
-            size = max(1, int(min(size, math.ceil(budget / max(min_fragment_usdc, 1.0)))))
+        if per_slice < min_fragment_quote and size > 1:
+            size = max(1, int(min(size, math.ceil(budget / max(min_fragment_quote, 1.0)))))
             per_slice = budget / size
         for _i in range(size):
             amt = per_slice
@@ -281,7 +306,7 @@ def build_fragment_plan(
         amounts[-1] = max(0.0, amounts[-1] + diff)
 
     # Fusionner une queue trop petite avec l'avant-dernière tranche
-    if len(amounts) >= 2 and amounts[-1] < (min_fragment_usdc * 0.5):
+    if len(amounts) >= 2 and amounts[-1] < (min_fragment_quote * 0.5):
         merged = amounts[-1] + amounts[-2]
         amounts[-2] = merged
         amounts.pop()
@@ -289,33 +314,51 @@ def build_fragment_plan(
             groups.pop()
 
     avg = (sum(amounts) / max(1, len(amounts))) if amounts else 0.0
-    return {"amounts": amounts, "groups": groups, "avg_fragment_usdc": avg}
+    return {
+        "amounts": amounts,
+        "groups": groups,
+        "avg_fragment_quote": avg,
+        "total_quote": total,
+        "desired_count": desired_count,
+        "weights": normalize_frontload_weights(weights, max_fragments=count),
+        "group_size": group_size,
+        "source": source,
+        "valid": True,
+    }
 
 
 def validate_fragment_plan(
-    amounts: List[float],
-    groups: List[str],
-    *,
-    total_usdc: float,
-    min_fragment_usdc: float,
+    plan: Dict[str, Any],
+    total_quote: float,
+    min_fragment_quote: float,
     max_fragments: Optional[int] = None,
+    *,
     tol: float = 1e-3,
 ) -> Dict[str, Any]:
-    """Valide/normalise un plan de fragments (fallback → tranche unique G1)."""
-    total = max(0.0, float(total_usdc))
-    amts = [float(a) for a in (amounts or []) if float(a) > 0]
-    grps = list(groups or [])
+    """Valide/normalise un plan de fragments (fallback mono-fragment G1)."""
+    total = max(0.0, float(total_quote))
+    amts = []
+    groups = []
+    try:
+        amts = [float(a) for a in (plan or {}).get("amounts", []) if float(a) > 0]
+    except Exception:
+        amts = []
+    try:
+        groups = list((plan or {}).get("groups", []))
+    except Exception:
+        groups = []
+
     valid = True
 
     if max_fragments and max_fragments > 0:
         amts = amts[: max_fragments]
-        grps = grps[: len(amts)]
+        groups = groups[: len(amts)]
 
-    if len(amts) != len(grps) or not amts:
+    if len(amts) != len(groups) or not amts:
         valid = False
-    if any(a < min_fragment_usdc for a in amts):
+    if any(a < min_fragment_quote for a in amts):
         valid = False
-    if any(g not in FRAGMENT_GROUPS for g in grps):
+    if any(g not in FRAGMENT_GROUPS for g in groups):
         valid = False
     if total > 0:
         if abs(sum(amts) - total) > max(tol, tol * max(1.0, total)):
@@ -323,20 +366,35 @@ def validate_fragment_plan(
 
     if not valid:
         amts = [total] if total > 0 else []
-        grps = ["G1"] if total > 0 else []
+        groups = ["G1"] if total > 0 else []
 
     avg = (sum(amts) / max(1, len(amts))) if amts else 0.0
-    return {"amounts": amts, "groups": grps, "avg_fragment_usdc": avg, "valid": valid}
+    out = {
+        "amounts": amts,
+        "groups": groups,
+        "avg_fragment_quote": avg,
+        "total_quote": total,
+        "valid": valid,
+    }
+    out.update({k: v for k, v in (plan or {}).items() if k not in out})
+    return out
 
 # -----------------------------------------------------------------------------
 # Sous-modèles typés (riches)
 # -----------------------------------------------------------------------------
 class Frag(_Cfg, BaseModel):
-    """Fragmentation front-load (cohortes G1/G2/G3, etc.)."""
-    cohort: Optional[str] = None
+    """Fragmentation front-load canonique (G1/G2/G3, plan embarqué)."""
+
+    group: Optional[str] = Field(default=None)
     idx: Optional[int] = Field(default=None, ge=0)
     total: Optional[int] = Field(default=None, ge=1)
+    weight: Optional[float] = Field(default=None, ge=0)
+    planned_notional_quote: Optional[float] = Field(default=None, ge=0)
+    plan: Optional[Dict[str, Any]] = None
+    # Legacy / compat
+    cohort: Optional[str] = None
     weights: Optional[List[float]] = None  # ex: [0.50, 0.35, 0.15]
+
 
 class Caps(_Cfg, BaseModel):
     """Caps d'exécution / concurrence / headroom."""
