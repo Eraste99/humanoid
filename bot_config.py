@@ -521,6 +521,20 @@ class RiskManagerCfg:
     mm_delta_hard_usd: float = 5000.0
     mm_delta_by_asset: Dict[str, Dict] = field(default_factory=dict)
 
+    # TT/TM delta (VaR-lite P0)
+    tttm_exposure_soft_usd: float = 2000.0
+    tttm_exposure_hard_usd: float = 5000.0
+    tttm_exposure_by_asset: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            "BTC": {"soft_usd": 5000.0, "hard_usd": 15000.0},
+            "ETH": {"soft_usd": 3000.0, "hard_usd": 10000.0},
+        }
+    )
+
+    tt_stuck_soft_usd: float = 1000.0
+    tt_stuck_hard_usd: float = 3000.0
+    tt_stuck_max_age_s: float = 10.0
+
     # Tailles cibles d'un slot MM par profil capital (USD/quote)
     mm_slot_notional_usdc_by_profile: Dict[str, float] = field(
         default_factory=lambda: {
