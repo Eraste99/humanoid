@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import self
+
 
 """
     Chef d’orchestre strict — **multi-comptes (TT/TM) par CEX**
@@ -62,6 +62,7 @@ RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
 
 RM_ALIAS_COLLAT_CRITICAL = "RM_ALIAS_COLLAT_CRITICAL"
 RM_ALIAS_COLLAT_LOW = "RM_ALIAS_COLLAT_LOW"
+RM_MM_DELTA_HARD_LIMIT = "RM_MM_DELTA_HARD_LIMIT"
 
 ENGINE_BACKPRESSURE_QUEUE_FULL = "ENGINE_BACKPRESSURE_QUEUE_FULL"
 ENGINE_BACKPRESSURE_CAP_BRANCH = "ENGINE_BACKPRESSURE_CAP_BRANCH"
@@ -186,7 +187,21 @@ RM_MM_PREEMPTED_TOTAL = get_counter(
     "MM liquidity preempted by higher-priority branches",
     labelnames=("by",),
 )
-
+RM_MM_DELTA_USD = get_gauge(
+    "rm_mm_delta_usd",
+    "Per-asset MM delta expressed in USD-like terms",
+    labelnames=("asset",),
+)
+RM_MM_DELTA_STATE = get_gauge(
+    "rm_mm_delta_state",
+    "Per-asset MM delta state (0=OK,1=SOFT,2=HARD)",
+    labelnames=("asset",),
+)
+RM_MM_DELTA_SOFT_HIT = get_counter(
+    "rm_mm_delta_soft_hit_total",
+    "Soft-limit MM delta hits observed during gating",
+    labelnames=("asset",),
+)
 
 
 # --- Helpers robusti per cast da ENV/config --------------------------------
@@ -854,6 +869,9 @@ class RiskManager:
         if self.mm_mode == "OFF":
             self.enable_mm = False
 
+        # Delta MM (mesure + garde-fou P0)
+        self.mm_delta_state: dict[str, dict] = {}
+
         # Tailles/slots MM par profil (définies dans BotConfig.rm)
         rm_cfg = getattr(self.cfg, "rm", None)
         slot_cfg = getattr(rm_cfg, "mm_slot_notional_usdc_by_profile", {}) or {}
@@ -1416,11 +1434,10 @@ class RiskManager:
             "[RM] Capital buffers mis à jour via MBF: "
             f"mode={mode}, total_usdc={total_usdc:.2f}"
         )
-
-    try:
-        self._refresh_alias_collat_from_mbf(now=self.last_capital_update_ts)
-    except Exception:
-        self.logger.debug("[RM] _refresh_alias_collat_from_mbf failed", exc_info=False)
+        try:
+            self._refresh_alias_collat_from_mbf(now=self.last_capital_update_ts)
+        except Exception:
+            self.logger.debug("[RM] _refresh_alias_collat_from_mbf failed", exc_info=False)
 
     def update_capital_from_mbf(self, *, mode: str = "merged") -> None:
         """
@@ -1501,6 +1518,111 @@ class RiskManager:
                     RM_ALIAS_COLLAT_STATE.labels(exchange=ex_u, alias=alias_u).set(state_val)
                 except Exception:
                     pass
+
+    def _refresh_mm_delta_from_balances(self, now: float | None = None) -> None:
+        """
+        Mesure le delta global MM par asset en USD-like à partir du snapshot MBF.
+        """
+        glue = getattr(self, "_mbf_glue", None) or getattr(self, "mbf", None)
+        if glue is None:
+            return
+
+        try:
+            if hasattr(glue, "snapshot"):
+                raw = glue.snapshot(mode="merged", cached_only=True)
+            elif hasattr(glue, "as_rm_snapshot"):
+                try:
+                    raw = glue.as_rm_snapshot(mode="merged", cached_only=True)
+                except TypeError:
+                    raw = glue.as_rm_snapshot(cached_only=True)
+            else:
+                return
+        except Exception as exc:
+            self.logger.debug("[RM] mm_delta snapshot MBF failed: %s", exc, exc_info=False)
+            return
+
+        if not isinstance(raw, dict) or not raw:
+            return
+
+        if "balances" in raw and isinstance(raw.get("balances"), dict):
+            balances = raw.get("balances") or {}
+        else:
+            balances = {
+                ex: per for ex, per in raw.items()
+                if ex != "meta" and isinstance(per, dict)
+            }
+
+        if not balances:
+            return
+
+        cfg_rm = getattr(self.cfg, "rm", None)
+        collat_quotes = [str(q).upper() for q in (getattr(cfg_rm, "collat_quotes", []) or [])]
+        mm_aliases = {str(getattr(self, "mm_alias", "MM") or "MM").upper()}
+        delta_usd: dict[str, float] = defaultdict(float)
+
+        for ex, per_alias in balances.items():
+            ex_u = str(ex).upper()
+            for alias, assets in (per_alias or {}).items():
+                alias_u = str(alias).upper()
+                if "MM" not in alias_u and alias_u not in mm_aliases:
+                    continue
+                for asset, qty in (assets or {}).items():
+                    asset_u = str(asset).upper()
+                    if asset_u in collat_quotes:
+                        continue
+                    try:
+                        qty_f = float(qty or 0.0)
+                    except Exception:
+                        qty_f = 0.0
+                    if qty_f == 0.0:
+                        continue
+
+                    price_usd: Optional[float] = None
+                    for quote in ("USDC", "USDT"):
+                        sym = f"{asset_u}{quote}"
+                        price_usd = self._get_price(ex_u, sym)
+                        if price_usd is not None:
+                            break
+                    if price_usd is None:
+                        continue
+
+                    delta_usd[asset_u] += qty_f * price_usd
+
+        now_ts = float(now) if now is not None else time.time()
+        default_soft = float(getattr(cfg_rm, "mm_delta_soft_usd", 0.0) or 0.0)
+        default_hard = float(getattr(cfg_rm, "mm_delta_hard_usd", 0.0) or 0.0)
+        overrides = getattr(cfg_rm, "mm_delta_by_asset", {}) or {}
+
+        mm_state: dict[str, dict] = {}
+        for asset, d_usd in delta_usd.items():
+            override = overrides.get(asset) or overrides.get(asset.upper()) or {}
+            soft_limit = float(override.get("soft_usd", default_soft) or default_soft)
+            hard_limit = float(override.get("hard_usd", default_hard) or default_hard)
+            abs_delta = abs(d_usd)
+
+            state = "OK"
+            if hard_limit > 0 and abs_delta > hard_limit:
+                state = "HARD"
+            elif soft_limit > 0 and abs_delta > soft_limit:
+                state = "SOFT"
+
+            state_val = {"OK": 0, "SOFT": 1, "HARD": 2}.get(state, 0)
+
+            mm_state[asset] = {
+                "delta_usd": d_usd,
+                "soft_limit_usd": soft_limit,
+                "hard_limit_usd": hard_limit,
+                "state": state,
+                "last_update_ts": now_ts,
+            }
+
+            try:
+                RM_MM_DELTA_USD.labels(asset=asset).set(d_usd)
+                RM_MM_DELTA_STATE.labels(asset=asset).set(state_val)
+            except Exception:
+                pass
+
+        self.mm_delta_state = mm_state
 
     def check_capital_drift(self, threshold_pct: float | None = None) -> None:
         """
@@ -5713,6 +5835,11 @@ class RiskManager:
                             self.update_capital_from_mbf()
                     except Exception:
                         logger.debug("[RiskManager] capital refresh from MBF failed (dry_run)", exc_info=False)
+                    try:
+                        self._refresh_mm_delta_from_balances()
+                    except Exception:
+                        logger.debug("[RiskManager] mm_delta refresh failed (dry_run)", exc_info=False)
+
 
 
 
@@ -5729,6 +5856,10 @@ class RiskManager:
                             self.update_capital_from_mbf()
                     except Exception:
                         logger.debug("[RiskManager] capital refresh from MBF failed (dry_run)", exc_info=False)
+                    try:
+                        self._refresh_mm_delta_from_balances()
+                    except Exception:
+                        logger.debug("[RiskManager] mm_delta refresh failed", exc_info=False)
 
                     # Publie les niveaux de tokens de fees si le collector expose l’API
                     try:
@@ -9941,6 +10072,17 @@ class RiskManager:
         strategy_u = str(strategy or "").upper()
 
         if strategy_u == "MM":
+            base_asset = self._pair_base(pk)
+            delta_state = self.mm_delta_state.get(base_asset, {}).get("state", "OK")
+            if delta_state == "HARD":
+                inc_rm_reject(reason=RM_MM_DELTA_HARD_LIMIT)
+                return None
+            if delta_state == "SOFT":
+                try:
+                    RM_MM_DELTA_SOFT_HIT.labels(asset=base_asset).inc()
+                except Exception:
+                    pass
+                
             ex_for_mm = (buy_ex or sell_ex or "").upper()
             if buy_ex and sell_ex and str(buy_ex).upper() != str(sell_ex).upper():
                 inc_rm_reject(reason="MM_MODE_MONO_REQUIRED")

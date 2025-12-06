@@ -517,6 +517,9 @@ class RiskManagerCfg:
     mm_min_p_both: float = 0.0
     mm_min_net_bps: float = 0.0005
     mm_hedge_cost_bps: float = 5.0
+    mm_delta_soft_usd: float = 2000.0
+    mm_delta_hard_usd: float = 5000.0
+    mm_delta_by_asset: Dict[str, Dict] = field(default_factory=dict)
 
     # Tailles cibles d'un slot MM par profil capital (USD/quote)
     mm_slot_notional_usdc_by_profile: Dict[str, float] = field(
