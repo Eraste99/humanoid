@@ -5302,6 +5302,108 @@ class ExecutionEngine:
         )
         return slices
 
+    def _build_mm_ladder(
+            self,
+            *,
+            pair: str,
+            side: str,
+            capital_profile: str,
+            base_price: float,
+            meta: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Construit une ladder MM fragmentée à partir du slot fourni par le RM.
+
+        Cette méthode est volontairement locale à l'Engine (pas de nouveau contrat
+        payload). Elle réutilise les paramètres de fragmentation globaux déjà
+        utilisés pour TT/TM (frontload, min_fragment_quote, group_size…) et le
+        slot MM fourni par le RiskManager (slot_notional_usdc, slots_per_pair).
+        """
+
+        # Paramètres de slot (profil capital Macro 1)
+        slot_params = meta.get("mm_slot_params") if isinstance(meta.get("mm_slot_params"), dict) else None
+        if not slot_params and getattr(self, "risk_manager", None):
+            try:
+                slot_params = self.risk_manager.get_mm_slot_params(capital_profile)
+            except Exception:
+                slot_params = None
+        slot_params = slot_params or {}
+
+        slot_notional = float(slot_params.get("slot_notional_usdc") or 0.0)
+        slots_per_pair = int(slot_params.get("slots_per_pair") or 1)
+        total_budget = slot_notional * max(1, slots_per_pair)
+
+        # Participation cible sur la ladder (permet de laisser un pad pour d'autres côtés)
+        try:
+            participation = float(getattr(self, "target_ladder_participation", 1.0) or 1.0)
+        except Exception:
+            participation = 1.0
+        total_budget *= max(0.0, min(1.0, participation))
+
+        # Garde : budget minimal
+        if total_budget <= 0.0:
+            return []
+
+        # Paramètres de fragmentation globaux
+        max_frags = int(getattr(self, "max_fragments", 0) or 0) or None
+        frag_pad = float(getattr(self, "fragment_safety_pad", 0.0) or 0.0)
+        weights = fraglib.normalize_frontload_weights(
+            getattr(self, "frontload_weights", [0.5, 0.35, 0.15]) or [0.5, 0.35, 0.15],
+            max_fragments=max_frags,
+        )
+        group_size = int(getattr(self, "frontload_group_size", 3) or 3)
+
+        _, quote = SymbolUtils.split_base_quote(pair)
+        min_fragment_map = getattr(self, "min_fragment_quote", {}) or {}
+        min_frag_quote = float(min_fragment_map.get(quote, min_fragment_map.get("USDC", 0.0)) or 0.0)
+
+        plan = fraglib.build_fragment_plan(
+            total_quote=total_budget,
+            desired_count=max_frags,
+            weights=weights,
+            max_fragments=max_frags,
+            min_fragment_quote=min_frag_quote,
+            group_size=group_size,
+            source="ENGINE_MM",
+            avg_fragment_quote=None,
+        )
+        slices, _ = self._plan_to_slices(
+            plan=plan,
+            total_usdc=total_budget,
+            min_fragment_usdc=min_frag_quote,
+            max_fragments=max_frags,
+        )
+
+        ladder: List[Dict[str, Any]] = []
+        effective_side = "BUY" if str(side or "").lower() == "bid" else "SELL"
+        ex = meta.get("exchange") or meta.get(f"{side}_exchange") or meta.get("ex")
+        ttl_ms = int(meta.get("mm_ttl_ms") or getattr(self, "mm_ttl_ms", 0) or getattr(self.config, "mm_ttl_ms", 0))
+        alias = meta.get("account_alias") or meta.get("alias") or getattr(self, "mm_alias_name", None)
+
+        for amt, _grp, _idx, _w in slices:
+            adj_amt = amt * max(0.0, 1.0 - frag_pad)
+            if adj_amt < min_frag_quote:
+                continue  # drop fragments trop petits
+            leg_meta = {
+                **(meta or {}),
+                "maker": True,
+                "kind": "MAKER_MM",
+                "branch": "MM",
+                "capital_profile": capital_profile,
+                "account_alias": alias or meta.get("account_alias"),
+                "ttl_ms": ttl_ms or meta.get("ttl_ms"),
+            }
+            ladder.append(
+                {
+                    "exchange": ex,
+                    "symbol": self._fmt_pair(pair),
+                    "side": effective_side,
+                    "price": float(base_price or 0.0),
+                    "volume_usdc": float(adj_amt),
+                    "meta": leg_meta,
+                }
+            )
+
+        return ladder
 
     async def _cancel_bg_tasks(self, *, timeout: float = 2.0) -> None:
         tasks = [t for t in getattr(self, "_bg_tasks", set()) if not t.done()]
@@ -5838,6 +5940,80 @@ class ExecutionEngine:
         self._ensure_ready()
 
         legs = payload.get("legs") or (payload.get("payload", {}) or {}).get("legs", [])
+        meta_payload = payload.get("meta") or {}
+        route_info = payload.get("route") or {}
+
+        route_strategy = ""
+        if isinstance(route_info, str):
+            route_strategy = route_info.upper()
+        elif isinstance(route_info, dict):
+            route_strategy = str(route_info.get("strategy") or route_info.get("route") or "").upper()
+
+        # -------------------- MM opportuniste (ladder) --------------------
+        if route_strategy == "MM":
+            pair_val = payload.get("pair_key") or payload.get("pair") or meta_payload.get("pair")
+            pair_key = self._fmt_pair(pair_val or "") if pair_val else ""
+            capital_profile = str(meta_payload.get("capital_profile") or meta_payload.get("profile") or "").upper()
+
+            # Fallback conservateur: profil capital issu de la config si absent
+            if not capital_profile:
+                try:
+                    capital_profile = str(getattr(self.config, "capital_profile", "") or "").upper()
+                except Exception:
+                    capital_profile = ""
+
+            try:
+                base_price = float(payload.get("base_price") or meta_payload.get("base_price") or 0.0)
+            except Exception:
+                base_price = 0.0
+            if base_price <= 0.0 and pair_key and getattr(self, "risk_manager", None):
+                with contextlib.suppress(Exception):
+                    base_price = float(self.risk_manager.get_mid_price_usdc(pair_key))
+
+            # Côtés à coter : défaut bid/ask
+            sides = meta_payload.get("sides") or route_info.get("sides") or ["bid", "ask"]
+            if isinstance(sides, str):
+                sides = [sides]
+
+            mm_legs: List[Dict[str, Any]] = []
+            for s in sides:
+                mm_legs.extend(
+                    self._build_mm_ladder(
+                        pair=pair_key,
+                        side=str(s or ""),
+                        capital_profile=capital_profile,
+                        base_price=base_price,
+                        meta=meta_payload,
+                    )
+                )
+
+            if not mm_legs:
+                self.stats.total_failed += 1
+                return
+
+            payload["legs"] = mm_legs
+            legs = mm_legs
+            # Taggage branch/kind homogène
+            meta_payload.setdefault("branch", "MM")
+            meta_payload.setdefault("kind", "MAKER_MM")
+            meta_payload.setdefault("capital_profile", capital_profile or "")
+            payload["meta"] = meta_payload
+
+            try:
+                log.debug(
+                    "[ExecutionEngine] MM ladder built pair=%s profile=%s levels=%s notional=%.2f",
+                    pair_key,
+                    capital_profile or "?",
+                    len(mm_legs),
+                    sum(float(l.get("volume_usdc") or 0.0) for l in mm_legs),
+                )
+            except Exception:
+                pass
+
+            # Pour MM opportuniste, on envoie directement les legs construits
+            await self._route_and_place(payload, cid=payload.get("cid") or payload.get("bundle_id") or "")
+            return
+
         if len(legs) != 2:
             self.stats.total_failed += 1
             return
@@ -5858,7 +6034,7 @@ class ExecutionEngine:
         if not buy_leg or not sell_leg:
             self._reject(pair_key, payload, "bundle sans BUY/SELL")
             return
-        meta_payload = payload.get("meta") or {}
+        
         branch = str(meta_payload.get("branch") or meta_payload.get("strategy") or "").upper()
         strategy = str(meta_payload.get("strategy", "")).upper()
 
