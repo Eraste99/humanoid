@@ -855,6 +855,8 @@ class RiskManager:
             getattr(getattr(self.cfg, "rm", None), "combo_cap_window_s", 120.0) or 120.0
         )
         self._combo_inflight_notional: Dict[str, List[Tuple[float, float]]] = {}
+        g_cfg = _cfg_g(self)
+        self.capital_profile = str(getattr(g_cfg, "capital_profile", "SMALL") or "SMALL").upper()
         # --- Résumé des caps globaux par profil (Macro 3 / M3-A) ---
         # Best-effort uniquement, pour debug / observabilité. Aucune logique RM ne s'appuie
         # sur cette structure (les décisions restent basées sur caps_trading_by_profile,
@@ -924,20 +926,20 @@ class RiskManager:
         self.tm_inflight_exposures: dict[str, list[dict]] = {}
 
         # Tailles/slots MM par profil (définies dans BotConfig.rm)
-        rm_cfg = getattr(self.cfg, "rm", None)
+        rm_cfg = _cfg_rm(self)
         slot_cfg = getattr(rm_cfg, "mm_slot_notional_usdc_by_profile", {}) or {}
         self.mm_slot_notional_usdc_by_profile: Dict[str, float] = {
-            str(k).upper(): float(v)
+            str(k).upper(): self._as_float_or(v, 0.0)
             for k, v in slot_cfg.items()
         }
         pair_ratio_cfg = getattr(rm_cfg, "mm_pair_cap_ratio_by_profile", {}) or {}
         self.mm_pair_cap_ratio_by_profile: Dict[str, float] = {
-            str(k).upper(): float(v)
+            str(k).upper(): self._as_float_or(v, 0.0)
             for k, v in pair_ratio_cfg.items()
         }
         slots_per_pair_cfg = getattr(rm_cfg, "mm_slots_per_pair_by_profile", {}) or {}
         self.mm_slots_per_pair_by_profile: Dict[str, int] = {
-            str(k).upper(): int(v)
+            str(k).upper(): self._as_int_or(v, 0)
             for k, v in slots_per_pair_cfg.items()
         }
 
@@ -2929,13 +2931,41 @@ class RiskManager:
 
         return True, ""
 
+    def _mm_profile_params(self, capital_profile: str | None = None) -> Dict[str, Any]:
+        p_requested = str(capital_profile or self.capital_profile or "SMALL").upper()
+        slot_map = self.mm_slot_notional_usdc_by_profile or {}
+        pair_ratio_map = self.mm_pair_cap_ratio_by_profile or {}
+        slots_per_pair_map = self.mm_slots_per_pair_by_profile or {}
+
+        def _resolve(map_obj: Dict[str, Any], default: Any) -> tuple[str, Any]:
+            if not map_obj:
+                return p_requested, default
+            if p_requested in map_obj:
+                return p_requested, map_obj[p_requested]
+            if "SMALL" in map_obj:
+                return "SMALL", map_obj["SMALL"]
+            key, value = next(iter(map_obj.items()))
+            return str(key).upper(), value
+
+        slot_profile, slot_value = _resolve(slot_map, 0.0)
+        pair_profile, pair_value = _resolve(pair_ratio_map, 0.0)
+        slots_profile, slots_value = _resolve(slots_per_pair_map, 0)
+        effective_profile = slot_profile or pair_profile or slots_profile or p_requested
+
+        return {
+            "profile": effective_profile,
+            "slot_notional_usdc": float(self._as_float_or(slot_value, 0.0)),
+            "pair_cap_ratio": float(self._as_float_or(pair_value, 0.0)),
+            "slots_per_pair": int(self._as_int_or(slots_value, 0)),
+        }
+
+    def get_mm_slot_params(self, capital_profile: str | None = None) -> Dict[str, Any]:
+        return self._mm_profile_params(capital_profile)
+
     def _mm_slot_notional_for_profile(self, profile: str, *, min_trade_usdc: float) -> float:
         """Renvoie la taille cible d'un slot MM pour le profil capital donné."""
-        prof = str(profile or "LARGE").upper()
-        try:
-            slot = float(self.mm_slot_notional_usdc_by_profile.get(prof, 0.0))
-        except Exception:
-            slot = 0.0
+        params = self._mm_profile_params(profile)
+        slot = float(params.get("slot_notional_usdc", 0.0))
         slot = max(slot, float(min_trade_usdc))
         return slot
 

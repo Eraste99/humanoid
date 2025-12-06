@@ -546,7 +546,9 @@ class RiskManagerCfg:
     tt_hedge_cooldown_s: float = 5.0
     tt_hedge_fraction_of_expo: float = 0.5
 
-    # Tailles cibles d'un slot MM par profil capital (USD/quote)
+    # Notional cible d'un slot MM (USD/USDC) par profil capital.
+    # Utilisé pour dimensionner la taille d'un quote MM élémentaire.
+    # Clés attendues en UPPERCASE (NANO, MICRO, SMALL, MID, LARGE).
     mm_slot_notional_usdc_by_profile: Dict[str, float] = field(
         default_factory=lambda: {
             "NANO": 25.0,
@@ -556,7 +558,9 @@ class RiskManagerCfg:
             "LARGE": 250.0,
         }
     )
-    # Cap par paire (ratio du budget MM profil) ; appliqué côté RiskManager
+    # Ratio du budget MM global (profil) alloué par paire (cap pair).
+    # Ex : 0.25 = max 25 % du budget MM profil sur une seule paire.
+    # Clés attendues en UPPERCASE (NANO, MICRO, SMALL, MID, LARGE).
     mm_pair_cap_ratio_by_profile: Dict[str, float] = field(
         default_factory=lambda: {
             "NANO": 0.25,
@@ -566,7 +570,9 @@ class RiskManagerCfg:
             "LARGE": 0.30,
         }
     )
-    # Nombre max de slots simultanés par paire (soft-cap piloté par profil)
+    # Nombre max de slots MM simultanés par paire (tous côtés confondus).
+    # Soft-cap : le RM/Engine ne doit pas ouvrir plus de slots actifs.
+    # Clés attendues en UPPERCASE (NANO, MICRO, SMALL, MID, LARGE).
     mm_slots_per_pair_by_profile: Dict[str, int] = field(
         default_factory=lambda: {
             "NANO": 1,
