@@ -220,6 +220,32 @@ RM_TTTM_DELTA_SOFT_HIT = get_counter(
     labelnames=("asset", "branch"),
 )
 
+RM_MM_HEDGE_TOTAL = get_counter(
+    "rm_mm_hedge_total",
+    "MM delta hedge attempts",
+    labelnames=("asset",),
+)
+RM_MM_HEDGE_USD = get_counter(
+    "rm_mm_hedge_usd",
+    "Notional hedged for MM delta",
+    labelnames=("asset",),
+)
+RM_TT_HEDGE_TOTAL = get_counter(
+    "rm_tt_hedge_total",
+    "TT stuck hedge attempts",
+    labelnames=("asset",),
+)
+RM_TT_HEDGE_USD = get_counter(
+    "rm_tt_hedge_usd",
+    "Notional hedged for TT stuck legs",
+    labelnames=("asset",),
+)
+RM_MM_HEDGE_FAILED_TOTAL = get_counter(
+    "rm_mm_hedge_failed_total",
+    "MM delta hedge failures",
+    labelnames=("asset",),
+)
+
 # --- Helpers robusti per cast da ENV/config --------------------------------
 # --- Helpers robusti per cast da ENV/config (module-scope, no decorator) ---
 
@@ -887,10 +913,12 @@ class RiskManager:
 
         # Delta MM (mesure + garde-fou P0)
         self.mm_delta_state: dict[str, dict] = {}
+        self.mm_last_hedge_ts: dict[str, float] = {}
 
         # TT/TM exposures + stuck TT legs (VaR-lite P0)
         self.tttm_exposure_state: dict[str, dict] = {}
         self.tt_stuck_state: dict[str, dict] = {}
+        self.tt_last_hedge_ts: dict[str, float] = {}
 
         # TM inflight exposures (stub P0)
         self.tm_inflight_exposures: dict[str, list[dict]] = {}
@@ -1776,6 +1804,205 @@ class RiskManager:
                 RM_TTTM_DELTA_STATE.labels(asset=asset).set(state_val)
             except Exception:
                 pass
+
+    def _pick_mm_hedge_venue(self, asset: str) -> tuple[str, str, str] | None:
+        """
+        Retourne (exchange, alias, symbol) pour exécuter un hedge MM sur 'asset'.
+        Filtre les alias en CRITICAL, applique mm_hedge_allowed_exchanges s'il est rempli,
+        et privilégie la plus grosse position (sinon le plus de collat_usd).
+        """
+        asset_u = str(asset or "").upper()
+        if not asset_u:
+            return None
+
+        balances = getattr(self, "_last_balances", {}) or {}
+        collat_map = dict(getattr(self, "alias_collat_state", {}) or {})
+        if not collat_map:
+            for ex, per_alias in balances.items():
+                for alias in (per_alias or {}).keys():
+                    collat_map[(str(ex).upper(), str(alias).upper())] = {"state": "OK", "collat_usd": 0.0}
+
+        mm_alias = str(getattr(self, "mm_alias", "MM") or "MM").upper()
+        rm_cfg = getattr(self.cfg, "rm", None)
+        allowed = {str(ex).upper() for ex in (getattr(rm_cfg, "mm_hedge_allowed_exchanges", []) or []) if ex}
+
+        candidates: list[tuple[float, float, str, str, str]] = []
+        for (ex, alias), meta in collat_map.items():
+            if mm_alias and mm_alias not in alias:
+                continue
+            if allowed and ex not in allowed:
+                continue
+            if str(meta.get("state") or "").upper() == "CRITICAL":
+                continue
+
+            assets = (balances.get(ex, {}) or {}).get(alias, {}) or {}
+            try:
+                position = float(assets.get(asset_u) or 0.0)
+            except Exception:
+                position = 0.0
+            try:
+                collat_usd = float(meta.get("collat_usd") or 0.0)
+            except Exception:
+                collat_usd = 0.0
+
+            symbol = None
+            for sym in getattr(self, "symbols", []) or []:
+                sym_u = str(sym).replace("-", "").upper()
+                if sym_u.startswith(asset_u):
+                    symbol = sym_u
+                    break
+            if not symbol:
+                quote = str(
+                    getattr(getattr(self.cfg, "g", None), "primary_quote", getattr(self.cfg, "primary_quote", "USDC"))
+                    or "USDC"
+                ).upper()
+                symbol = f"{asset_u}{quote}"
+
+            candidates.append((abs(position), collat_usd, ex, alias, symbol))
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        _, _, ex, alias, symbol = candidates[0]
+        return ex, alias, symbol
+
+    def _compute_mm_hedge_step_usd(self, asset: str) -> float:
+        state = self.mm_delta_state.get(asset, {}) if isinstance(self.mm_delta_state, dict) else {}
+        rm_cfg = getattr(self.cfg, "rm", None)
+        max_step = float(getattr(rm_cfg, "mm_hedge_max_step_usd", 0.0) or 0.0)
+        try:
+            delta = abs(float(state.get("delta_usd") or 0.0))
+        except Exception:
+            delta = 0.0
+        try:
+            hard_limit = float(state.get("hard_limit_usd") or 0.0)
+        except Exception:
+            hard_limit = 0.0
+
+        over = max(delta - hard_limit, 0.0)
+        if over <= 0:
+            return 0.0
+        return min(over, max_step) if max_step > 0 else over
+
+    async def _mm_hedge_tick(self, now: float) -> None:
+        rm_cfg = getattr(self.cfg, "rm", None)
+        if not getattr(rm_cfg, "mm_hedge_enabled", False):
+            return
+        if not getattr(self, "engine", None):
+            return
+
+        cooldown = float(getattr(rm_cfg, "mm_hedge_cooldown_s", 0.0) or 0.0)
+        for asset, state in (self.mm_delta_state or {}).items():
+            if str(state.get("state") or "").upper() != "HARD":
+                continue
+
+            last_ts = float(self.mm_last_hedge_ts.get(asset, 0.0) or 0.0)
+            if (now - last_ts) < cooldown:
+                continue
+
+            step_usd = self._compute_mm_hedge_step_usd(asset)
+            if step_usd <= 0:
+                continue
+
+            delta_usd = float(state.get("delta_usd") or 0.0)
+            side = "SELL" if delta_usd > 0 else "BUY"
+            venue = self._pick_mm_hedge_venue(asset)
+            if venue is None:
+                self.logger.warning("[RM] mm hedge venue unavailable for %s", asset)
+                continue
+            exchange, alias, symbol = venue
+            req = {
+                "exchange": exchange,
+                "alias": alias,
+                "symbol": symbol,
+                "side": side,
+                "notional_usd": step_usd,
+                "max_slippage_bps": None,
+                "tag": "MM_DELTA_HEDGE",
+            }
+
+            try:
+                RM_MM_HEDGE_TOTAL.labels(asset=asset).inc()
+                RM_MM_HEDGE_USD.labels(asset=asset).inc(step_usd)
+            except Exception:
+                pass
+
+            try:
+                result = await self.engine.hedge_delta_single(req)
+            except Exception as exc:
+                self.logger.warning("[RM] engine hedge MM failed for %s: %s", asset, exc, exc_info=False)
+                try:
+                    RM_MM_HEDGE_FAILED_TOTAL.labels(asset=asset).inc()
+                except Exception:
+                    pass
+                self.mm_last_hedge_ts[asset] = now
+                continue
+
+            self.mm_last_hedge_ts[asset] = now
+            if not (result or {}).get("ok"):
+                try:
+                    RM_MM_HEDGE_FAILED_TOTAL.labels(asset=asset).inc()
+                except Exception:
+                    pass
+
+    async def _tt_hedge_tick(self, now: float) -> None:
+        rm_cfg = getattr(self.cfg, "rm", None)
+        if not getattr(rm_cfg, "tt_hedge_enabled", False):
+            return
+        if not getattr(self, "engine", None):
+            return
+
+        hard_threshold = float(getattr(rm_cfg, "tt_stuck_hard_usd", 0.0) or 0.0)
+        cooldown = float(getattr(rm_cfg, "tt_hedge_cooldown_s", 0.0) or 0.0)
+        fraction = float(getattr(rm_cfg, "tt_hedge_fraction_of_expo", 0.0) or 0.0)
+        max_step = float(getattr(rm_cfg, "tt_hedge_max_step_usd", 0.0) or 0.0)
+
+        for asset, stuck_info in (self.tt_stuck_state or {}).items():
+            delta_usd = float(stuck_info.get("delta_usd", 0.0) or 0.0)
+            if abs(delta_usd) < hard_threshold:
+                continue
+
+            last_ts = float(self.tt_last_hedge_ts.get(asset, 0.0) or 0.0)
+            if (now - last_ts) < cooldown:
+                continue
+
+            step_usd = abs(delta_usd) * (fraction if fraction > 0 else 0.0)
+            if max_step > 0:
+                step_usd = min(step_usd, max_step)
+            if step_usd <= 0:
+                continue
+
+            side = "SELL" if delta_usd > 0 else "BUY"
+            venue = self._pick_mm_hedge_venue(asset)
+            if venue is None:
+                self.logger.warning("[RM] tt hedge venue unavailable for %s", asset)
+                continue
+            exchange, alias, symbol = venue
+            req = {
+                "exchange": exchange,
+                "alias": alias,
+                "symbol": symbol,
+                "side": side,
+                "notional_usd": step_usd,
+                "max_slippage_bps": None,
+                "tag": "TT_STUCK_HEDGE",
+            }
+
+            try:
+                RM_TT_HEDGE_TOTAL.labels(asset=asset).inc()
+                RM_TT_HEDGE_USD.labels(asset=asset).inc(step_usd)
+            except Exception:
+                pass
+
+            try:
+                await self.engine.hedge_delta_single(req)
+            except Exception as exc:
+                self.logger.warning("[RM] engine hedge TT failed for %s: %s", asset, exc, exc_info=False)
+                self.tt_last_hedge_ts[asset] = now
+                continue
+
+            self.tt_last_hedge_ts[asset] = now
 
     def check_capital_drift(self, threshold_pct: float | None = None) -> None:
         """
@@ -6046,6 +6273,12 @@ class RiskManager:
                     self._run_capital_ladder_tick()
                 except Exception:
                     logger.debug("[RiskManager] ladder_tick from balances loop failed", exc_info=False)
+                try:
+                    now_ts = time.time()
+                    await self._mm_hedge_tick(now_ts)
+                    await self._tt_hedge_tick(now_ts)
+                except Exception:
+                    logger.debug("[RiskManager] hedge ticks failed", exc_info=False)
 
                 if self.rebalancing and hasattr(self.rebalancing, "update_balances"):
                     self.rebalancing.update_balances(bals)

@@ -521,6 +521,12 @@ class RiskManagerCfg:
     mm_delta_hard_usd: float = 5000.0
     mm_delta_by_asset: Dict[str, Dict] = field(default_factory=dict)
 
+    # MM delta hedge P0
+    mm_hedge_enabled: bool = True
+    mm_hedge_max_step_usd: float = 5000.0
+    mm_hedge_cooldown_s: float = 10.0
+    mm_hedge_allowed_exchanges: List[str] = field(default_factory=list)
+
     # TT/TM delta (VaR-lite P0)
     tttm_exposure_soft_usd: float = 2000.0
     tttm_exposure_hard_usd: float = 5000.0
@@ -534,6 +540,11 @@ class RiskManagerCfg:
     tt_stuck_soft_usd: float = 1000.0
     tt_stuck_hard_usd: float = 3000.0
     tt_stuck_max_age_s: float = 10.0
+
+    tt_hedge_enabled: bool = True
+    tt_hedge_max_step_usd: float = 5000.0
+    tt_hedge_cooldown_s: float = 5.0
+    tt_hedge_fraction_of_expo: float = 0.5
 
     # Tailles cibles d'un slot MM par profil capital (USD/quote)
     mm_slot_notional_usdc_by_profile: Dict[str, float] = field(

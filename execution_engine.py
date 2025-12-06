@@ -5095,6 +5095,89 @@ class ExecutionEngine:
         }
         await self._exec_single(order)
 
+    async def hedge_delta_single(self, request: dict) -> dict:
+        """
+        Exécute un hedge unitaire (ordre taker simple) pour réduire un delta.
+
+        request keys:
+          - exchange: str
+          - alias: str  # ou subaccount
+          - symbol: str  # ex: "ETHUSDC"
+          - side: "BUY" | "SELL"
+          - notional_usd: float
+          - max_slippage_bps: float | None
+          - tag: str
+
+        Retourne un dict avec au minimum:
+          - "ok": bool
+          - "reason": str
+          - "filled_notional_usd": float
+        """
+        resp = {"ok": False, "reason": "invalid_request", "filled_notional_usd": 0.0}
+        try:
+            if request is None:
+                return resp
+
+            exchange = str(request.get("exchange") or "").upper()
+            symbol = str(request.get("symbol") or "").replace("-", "").upper()
+            side = str(request.get("side") or "").upper()
+            alias = str(request.get("alias") or "").upper()
+            notional_usd = float(request.get("notional_usd") or 0.0)
+            max_slippage_bps = request.get("max_slippage_bps")
+            tag = str(request.get("tag") or "")
+
+            if not exchange or not symbol or side not in {"BUY", "SELL"} or notional_usd <= 0:
+                resp["reason"] = "bad_request"
+                return resp
+
+            price, best_ts = self._best_price_from_rm(exchange, symbol, side)
+            if price <= 0:
+                resp["reason"] = "missing_price"
+                return resp
+
+            meta = {
+                "best_price": price,
+                "best_ts": best_ts or int(time.time() * 1000),
+                "tif_override": "IOC",
+                "fastpath_ok": True,
+                "skip_inventory": True,
+                "strategy": "TT",
+                "account_alias": alias,
+            }
+            if tag:
+                meta["tag"] = tag
+            if max_slippage_bps is not None:
+                try:
+                    meta["max_slippage_bps"] = float(max_slippage_bps)
+                except Exception:
+                    pass
+
+            order = {
+                "type": "single",
+                "exchange": self._norm_ex(exchange),
+                "symbol": symbol,
+                "side": side,
+                "price": price,
+                "volume_usdc": notional_usd,
+                "meta": meta,
+            }
+
+            ok = await self._exec_single(order)
+            resp.update({
+                "ok": bool(ok),
+                "reason": "",
+                "filled_notional_usd": float(notional_usd if ok else 0.0),
+            })
+            log.info(
+                "[Engine] hedge_delta_single %s %s %s %s notional=%.2f ok=%s",
+                exchange, alias, symbol, side, notional_usd, ok,
+            )
+            return resp
+        except Exception as exc:
+            log.exception("[Engine] hedge_delta_single failed: %s", exc)
+            resp["reason"] = "exception"
+            return resp
+
     def _mm_active_for(self, exchange: str, pair_key: str) -> list[str]:
         return list(self._mm_active_by_pair.get((exchange.upper(), pair_key.upper()), set()))
 
@@ -5784,6 +5867,8 @@ class ExecutionEngine:
                 or (payload.get("meta") or {}).get("type") == "rebalancing"
                 or any((l.get("meta") or {}).get("type") == "rebalancing" for l in legs)
         )
+        if is_rebal and str(meta_payload.get("source") or "").upper() == "MM_REB_CRITICAL":
+            logger.info("[ExecutionEngine] rebalancing bundle tagged mm_reb_critical", extra={"pair": pair_key})
         if branch == "MM" or strategy == "MM":
             same_pair = all(self._fmt_pair(l.get("symbol")) == pair_key for l in legs)
             makers = all(bool((l.get("meta") or {}).get("maker")) for l in legs)

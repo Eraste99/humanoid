@@ -180,6 +180,11 @@ class SlippageAndFeesCollector:
         # Fraîcheur globale du dernier refresh fees (toutes venues/aliases confondues)
         self.last_fee_sync_ts: float = 0.0
 
+        # Compat: point d’ancrage pour l’ancienne implémentation de get_total_cost_pct
+        # (utilisé par _sfc_get_total_cost_pct_compat / install_get_total_cost_pct_compat).
+        self.__orig_get_total_cost_pct: Optional[Callable[..., float]] = None
+        self._sfc_compat_installed: bool = False
+
 
     # --------------------------- Slippage (minimal) ---------------------------
 
@@ -947,15 +952,70 @@ class SlippageAndFeesCollector:
 
     # ---------------------------- Coût total ----------------------------------
 
+    # ---------------------------- Coût total ----------------------------------
+
     def leg_fee_pct(self, ex: str, alias: str, *, pair: Optional[str], role: str) -> float:
         mk, tk = self.get_effective_fees(ex, alias, pair=pair)
         return float(mk if (role or "taker").lower() == "maker" else tk)
 
-    def leg_cost_pct(self, ex: str, alias: str, pair: str, side: str, role: str,
-                     *, slippage_kind: Optional[str]=None, default_slippage: float=0.0) -> float:
-        k = (slippage_kind or getattr(self.cfg, "sfc_slippage_source","ewma")).lower()
+    def leg_cost_pct(
+            self,
+            ex: Optional[str] = None,
+            alias: Optional[str] = None,
+            pair: Optional[str] = None,
+            side: Optional[str] = None,
+            role: Optional[str] = None,
+            *,
+            exchange: Optional[str] = None,
+            size_quote: Optional[float] = None,
+            prudence_key: Optional[str] = None,
+            slippage_kind: Optional[str] = None,
+            default_slippage: float = 0.0,
+            **extra: Any,
+    ) -> float:
+        """
+        Coût d'une jambe (exchange+alias, maker/taker) en fraction (frais + slippage).
+
+        Paramètres
+        ----------
+        ex / exchange : str
+            Nom de l'exchange (ex: "BINANCE").
+            On accepte soit `ex` (positional/kw), soit `exchange` (kw-only).
+        alias : str
+            Alias de compte (ex: "TT", "MM", ...).
+        pair : str
+            Paire normalisée "BTCUSDC" (sans tiret).
+        side : str
+            "buy" ou "sell".
+        role : str
+            "maker" ou "taker".
+        size_quote : float, optionnel
+            Notionnel en quote (actuellement ignoré ici, réservé pour affiner le slippage).
+        prudence_key : str, optionnel
+            Clé de prudence (actuellement non utilisée ici; appliquée plutôt côté RM/policy).
+        slippage_kind : str, optionnel
+            "ewma" (défaut), "last", "p95".
+        default_slippage : float
+            Valeur de repli si on n'a pas d'historique.
+
+        La signature est volontairement tolérante pour rester compatible avec les
+        anciens appels positionnels + kwargs supplémentaires.
+        """
+        # Supporte aussi l'alias "exchange" en kw
+        if exchange is not None:
+            ex = exchange
+
+        ex = _norm_ex(ex or "")
+        alias = (alias or "").upper()
+        pair = _norm_pair(pair or "")
+        side = (side or "").lower()
+        role = (role or "taker").lower()
+
+        # NB: size_quote et prudence_key sont acceptés mais pas encore utilisés ici
+        k = (slippage_kind or getattr(self.cfg, "sfc_slippage_source", "ewma")).lower()
         slip = self.get_slippage(ex, pair, side, kind=k, default=default_slippage)
-        fee  = self.leg_fee_pct(ex, alias, pair=pair, role=role)
+        fee = self.leg_fee_pct(ex, alias, pair=pair, role=role)
+
         return float(max(0.0, slip) + max(0.0, fee))
 
     def last_age_seconds(self, _opp: Optional[Any] = None) -> float:
