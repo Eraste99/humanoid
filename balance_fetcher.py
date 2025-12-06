@@ -985,61 +985,74 @@ class MultiBalanceFetcher:
         Contrat de sortie (schéma logique) :
 
         {
+            "pockets_by_quote": {
+                "EXCHANGE": {"ALIAS": {"QUOTE": available_float}}
+            },
+            "meta": {
+                "fee_tokens": {
+                    "TOKEN": {
+                        "EX.ALIAS": {
+                            "balance": float,
+                            "level": "low" | "ok" | "high",
+                            "low_watermark": float,
+                            "high_watermark": float,
+                        },
+                    },
+
+                },
+             "age_s": float,
+            },
             "mode": "merged" | "real" | "virtual",
             "as_of_ts": <float monotonic>,
-            "pockets_by_quote": {
-                "<exchange>": {
-                    "<alias>": {
-                        "<quote>": {
-                            "total": <float>,      # solde total dans cette quote
-                            "available": <float>,  # part exploitable pour trading
-                        },
-                        ...
-                    },
-                    ...
-                },
-                ...
-            },
-            "fee_token_levels": {
-                "<exchange>": {
-                    "<alias>": {
-                        "<token>": <balance_float>,  # solde brut du token de fees
-                        ...
-                    },
-                    ...
-                },
-                ...
-            },
         }
 
-        - pockets_by_quote est la base UNIQUE pour dimensionner les capacités
+        - `pockets_by_quote` est la base UNIQUE pour dimensionner les capacités
           de capital par quote / alias (caps profils, RM, simulateur).
-        - fee_token_levels donne l’état brut des tokens de fees par alias.
-          (Les vues enrichies type meta_fee[token][ex.alias] restent fournies
-          par as_rm_snapshot(...).)
-
-        Cette méthode est la SOURCE OFFICIELLE pour :
-        - calculer la capacité de capital disponible par quote/alias,
-        - aligner les caps par profil (NANO/MICRO/…),
-        - alimenter le simulateur en capacité (DRY_RUN vs LIVE).
-         """
+        - `meta["fee_tokens"]` reprend la structure enrichie déjà produite par
+          `_record_snapshot_sync`, pour consommation directe par le RM.
+        """
         # Vue « poches par quote » : base de capacité capital
-        pockets = self.get_pockets_by_quote(
-            mode=mode,
+        view = (mode or "merged").lower()
+        if view not in ("real", "virtual", "merged"):
+            view = "merged"
+
+        raw_pockets = self.get_pockets_by_quote(
+            mode=view,
             quotes=tuple(quotes),
         )
+        pockets: Dict[str, Dict[str, Dict[str, float]]] = {}
+        for ex, per_alias in (raw_pockets or {}).items():
+            exu = _upper(ex)
+            ex_map = pockets.setdefault(exu, {})
+            for alias, per_quote in (per_alias or {}).items():
+                alu = _upper(alias)
+                alias_map = ex_map.setdefault(alu, {})
+                for quote, amt in (per_quote or {}).items():
+                    alias_map[_upper(quote)] = float(amt or 0.0)
 
-        # Vue simplifiée des tokens de fees par (exchange, alias, token)
-        fee_token_levels = self.get_fee_token_levels_from_balances(
-            mode=mode,
-            tokens=tuple(fee_tokens),
-        )
+        meta_fee: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        now = time.time()
+        age_s = float("inf")
+        for (ex, al), rec in list(getattr(self, "_snap", {}).items()):
+            ts = float(rec.get("ts", 0.0) or 0.0)
+            if ts > 0.0:
+                age_s = min(age_s, max(0.0, now - ts)) if age_s != float("inf") else max(0.0, now - ts)
+            for token, info in (rec.get("fee_tokens") or {}).items():
+                tkn = str(token).upper()
+                meta_fee.setdefault(tkn, {})
+                meta_fee[tkn][f"{ex}.{al}"] = {
+                    "balance": float(info.get("balance", 0.0) or 0.0),
+                    "level": str(info.get("level", "")).lower() or "unknown",
+                    "low_watermark": float(info.get("low_watermark", 0.0) or 0.0),
+                    "high_watermark": float(info.get("high_watermark", 0.0) or 0.0),
+                }
+
 
         return {
-            "mode": mode,
+            "mode": view,
             "as_of_ts": time.time(),
             "pockets_by_quote": pockets,
-            "fee_token_levels": fee_token_levels,
+            "meta": {"fee_tokens": meta_fee, "age_s": age_s if age_s != float("inf") else None},
         }
     def get_available_quote_simple(
         self,

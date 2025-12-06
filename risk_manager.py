@@ -465,11 +465,14 @@ class FeeTokenReservesPolicy:
             }
 
         Retourne une liste d'actions (dict) décrivant les top-ups à effectuer.
+        Cette méthode ne place aucun ordre ; elle produit uniquement des
+        instructions structurées pour une pipeline séparée.
         """
         actions = []
 
         # Si aucune politique de cible ni step n'est définie, on ne fait rien.
-        if not self.targets_quote and self.topup_step <= 0.0:
+        targets = self.targets_quote()
+        if not targets and self.topup_step <= 0.0:
             return actions
 
         if not isinstance(fee_meta, dict):
@@ -494,9 +497,9 @@ class FeeTokenReservesPolicy:
                 # Politique de cible en quote :
                 # 1) clé complète exal:token
                 # 2) fallback sur le token seul
-                target_quote = float(self.targets_quote.get(symbol_key, 0.0) or 0.0)
+                target_quote = float(targets.get(symbol_key, 0.0) or 0.0)
                 if target_quote <= 0.0:
-                    target_quote = float(self.targets_quote.get(token, 0.0) or 0.0)
+                    target_quote = float(targets.get(token, 0.0) or 0.0)
 
                 amount_quote = target_quote if target_quote > 0.0 else float(self.topup_step or 0.0)
                 if amount_quote <= 0.0:
@@ -819,6 +822,27 @@ class RiskManager:
         self.mm_alias = _cfg_str(self.bot_cfg, "mm_alias_name", "MM").upper()
         if self.mm_mode == "OFF":
             self.enable_mm = False
+
+        # --- MM rebalancing ladder (mono-CEX + intra + cross) ---
+        self.mm_reb_inventory_soft_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_soft_pct", 5.0)
+        self.mm_reb_inventory_hard_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_hard_pct", 15.0)
+        self.mm_reb_inventory_critical_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_critical_pct", 25.0)
+        self.mm_reb_inventory_min_notional_usd = _cfg_float(
+            self.bot_cfg, "mm_reb_inventory_min_notional_usd", 200.0
+        )
+        self.mm_reb_collat_target_low_ratio = _cfg_float(
+            self.bot_cfg, "mm_reb_collat_target_low_ratio", 1.2
+        )
+        self.mm_reb_collat_min_safe_ratio = _cfg_float(
+            self.bot_cfg, "mm_reb_collat_min_safe_ratio", 1.05
+        )
+        # Placeholders P0 : ratios delta/collat non utilisés dans ce ticket
+        self.mm_reb_delta_soft_usd = _cfg_float(self.bot_cfg, "mm_reb_delta_soft_usd", 0.0)
+        self.mm_reb_delta_hard_usd = _cfg_float(self.bot_cfg, "mm_reb_delta_hard_usd", 0.0)
+        self.mm_reb_allow_loss_bps = _cfg_float(self.bot_cfg, "mm_reb_allow_loss_bps", 5.0)
+        self.mm_reb_state: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+
+
 
         # --- MM MONO : conditions pour 2 côtés (BUY+SELL) ---
         self.mm_dual_min_net_bps = _cfg_float(self.bot_cfg, "mm_dual_min_net_bps", 3.0)
@@ -1267,7 +1291,10 @@ class RiskManager:
             for alias, quotes in (aliases or {}).items():
                 alias_map = ex_map.setdefault(alias, {})
                 for quote, qdata in (quotes or {}).items():
-                    available = float((qdata or {}).get("available", 0.0) or 0.0)
+                    if isinstance(qdata, dict):
+                        available = float((qdata or {}).get("available", qdata.get("total", 0.0)) or 0.0)
+                    else:
+                        available = float(qdata or 0.0)
                     alias_map[quote] = available
                     if str(quote).upper() == "USDC":
                         total_usdc += available
@@ -4560,16 +4587,38 @@ class RiskManager:
             self._spent_today_quote[strat] = 0.0
         self._budget_reset_ts = now
 
-    def _budget_allows(self, strategy: str, notional_quote: float) -> tuple[bool, str]:
+    def _check_and_reserve_daily_budget(self, strategy: str, notional_quote: float) -> tuple[bool, str]:
+        """Vérifie et réserve le budget journalier pour une stratégie donnée.
+
+               - Réinitialise les compteurs si l'intervalle de reset est dépassé.
+               - Bloque si la réservation dépasserait le budget configuré.
+               - Incrémente _spent_today_quote en cas d'acceptation.
+               """
+
         self._maybe_reset_daily_budget()
         strat = str(strategy or "TT").upper()
+        amount = float(notional_quote or 0.0)
         cap = float(self.daily_strategy_budget_quote.get(strat, 0.0))
         if cap <= 0.0:
-            return True, ""
+            return True, "ok"
         spent = float(self._spent_today_quote.get(strat, 0.0))
-        if spent + float(notional_quote) > cap:
-            return False, "BUDGET_EXCEEDED"
-        return True, ""
+        if spent + amount > cap:
+            try:
+                RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(strat, "GLOBAL", "QUOTE").inc()
+            except Exception:
+                pass
+            return False, "RM_BUDGET_EXHAUSTED"
+
+        self._spent_today_quote[strat] = spent + amount
+        try:
+            RM_MM_BUDGET_SPENT_QUOTE.labels(strat, "GLOBAL", "QUOTE").inc(amount)
+        except Exception:
+            pass
+        return True, "ok"
+
+    def _budget_allows(self, strategy: str, notional_quote: float) -> tuple[bool, str]:
+        return self._check_and_reserve_daily_budget(strategy, notional_quote)
+    
 
     def _record_budget_spend(self, strategy: Optional[str], bundle: Dict[str, Any]) -> None:
         try:
@@ -5530,6 +5579,10 @@ class RiskManager:
                 if not self.rebalancing:
                     await asyncio.sleep(self.t_rebal)
                     continue
+                try:
+                    await self._mm_rebalancing_step()
+                except Exception:
+                    logger.exception("[RiskManager] mm_rebalancing_step failed")
 
                 imb = self.rebalancing.detect_imbalance()
                 if imb:
@@ -5578,6 +5631,168 @@ class RiskManager:
                 logger.exception(f"[RiskManager] rebalancing loop: {e}")
                 self._mark_loop_error("rebalancing", e)
             await asyncio.sleep(self.t_rebal)
+
+    async def _mm_rebalancing_step(self) -> None:
+        if not bool(getattr(self, "enable_mm", False)):
+            return
+
+        balances = self._balances_snapshot()
+        alias_mm = str(getattr(self, "mm_alias", "MM") or "MM").upper()
+        now = time.time()
+        status_cache = getattr(self, "_alias_balance_status", {}) or {}
+
+        for ex, per_alias in (balances or {}).items():
+            exu = str(ex).upper()
+            if status_cache.get((exu, alias_mm)) != "OK":
+                continue
+
+            assets = (per_alias or {}).get(alias_mm, {}) or {}
+            for asset in assets.keys():
+                asset_u = str(asset).upper()
+                drift_usd, drift_pct = self._mm_compute_inventory_drift(exu, alias_mm, asset_u, balances)
+                state = self._mm_classify_inventory_state(drift_usd, drift_pct)
+                self.mm_reb_state[(exu, alias_mm, asset_u)] = {
+                    "state": state,
+                    "drift_usd": drift_usd,
+                    "drift_pct": drift_pct,
+                    "last_update_ts": now,
+                }
+
+                await self._mm_dispatch_actions_for_state(exu, alias_mm, asset_u, state, drift_usd)
+
+    async def _mm_dispatch_actions_for_state(self, ex: str, alias_mm: str, asset: str, state: str,
+                                             drift_usd: float) -> None:
+        st = str(state or "").upper()
+        if st == "NORMAL":
+            return
+
+        status_cache = getattr(self, "_alias_balance_status", {}) or {}
+        if status_cache.get((ex, alias_mm)) != "OK":
+            return
+
+        if st == "ALERT":
+            self._mm_trigger_self_rebal(ex, alias_mm, asset, drift_usd)
+        elif st == "TENSION":
+            await self._mm_plan_intra_cex_transfers(ex, alias_mm, asset, drift_usd)
+        elif st == "CRITICAL":
+            await self._mm_trigger_cross_cex_reb(ex, alias_mm, asset, drift_usd)
+
+    def _mm_trigger_self_rebal(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> None:
+        if not getattr(self, "mm_inventory_enabled", False):
+            return
+
+        pair_key = self._norm_pair(f"{asset}USDT")
+        opp = {
+            "pair": pair_key,
+            "buy_ex": ex,
+            "sell_ex": ex,
+            "notional_usdc": abs(float(drift_usd)),
+        }
+        self._maybe_fire_mm_inventory_single(opp, reason="mm_reb_alert")
+
+    async def _mm_plan_intra_cex_transfers(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> None:
+        if self.rebalancing is None:
+            return
+
+        now = time.time()
+        if now < getattr(self, "_rebal_emit_next_allowed", 0.0):
+            return
+
+        imbalance = {
+            "CRYPTO": {ex: {alias_mm: {asset: drift_usd}}},
+            "CASH": {},
+            "OVERLAY": {},
+        }
+
+        try:
+            plan = self.rebalancing.build_plan(imbalance)
+        except Exception:
+            logger.exception("[RiskManager] mm_reb build_plan failed")
+            return
+
+        try:
+            ops = list(self.rebalancing.plan_to_operations(plan) or [])
+        except Exception:
+            logger.exception("[RiskManager] mm_reb plan_to_operations failed")
+            return
+
+        allowed_types = {"internal_subaccount_transfer", "internal_wallet_transfer"}
+        ops = [op for op in ops if (op or {}).get("type") in allowed_types]
+        if not ops:
+            return
+
+        for op in ops:
+            try:
+                await self._handle_rebalancing_op(op)
+            except Exception:
+                logger.exception("[RiskManager] mm_reb handle op failed")
+
+        self._rebal_emit_next_allowed = now + self.rebal_emit_cooldown_s
+
+    def _mm_pick_reb_counterparty_exchange(self, ex_mm: str, asset: str) -> Optional[str]:
+        # P0 : sélection naive, à raffiner (capital dispo, slippage, etc.)
+        candidates = ["BINANCE", "BYBIT", "COINBASE"]
+        exu = str(ex_mm).upper()
+        for cand in candidates:
+            if cand != exu:
+                return cand
+        return None
+
+    async def _mm_trigger_cross_cex_reb(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> None:
+        counterparty = self._mm_pick_reb_counterparty_exchange(ex, asset)
+        if not counterparty:
+            return
+
+        pair_key = self._norm_pair(f"{asset}USDT")
+        try:
+            bid, ask = self.get_top_of_book(ex, pair_key, enforce_fresh=False)
+        except Exception:
+            bid, ask = 0.0, 0.0
+        mid = (float(bid) + float(ask)) / 2.0 if (bid and ask) else 0.0
+        if mid <= 0:
+            return
+
+        qty = abs(float(drift_usd)) / mid
+        if qty <= 0:
+            return
+
+        if drift_usd > 0:
+            buy_ex, sell_ex = counterparty, ex
+        else:
+            buy_ex, sell_ex = ex, counterparty
+
+        opp = {
+            "pair": pair_key,
+            "buy_ex": buy_ex,
+            "sell_ex": sell_ex,
+            "qty": qty,
+            "notional_usdc": abs(float(drift_usd)),
+            "meta": {
+                "branch": "REB",
+                "strategy": "REB",
+                "type": "rebalancing",
+                "source": "MM_REB_CRITICAL",
+                "allow_final_loss_bps": float(self.mm_reb_allow_loss_bps),
+                "allow_loss_bps": float(self.mm_reb_allow_loss_bps),
+            },
+        }
+
+        bundle = self._build_bundle(opp, strategy="REB")
+        if not bundle:
+            return
+
+        meta = bundle.setdefault("meta", {}) or {}
+        meta.setdefault("source", "MM_REB_CRITICAL")
+        meta.setdefault("type", "rebalancing")
+        meta.setdefault("branch", "REB")
+        meta["allow_final_loss_bps"] = float(self.mm_reb_allow_loss_bps)
+        meta["allow_loss_bps"] = float(self.mm_reb_allow_loss_bps)
+
+        try:
+            await self.engine.execute(bundle)
+        except Exception:
+            logger.exception("[RiskManager] mm_reb cross-cex execution failed")
+
 
 
     async def _loop_volatility(self):
@@ -7356,6 +7571,74 @@ class RiskManager:
                 dst[al] = {str(ccy).upper(): float(v or 0.0) for ccy, v in (assets or {}).items()}
         return normalized
 
+    def _mm_compute_inventory_drift(
+            self,
+            ex: str,
+            alias_mm: str,
+            asset: str,
+            balances_snapshot: Dict[str, Dict[str, Dict[str, float]]],
+    ) -> tuple[float, float]:
+        """Calcule la dérive inventaire MM pour (ex, alias, asset).
+
+        P0 : cible d'inventaire = 0 → drift_pct reste à 0.0 tant que l'on n'a pas
+        de référence plus riche (à étendre dans les tickets delta/collat). L'état
+        est donc principalement piloté par drift_usd + paliers.
+        """
+        try:
+            pos_units = float(((balances_snapshot.get(ex, {}) or {}).get(alias_mm, {}) or {}).get(asset, 0.0))
+        except Exception:
+            pos_units = 0.0
+
+        pair_key = self._norm_pair(f"{asset}USDT")
+        try:
+            bid, ask = self.get_top_of_book(ex, pair_key, enforce_fresh=False)
+        except Exception:
+            bid, ask = 0.0, 0.0
+        mid = (float(bid) + float(ask)) / 2.0 if (bid and ask) else 0.0
+
+        drift_usd = float(pos_units) * float(mid)
+        # P0 : cible neutre (0) → drift_pct = 0.0 en attendant une cible enrichie
+        drift_pct = 0.0
+        return drift_usd, drift_pct
+
+    def _mm_classify_inventory_state(self, drift_usd: float, drift_pct: float) -> str:
+        """Classe l'état MM en fonction des seuils drift_usd/pct.
+
+        P0 : si drift_pct est nul (cible = 0), on utilise des paliers USD basés
+        sur la magnitude du drift vs mm_reb_inventory_min_notional_usd.
+        """
+        abs_usd = abs(float(drift_usd))
+        abs_pct = abs(float(drift_pct))
+
+        if abs_usd < float(self.mm_reb_inventory_min_notional_usd):
+            return "NORMAL"
+
+        soft = float(self.mm_reb_inventory_soft_pct)
+        hard = float(self.mm_reb_inventory_hard_pct)
+        critical = float(self.mm_reb_inventory_critical_pct)
+
+        if abs_pct > 0:
+            if abs_pct <= soft:
+                return "NORMAL"
+            if abs_pct <= hard:
+                return "ALERT"
+            if abs_pct <= critical:
+                return "TENSION"
+            return "CRITICAL"
+
+        # Fallback cible neutre : on transpose les seuils pct en multiples de la base
+        base = max(float(self.mm_reb_inventory_min_notional_usd), 1.0)
+        soft_usd = base * max(soft / 100.0, 1.0)
+        hard_usd = base * max(hard / 100.0, 1.0)
+        critical_usd = base * max(critical / 100.0, 1.0)
+
+        if abs_usd <= soft_usd:
+            return "NORMAL"
+        if abs_usd <= hard_usd:
+            return "ALERT"
+        if abs_usd <= critical_usd:
+            return "TENSION"
+        return "CRITICAL"
 
     @staticmethod
     def _aggregate_by_exchange(snapshot: Dict[str, Dict[str, Dict[str, float]]], asset: str) -> Dict[str, float]:
