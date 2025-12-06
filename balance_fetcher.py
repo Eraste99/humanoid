@@ -241,6 +241,7 @@ class MultiBalanceFetcher:
 
         # Snap enrichi (fee tokens, vip…)
         self._snap: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._merged_snapshots: Dict[Tuple[str, str], Dict[str, Any]] = {}  # vue merged flattenée pour l'alerting
         self._event_sink = None  # callback optionnel (alerts)
 
         # Source WS (optionnelle): si un flux "account WS" alimente ces snapshots, on merge conservateur
@@ -915,6 +916,32 @@ class MultiBalanceFetcher:
                     out[ex][al][cy] = v if (self._virt_mode_set_abs and cy in ((virt.get(ex) or {}).get(al) or {})) else (r + v)
         return out
 
+    def _rebuild_latest_balances_snapshot(self) -> None:
+        try:
+            new_latest: Dict[str, Dict[str, Dict[str, float]]] = {"BINANCE": {}, "COINBASE": {}, "BYBIT": {}}
+            for (ex, al), rec in list((self._cache or {}).items()):
+                ex_up, al_up = _upper(ex), _upper(al)
+                balances = self._apply_ccy_filter(((rec or {}).get("data")) or {})
+                new_latest.setdefault(ex_up, {})
+                new_latest[ex_up][al_up] = {cy: float(v) for cy, v in (balances or {}).items()}
+            self.latest_balances = new_latest
+
+            real_snap = self.get_balances_snapshot("real")
+            merged_snap = self._merge_real_virtual(real_snap)
+
+            new_merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+            for ex, per_al in (merged_snap or {}).items():
+                for al, bal in (per_al or {}).items():
+                    ex_up, al_up = _upper(ex), _upper(al)
+                    new_merged[(ex_up, al_up)] = {"balances": {cy: float(v) for cy, v in (bal or {}).items()}}
+            self._merged_snapshots = new_merged
+
+            for ex, per_al in (real_snap or {}).items():
+                for al, bal in (per_al or {}).items():
+                    self._record_snapshot_sync(ex, al, bal)
+        except Exception:
+            logger.exception("MultiBalanceFetcher: rebuild_latest_balances_snapshot failed")
+
     # Poches par quote (USDC/EUR/USD)
     def get_pockets_by_quote(self, *, mode: str = "real", quotes: Tuple[str, ...] = ("USDC", "EUR", "USD")) -> Dict[str, Dict[str, Dict[str, float]]]:
         snap = self.get_balances_snapshot(mode)
@@ -995,12 +1022,11 @@ class MultiBalanceFetcher:
         - calculer la capacité de capital disponible par quote/alias,
         - aligner les caps par profil (NANO/MICRO/…),
         - alimenter le simulateur en capacité (DRY_RUN vs LIVE).
-        """
+         """
         # Vue « poches par quote » : base de capacité capital
         pockets = self.get_pockets_by_quote(
             mode=mode,
             quotes=tuple(quotes),
-            cached_only=cached_only,
         )
 
         # Vue simplifiée des tokens de fees par (exchange, alias, token)
@@ -1090,7 +1116,7 @@ class MultiBalanceFetcher:
             log.exception("MultiBalanceFetcher: event_sink capital_refresh failed")
 
 
-    async def _record_snapshot(self, exchange: str, alias: str, balances: Dict[str, float]) -> None:
+    async def _record_snapshot_sync(self, exchange: str, alias: str, balances: Dict[str, float]) -> None:
         ex, al = _upper(exchange), _upper(alias)
         now = time.time()
         rec = self._snap.get((ex, al), {"balances": {}, "fee_tokens": {}, "vip": {}, "vip_ts": 0.0})
@@ -1118,6 +1144,10 @@ class MultiBalanceFetcher:
 
         rec["fee_tokens"] = ft
         self._snap[(ex, al)] = rec
+
+    async def _record_snapshot(self, exchange: str, alias: str, balances: Dict[str, float]) -> None:
+        self._record_snapshot_sync(exchange, alias, balances)
+
 
     def _get_ws_accounts_status_for_alias(self, exchange: str, alias: str) -> Dict[str, Any]:
         """

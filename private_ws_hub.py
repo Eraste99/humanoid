@@ -240,25 +240,34 @@ class _BaseWSClient:
         self._reconnects: int = 0
         self._errors: int = 0
 
-        # --- cfg.pws (source de vérité) ---
-        pws = self.cfg.pws
-        self._region_map  = dict(getattr(pws, "PWS_REGION_MAP", {"BINANCE":"EU","BYBIT":"EU","COINBASE":"US"}))
-        self._queue_max   = getattr_int(pws, "PWS_QUEUE_MAXLEN", 10_000)
-        self._sat_ratio   = getattr_float(pws, "PWS_QUEUE_SATURATION_RATIO", 0.90)
-        self._ping_s      = getattr_int(pws, "PWS_PING_INTERVAL_S", 20)
-        self._pong_to_s   = getattr_int(pws, "PWS_PONG_TIMEOUT_S", 10)
-        self._hb_max_gap  = getattr_int(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30)
+        # --- cfg.pws (source de vérité) — compat si cfg/pws absent ---
+        pws = getattr(self.cfg, "pws", None) if self.cfg is not None else None
+        if pws is None:
+            class _PWSStub:
+                pass
+
+            pws = _PWSStub()
+
+        self._region_map = dict(getattr(pws, "PWS_REGION_MAP", {"BINANCE": "EU", "BYBIT": "EU", "COINBASE": "US"}))
+        self._queue_max = getattr_int(pws, "PWS_QUEUE_MAXLEN", 10_000)
+        self._sat_ratio = getattr_float(pws, "PWS_QUEUE_SATURATION_RATIO", 0.90)
+        self._ping_s = getattr_int(pws, "PWS_PING_INTERVAL_S", 20)
+        self._pong_to_s = getattr_int(pws, "PWS_PONG_TIMEOUT_S", 10)
+        self._hb_max_gap = getattr_int(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30)
         self._stable_reset_s = getattr_int(pws, "PWS_STABLE_RESET_S", 3600)
-        self._jitter_ms   = getattr_int(pws, "PWS_JITTER_MS", 50)
-        self._bo_base_ms  = getattr_int(pws, "PWS_BACKOFF_BASE_MS", 500)
-        self._bo_max_ms   = getattr_int(pws, "PWS_BACKOFF_MAX_MS", 15_000)
+        self._jitter_ms = getattr_int(pws, "PWS_JITTER_MS", 50)
+        self._bo_base_ms = getattr_int(pws, "PWS_BACKOFF_BASE_MS", 500)
+        self._bo_max_ms = getattr_int(pws, "PWS_BACKOFF_MAX_MS", 15_000)
 
         # dérivés pratiques
         self._bo_base_s = self._bo_base_ms / 1000.0
-        self._bo_max_s  = self._bo_max_ms / 1000.0
+        self._bo_max_s = self._bo_max_ms / 1000.0
 
-        # --- garde DRY_RUN/PROD ---
-        if self.cfg.g.mode == "DRY_RUN" and self.cfg.g.feature_switches.get("private_ws", False):
+        # --- garde DRY_RUN/PROD (si cfg.g présent) ---
+        g = getattr(self.cfg, "g", None) if self.cfg is not None else None
+        feature_switches = getattr(g, "feature_switches", {}) if g is not None else {}
+        mode = getattr(g, "mode", None)
+        if mode == "DRY_RUN" and feature_switches.get("private_ws", False):
             raise RuntimeError("DRY_RUN: private_ws must be OFF")
 
     def register_callback(self, cb, *, role: str = "engine") -> None:
@@ -286,6 +295,26 @@ class _BaseWSClient:
         self._session = aiohttp.ClientSession(trust_env=True)
         # TODO: ouvrir la bonne URL selon self._region_map[self.exchange]
         self._task = asyncio.create_task(self._run())
+
+    async def _run(self) -> None:
+        """
+        Boucle principale WebSocket pour un client privé.
+
+        La classe de base ne connaît pas le protocole concret (auth, subscribe,
+        format des messages, etc.). Deux modèles d’utilisation possibles :
+
+        - soit une sous-classe redéfinit `start()` et ne passe jamais par `_run()`
+          (cas actuel de BinanceUserStream / BybitPrivateWS / CoinbaseOrdersWS) ;
+        - soit une sous-classe garde `start()` tel quel et surchargera `_run()`
+          pour implémenter la vraie boucle WS (connexion, souscriptions, read loop).
+
+        Si cette implémentation de base est appelée telle quelle, c’est un
+        problème de wiring : on préfère lever un NotImplementedError explicite.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} doit surcharger `_run()` ou `start()` "
+            "pour implémenter la boucle WebSocket privée."
+        )
 
 
     async def stop(self) -> None:
@@ -347,10 +376,15 @@ class _BaseWSClient:
 # ---------------------------------------------------------------------------
 
 class BinanceUserStream(_BaseWSClient):
-    def __init__(self, alias: str, api_key: str,
-                 rest_base: str = "https://api.binance.com",
-                 ws_base: str = "wss://stream.binance.com:9443"):
-        super().__init__("BINANCE", alias)
+    def __init__(
+        self,
+        cfg: Any,
+        alias: str,
+        api_key: str,
+        rest_base: str = "https://api.binance.com",
+        ws_base: str = "wss://stream.binance.com:9443",
+    ):
+        super().__init__(cfg, "BINANCE", alias)
         self.api_key = api_key
         self._ws_idx = 0
         self.rest_base = rest_base
@@ -482,15 +516,22 @@ class BinanceUserStream(_BaseWSClient):
 
     async def _run_ws(self) -> None:
         assert self._session and self._listen_key
-        backoff = 1.0
+
+        # Paramètres hérités de _BaseWSClient (cfg.pws.*)
+        base_s = float(getattr(self, "_bo_base_s", 1.0) or 1.0)
+        max_s = float(getattr(self, "_bo_max_s", 30.0) or 30.0)
+        jitter_s = max(0.0, float(getattr(self, "_jitter_ms", 50)) / 1000.0)
+        heartbeat_s = int(getattr(self, "_ping_s", 30) or 30)
+
+        backoff = base_s
         while self._running:
             base = self._ws_bases[self._ws_ix % len(self._ws_bases)]
             url = f"{base}/ws/{self._listen_key}"
             try:
-                async with self._session.ws_connect(url, heartbeat=30) as ws:
+                async with self._session.ws_connect(url, heartbeat=heartbeat_s) as ws:
                     self._ws = ws
                     log.info("[BINANCE:%s] WS connected (%s)", self.alias, base)
-                    backoff = 1.0
+                    backoff = base_s  # reset après une connexion OK
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             try:
@@ -512,22 +553,46 @@ class BinanceUserStream(_BaseWSClient):
                     self._ws_ix = (self._ws_ix + 1) % max(1, len(self._ws_bases))
                     new = self._ws_bases[self._ws_ix % len(self._ws_bases)]
                     if new != old:
-                        WS_FAILOVER_TOTAL.labels(exchange="BINANCE", alias=_upper(self.alias), endpoint=new).inc()
+                        WS_FAILOVER_TOTAL.labels(
+                            exchange="BINANCE",
+                            alias=_upper(self.alias),
+                            endpoint=new,
+                        ).inc()
                 except Exception:
                     pass
-                # backoff jitteré
-                delay = min(30.0, backoff * (0.3 + 0.7 * random.random()))
+
+                # backoff exponentiel avec jitter cfg.pws (PWS_BACKOFF_*, PWS_JITTER_MS)
+                delay = min(
+                    max_s,
+                    backoff + (random.random() * jitter_s),
+                )
                 try:
-                    PWS_RECONNECTS_TOTAL.labels(exchange="BINANCE", alias=_upper(self.alias)).inc()
-                    log.info("[PrivateWSHub] %s", json.dumps({
-                        "pws_reconnect": True, "exchange": "BINANCE",
-                        "alias": _upper(self.alias), "delay_s": round(delay, 2), "endpoint": base
-                    }))
+                    PWS_RECONNECTS_TOTAL.labels(
+                        exchange="BINANCE",
+                        alias=_upper(self.alias),
+                    ).inc()
+                    log.info(
+                        "[PrivateWSHub] %s",
+                        json.dumps(
+                            {
+                                "pws_reconnect": True,
+                                "exchange": "BINANCE",
+                                "alias": _upper(self.alias),
+                                "delay_s": round(delay, 2),
+                                "endpoint": base,
+                            }
+                        ),
+                    )
                 except Exception:
                     pass
-                log.exception("[BINANCE:%s] reconnect in %.2fs (next endpoint idx=%d)", _upper(self.alias), delay, self._ws_ix)
+                log.exception(
+                    "[BINANCE:%s] reconnect in %.2fs (next endpoint idx=%d)",
+                    _upper(self.alias),
+                    delay,
+                    self._ws_ix,
+                )
                 await asyncio.sleep(delay)
-                backoff = min(backoff * 2, 30.0)
+                backoff = min(backoff * 2.0, max_s)
 
 
 # ---------------------------------------------------------------------------
@@ -539,19 +604,19 @@ class BybitPrivateWS(_BaseWSClient):
     Client WS privé Bybit — multi-endpoints + failover rotatif.
     Émet les events "order" → callback Hub (ACK/PARTIAL/FILLED/etc.)
     """
-    def __init__(self, alias: str, api_key: str, secret: str,
-                 ws_url: str | None = "wss://stream.bybit.com/v5/private",
-                 ws_urls: List[str] | None = None):
-        super().__init__("BYBIT", alias)
+    def __init__(
+        self,
+        cfg: Any,
+        alias: str,
+        api_key: str,
+        secret: str,
+        ws_url: str | None = "wss://stream.bybit.com/v5/private",
+        ws_urls: List[str] | None = None,
+    ):
+        super().__init__(cfg, "BYBIT", alias)
         self.api_key = api_key
         self.secret = secret.encode()
 
-        # Multi-endpoints: priorise ws_urls, sinon dérive de ws_url
-        if ws_urls and isinstance(ws_urls, (list, tuple)) and len(ws_urls) > 0:
-            self._ws_urls = list(ws_urls)
-        else:
-            self._ws_urls = [ws_url] if isinstance(ws_url, str) else ["wss://stream.bybit.com/v5/private"]
-        self._ws_ix = 0  # index courant de l'endpoint
 
     @staticmethod
     def _sign(ts_ms: int, api_key: str, secret: bytes) -> str:
@@ -585,18 +650,26 @@ class BybitPrivateWS(_BaseWSClient):
 
     async def _run_ws(self) -> None:
         assert self._session
-        backoff_s = 1.0
+
+        base_s = float(getattr(self, "_bo_base_s", 1.0) or 1.0)
+        max_s = float(getattr(self, "_bo_max_s", 30.0) or 30.0)
+        jitter_s = max(0.0, float(getattr(self, "_jitter_ms", 50)) / 1000.0)
+        heartbeat_s = int(getattr(self, "_ping_s", 20) or 20)
+
+        backoff_s = base_s
         while self._running:
             base = self._ws_urls[self._ws_ix % len(self._ws_urls)]
             try:
-                async with self._session.ws_connect(base, heartbeat=20) as ws:
+                async with self._session.ws_connect(base, heartbeat=heartbeat_s) as ws:
                     self._ws = ws
                     ts_ms = int(_now() * 1000)
                     sign = self._sign(ts_ms, self.api_key, self.secret)
-                    await ws.send_json({"op": "auth", "args": [self.api_key, ts_ms, sign, "5000"]})
+                    await ws.send_json(
+                        {"op": "auth", "args": [self.api_key, ts_ms, sign, "5000"]}
+                    )
                     await ws.send_json({"op": "subscribe", "args": ["order"]})
                     log.info("[BYBIT:%s] WS connected & subscribed (%s)", self.alias, base)
-                    backoff_s = 1.0
+                    backoff_s = base_s
 
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
@@ -651,11 +724,26 @@ class BybitPrivateWS(_BaseWSClient):
                     pass
                 self._ws_ix = (self._ws_ix + 1) % len(self._ws_urls)
 
-            try:
-                await asyncio.sleep(backoff_s)
-            except asyncio.CancelledError:
-                return
-            backoff_s = min(backoff_s * 2.0, 30.0)
+                delay = min(
+                    max_s,
+                    backoff_s + (random.random() * jitter_s),
+                )
+                try:
+                    PWS_RECONNECTS_TOTAL.labels(
+                        exchange="BYBIT",
+                        alias=_upper(self.alias),
+                    ).inc()
+                except Exception:
+                    pass
+                log.exception(
+                    "[BYBIT:%s] reconnect in %.2fs (next endpoint idx=%d)",
+                    _upper(self.alias),
+                    delay,
+                    self._ws_ix,
+                )
+                await asyncio.sleep(delay)
+                backoff_s = min(backoff_s * 2.0, max_s)
+
 
 # ---------------------------------------------------------------------------
 # Coinbase Advanced Trade: poller (orders + fills)
@@ -669,13 +757,22 @@ class CoinbaseOrdersWS(_BaseWSClient):
     Client WS minimal pour ACK "orders" (fills conservés via poller REST).
     Auth pluggable via `auth_msg_factory` (callable ts_ms -> dict message).
     """
-    def __init__(self, alias: str, *, ws_urls=None, auth_msg_factory=None, subscribe_payload=None):
-        super().__init__("COINBASE", alias)
+    def __init__(
+        self,
+        cfg: Any,
+        alias: str,
+        *,
+        ws_urls=None,
+        auth_msg_factory=None,
+        subscribe_payload=None,
+    ):
+        super().__init__(cfg, "COINBASE", alias)
         self.ws_urls = list(ws_urls or ["wss://advanced-trade-ws.coinbase.com"])
         self._ws_idx = 0
         self._auth_msg_factory = auth_msg_factory    # ex: lambda ts: {...}
         # Par défaut on cible un canal "orders" (adapter selon ton infra)
         self._subscribe_payload = subscribe_payload or {"type":"subscribe","channel":"orders"}
+
 
     async def start(self) -> None:
         if self._running:
@@ -687,49 +784,40 @@ class CoinbaseOrdersWS(_BaseWSClient):
 
     async def _run_ws(self) -> None:
         assert self._session
-        backoff = 1.0
+
+        base_s = float(getattr(self, "_bo_base_s", 1.0) or 1.0)
+        max_s = float(getattr(self, "_bo_max_s", 30.0) or 30.0)
+        jitter_s = max(0.0, float(getattr(self, "_jitter_ms", 50)) / 1000.0)
+        heartbeat_s = int(getattr(self, "_ping_s", 20) or 20)
+
+        backoff = base_s
         while self._running:
             try:
                 base = self.ws_urls[self._ws_idx % len(self.ws_urls)]
-                async with self._session.ws_connect(base, heartbeat=20) as ws:
+                async with self._session.ws_connect(base, heartbeat=heartbeat_s) as ws:
                     self._ws = ws
                     # auth si fournie
                     try:
                         import time
                         if callable(self._auth_msg_factory):
-                            ts = int(time.time()*1000)
+                            ts = int(time.time() * 1000)
                             await ws.send_json(self._auth_msg_factory(ts))
                     except Exception:
-                        log.warning("[COINBASE:%s] auth_msg_factory failed; continuing unauth", self.alias)
+                        log.warning(
+                            "[COINBASE:%s] auth_msg_factory failed; continuing unauth",
+                            self.alias,
+                        )
                     # subscribe
                     await ws.send_json(self._subscribe_payload)
-                    log.info("[COINBASE:%s] WS connected & subscribed (ACK only)", self.alias)
-                    backoff = 1.0
+                    log.info(
+                        "[COINBASE:%s] WS connected & subscribed (ACK only)",
+                        self.alias,
+                    )
+                    backoff = base_s
+
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
-                            try:
-                                js = json.loads(msg.data)
-                                # Adapter à ton format réel: on mappe un ACK minimal si on voit un ordre
-                                row = js.get("order") or js.get("data") or js
-                                if row and isinstance(row, dict):
-                                    symbol = str(row.get("product_id") or row.get("symbol") or "").replace("-","").upper()
-                                    st = str(row.get("status") or row.get("order_status") or "ACK").upper()
-                                    status = "ACK" if st not in ("REJECTED","CANCELED","FILLED","PARTIALLY_FILLED") else st
-                                    client_id = row.get("client_order_id") or row.get("clientOrderId")
-                                    ex_order_id = row.get("order_id") or row.get("orderId")
-                                    self._emit({
-                                        "type": "order",
-                                        "exchange": "COINBASE",
-                                        "alias": self.alias,
-                                        "client_id": client_id,
-                                        "exchange_order_id": ex_order_id,
-                                        "status": status,
-                                        "symbol": symbol,
-                                        "ts": _now(),
-                                        "meta": {"source":"ws"},
-                                    })
-                            except Exception:
-                                log.exception("[COINBASE:%s] parse error", self.alias)
+                            ...
                         elif msg.type == aiohttp.WSMsgType.ERROR:
                             raise RuntimeError("WS error")
             except asyncio.CancelledError:
@@ -743,15 +831,32 @@ class CoinbaseOrdersWS(_BaseWSClient):
                     self._ws_idx = (self._ws_idx + 1) % max(1, len(self.ws_urls))
                     new = self.ws_urls[self._ws_idx % len(self.ws_urls)]
                     if new != old:
-                        WS_FAILOVER_TOTAL.labels(exchange="COINBASE", alias=_upper(self.alias), endpoint=new).inc()
+                        WS_FAILOVER_TOTAL.labels(
+                            exchange="COINBASE",
+                            alias=_upper(self.alias),
+                            endpoint=new,
+                        ).inc()
                 except Exception:
                     pass
-                delay = min(30.0, backoff * (0.3 + 0.7 * random.random()))
-                PWS_RECONNECTS_TOTAL.labels(exchange="COINBASE", alias=_upper(self.alias)).inc()
-                log.exception("[COINBASE:%s] reconnect in %.2fs", _upper(self.alias), delay)
-                await asyncio.sleep(delay)
-                backoff = min(backoff * 2, 30.0)
 
+                delay = min(
+                    max_s,
+                    backoff + (random.random() * jitter_s),
+                )
+                try:
+                    PWS_RECONNECTS_TOTAL.labels(
+                        exchange="COINBASE",
+                        alias=_upper(self.alias),
+                    ).inc()
+                except Exception:
+                    pass
+                log.exception(
+                    "[COINBASE:%s] reconnect in %.2fs",
+                    _upper(self.alias),
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                backoff = min(backoff * 2.0, max_s)
 
 
 class CoinbaseATPoller:
@@ -1097,6 +1202,7 @@ class PrivateWSHub:
             }
 
             c = CoinbaseOrdersWS(
+                self.config,
                 alias=alias,
                 ws_urls=ws_urls,
                 auth_msg_factory=auth_msg_factory,
@@ -1114,7 +1220,8 @@ class PrivateWSHub:
                     alias = _upper(al)
                     if alias in self.cb_ack_ws_by_alias:
                         continue
-                    c = CoinbaseOrdersWS(alias=alias, ws_urls=default_urls)
+                    c = CoinbaseOrdersWS(self.config, alias=alias, ws_urls=default_urls)
+
                     c.register_callback(self._dispatch(alias, "COINBASE"))
                     self.cb_ack_ws_by_alias[alias] = c
         except Exception:
@@ -1129,9 +1236,10 @@ class PrivateWSHub:
                       or ["wss://advanced-trade-ws.coinbase.com"]
             auth_msg_factory = cfg.get("auth_msg_factory")  # optionnel
             subscribe_payload = cfg.get("subscribe_payload") or {"type": "subscribe", "channel": "orders"}
-            c = CoinbaseOrdersWS(alias=alias, ws_urls=ws_urls,
+            c = CoinbaseOrdersWS(self.config, alias=alias, ws_urls=ws_urls,
                                  auth_msg_factory=auth_msg_factory,
                                  subscribe_payload=subscribe_payload)
+
             c.register_callback(self._dispatch(alias, "COINBASE"))
             self.cb_ack_ws_by_alias[alias] = c
 
@@ -1144,7 +1252,8 @@ class PrivateWSHub:
                     alias = _upper(al)
                     if alias in self.cb_ack_ws_by_alias:
                         continue
-                    c = CoinbaseOrdersWS(alias=alias, ws_urls=default_ws_urls)
+                    c = CoinbaseOrdersWS(self.config, alias=alias, ws_urls=default_ws_urls)
+
                     c.register_callback(self._dispatch(alias, "COINBASE"))
                     self.cb_ack_ws_by_alias[alias] = c
         except Exception:
@@ -1156,12 +1265,14 @@ class PrivateWSHub:
         if transfer_clients:
             self.connect_transfer_clients(transfer_clients)
 
+
         # Instantiation par alias — TT/TM/MM ou autre
-        for al, cfg in (binance_accounts or {}).items():
+        for al, creds in (binance_accounts or {}).items():
             alias = _upper(al)
             c = BinanceUserStream(
+                self.config,  # cfg = BotConfig ou équivalent
                 alias=alias,
-                api_key=cfg["api_key"],
+                api_key=creds["api_key"],
                 rest_base=self._binance_rest_base,
                 ws_base=self._binance_ws_priv,
             )
@@ -1169,21 +1280,24 @@ class PrivateWSHub:
             self.binance_by_alias[alias] = c
 
         # === Clients Bybit par alias (multi-endpoints supportés) ===============
-        for al, cfg in (bybit_accounts or {}).items():
+        # === Clients Bybit par alias (multi-endpoints supportés) ===============
+        for al, creds in (bybit_accounts or {}).items():
             alias = _upper(al)
             urls_cfg = getattr(self.config, "bybit_ws_private_urls", None)
             if urls_cfg and isinstance(urls_cfg, (list, tuple)) and len(urls_cfg) > 0:
                 c = BybitPrivateWS(
+                    self.config,
                     alias=alias,
-                    api_key=cfg["api_key"],
-                    secret=cfg["secret"],
+                    api_key=creds["api_key"],
+                    secret=creds["secret"],
                     ws_urls=list(urls_cfg),
                 )
             else:
                 c = BybitPrivateWS(
+                    self.config,
                     alias=alias,
-                    api_key=cfg["api_key"],
-                    secret=cfg["secret"],
+                    api_key=creds["api_key"],
+                    secret=creds["secret"],
                     ws_url=getattr(self.config, "bybit_ws_private_url", "wss://stream.bybit.com/v5/private"),
                 )
             c.register_callback(self._dispatch(alias, "BYBIT"))
@@ -1204,6 +1318,9 @@ class PrivateWSHub:
         # === P0: QoS / queues / heartbeats - init unique (après création des clients) ===
         # Alias compat (le reste du code lit 'self.cfg')
         self.cfg = self.config
+        # Source de vérité PWS : privilégier cfg.pws si présent, sinon cfg (legacy)
+        self._pws_cfg = getattr(self.config, "pws", self.config)
+
 
         # Priorités QoS (plus petit = plus prioritaire)
         if not hasattr(self, "_priority_map"):
@@ -1220,10 +1337,12 @@ class PrivateWSHub:
             self._last_hb = {}
 
         # Paramètres ping/backoff (défauts sûrs)
-        self._ping_interval_s = float(getattr(self.cfg, "PWS_PING_INTERVAL_S", 10.0))
-        self._pong_timeout_s = float(getattr(self.cfg, "PWS_PONG_TIMEOUT_S", 3.0))
-        self._backoff_base_ms = int(getattr(self.cfg, "PWS_BACKOFF_BASE_MS", 200))
-        self._backoff_max_ms = int(getattr(self.cfg, "PWS_BACKOFF_MAX_MS", 5000))
+        pws = getattr(self, "_pws_cfg", self.cfg)
+        self._ping_interval_s = float(getattr(pws, "PWS_PING_INTERVAL_S", 10.0))
+        self._pong_timeout_s = float(getattr(pws, "PWS_PONG_TIMEOUT_S", 3.0))
+        self._backoff_base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 200))
+        self._backoff_max_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 5000))
+
 
         # Pools WS par région (optionnel, valeur non bloquante si métrique absente)
         try:
@@ -1694,16 +1813,17 @@ class PrivateWSHub:
     def _pws_backoff_bounds(self, region: str) -> tuple[int, int]:
         """
         Consolidé: bornes de backoff WS privés, modulées par l'état PACER.
-        - Lit PWS_BACKOFF_BASE_MS / PWS_BACKOFF_MAX_MS (défauts 200/5000).
+        - Lit PWS_BACKOFF_BASE_MS / PWS_BACKOFF_MAX_MS depuis cfg.pws (fallback cfg).
         - DEGRADED: cap ≤ 2000 ms ; SEVERE: cap ≤ 800 ms.
         - base_ms ≥ 50 ms, cap_ms ≥ base_ms.
         """
-        base_ms = int(getattr(self.cfg, "PWS_BACKOFF_BASE_MS", getattr(self, "_backoff_base_ms", 200)))
-        cap_ms = int(getattr(self.cfg, "PWS_BACKOFF_MAX_MS", getattr(self, "_backoff_max_ms", 5000)))
+        pws = getattr(self, "_pws_cfg", self.cfg)
+        base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 200))
+        cap_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 5000))
         base_ms = max(50, base_ms)
         cap_ms = max(base_ms, cap_ms)
         try:
-            state = str(getattr(self.cfg, f"PWS_PACER_{region}", "NORMAL")).upper()
+            state = str(getattr(pws, f"PWS_PACER_{region}", "NORMAL")).upper()
             if state == "DEGRADED":
                 cap_ms = min(cap_ms, 2000)
             elif state == "SEVERE":
@@ -1711,6 +1831,7 @@ class PrivateWSHub:
         except Exception:
             pass
         return base_ms, cap_ms
+
 
     async def run_alerts(self) -> None:
         """
@@ -1720,9 +1841,11 @@ class PrivateWSHub:
             - PWS_HEARTBEAT_MAX_GAP_S (def 5.0)
             - PWS_ALERT_PERIOD_S (def 5.0)
         """
-        ratio_thr = float(getattr(self.cfg, "PWS_QUEUE_SATURATION_RATIO", 0.85))
-        hb_max = float(getattr(self.cfg, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
-        period = float(getattr(self.cfg, "PWS_ALERT_PERIOD_S", 5.0))
+        pws = getattr(self, "_pws_cfg", self.cfg)
+        ratio_thr = float(getattr(pws, "PWS_QUEUE_SATURATION_RATIO", 0.85))
+        hb_max = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
+        period = float(getattr(pws, "PWS_ALERT_PERIOD_S", 5.0))
+
 
         while getattr(self, "_started", False):
             now = _now()
@@ -1789,10 +1912,13 @@ class PrivateWSHub:
         import asyncio, random, time, logging
         region = self._get_region(exchange, alias)
         pool = (getattr(self, "_pools_by_region", {}) or {}).get(region)
+
         base_ms, cap_ms = self._pws_backoff_bounds(region)
         backoff_ms = max(50, base_ms)
-        stable_s = float(getattr(self.cfg, "PWS_STABLE_RESET_S", 30.0))
-        jitter_ms = int(getattr(self.cfg, "PWS_JITTER_MS", 50))
+        pws = getattr(self, "_pws_cfg", self.cfg)
+        stable_s = float(getattr(pws, "PWS_STABLE_RESET_S", 30.0))
+        jitter_ms = int(getattr(pws, "PWS_JITTER_MS", 50))
+
         last_ok = 0.0
         while True:
             try:
@@ -1828,9 +1954,12 @@ class PrivateWSHub:
     async def start(self) -> None:
         """
         Démarre tous les clients (Binance/Bybit/COINBASE poller + ACK WS),
-        instrumente les (re)connexions avec backoff pacer-aware,
-        lance la sonde heartbeat 1 Hz.
+        en appliquant seulement le PACER + pools régionaux sur le "connect".
+        La logique de backoff / reconnect vit dans les clients eux-mêmes.
+        Lance ensuite la sonde heartbeat 1 Hz.
         """
+
+
         if getattr(self, "_started", False):
             return
 
@@ -1855,14 +1984,13 @@ class PrivateWSHub:
                 await client.start()
 
             async def _with_pool():
+                # Le Hub borne juste la concurrence + applique le PACER.
+                # La logique de backoff / reconnect vit dans le client (start/_run_ws/_run).
                 async with pool:
                     await _connect_once()
 
-            # Démarrage via backoff pacer-aware (Hub)
-            if hasattr(self, "reconnect_with_backoff") and callable(getattr(self, "reconnect_with_backoff")):
-                tasks.append(asyncio.create_task(self.reconnect_with_backoff(exu, alu, _with_pool)))
-            else:
-                tasks.append(asyncio.create_task(_with_pool()))
+            # Démarrage simple : les clients gèrent eux-mêmes le backoff / reconnect
+            tasks.append(asyncio.create_task(_with_pool()))
 
         # WS ACK Coinbase (dual-path)
         for al, c in (getattr(self, "cb_ack_ws_by_alias", {}) or {}).items():

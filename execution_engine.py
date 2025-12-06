@@ -1459,6 +1459,14 @@ class ExecutionEngine:
             getattr(self.config, "mm_hedge_final_ratio", 1.0)
         )
 
+        # Feature flags MM (garde-fou global)
+        self.mm_dual_engine_enabled = bool(
+            getattr(self.config, "mm_dual_engine_enabled", False)
+        )
+        self.mm_single_inventory_enabled = bool(
+            getattr(self.config, "mm_single_inventory_enabled", False)
+        )
+
         # ==== Fragmentation front-loaded ====
         self.frontload_weights = list(
             getattr(self.config, "frontload_weights", [0.6, 0.3, 0.1])
@@ -1497,11 +1505,30 @@ class ExecutionEngine:
         self._mm_active_by_pair: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
         self._mm_expiry_by_cid: dict[str, tuple[str, str, float]] = {}
 
+        self.max_parallel_pairs_mm = int(getattr(self.config, "max_parallel_pairs_mm", 1))
+
         # ==== Concurrence / pacing global par branche ====
         self.max_parallel_pairs_tt = int(getattr(self.config, "max_parallel_pairs_tt", 2))
         self.max_parallel_pairs_tm = int(getattr(self.config, "max_parallel_pairs_tm", 2))
         self._sem_tt_pairs = asyncio.Semaphore(self.max_parallel_pairs_tt)
         self._sem_tm_pairs = asyncio.Semaphore(self.max_parallel_pairs_tm)
+        self._sem_mm_pairs = asyncio.Semaphore(max(1, self.max_parallel_pairs_mm))
+        # ==== Concurrence / pacing global par branche ====
+        self.max_parallel_pairs_tt = int(getattr(self.config, "max_parallel_pairs_tt", 2))
+        self.max_parallel_pairs_tm = int(getattr(self.config, "max_parallel_pairs_tm", 2))
+
+        # max MM configurable, par défaut aligné sur TM (MM ne dépasse jamais TM)
+        self.max_parallel_pairs_mm = int(
+            getattr(self.config, "max_parallel_pairs_mm", self.max_parallel_pairs_tm)
+        )
+
+        self._sem_tt_pairs = asyncio.Semaphore(self.max_parallel_pairs_tt)
+        self._sem_tm_pairs = asyncio.Semaphore(self.max_parallel_pairs_tm)
+        self._sem_mm_pairs = asyncio.Semaphore(self.max_parallel_pairs_mm)
+
+        # ---- Multi-wallet router & timings (ta classe) ----
+        self.wallet_router = WalletRouter(self.config)
+
 
         # ---- Multi-wallet router & timings (ta classe) ----
         self.wallet_router = WalletRouter(self.config)
@@ -2633,6 +2660,26 @@ class ExecutionEngine:
         self._update_submit_queue_gauge()
         return {"accepted": True}
 
+    async def _execute_bundle(self, bundle: Dict[str, Any]) -> bool:
+        """
+        Hook async utilisé par RMCompat._submit_bundle.
+
+        RMCompat fournit ici un bundle déjà normalisé (legs avec symbol/price/qty/etc.).
+        On délègue à la méthode synchrone `execute_bundle`, qui applique:
+
+        - les mêmes règles de readiness (_ensure_ready / NotReadyError),
+        - les mêmes caps locaux (bundle_concurrency / inflight_cap / headroom_min),
+        - la même backpressure (QUEUE_FULL / HIGH_WM / MM_HIGH_WM),
+        - la même déduplication CID + enqueue non bloquant dans `order_queue`.
+
+        Retour:
+            bool: True si le bundle a été accepté dans la file Engine.
+                  En cas de rejet technique, EngineSubmitError est propagée
+                  exactement comme pour le RM.
+        """
+        # On réutilise la logique existante de l’interface RM synchrone.
+        return self.execute_bundle(bundle)
+
     def execute_bundle(self, bundle: Dict[str, Any]) -> bool:
         """Interface synchrone utilisée par le RiskManager.
 
@@ -2932,6 +2979,9 @@ class ExecutionEngine:
         MM: 2 makers en // (A & B) + hedge progressif côté manquant.
         Guards: net-bps (fees+slip+buffer) + queue-position bilatéral.
         """
+        if not self.mm_dual_engine_enabled:
+            logger.info("[Engine] place_two_makers_with_hedge appelé alors que mm_dual_engine_enabled=False")
+            return
         async with self._sem_mm_pairs:  # back-pressure MM
             pair = str(bundle.get("pair") or "").replace("-", "").upper()
             a = bundle.get("a") or {}
@@ -2944,7 +2994,7 @@ class ExecutionEngine:
 
             a_amt = float(((a.get("notional_quote") or {}).get("amount") or 0.0))
             b_amt = float(((b.get("notional_quote") or {}).get("amount") or 0.0))
-            if min(a_amt, b_amt) <= 0:
+            if min(a_amt, b_amt) <= 0 or a_ex != b_ex:
                 return
 
             # TOB bruts
@@ -4087,6 +4137,13 @@ class ExecutionEngine:
                     if t_lower in ("arbitrage", "arbitrage_bundle"):
                         payload = self._convert_arbitrage_to_bundle(payload)
 
+                    if t_lower == "mm_single_inventory":
+                        if self.mm_single_inventory_enabled:
+                            await self.mm_single_inventory(payload)
+                        else:
+                            logger.info("[Engine/W%d] mm_single_inventory payload ignoré (flag off)", wid)
+                        continue
+
                     if payload.get("type") in ("bundle", "rebalancing"):
                         await self._exec_bundle(payload)
                     else:
@@ -4958,7 +5015,7 @@ class ExecutionEngine:
         return bool(fsm and fsm.state == "FILLED")
 
     async def _mm_place_maker(self, *, pair_key: str, exchange: str, side: str,
-                              amount_quote: float, bundle_id: str) -> str:
+                              amount_quote: float, bundle_id: str, ttl_ms: int | None = None) -> str:
         """
         Soumet un maker GTC/PostOnly via le chemin 'single' existant.
         Retourne le client_id (FSM/WS feront la suite).
@@ -4989,7 +5046,9 @@ class ExecutionEngine:
                 "best_ts": int(ts or time.time() * 1000),
                 "tif_override": "GTC",
                 "maker": True,  # → LIMIT_MAKER / PostOnly
-                "strategy": "TM",  # routing wallet_router by quote (MM ~ TM côté alias)
+                "strategy": "MM",
+                "branch": "MM",
+                "kind": "MAKER_MM",
                 "bundle_id": bundle_id,
                 "fastpath_ok": True,
                 "skip_inventory": False,  # MM réserve déjà en amont côté RM
@@ -5716,13 +5775,48 @@ class ExecutionEngine:
         if not buy_leg or not sell_leg:
             self._reject(pair_key, payload, "bundle sans BUY/SELL")
             return
+        meta_payload = payload.get("meta") or {}
+        branch = str(meta_payload.get("branch") or meta_payload.get("strategy") or "").upper()
+        strategy = str(meta_payload.get("strategy", "")).upper()
 
         is_rebal = (
                 payload.get("type") == "rebalancing"
                 or (payload.get("meta") or {}).get("type") == "rebalancing"
                 or any((l.get("meta") or {}).get("type") == "rebalancing" for l in legs)
         )
-        strategy = str((payload.get("meta") or {}).get("strategy", "")).upper()
+        if branch == "MM" or strategy == "MM":
+            same_pair = all(self._fmt_pair(l.get("symbol")) == pair_key for l in legs)
+            makers = all(bool((l.get("meta") or {}).get("maker")) for l in legs)
+            exchanges = {self._norm_ex(l.get("exchange")) for l in legs}
+
+            if makers and len(exchanges) == 1 and same_pair:
+                if not self.mm_dual_engine_enabled:
+                    logger.info("[Engine] MM dual reçu mais flag désactivé, ignoré")
+                    return
+                ttl_mm = payload.get("ttl_ms") or meta_payload.get("ttl_ms") or self.mm_ttl_ms
+                a_leg, b_leg = buy_leg, sell_leg
+
+                mm_bundle = {
+                    "pair": pair_key,
+                    "ttl_ms": int(ttl_mm or 0),
+                    "a": {
+                        "ex": self._norm_ex(a_leg.get("exchange")),
+                        "side": str(a_leg.get("side") or "").upper(),
+                        "notional_quote": {"amount": float(a_leg.get("volume_usdc") or 0.0)},
+                    },
+                    "b": {
+                        "ex": self._norm_ex(b_leg.get("exchange")),
+                        "side": str(b_leg.get("side") or "").upper(),
+                        "notional_quote": {"amount": float(b_leg.get("volume_usdc") or 0.0)},
+                    },
+                }
+                await self.place_two_makers_with_hedge(mm_bundle)
+                return
+
+            # Bundle marqué MM mais pas sous forme dual mono-CEX propre
+            self._reject(pair_key, payload, "mm_dual_shape_invalid")
+            return
+
         # Canonise le marquage REB au niveau payload.meta
         if is_rebal:
             meta = payload.setdefault("meta", {}) or {}
@@ -7695,6 +7789,9 @@ class ExecutionEngine:
           - optionnel: "ttl_ms" (si absent → fallback self.mm_ttl_ms)
           - optionnel: "bundle_id" (corrélation histo/metrics)
         """
+        if not self.mm_single_inventory_enabled:
+            logger.info("[Engine] mm_single_inventory ignoré (flag off)")
+            return
         async with self._sem_mm_pairs:
             pair = str(
                 payload.get("pair")
@@ -7745,6 +7842,7 @@ class ExecutionEngine:
                     side=side,
                     amount_quote=amt,
                     bundle_id=bundle_id,
+                    ttl_ms=payload.get("ttl_ms"),
                 )
             except EngineSubmitError as exc:
                 # throttle / not ready / capital / etc.
@@ -7775,23 +7873,6 @@ class ExecutionEngine:
                 except Exception:
                     ttl_ms = 2300
 
-            # Cas simple: pas de hedge auto → on laisse vivre puis cancel TTL
-            if not self.mm_allow_auto_hedge:
-                await asyncio.sleep(max(0.0, ttl_ms / 1000.0))
-                await self._mm_cancel_open_makers([maker_cid])
-                try:
-                    await self._hist("trade", {
-                        "_hist_kind": "MM_INV",
-                        "pair": pair,
-                        "status": "ttl_cancel",
-                        "exchange": ex,
-                        "side": side,
-                        "bundle_id": bundle_id,
-                        "timestamp": time.time(),
-                    })
-                except Exception:
-                    pass
-                return
 
             # 3) Boucle d’attente + hedging progressif si tu veux
             deadline = time.monotonic() + (ttl_ms / 1000.0)
@@ -7799,6 +7880,8 @@ class ExecutionEngine:
             progressive_task = None
             hedged_progress_usdc = 0.0
             progressive_started = False
+
+
 
             # TODO (optionnel) : progressive hedge sur inventaire
             # Pour commencer simple, on peut ne PAS démarrer de hedge progressif
@@ -7828,6 +7911,46 @@ class ExecutionEngine:
                     except Exception:
                         pass
                     break
+                    # Asymétrie / risque détecté : lancer le hedge progressif une seule fois
+                if (
+                        self.mm_allow_auto_hedge
+                        and getattr(self, "mm_use_progressive_hedge", True)
+                        and not is_dry
+                        and not progressive_started
+                ):
+                    progressive_started = True
+                    hedge_side = "BUY" if side == "SELL" else "SELL"
+                    try:
+                        progressive_task = self._spawn(
+                            self._mm_progressive_hedge(
+                                pair_key=pair,
+                                exchange=ex,
+                                side=hedge_side,
+                                notional_quote=self.mm_hedge_final_ratio * float(amt),
+                                schedule=self.mm_hedge_schedule,
+                                deadline=deadline,
+                                bundle_id=bundle_id,
+                            ),
+                            name=f"mm-hedge-{bundle_id}",
+                        )
+                        await self._hist("trade", {
+                            "_hist_kind": "MM_INV",
+                            "pair": pair,
+                            "status": "progressive_hedge_start",
+                            "side": hedge_side,
+                            "exchange": ex,
+                            "schedule": self.mm_hedge_schedule,
+                            "bundle_id": bundle_id,
+                            "timestamp": time.time(),
+                        })
+                    except Exception:
+                        # On loggue mais on ne casse pas la boucle: le panic hedge final prendra le relais
+                        logger.exception("[Engine] mm_single_inventory progressive hedge spawn failed", extra={
+                            "pair": pair,
+                            "exchange": ex,
+                            "side": hedge_side,
+                            "bundle_id": bundle_id,
+                        })
 
                 await asyncio.sleep(0.01)
 

@@ -789,6 +789,273 @@ class DynamicExecutionSimulator:
     # === dynamic_execution_simulator.py ===
     # Dans class DynamicExecutionSimulator
 
+    async def _simulate_tt(
+            self,
+            payload: Dict[str, Any],
+            extra_latency_s: float = 0.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Helper interne pour la branche TT du mode shadow.
+
+        Construit une mini-opportunité TT à partir du payload shadow et renvoie
+        un petit dict consommable par simulate_both_parallel.
+        """
+        t_start = time.time()
+
+        # 1) Contexte de route (pair / buy_ex / sell_ex)
+        bundle = payload.get("bundle") or {}
+        route = bundle.get("route") or {}
+        pair = payload.get("pair") or route.get("pair")
+        buy_ex = payload.get("buy_ex") or route.get("buy_ex")
+        sell_ex = payload.get("sell_ex") or route.get("sell_ex")
+
+        if not pair or not buy_ex or not sell_ex:
+            return None
+
+        # 2) Top-of-book → mini livres (un seul niveau)
+        buy_tob = payload.get("buy_tob") or {}
+        sell_tob = payload.get("sell_tob") or {}
+
+        def _levels_from_tob(tob: Dict[str, Any], side: str) -> List[Tuple[float, float]]:
+            lvl = (tob or {}).get(side) or {}
+            try:
+                px = float(lvl.get("px") or 0.0)
+                qty = float(lvl.get("qty") or 0.0)
+            except Exception:
+                return []
+            if px > 0.0 and qty > 0.0:
+                return [(px, qty)]
+            return []
+
+        buy_levels_raw = _levels_from_tob(buy_tob, "ask")  # taker sur BUY
+        sell_levels_raw = _levels_from_tob(sell_tob, "bid")  # taker sur SELL
+
+        if not buy_levels_raw or not sell_levels_raw:
+            return None
+
+        # 3) Budget capital
+        capital_usdc = 0.0
+        raw_cap = payload.get("capital_available_usdc")
+        try:
+            if raw_cap is not None:
+                capital_usdc = float(raw_cap)
+        except Exception:
+            capital_usdc = 0.0
+
+        if capital_usdc <= 0.0:
+            try:
+                vol_opp = float(route.get("volume_possible_usdc") or 0.0)
+            except Exception:
+                vol_opp = 0.0
+            capital_usdc = vol_opp
+
+        if capital_usdc <= 0.0:
+            return None
+
+        # 4) Opportunité minimale TT
+        opportunity: Dict[str, Any] = {
+            "pair": str(pair),
+            "buy_exchange": str(buy_ex).upper(),
+            "sell_exchange": str(sell_ex).upper(),
+            "volume_possible_usdc": float(capital_usdc),
+            "meta": {},
+        }
+        meta = opportunity.setdefault("meta", {})
+        meta.update(dict(route.get("meta") or {}))
+        meta.setdefault("shadow", True)
+        meta.setdefault("shadow_branch", "TT")
+
+        # 5) Timeout par branche (aligné grossièrement sur timeout_each_s)
+        timeout_each = float(getattr(self, "timeout_each_s", 1.2))
+        timeout_branch = max(0.05, timeout_each - float(extra_latency_s))
+
+        # 6) Appel à la simulation TT
+        result = await self.simulate(
+            opportunity=opportunity,
+            buy_levels_raw=buy_levels_raw,
+            sell_levels_raw=sell_levels_raw,
+            capital_available_usdc=capital_usdc,
+            strategy="TT",
+            timeout=timeout_branch,
+        )
+
+        # Si la simu retourne None (combo interdit, depth insuffisante, spread négatif, etc.)
+        if not result:
+            return None
+
+        # 7) Dérivés pour le score
+        try:
+            vbuy = float(result.get("vwap_buy", 0.0) or 0.0)
+            vsell = float(result.get("vwap_sell", 0.0) or 0.0)
+            dev_bps = (abs(vsell - vbuy) / max(vbuy, 1e-12)) * 1e4
+        except Exception:
+            dev_bps = float("inf")
+
+        capital_block = result.get("capital") or {}
+        usage_ratio = float(capital_block.get("usage_ratio", 0.0) or 0.0)
+        usage_ratio = max(0.0, min(1.0, usage_ratio))
+
+        lat_ms = (time.time() - t_start + float(extra_latency_s)) * 1000.0
+
+        ok = bool(result) and math.isfinite(dev_bps) and usage_ratio > 0.0
+
+        guards: Dict[str, Any] = {
+            "branch": "TT",
+            "has_buy_book": bool(buy_levels_raw),
+            "has_sell_book": bool(sell_levels_raw),
+            "usage_ratio": usage_ratio,
+        }
+
+        return {
+            "ok": ok,
+            "reason": None if ok else "TT_BAD_RESULT",
+            "dev_bps": dev_bps,
+            "fills_ratio": usage_ratio,
+            "lat_ms": lat_ms,
+            "guards": guards,
+        }
+
+    async def _simulate_tm(
+        self,
+        payload: Dict[str, Any],
+        extra_latency_s: float = 0.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Helper interne pour la branche TM du mode shadow.
+
+        Même principe que _simulate_tt, mais en laissant le core utiliser la
+        logique maker (prix maker conservateur) via sell_best_ask / maker_best_ask.
+        """
+        t_start = time.time()
+
+        # 1) Contexte de route (pair / buy_ex / sell_ex)
+        bundle = payload.get("bundle") or {}
+        route = bundle.get("route") or {}
+        pair = payload.get("pair") or route.get("pair")
+        buy_ex = payload.get("buy_ex") or route.get("buy_ex")
+        sell_ex = payload.get("sell_ex") or route.get("sell_ex")
+
+        if not pair or not buy_ex or not sell_ex:
+            return None
+
+        # 2) Top-of-book → mini livres (un seul niveau)
+        buy_tob = payload.get("buy_tob") or {}
+        sell_tob = payload.get("sell_tob") or {}
+
+        def _levels_from_tob(tob: Dict[str, Any], side: str) -> List[Tuple[float, float]]:
+            lvl = (tob or {}).get(side) or {}
+            try:
+                px = float(lvl.get("px") or 0.0)
+                qty = float(lvl.get("qty") or 0.0)
+            except Exception:
+                return []
+            if px > 0.0 and qty > 0.0:
+                return [(px, qty)]
+            return []
+
+        buy_levels_raw = _levels_from_tob(buy_tob, "ask")    # taker sur BUY
+        sell_levels_raw = _levels_from_tob(sell_tob, "bid")  # profondeur côté SELL (maker)
+
+        if not buy_levels_raw or not sell_levels_raw:
+            return None
+
+        # On essaie aussi de récupérer un best_ask côté SELL pour le calcul maker_price
+        sell_best_ask_px: Optional[float] = None
+        try:
+            ask = (sell_tob or {}).get("ask") or {}
+            px = float(ask.get("px") or 0.0)
+            if px > 0.0:
+                sell_best_ask_px = px
+        except Exception:
+            sell_best_ask_px = None
+
+        # 3) Budget capital
+        capital_usdc = 0.0
+        raw_cap = payload.get("capital_available_usdc")
+        try:
+            if raw_cap is not None:
+                capital_usdc = float(raw_cap)
+        except Exception:
+            capital_usdc = 0.0
+
+        if capital_usdc <= 0.0:
+            try:
+                vol_opp = float(route.get("volume_possible_usdc") or 0.0)
+            except Exception:
+                vol_opp = 0.0
+            capital_usdc = vol_opp
+
+        if capital_usdc <= 0.0:
+            return None
+
+        # 4) Opportunité minimale TM
+        opportunity: Dict[str, Any] = {
+            "pair": str(pair),
+            "buy_exchange": str(buy_ex).upper(),
+            "sell_exchange": str(sell_ex).upper(),
+            "volume_possible_usdc": float(capital_usdc),
+            "meta": {},
+        }
+        meta = opportunity.setdefault("meta", {})
+        meta.update(dict(route.get("meta") or {}))
+        meta.setdefault("shadow", True)
+        meta.setdefault("shadow_branch", "TM")
+
+        # On fournit un best ask côté SELL pour aider la logique maker du core
+        if sell_best_ask_px is not None and sell_best_ask_px > 0.0:
+            opportunity["sell_best_ask"] = sell_best_ask_px
+            opportunity.setdefault("maker_best_ask", sell_best_ask_px)
+
+        # 5) Timeout par branche (aligné grossièrement sur timeout_each_s)
+        timeout_each = float(getattr(self, "timeout_each_s", 1.2))
+        timeout_branch = max(0.05, timeout_each - float(extra_latency_s))
+
+        # 6) Appel à la simulation TM
+        result = await self.simulate(
+            opportunity=opportunity,
+            buy_levels_raw=buy_levels_raw,
+            sell_levels_raw=sell_levels_raw,
+            capital_available_usdc=capital_usdc,
+            strategy="TM",
+            timeout=timeout_branch,
+        )
+
+        if not result:
+            return None
+
+        # 7) Dérivés pour le score
+        try:
+            vbuy = float(result.get("vwap_buy", 0.0) or 0.0)
+            vsell = float(result.get("vwap_sell", 0.0) or 0.0)
+            dev_bps = (abs(vsell - vbuy) / max(vbuy, 1e-12)) * 1e4
+        except Exception:
+            dev_bps = float("inf")
+
+        capital_block = result.get("capital") or {}
+        usage_ratio = float(capital_block.get("usage_ratio", 0.0) or 0.0)
+        usage_ratio = max(0.0, min(1.0, usage_ratio))
+
+        lat_ms = (time.time() - t_start + float(extra_latency_s)) * 1000.0
+
+        ok = bool(result) and math.isfinite(dev_bps) and usage_ratio > 0.0
+
+        guards: Dict[str, Any] = {
+            "branch": "TM",
+            "has_buy_book": bool(buy_levels_raw),
+            "has_sell_book": bool(sell_levels_raw),
+            "usage_ratio": usage_ratio,
+            "sell_best_ask_px": sell_best_ask_px,
+        }
+
+        return {
+            "ok": ok,
+            "reason": None if ok else "TM_BAD_RESULT",
+            "dev_bps": dev_bps,
+            "fills_ratio": usage_ratio,
+            "lat_ms": lat_ms,
+            "guards": guards,
+        }
+
 
     async def simulate_both_parallel(self, payload: dict) -> dict:
         """

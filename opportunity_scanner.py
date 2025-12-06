@@ -394,19 +394,38 @@ class OpportunityScanner:
         # ------------------------------------
         # 6) États & métriques d'exécution
         # ------------------------------------
+        # 6) États & métriques d'exécution
+        # ------------------------------------
         from collections import deque
-        self.orderbooks = {}                               # type: Dict[str, Dict[str, dict]]
+        self.orderbooks = {}  # type: Dict[str, Dict[str, dict]]
         self.opportunities_brutes = deque(maxlen=self.max_opportunities)
-        self._last_emit = {}                                # type: Dict[tuple, float]
+        # Taille max utilisée aussi pour le backpressure (cf. _evaluate_pair/snapshot)
+        self._maxlen = int(self.max_opportunities)
+
+        self._last_emit = {}  # type: Dict[tuple, float]
         self._running = False
-        self._task = None                                   # type: Optional[asyncio.Task]
+        self._task = None  # type: Optional[asyncio.Task]
         self.last_scan_time = 0.0
         self.opportunity_count = 0
         self.active_pairs_count = 0
         self.scan_frequency = 0.0
         self.average_spread = D("0")
         self.net_positive_count = 0
-        self._last_opp_ts_by_pair = {}                     # type: Dict[str, float]
+        self._last_opp_ts_by_pair = {}  # type: Dict[str, float]
+
+        # Dédup courte par paire (worker mode)
+        self._last_scan_ts_by_pair = {}  # type: Dict[str, float]
+
+        # Fraîcheur des books par exchange (latence WS→Scanner)
+        self._last_seen_books_by_ex = {}  # type: Dict[str, float]
+
+        # Fenêtre glissante de profondeur QUOTE par (exchange, pair)
+        # utilisée par _depth_quote_snapshot / _depth_usd_p95
+        self._depth_window_usd = defaultdict(lambda: deque(maxlen=64))
+
+        # Liste d'exchanges utilisée en mode pull (tick); peut être override par Boot
+        self.exchanges: List[str] = []
+
 
         # Compteurs de filtrage / backpressure
         self.queue_drops = 0
@@ -816,6 +835,29 @@ class OpportunityScanner:
 
         # Évalue uniquement la paire concernée
         self.check_opportunity(pair)
+
+    # ---------------- Pull utils ----------------
+    def get_books(self) -> Dict[str, Dict[str, dict]]:
+        """
+        Mode pull : retourne un snapshot des orderbooks par exchange/pair.
+
+        Par défaut on expose simplement le cache interne alimenté par
+        update_orderbook(). Un environnement peut surcharger cette méthode
+        (monkey-patch) tant qu'il renvoie un mapping du type :
+
+            {
+                "BINANCE": { "BTCUSDC": {...}, ... },
+                "BYBIT":   { ... },
+                ...
+            }
+
+        où chaque valeur interne est un dict contenant au minimum les
+        champs utilisés par le Scanner (best_bid/best_ask, orderbook, ts, ...).
+        """
+        books = self.orderbooks or {}
+        # Shallow-copy pour éviter que l'appelant ne mute nos dicts internes.
+        return {ex: dict(pairs) for ex, pairs in books.items()}
+
 
     # ---------------- Pull utils ----------------
     def _top_pairs(self) -> List[str]:
@@ -2470,6 +2512,121 @@ class OpportunityScanner:
     async def restart(self):
         await self.stop()
         await self.start()
+
+    def _next_candidate_pair(self) -> Optional[str]:
+        """
+        Sélectionne la prochaine paire à scanner pour les workers (_scan_loop).
+
+        Stratégie :
+        1) Si des évènements existent dans _queues, on privilégie une paire
+           avec du backlog (file non vide).
+        2) Sinon on itère en round-robin sur _top_pairs(), qui reflète
+           l’univers + la priorisation (CORE/PRIMARY/AUDITION/SANDBOX).
+        """
+        # 1) Backlog explicite (mode évènementiel, future-proof)
+        try:
+            queues = getattr(self, "_queues", {}) or {}
+            non_empty = [(pk, dq) for pk, dq in queues.items() if dq]
+        except Exception:
+            non_empty = []
+
+        if non_empty:
+            # On choisit la paire avec la file la plus longue
+            non_empty.sort(key=lambda kv: len(kv[1]), reverse=True)
+            return non_empty[0][0]
+
+        # 2) Fallback : round-robin sur l'univers priorisé
+        pairs = getattr(self, "_rr_pairs", None)
+        idx = int(getattr(self, "_rr_index", 0))
+
+        if not pairs:
+            pairs = self._top_pairs()
+            self._rr_pairs = list(pairs)
+            self._rr_index = 0
+            idx = 0
+
+        if not pairs:
+            return None
+
+        if idx >= len(pairs):
+            pairs = self._top_pairs()
+            self._rr_pairs = list(pairs)
+            self._rr_index = 0
+            idx = 0
+            if not pairs:
+                return None
+
+        pair = pairs[idx]
+        self._rr_index = idx + 1
+        return pair
+
+    def _dedup_ok(self, pair: str) -> bool:
+        """
+        Garde-fou de déduplication courte par paire pour le mode worker.
+
+        On évite de rescanner boucles infinies sur la même paire si un worker
+        vient de la traiter il y a moins de `_dedup_window_s` secondes,
+        même si aucune opp n’a été émise (pré-filtres bloquants, etc.).
+        """
+        window = float(getattr(self, "_dedup_window_s", 0.0) or 0.0)
+        if window <= 0.0:
+            return True
+
+        try:
+            pk = self._norm_pair(pair)
+        except Exception:
+            pk = (pair or "").replace("-", "").upper()
+
+        now = time.time()
+        last = float(self._last_scan_ts_by_pair.get(pk, 0.0) or 0.0)
+        if last and (now - last) < window:
+            # On compte dans le bloc "dedup" mais sans spammer les logs
+            try:
+                self.blocks["dedup"] += 1
+            except Exception:
+                pass
+            return False
+
+        self._last_scan_ts_by_pair[pk] = now
+        return True
+
+    def _pop_latest_event(self, pair: str) -> Optional[dict]:
+        """
+        Récupère le dernier évènement pour une paire dans le mode worker.
+
+        - Si _queues contient des évènements pour cette paire → on prend
+          le plus récent (LIFO).
+        - Sinon, on fabrique un évènement minimal basé sur le dernier
+          snapshot orderbook connu, pour garder un comportement correct
+          même si le Router ne remplit pas encore _queues.
+        """
+        try:
+            pk = self._norm_pair(pair)
+        except Exception:
+            pk = (pair or "").replace("-", "").upper()
+
+        # 1) Mode file évènementielle (future-proof)
+        dq = None
+        try:
+            queues = getattr(self, "_queues", {}) or {}
+            dq = queues.get(pk)
+        except Exception:
+            dq = None
+
+        if dq:
+            try:
+                return dq.pop()
+            except IndexError:
+                pass
+
+        # 2) Fallback : évènement synthétique à partir du cache orderbooks
+        for ex, per_pair in (self.orderbooks or {}).items():
+            if pk in per_pair:
+                # _evaluate_routes_for_pair ne lit pas encore `ev`, un dict non vide suffit
+                return {"pair": pk, "exchange": ex, "ts": time.time()}
+
+        # Aucun snapshot disponible pour cette paire
+        return None
 
     async def _scan_loop(self):
         await asyncio.sleep(random.random() * 0.03)  # jitter

@@ -1842,14 +1842,8 @@ class RiskManager:
             return 0.0
         return self._apply_caps_and_preempt_legacy(strategy, ex, desired_notional)
 
-    def _maybe_fire_mm_inventory_single(self, opp: Dict[str, Any]) -> None:
-        """
-        MM inventaire: déclenche un seul maker (BUY ou SELL) sur un CEX
-        si l'exposition / skew dépasse un certain seuil.
-
-        Ce helper ne regarde PAS le spread scanner :
-        il est purement piloté par l'état d'inventaire.
-        """
+    def _maybe_fire_mm_inventory_single(self, opp: Dict[str, Any], reason: str) -> None:
+        """Déclenche un maker inventaire vers l'Engine via la file standard."""
         if not getattr(self, "mm_inventory_enabled", False):
             return
 
@@ -1858,63 +1852,59 @@ class RiskManager:
             return
         pk = self._norm_pair(pair)
 
-        # Choisir un exchange de référence pour l'inventaire MM
+
         ex = (opp.get("buy_ex") or opp.get("sell_ex") or "").upper()
         if not ex:
             return
 
-        # Snapshot d'inventaire
+
         snap = getattr(self, "balances", None) or {}
         base = self._pair_base(pk)
-        quote = self._pair_quote(pk)
+
 
         try:
             base_pos = float((snap.get(ex, {}).get(base) or {}).get("free", 0.0))
         except Exception:
             base_pos = 0.0
 
-        # Convertir en USD approximatif via prix mid
+
         bid, ask = getattr(self, "get_top_of_book", lambda *a: (0.0, 0.0))(ex, pk)
         mid = (float(bid) + float(ask)) / 2.0 if (bid and ask) else 0.0
         inv_usd = base_pos * mid
 
-        # Skew en % vs notional cible (grossier mais suffisant pour P0)
+
         notional_target = float(getattr(self, "notional_usd", 0.0) or opp.get("notional_usdc") or 0.0)
         if notional_target <= 0:
-            notional_target = abs(inv_usd)  # fallback
-
-        skew_pct = 0.0
-        if notional_target > 0:
-            skew_pct = 100.0 * inv_usd / notional_target
-
+            notional_target = abs(inv_usd)
+        skew_pct = 100.0 * inv_usd / notional_target if notional_target else 0.0
         max_skew = float(getattr(self, "mm_inventory_max_skew_pct", 15.0) or 0.0)
         min_notional = float(getattr(self, "mm_inventory_notional_usd", 0.0) or 0.0)
 
         if abs(skew_pct) < max_skew or abs(inv_usd) < min_notional:
-            # rien à faire: l'inventaire n'est pas assez "déformé"
+
             return
 
-        # Décider le sens du maker:
-        # - inv_usd > 0 → trop de base → on veut VENDRE base → maker SELL
-        # - inv_usd < 0 → trop short base → on veut ACHETER base → maker BUY
-        maker_side = "SELL" if inv_usd > 0 else "BUY"
 
-        amount_quote = abs(inv_usd)
+        maker_side = "SELL" if inv_usd > 0 else "BUY"
+        amount_quote = max(abs(inv_usd), 0.0)
+
+        try:
+            ttl_ms = int(getattr(self, "mm_ttl_ms", 2300))
+        except Exception:
+            ttl_ms = 2300
 
         payload = {
+            "type": "mm_single_inventory",
             "pair": pk,
             "exchange": ex,
             "side": maker_side,
             "amount_quote": amount_quote,
-            # On laisse le Engine choisir ttl_ms (mm_ttl_ms) pour P0
+            "ttl_ms": ttl_ms,
+            "meta": {"branch": "MM", "mm_mode": "SINGLE", "reason": reason},
         }
 
         try:
-            # fire & forget: l'Engine gère TTL + panic hedge
-            self.engine._spawn(
-                self.engine.mm_single_inventory(payload),
-                name=f"mm-inv-{pk}-{ex}",
-            )
+            self.engine._spawn(self.engine.execute(payload), name=f"mm-inv-{pk}-{ex}")
         except Exception:
             if getattr(self, "log", None):
                 self.log.exception("RM._maybe_fire_mm_inventory_single: failed")
@@ -9437,7 +9427,7 @@ class RiskManager:
                     and mm_dual_attempted
                     and not mm_dual_enqueued
             ):
-                self._maybe_fire_mm_inventory_single(opp)
+                self._maybe_fire_mm_inventory_single(opp, reason="dual_fallback")
         except Exception:
             if getattr(self, "log", None):
                 self.log.exception("RM.on_scanner_opportunity: mm_inventory_single failed")
@@ -9858,6 +9848,13 @@ class RiskManager:
         # Injection explicite de la décision TM dans le payload pour l'Engine
         if tm_meta and isinstance(bundle, dict):
             bundle.setdefault("tm", tm_meta)
+
+        if strategy_u == "MM" and isinstance(bundle, dict):
+            meta_mm = bundle.setdefault("meta", {}) or {}
+            meta_mm.setdefault("branch", "MM")
+            meta_mm.setdefault("strategy", "MM")
+            meta_mm.setdefault("capital_profile", "MM")
+            meta_mm.setdefault("mm_mode", "DUAL")
 
         # --- Contrat M3-3 : TTL MM owner = RM (per-bundle) -----------------
         if strategy_u == "MM":
