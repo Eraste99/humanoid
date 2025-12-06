@@ -501,6 +501,13 @@ class RiskManagerCfg:
     tm_queuepos_max_eta_ms: int = 1200
     tm_neutral_hedge_ratio: float = 0.60
 
+    # Collat / marge alias-aware
+    collat_default_min_usd: float = 500.0
+    collat_alias_overrides: Dict[str, Dict] = field(default_factory=dict)
+    collat_ratio_warn: float = 1.1
+    collat_ratio_crit: float = 1.0
+    collat_quotes: List[str] = field(default_factory=lambda: ["USDC", "USDT", "USD", "EUR"])
+
     sfc_slippage_source: str = "fills"  # fills|hybrid|off
     prefilter_slip_bps: float = 2.0
     mm_ttl_ms: int = 2200
@@ -1430,6 +1437,22 @@ class BotConfig:
         cfg.rm.mm_min_net_bps = _Env.get_float("RM_MM_MIN_NET_BPS", cfg.rm.mm_min_net_bps)
         cfg.rm.mm_hedge_cost_bps = _Env.get_float("RM_MM_HEDGE_COST_BPS", cfg.rm.mm_hedge_cost_bps)
         cfg.rm.mm_vol_bps_max = _Env.get_float("RM_MM_VOL_BPS_MAX", cfg.rm.mm_vol_bps_max)
+        cfg.rm.collat_default_min_usd = _Env.get_float(
+            "RM_COLLAT_DEFAULT_MIN_USD", cfg.rm.collat_default_min_usd
+        )
+        cfg.rm.collat_alias_overrides = _Env.get_dict(
+            "RM_COLLAT_ALIAS_OVERRIDES", cfg.rm.collat_alias_overrides
+        )
+        cfg.rm.collat_ratio_warn = _Env.get_float(
+            "RM_COLLAT_RATIO_WARN", cfg.rm.collat_ratio_warn
+        )
+        cfg.rm.collat_ratio_crit = _Env.get_float(
+            "RM_COLLAT_RATIO_CRIT", cfg.rm.collat_ratio_crit
+        )
+        cfg.rm.collat_quotes = _Env.get_list(
+            "RM_COLLAT_QUOTES", cfg.rm.collat_quotes
+        )
+
         cfg.rm.global_kill_switch = _Env.get_bool("GLOBAL_KILL_SWITCH", cfg.rm.global_kill_switch)
         cfg.rm.daily_strategy_budget_quote = _Env.get_dict("DAILY_STRATEGY_BUDGET_QUOTE",
                                                            cfg.rm.daily_strategy_budget_quote)

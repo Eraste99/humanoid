@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
+import self
+
 """
     Chef d’orchestre strict — **multi-comptes (TT/TM) par CEX**
 
@@ -43,9 +46,9 @@ from dataclasses import dataclass, asdict
 import json
 from contracts import payloads as fraglib
 
-from typing import Any, Dict, List, Optional, Callable, Tuple, Set,Iterable
+from typing import Any, Dict, List, Optional, Callable, Tuple, Set, Iterable
 import math, random
-
+import unittest
 
 # RM_* : décisions métier / risque prises par le RiskManager.
 # ENGINE_* : rejets techniques ou incapacité du moteur / CEX (backpressure, erreurs réseau, etc.).
@@ -56,6 +59,9 @@ RM_BELOW_MIN_BPS = "RM_BELOW_MIN_BPS"
 RM_BELOW_MIN_NOTIONAL = "RM_BELOW_MIN_NOTIONAL"
 RM_BALANCE_TTL_BLOCK = "RM_BALANCE_TTL_BLOCK"
 RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
+
+RM_ALIAS_COLLAT_CRITICAL = "RM_ALIAS_COLLAT_CRITICAL"
+RM_ALIAS_COLLAT_LOW = "RM_ALIAS_COLLAT_LOW"
 
 ENGINE_BACKPRESSURE_QUEUE_FULL = "ENGINE_BACKPRESSURE_QUEUE_FULL"
 ENGINE_BACKPRESSURE_CAP_BRANCH = "ENGINE_BACKPRESSURE_CAP_BRANCH"
@@ -107,7 +113,7 @@ except Exception:
 from modules.obs_metrics import (
     mark_books_fresh, mark_balances_fresh, inc_rm_reject,
     set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
-    get_counter, safe_inc,
+    get_counter, get_gauge, safe_inc,
 )
 from modules.bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
@@ -145,6 +151,24 @@ RM_CAPS_BUNDLE_CALLS_TOTAL = get_counter(
     "rm_caps_bundle_calls_total",
     "Bundle-level caps/preemption path invocations",
 )
+
+# --- Collat health ----------------------------------------------------------
+RM_ALIAS_COLLAT_RATIO = get_gauge(
+    "rm_alias_collat_ratio",
+    "Alias-level collateral ratio (USD-like holdings / min_usd)",
+    labelnames=("exchange", "alias"),
+)
+RM_ALIAS_COLLAT_STATE = get_gauge(
+    "rm_alias_collat_state",
+    "Alias-level collateral state (0=OK,1=LOW,2=CRITICAL)",
+    labelnames=("exchange", "alias"),
+)
+RM_ALIAS_COLLAT_LOW_TOTAL = get_counter(
+    "rm_alias_collat_low_total",
+    "Alias collateral LOW state occurrences during gating",
+    labelnames=("exchange", "alias", "branch"),
+)
+
 
 # --- MM obs: budgets, preemptions, wallet inventory ------------------------
 RM_MM_BUDGET_SPENT_QUOTE = get_counter(
@@ -764,6 +788,12 @@ class RiskManager:
         self.cfg = base_cfg
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.history_logger = history_logger
+        # Hooks optionnels : observabilité (obs_inc) et mute de routes.
+        # Le Boot / orchestrateur peut les remplir via set_obs_inc_callback /
+        # set_mute_route_callback ou en assignant directement _obs_inc_cb/_mute_route_cb.
+        self._obs_inc_cb: Optional[Callable[[str], Any]] = None
+        self._mute_route_cb: Optional[Callable[..., Any]] = None
+
         self._combo_cap_window_s = float(
             getattr(getattr(self.cfg, "rm", None), "combo_cap_window_s", 120.0) or 120.0
         )
@@ -824,23 +854,23 @@ class RiskManager:
         if self.mm_mode == "OFF":
             self.enable_mm = False
 
-            # Tailles/slots MM par profil (définies dans BotConfig.rm)
-            rm_cfg = getattr(self.cfg, "rm", None)
-            slot_cfg = getattr(rm_cfg, "mm_slot_notional_usdc_by_profile", {}) or {}
-            self.mm_slot_notional_usdc_by_profile: Dict[str, float] = {
-                str(k).upper(): float(v)
-                for k, v in slot_cfg.items()
-            }
-            pair_ratio_cfg = getattr(rm_cfg, "mm_pair_cap_ratio_by_profile", {}) or {}
-            self.mm_pair_cap_ratio_by_profile: Dict[str, float] = {
-                str(k).upper(): float(v)
-                for k, v in pair_ratio_cfg.items()
-            }
-            slots_per_pair_cfg = getattr(rm_cfg, "mm_slots_per_pair_by_profile", {}) or {}
-            self.mm_slots_per_pair_by_profile: Dict[str, int] = {
-                str(k).upper(): int(v)
-                for k, v in slots_per_pair_cfg.items()
-            }
+        # Tailles/slots MM par profil (définies dans BotConfig.rm)
+        rm_cfg = getattr(self.cfg, "rm", None)
+        slot_cfg = getattr(rm_cfg, "mm_slot_notional_usdc_by_profile", {}) or {}
+        self.mm_slot_notional_usdc_by_profile: Dict[str, float] = {
+            str(k).upper(): float(v)
+            for k, v in slot_cfg.items()
+        }
+        pair_ratio_cfg = getattr(rm_cfg, "mm_pair_cap_ratio_by_profile", {}) or {}
+        self.mm_pair_cap_ratio_by_profile: Dict[str, float] = {
+            str(k).upper(): float(v)
+            for k, v in pair_ratio_cfg.items()
+        }
+        slots_per_pair_cfg = getattr(rm_cfg, "mm_slots_per_pair_by_profile", {}) or {}
+        self.mm_slots_per_pair_by_profile: Dict[str, int] = {
+            str(k).upper(): int(v)
+            for k, v in slots_per_pair_cfg.items()
+        }
 
         # --- MM rebalancing ladder (mono-CEX + intra + cross) ---
         self.mm_reb_inventory_soft_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_soft_pct", 5.0)
@@ -1239,6 +1269,7 @@ class RiskManager:
         # Clés toujours en UPPER pour être robustes.
         self._alias_balance_age_s: Dict[Tuple[str, str], float] = {}
         self._alias_balance_status: Dict[Tuple[str, str], str] = {}
+        self.alias_collat_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         # Cache local des statuts comptes WS (Hub + Reconciler) vus via MBF.as_rm_snapshot().
         # Clés: (EX, ALIAS) en UPPER. Valeur: dict(meta_ws) incluant capital_at_risk/hub_status/reco_status...
@@ -1263,6 +1294,66 @@ class RiskManager:
         # Cache local des fenêtres "capital en mouvement" par (EXCHANGE, ALIAS)
         # Clés en UPPER, valeurs = dict(state) avec start_ts / deadline_ts / last_notional_usdc.
         self._alias_capital_move_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # Hooks d'observabilité / mute de routes (callbacks injectés par Boot)
+    # ------------------------------------------------------------------
+
+    def set_obs_inc_callback(self, cb: Optional[Callable[[str, Any], Any]]) -> None:
+        """
+        Enregistre un callback pour l'incrément de métriques (obs_inc).
+
+        Exemple typique dans le Boot :
+            rm.set_obs_inc_callback(obs.inc)
+        """
+        self._obs_inc_cb = cb
+
+    def obs_inc(self, metric: str, **labels: Any) -> None:
+        """
+        Incrémente une métrique d'observabilité.
+
+        Délègue à `_obs_inc_cb` si présent et ne laisse jamais remonter d'exception.
+        Si aucun callback n'est configuré, c'est un no-op.
+        """
+        cb = getattr(self, "_obs_inc_cb", None)
+        if cb is None:
+            return
+        try:
+            cb(metric, **labels)
+        except Exception:
+            # Pure obs : jamais bloquant
+            return
+
+    def set_mute_route_callback(self, cb: Optional[Callable[..., Any]]) -> None:
+        """
+        Enregistre un callback pour muter une route (buy_ex, sell_ex, pair).
+
+        Exemple dans le Boot :
+            rm.set_mute_route_callback(router.mute_route_for)
+        """
+        self._mute_route_cb = cb
+
+    def mute_route_for(
+        self,
+        buy_ex: str,
+        sell_ex: str,
+        pair: str,
+        *,
+        ttl_s: float | int,
+        reason: Optional[str] = None,
+    ) -> None:
+        """
+        Mute temporairement une route (buy_ex, sell_ex, pair) en déléguant à `_mute_route_cb`
+        si celui-ci est défini. Sinon, no-op.
+        """
+        cb = getattr(self, "_mute_route_cb", None)
+        if cb is None:
+            return
+        try:
+            cb(buy_ex, sell_ex, pair, ttl_s=ttl_s, reason=reason)
+        except Exception:
+            # Ne jamais bloquer le RM à cause d'un problème de mute côté Router.
+            return
 
 
     @property
@@ -1326,12 +1417,90 @@ class RiskManager:
             f"mode={mode}, total_usdc={total_usdc:.2f}"
         )
 
+    try:
+        self._refresh_alias_collat_from_mbf(now=self.last_capital_update_ts)
+    except Exception:
+        self.logger.debug("[RM] _refresh_alias_collat_from_mbf failed", exc_info=False)
+
     def update_capital_from_mbf(self, *, mode: str = "merged") -> None:
         """
         Wrapper public pour compatibilité ascendante.
         Préférer l'usage interne de _refresh_capital_from_buffers().
         """
         self._refresh_capital_from_buffers(mode=mode)
+
+    def _refresh_alias_collat_from_mbf(self, now: float | None = None) -> None:
+        """Rafraîchit la vue collat/marge par alias depuis le MBF."""
+        glue = getattr(self, "_mbf_glue", None) or getattr(self, "mbf", None)
+        if not glue or not hasattr(glue, "as_buffers_snapshot"):
+            return
+
+        try:
+            snapshot = glue.as_buffers_snapshot(mode="merged", cached_only=True)
+        except Exception as exc:
+            self.logger.debug("[RM] collat snapshot MBF failed: %s", exc, exc_info=False)
+            return
+
+        pockets = snapshot.get("pockets_by_quote", {}) or {}
+        meta = snapshot.get("meta") or {}
+        age_s = None
+        try:
+            age_s = float(meta.get("age_s")) if meta.get("age_s") is not None else None
+        except Exception:
+            age_s = None
+
+        cfg_rm = getattr(self.cfg, "rm", None)
+        min_default = float(getattr(cfg_rm, "collat_default_min_usd", 0.0) or 0.0)
+        ratio_warn = float(getattr(cfg_rm, "collat_ratio_warn", 1.1) or 1.1)
+        ratio_crit = float(getattr(cfg_rm, "collat_ratio_crit", 1.0) or 1.0)
+        overrides = getattr(cfg_rm, "collat_alias_overrides", {}) or {}
+        collat_quotes = [str(q).upper() for q in (getattr(cfg_rm, "collat_quotes", []) or [])]
+        now_ts = float(now) if now is not None else time.time()
+
+        for ex, aliases in pockets.items():
+            for alias, quotes in (aliases or {}).items():
+                ex_u = str(ex).upper()
+                alias_u = str(alias).upper()
+                collat_usd = 0.0
+                for quote, value in (quotes or {}).items():
+                    if str(quote).upper() in collat_quotes:
+                        try:
+                            collat_usd += float(value or 0.0)
+                        except Exception:
+                            collat_usd += 0.0
+
+                key = f"{ex_u}.{alias_u}"
+                override = overrides.get(key, {}) if isinstance(overrides, dict) else {}
+                min_usd = float(override.get("min_usd", min_default) or 0.0)
+
+                if min_usd <= 0:
+                    ratio = float("inf")
+                    state = "OK"
+                else:
+                    ratio = collat_usd / min_usd if min_usd else float("inf")
+                    if ratio < ratio_crit:
+                        state = "CRITICAL"
+                    elif ratio < ratio_warn:
+                        state = "LOW"
+                    else:
+                        state = "OK"
+
+                state_val = {"OK": 0, "LOW": 1, "CRITICAL": 2}.get(state, 0)
+
+                self.alias_collat_state[(ex_u, alias_u)] = {
+                    "collat_usd": collat_usd,
+                    "min_usd": min_usd,
+                    "ratio": ratio,
+                    "state": state,
+                    "age_s": age_s,
+                    "last_update_ts": now_ts,
+                }
+
+                try:
+                    RM_ALIAS_COLLAT_RATIO.labels(exchange=ex_u, alias=alias_u).set(ratio)
+                    RM_ALIAS_COLLAT_STATE.labels(exchange=ex_u, alias=alias_u).set(state_val)
+                except Exception:
+                    pass
 
     def check_capital_drift(self, threshold_pct: float | None = None) -> None:
         """
