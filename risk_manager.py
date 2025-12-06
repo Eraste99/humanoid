@@ -724,6 +724,7 @@ class RiskManager:
     _as_str_or = staticmethod(_as_str_or)
     _as_dict_or_empty = staticmethod(_as_dict_or_empty)
     _as_list_upper=staticmethod(_as_list_upper)
+    _pair_quote = staticmethod(_pair_quote)  # si tu veux pouvoir l’appeler en self._pair_quote(...)
 
 
     def __init__(
@@ -822,6 +823,24 @@ class RiskManager:
         self.mm_alias = _cfg_str(self.bot_cfg, "mm_alias_name", "MM").upper()
         if self.mm_mode == "OFF":
             self.enable_mm = False
+
+            # Tailles/slots MM par profil (définies dans BotConfig.rm)
+            rm_cfg = getattr(self.cfg, "rm", None)
+            slot_cfg = getattr(rm_cfg, "mm_slot_notional_usdc_by_profile", {}) or {}
+            self.mm_slot_notional_usdc_by_profile: Dict[str, float] = {
+                str(k).upper(): float(v)
+                for k, v in slot_cfg.items()
+            }
+            pair_ratio_cfg = getattr(rm_cfg, "mm_pair_cap_ratio_by_profile", {}) or {}
+            self.mm_pair_cap_ratio_by_profile: Dict[str, float] = {
+                str(k).upper(): float(v)
+                for k, v in pair_ratio_cfg.items()
+            }
+            slots_per_pair_cfg = getattr(rm_cfg, "mm_slots_per_pair_by_profile", {}) or {}
+            self.mm_slots_per_pair_by_profile: Dict[str, int] = {
+                str(k).upper(): int(v)
+                for k, v in slots_per_pair_cfg.items()
+            }
 
         # --- MM rebalancing ladder (mono-CEX + intra + cross) ---
         self.mm_reb_inventory_soft_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_soft_pct", 5.0)
@@ -2239,7 +2258,15 @@ class RiskManager:
 
         return True, ""
 
-        return True, ""
+    def _mm_slot_notional_for_profile(self, profile: str, *, min_trade_usdc: float) -> float:
+        """Renvoie la taille cible d'un slot MM pour le profil capital donné."""
+        prof = str(profile or "LARGE").upper()
+        try:
+            slot = float(self.mm_slot_notional_usdc_by_profile.get(prof, 0.0))
+        except Exception:
+            slot = 0.0
+        slot = max(slot, float(min_trade_usdc))
+        return slot
 
     # modules/risk_manager.py — class RiskManager
 
@@ -4618,7 +4645,7 @@ class RiskManager:
 
     def _budget_allows(self, strategy: str, notional_quote: float) -> tuple[bool, str]:
         return self._check_and_reserve_daily_budget(strategy, notional_quote)
-    
+
 
     def _record_budget_spend(self, strategy: Optional[str], bundle: Dict[str, Any]) -> None:
         try:
@@ -9691,7 +9718,12 @@ class RiskManager:
         # 5.b) MM dual : seulement si la paire est éligible et qu’aucun TT/TM n’a tiré
         if "MM" in strategies and caps.get("MM", 0) > 0 and not sent_any:
             mm_dual_attempted = True
+
             try:
+                slot_notional = self._mm_slot_notional_for_profile(profile_name, min_trade_usdc=min_trade_usdc)
+                opp = dict(opp)
+                opp.setdefault("notional_usdc", slot_notional)
+                opp.setdefault("notional_quote", {"ccy": "USDC", "amount": slot_notional})
                 bundle = self._build_bundle(opp, strategy="MM")
                 if bundle:
                     self._multicast_shadow(bundle)

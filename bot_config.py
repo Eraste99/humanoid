@@ -510,6 +510,38 @@ class RiskManagerCfg:
     mm_min_p_both: float = 0.0
     mm_min_net_bps: float = 0.0005
     mm_hedge_cost_bps: float = 5.0
+
+    # Tailles cibles d'un slot MM par profil capital (USD/quote)
+    mm_slot_notional_usdc_by_profile: Dict[str, float] = field(
+        default_factory=lambda: {
+            "NANO": 25.0,
+            "MICRO": 50.0,
+            "SMALL": 120.0,
+            "MID": 180.0,
+            "LARGE": 250.0,
+        }
+    )
+    # Cap par paire (ratio du budget MM profil) ; appliqué côté RiskManager
+    mm_pair_cap_ratio_by_profile: Dict[str, float] = field(
+        default_factory=lambda: {
+            "NANO": 0.25,
+            "MICRO": 0.25,
+            "SMALL": 0.25,
+            "MID": 0.30,
+            "LARGE": 0.30,
+        }
+    )
+    # Nombre max de slots simultanés par paire (soft-cap piloté par profil)
+    mm_slots_per_pair_by_profile: Dict[str, int] = field(
+        default_factory=lambda: {
+            "NANO": 1,
+            "MICRO": 2,
+            "SMALL": 2,
+            "MID": 3,
+            "LARGE": 4,
+        }
+    )
+
     # Seuil MM côté RM (non utilisé pour l’instant) :
     # - Scanner.mm_vol_bps_max = couche soft : coupe les hints MM en vol élevée.
     # - RiskManager.mm_vol_bps_max = garde-fou hard éventuel (par profil / VM) si on
