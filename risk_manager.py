@@ -926,6 +926,7 @@ class RiskManager:
 
         # Delta MM (mesure + garde-fou P0)
         self.mm_delta_state: dict[str, dict] = {}
+        self.mm_pair_spent_usdc: dict[tuple[str, str, str], float] = {}
         self.mm_last_hedge_ts: dict[str, float] = {}
 
         # Expo globale TT/TM par asset (VaR-lite).
@@ -1831,6 +1832,82 @@ class RiskManager:
         a = str(asset).upper()
         return self.mm_delta_state.get(a)
 
+    def _update_mm_delta_from_event(self, event: Dict[str, Any]) -> None:
+        try:
+            meta = event.get("meta") or {}
+            branch = str(meta.get("branch") or meta.get("strategy") or meta.get("kind") or "").upper()
+            if branch not in {"MM", "MAKER_MM"}:
+                return
+
+            symbol = event.get("symbol") or meta.get("pair") or meta.get("symbol")
+            pk = self._norm_pair(symbol or "")
+            if not pk:
+                return
+            base_asset = self._pair_base(pk)
+            if not base_asset:
+                return
+
+            try:
+                fill_px = float(event.get("fill_px") or meta.get("fill_px") or 0.0)
+                base_qty = float(event.get("base_qty") or meta.get("base_qty") or 0.0)
+            except Exception:
+                fill_px = 0.0
+                base_qty = 0.0
+            if fill_px <= 0 or base_qty == 0:
+                return
+
+            side = str(event.get("side") or meta.get("side") or "").upper()
+            signed_delta = base_qty * fill_px
+            if side == "SELL":
+                signed_delta *= -1.0
+
+            prev_state = self.mm_delta_state.get(base_asset, {}) if isinstance(self.mm_delta_state, dict) else {}
+            delta_usd = float(prev_state.get("delta_usd") or 0.0) + signed_delta
+            delta_sq = float(prev_state.get("delta_sq_usd2") or 0.0) + signed_delta ** 2
+
+            cfg_rm = getattr(self.cfg, "rm", None)
+            default_soft = float(getattr(cfg_rm, "mm_delta_soft_usd", 0.0) or 0.0)
+            default_hard = float(getattr(cfg_rm, "mm_delta_hard_usd", 0.0) or 0.0)
+            overrides = getattr(cfg_rm, "mm_delta_by_asset", {}) or {}
+            override = overrides.get(base_asset) or overrides.get(base_asset.upper()) or {}
+            soft_limit = float(override.get("soft_usd", default_soft) or default_soft)
+            hard_limit = float(override.get("hard_usd", default_hard) or default_hard)
+
+            abs_delta = abs(delta_usd)
+            state_simple = "OK"
+            status = "FLAT"
+            if hard_limit > 0 and abs_delta > hard_limit:
+                state_simple = "HARD"
+                status = "LONG_HARD" if delta_usd > 0 else "SHORT_HARD"
+            elif soft_limit > 0 and abs_delta > soft_limit:
+                state_simple = "SOFT"
+                status = "LONG_SOFT" if delta_usd > 0 else "SHORT_SOFT"
+            elif delta_usd != 0:
+                status = "LONG_SOFT" if delta_usd > 0 else "SHORT_SOFT"
+
+            state_val = {"OK": 0, "SOFT": 1, "HARD": 2}.get(state_simple, 0)
+            now_ts = float(event.get("ts") or event.get("ts_local") or time.time())
+            self.mm_delta_state[base_asset] = {
+                "delta_usd": delta_usd,
+                "delta_sq_usd2": delta_sq,
+                "soft_usd": soft_limit,
+                "hard_usd": hard_limit,
+                "status": status,
+                "state": state_simple,
+                "last_update_ts": now_ts,
+            }
+
+            try:
+                RM_MM_DELTA_USD.labels(asset=base_asset).set(delta_usd)
+                RM_MM_DELTA_STATE.labels(asset=base_asset).set(state_val)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                logger.debug("[RM] mm_delta_from_event failed", exc_info=False)
+            except Exception:
+                pass
+
     def _register_tt_stuck_leg(self, leg_info: Dict[str, Any]) -> None:
         """
         Enregistre un leg TT coincé dans tt_stuck_state.
@@ -2399,6 +2476,173 @@ class RiskManager:
         cap_profile = (budget_branches / max(1, branches)) * 0.6
         return max(10.0, min(cap_tail, cap_profile))
 
+    def _mm_wallet_key(self, exchange: str, quote: str) -> tuple[str, str]:
+        return str(exchange or "").upper(), str(quote or "").upper()
+
+    def _mm_wallet_remaining(self, exchange: str, quote: str) -> float:
+        exu, q = self._mm_wallet_key(exchange, quote)
+        return max(0.0, float(self.virt_balances.get(exu, {}).get(q, 0.0)))
+
+    def _mm_wallet_reserve(
+            self,
+            exchange: str,
+            quote: str,
+            amt: float,
+            *,
+            dry_run: bool = False,
+            reason: str = "",
+            profile: str | None = None,
+    ) -> bool:
+        exu, q = self._mm_wallet_key(exchange, quote)
+        need = float(amt or 0.0)
+        cur = self._mm_wallet_remaining(exu, q)
+        if cur < need or need <= 0.0:
+            return False
+        if dry_run:
+            return True
+
+        self.virt_balances.setdefault(exu, {})[q] = cur - need
+        try:
+            self._maybe_reset_daily_budget()
+            strat = "MM"
+            self._spent_today_quote[strat] = self._spent_today_quote.get(strat, 0.0) + need
+        except Exception:
+            pass
+
+        prof_label = str(profile or getattr(self, "capital_profile", "UNKNOWN") or "UNKNOWN").upper()
+        try:
+            RM_MM_BUDGET_SPENT_QUOTE.labels(prof_label, exu or "UNKNOWN", q or "UNKNOWN").inc(need)
+        except Exception:
+            pass
+        if INVENTORY_USD:
+            try:
+                INVENTORY_USD.labels(exu, q).set(self.virt_balances[exu][q])
+            except Exception:
+                logging.exception("Unhandled exception")
+        return True
+
+    def _mm_wallet_release(self, exchange: str, quote: str, amt: float, *, reason: str = "") -> None:
+        exu, q = self._mm_wallet_key(exchange, quote)
+        add = float(amt or 0.0)
+        cur = self._mm_wallet_remaining(exu, q)
+        new_val = max(cur + add, 0.0)
+        self.virt_balances.setdefault(exu, {})[q] = new_val
+        try:
+            if INVENTORY_USD:
+                INVENTORY_USD.labels(exu, q).set(new_val)
+        except Exception:
+            logging.exception("Unhandled exception")
+
+    def _mm_pair_headroom(self, profile: str, exchange: str, pair_key: str, quote: str) -> float:
+        prof = str(profile or "LARGE").upper()
+        exu, pk, q = str(exchange or "").upper(), self._norm_pair(pair_key), str(quote or "USDC").upper()
+        spent = float(self.mm_pair_spent_usdc.get((prof, exu, pk), 0.0))
+
+        params = self.get_mm_slot_params(prof)
+        slot_notional = float(params.get("slot_notional_usdc") or 0.0)
+        slots_per_pair = int(params.get("slots_per_pair") or 0)
+        cap_ratio = float(params.get("pair_cap_ratio") or self.mm_pair_cap_ratio_by_profile.get(prof, 0.0))
+
+        profile_cap = float(self._profile_cap_notional(profile=prof))
+        cap_from_ratio = profile_cap * max(0.0, min(1.0, cap_ratio)) if cap_ratio > 0 else 0.0
+        cap_from_slots = slot_notional * float(slots_per_pair) if slot_notional > 0 and slots_per_pair > 0 else 0.0
+
+        cap_pair = cap_from_ratio if cap_from_ratio > 0 else cap_from_slots
+        remaining = max(cap_pair - spent, 0.0)
+        return remaining
+
+    def _handle_mm_budget_event(self, ev: Dict[str, Any]) -> None:
+        meta = ev.get("meta") or {}
+        branch = str(meta.get("branch") or meta.get("strategy") or meta.get("kind") or "").upper()
+        if branch not in {"MM", "MAKER_MM"}:
+            return
+
+        status = str(ev.get("status") or meta.get("status") or meta.get("state") or "").upper()
+        if status not in {"FILL", "FILLED", "PARTIAL", "PARTIAL_FILL", "CANCEL", "CANCELED", "CANCELLED"}:
+            return
+
+        exchange = str(ev.get("exchange") or meta.get("exchange") or "").upper()
+        quote = str(meta.get("quote") or ev.get("quote") or "").upper()
+        profile = str(meta.get("capital_profile") or meta.get("profile") or getattr(self, "capital_profile",
+                                                                                    "LARGE") or "LARGE").upper()
+        pair_key = meta.get("pair") or ev.get("symbol") or meta.get("symbol")
+        pk = self._norm_pair(pair_key or "")
+
+        if not exchange or not quote or not pk:
+            try:
+                logger.warning("[RM] MM budget release skipped missing data ex=%s quote=%s pair=%s", exchange or "?",
+                               quote or "?", pk or "?")
+            except Exception:
+                pass
+            return
+
+        def _as_float(val: Any) -> Optional[float]:
+            try:
+                return float(val)
+            except Exception:
+                return None
+
+        meta_open_keys = ["prev_open_notional_usdc", "open_notional_prev_usdc", "open_notional_before_usdc"]
+        prev_open = None
+        for key in meta_open_keys:
+            prev_open = _as_float(meta.get(key))
+            if prev_open is not None:
+                break
+
+        new_open = _as_float(meta.get("open_notional_usdc"))
+        if new_open is None:
+            new_open = _as_float(meta.get("remaining_notional_usdc"))
+        if new_open is None:
+            new_open = 0.0 if status in {"FILL", "FILLED", "CANCEL", "CANCELED", "CANCELLED"} else None
+
+        if prev_open is None:
+            try:
+                logger.warning(
+                    "[RM] MM budget release missing prev_open ex=%s pair=%s status=%s", exchange, pk, status
+                )
+            except Exception:
+                pass
+            return
+        if new_open is None:
+            try:
+                logger.warning(
+                    "[RM] MM budget release missing new_open ex=%s pair=%s status=%s", exchange, pk, status
+                )
+            except Exception:
+                pass
+            return
+
+        delta_release = max(prev_open - new_open, 0.0)
+        if delta_release <= 0.0:
+            return
+
+        self._mm_wallet_release(exchange, quote, delta_release, reason=status.lower())
+        key = (profile, exchange, pk)
+        before = float(self.mm_pair_spent_usdc.get(key, 0.0))
+        self.mm_pair_spent_usdc[key] = max(before - delta_release, 0.0)
+
+        try:
+            logger.debug(
+                "[RM] MM budget release ex=%s pair=%s profile=%s quote=%s delta=%.4f spent_before=%.4f spent_after=%.4f",
+                exchange,
+                pk,
+                profile,
+                quote,
+                delta_release,
+                before,
+                self.mm_pair_spent_usdc[key],
+            )
+        except Exception:
+            pass
+
+    def rm_is_asset_under_rebalancing(self, exchange: str, asset: str) -> bool:
+        reb = getattr(self, "rebalancer", None)
+        if not reb or not hasattr(reb, "is_asset_under_rebalancing"):
+            return False
+        try:
+            return bool(reb.is_asset_under_rebalancing(exchange, asset))
+        except Exception:
+            return False
 
     def _reb_cost_fn(self, route: dict) -> float:
         """
@@ -2889,13 +3133,16 @@ class RiskManager:
         côté Engine via bundle_concurrency/headroom_min ; ici on se contente
         d'un pré-check très léger pour la traçabilité.
         """
+        meta = bundle.get("meta") or {}
+        trade_mode = str(meta.get("mode") or getattr(self, "trade_mode", "NORMAL") or "NORMAL").upper()
+
         if not isinstance(caps_local, dict):
-            return False, RM_CAPS_INVALID
+            return False, RM_CAPS_INVALID, trade_mode
 
         inflight_cap = caps_local.get("inflight_cap")
         try:
             if isinstance(inflight_cap, (int, float)) and inflight_cap <= 0:
-                return False, RM_CAPS_ZERO
+                return False, RM_CAPS_ZERO, trade_mode
         except Exception:
             # On ne bloque pas si on ne sait pas interpréter le cap.
             pass
@@ -10908,29 +11155,6 @@ class RiskManager:
                 inc_rm_reject(reason="MM_BUDGET_EXHAUSTED")
                 return None
 
-            remaining = self._mm_pair_budget_remaining(profile, ex_for_mm, pair, mm_quote)
-            if remaining <= 0.0:
-                try:
-                    RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc()
-                except Exception:
-                    pass
-                inc_rm_reject(reason="MM_PAIR_CAP_EXCEEDED")
-                return None
-            if mm_notional > remaining:
-                inc_rm_reject(reason="MM_PAIR_CAP_EXCEEDED")
-                return None
-
-            if not self._reserve_quote(ex_for_mm, mm_quote, mm_notional):
-                try:
-                    RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc()
-                except Exception:
-                    pass
-                inc_rm_reject(reason="MM_BUDGET_EXHAUSTED")
-                return None
-            try:
-                RM_MM_BUDGET_SPENT_QUOTE.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc(mm_notional)
-            except Exception:
-                pass
 
         try:
             total = float((notional or {}).get("amount") or opp.get("notional_usdc") or 0.0)
@@ -11294,6 +11518,25 @@ class RiskManager:
             shadow=False,
             client_id=client_id,
         )
+        base_for_meta = self._pair_base(pk)
+        ex_for_state = ex_for_mm if strategy_u == "MM" else (buy_ex or sell_ex)
+        if base_for_meta:
+            meta_root = bundle.setdefault("meta", {}) or {}
+            mm_state = self.mm_delta_state.get(base_for_meta, {}) if isinstance(self.mm_delta_state, dict) else {}
+            meta_root.setdefault(
+                "mm_delta_state",
+                {
+                    "asset": base_for_meta,
+                    "status": mm_state.get("status", "UNKNOWN"),
+                    "delta_usd": float(mm_state.get("delta_usd") or 0.0),
+                },
+            )
+            try:
+                reb_flag = bool(self.rm_is_asset_under_rebalancing(ex_for_state, base_for_meta))
+            except Exception:
+                reb_flag = False
+            meta_root.setdefault("rebalancing_active", reb_flag)
+            bundle["meta"] = meta_root
 
         # Injection explicite de la décision TM dans le payload pour l'Engine
         if tm_meta and isinstance(bundle, dict):
@@ -11560,7 +11803,7 @@ class RiskManager:
                     pass
             return
 
-        if status not in ("FILL", "PARTIAL"):
+        if status not in ("FILL", "FILLED", "PARTIAL", "PARTIAL_FILL", "CANCEL", "CANCELED", "CANCELLED"):
             return
 
 
@@ -11656,6 +11899,15 @@ class RiskManager:
                 sh.observe_slippage(ev)
             except Exception as exc:
                 _handle_error("slippage_observer_failed", exc)
+        try:
+            self._handle_mm_budget_event(ev)
+        except Exception:
+            logger.debug("[RM] mm budget release handling failed", exc_info=False)
+
+        try:
+            self._update_mm_delta_from_event(ev)
+        except Exception:
+            logger.debug("[RM] mm delta update failed", exc_info=False)
 
 
     # risk_manager.py — dans class RiskManager
