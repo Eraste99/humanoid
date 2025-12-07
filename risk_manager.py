@@ -47,6 +47,7 @@ import json
 from contracts import payloads as fraglib
 
 from typing import Any, Dict, List, Optional, Callable, Tuple, Set, Iterable
+from types import SimpleNamespace
 import math, random
 import unittest
 
@@ -917,13 +918,30 @@ class RiskManager:
         self.mm_delta_state: dict[str, dict] = {}
         self.mm_last_hedge_ts: dict[str, float] = {}
 
-        # TT/TM exposures + stuck TT legs (VaR-lite P0)
-        self.tttm_exposure_state: dict[str, dict] = {}
-        self.tt_stuck_state: dict[str, dict] = {}
+        # Expo globale TT/TM par asset (VaR-lite).
+        # Clé: asset UPPER -> {
+        #   "tt_delta_usd": float,
+        #   "tm_delta_usd": float,
+        #   "delta_usd": float,
+        #   "soft_usd": float,
+        #   "hard_usd": float,
+        #   "state": "OK" | "SOFT" | "HARD",
+        #   "last_update_ts": float,
+        # }
+        self.tttm_exposure_state: Dict[str, Dict[str, Any]] = {}
+
+        # Legs TT coincés ("stuck") agrégés par asset.
+        # Clé: asset UPPER -> {
+        #   "delta_usd": float,
+        #   "legs": List[Dict[str, Any]],
+        #   "last_update_ts": float,
+        # }
+        self.tt_stuck_state: Dict[str, Dict[str, Any]] = {}
         self.tt_last_hedge_ts: dict[str, float] = {}
 
-        # TM inflight exposures (stub P0)
-        self.tm_inflight_exposures: dict[str, list[dict]] = {}
+        # Expositions TM "inflight" (P0: peut rester vide).
+        # Clé: asset UPPER -> List[{"notional_usd": float, "side": "LONG"|"SHORT", "created_ts": float, "max_exposure_s": float}]
+        self.tm_inflight_exposures: Dict[str, List[Dict[str, Any]]] = {}
 
         # Tailles/slots MM par profil (définies dans BotConfig.rm)
         rm_cfg = _cfg_rm(self)
@@ -1785,79 +1803,104 @@ class RiskManager:
         a = str(asset).upper()
         return self.mm_delta_state.get(a)
 
-    def _register_tt_stuck_leg(self, leg_info: dict) -> None:
+    def _register_tt_stuck_leg(self, leg_info: Dict[str, Any]) -> None:
         """
-        leg_info keys expected:
-        - asset: str
-        - side: "BUY" | "SELL"
-        - qty: float
-        - notional_usd: float
-        - exchange: str
-        - alias: str
-        - pair: str
-        - created_ts: float
+        Enregistre un leg TT coincé dans tt_stuck_state.
+
+        leg_info attendu:
+          - asset: str           (ex: "ETH")
+          - side: "BUY"|"SELL"
+          - notional_usd: float  (exposition de ce leg en USD-like)
+          - exchange: str
+          - alias: str
+          - pair: str            (ex: "ETHUSDC")
+          - created_ts: float    (epoch seconds)
         """
         asset = str(leg_info.get("asset") or "").upper()
         if not asset:
             return
 
         side = str(leg_info.get("side") or "").upper()
-        leg = dict(leg_info)
-        leg["asset"] = asset
-        leg["side"] = side
+        notional_usd = float(leg_info.get("notional_usd") or 0.0)
+        if notional_usd <= 0.0:
+            return
 
-        state = self.tt_stuck_state.setdefault(asset, {"delta_usd": 0.0, "legs": [], "last_update_ts": 0.0})
-        state["legs"].append(leg)
-        state["last_update_ts"] = time.time()
+        # Sign convention: BUY = +, SELL = -
+        signed = notional_usd if side == "BUY" else -notional_usd
+        state = self.tt_stuck_state.get(asset)
+        if not state:
+            state = {"delta_usd": 0.0, "legs": [], "last_update_ts": 0.0}
+            self.tt_stuck_state[asset] = state
 
-        delta_usd = 0.0
-        for l in state["legs"]:
-            try:
-                notional = float(l.get("notional_usd") or 0.0)
-            except Exception:
-                notional = 0.0
-            sign = 1.0 if str(l.get("side") or "").upper() == "BUY" else -1.0
-            delta_usd += sign * notional
-
-        state["delta_usd"] = delta_usd
+        state["legs"].append(dict(leg_info))
+        state["delta_usd"] += signed
+        state["last_update_ts"] = float(leg_info.get("created_ts") or time.time())
 
     def _gc_tt_stuck_legs(self, now: float) -> None:
         """
-        Met à jour age_s, purge les legs de plus de tt_stuck_max_age_s,
-        recalcule delta_usd par asset.
+        GC des legs TT coincés:
+          - supprime ceux dont l'âge > cfg.rm.tt_stuck_max_age_s,
+          - recalcule delta_usd par asset.
         """
         max_age = float(getattr(getattr(self.cfg, "rm", None), "tt_stuck_max_age_s", 0.0) or 0.0)
+        rm_cfg = getattr(self, "cfg", None)
+        rm_section = getattr(rm_cfg, "rm", None)
+        max_age = float(getattr(rm_section, "tt_stuck_max_age_s", 10.0) or 0.0)
+        if max_age <= 0.0:
+            return
+
         for asset, state in list(self.tt_stuck_state.items()):
-            legs = list(state.get("legs") or [])
-            fresh_legs = [
-                leg for leg in legs
-                if max_age <= 0.0 or (now - float(leg.get("created_ts") or 0.0)) <= max_age
-            ]
-
+            legs = state.get("legs") or []
+            kept: List[Dict[str, Any]] = []
             delta_usd = 0.0
-            for leg in fresh_legs:
-                try:
-                    notional = float(leg.get("notional_usd") or 0.0)
-                except Exception:
-                    notional = 0.0
-                sign = 1.0 if str(leg.get("side") or "").upper() == "BUY" else -1.0
-                delta_usd += sign * notional
 
-            self.tt_stuck_state[asset] = {
-                "legs": fresh_legs,
-                "delta_usd": delta_usd,
-                "last_update_ts": now,
-            }
+        for leg in legs:
+            created_ts = float(leg.get("created_ts") or 0.0)
+            age_s = max(0.0, now - created_ts)
+            if age_s > max_age:
+                continue
+
+            side = str(leg.get("side") or "").upper()
+            notional_usd = float(leg.get("notional_usd") or 0.0)
+            if notional_usd <= 0.0:
+                continue
+            signed = notional_usd if side == "BUY" else -notional_usd
+
+            kept.append(leg)
+            delta_usd += signed
+
+        if not kept:
+            # plus de legs pertinents -> on purge l'asset
+            self.tt_stuck_state.pop(asset, None)
+        else:
+            state["legs"] = kept
+            state["delta_usd"] = delta_usd
+            state["last_update_ts"] = now
 
     def _refresh_tm_inflight_exposures(self, now: float) -> None:
         """
-        P0: laisser self.tm_inflight_exposures vide ou
-        fournir un hook pour plus tard.
-        Tu peux mettre un 'pass' ou un comportement minimal.
+        P0: stub pour expositions TM "inflight".
+        On laisse self.tm_inflight_exposures vide ou inchangé.
+
+        Un ticket ultérieur pourra peupler cette structure à partir
+        de l'historique de bundles TM et des TTL TM.
+
         """
-        return None
+        return
 
     def _refresh_tttm_exposure_state(self, now: float) -> None:
+        """
+                Reconstruit tttm_exposure_state[asset] à partir de:
+                  - tt_stuck_state (legs TT coincés)
+                  - tm_inflight_exposures (P0: peut rester vide)
+
+                Classe chaque asset en OK/SOFT/HARD selon les seuils de config.
+                """
+        rm_cfg = getattr(self.cfg, "rm", None)
+        if rm_cfg is None:
+            return
+
+        # GC des stuck legs d'abord
         self._gc_tt_stuck_legs(now)
         try:
             self._refresh_tm_inflight_exposures(now)
@@ -1865,55 +1908,83 @@ class RiskManager:
             if getattr(self, "logger", None):
                 self.logger.debug("[RM] refresh_tm_inflight_exposures failed", exc_info=False)
 
-        cfg_rm = getattr(self.cfg, "rm", None)
-        default_soft = float(getattr(cfg_rm, "tttm_exposure_soft_usd", 0.0) or 0.0)
-        default_hard = float(getattr(cfg_rm, "tttm_exposure_hard_usd", 0.0) or 0.0)
-        overrides = getattr(cfg_rm, "tttm_exposure_by_asset", {}) or {}
-
+        result: Dict[str, Dict[str, Any]] = {}
+        # 1) Atomes TT
         assets = set(self.tt_stuck_state.keys()) | set(self.tm_inflight_exposures.keys())
+
+
         for asset in assets:
-            tt_delta = float(self.tt_stuck_state.get(asset, {}).get("delta_usd", 0.0) or 0.0)
+            asset_u = str(asset).upper()
 
-            tm_delta = 0.0
-            inflights = self.tm_inflight_exposures.get(asset) or []
-            if inflights:
-                for inflight in inflights:
-                    try:
-                        notional = float(inflight.get("notional_usd") or 0.0)
-                    except Exception:
-                        notional = 0.0
-                    side = str(inflight.get("side") or "").upper()
-                    sign = 1.0 if side == "LONG" else -1.0
-                    tm_delta += sign * notional
+            # TT component
+            tt_state = self.tt_stuck_state.get(asset_u) or {}
+            tt_delta_usd = float(tt_state.get("delta_usd") or 0.0)
 
-            delta_usd = tt_delta + tm_delta
-            override = overrides.get(asset) or overrides.get(str(asset).upper()) or {}
-            soft_limit = float(override.get("soft_usd", default_soft) or default_soft)
-            hard_limit = float(override.get("hard_usd", default_hard) or default_hard)
+            # TM component (P0: somme notional_usd * signe)
+            tm_list = self.tm_inflight_exposures.get(asset_u) or []
+            tm_delta_usd = 0.0
+            for entry in tm_list:
+                notional_usd = float(entry.get("notional_usd") or 0.0)
+                side = str(entry.get("side") or "").upper()
+                if notional_usd <= 0.0:
+                    continue
+                signed = notional_usd if side in ("LONG", "BUY") else -notional_usd
+                tm_delta_usd += signed
 
-            abs_delta = abs(delta_usd)
-            state = "OK"
-            if hard_limit > 0 and abs_delta > hard_limit:
+            delta_usd = tt_delta_usd + tm_delta_usd
+            # Seuils de config
+            overrides = getattr(rm_cfg, "tttm_exposure_by_asset", {}) or {}
+            ov = overrides.get(asset_u) or {}
+            soft_default = float(getattr(rm_cfg, "tttm_exposure_soft_usd", 2000.0) or 0.0)
+            hard_default = float(getattr(rm_cfg, "tttm_exposure_hard_usd", 5000.0) or 0.0)
+            soft = float(ov.get("soft_usd", soft_default) or 0.0)
+            hard = float(ov.get("hard_usd", hard_default) or 0.0)
+
+            abs_d = abs(delta_usd)
+            if hard > 0.0 and abs_d > hard:
                 state = "HARD"
-            elif soft_limit > 0 and abs_delta > soft_limit:
+            elif soft > 0.0 and abs_d > soft:
                 state = "SOFT"
+            else:
+                state = "OK"
 
-            state_val = {"OK": 0, "SOFT": 1, "HARD": 2}.get(state, 0)
-            self.tttm_exposure_state[asset] = {
-                "tt_delta_usd": tt_delta,
-                "tm_delta_usd": tm_delta,
+            result[asset_u] = {
+                "tt_delta_usd": tt_delta_usd,
+                "tm_delta_usd": tm_delta_usd,
                 "delta_usd": delta_usd,
-                "soft_limit_usd": soft_limit,
-                "hard_limit_usd": hard_limit,
+                "soft_usd": soft,
+                "hard_usd": hard,
                 "state": state,
                 "last_update_ts": now,
             }
-
+            # Metrics optionnelles (si infra metrics déjà en place)
             try:
-                RM_TTTM_DELTA_USD.labels(asset=asset).set(delta_usd)
-                RM_TTTM_DELTA_STATE.labels(asset=asset).set(state_val)
+                self.metrics.gauge(
+                    "RM_TTTM_DELTA_USD",
+                    delta_usd,
+                    tags={"asset": asset_u},
+                )
+                state_int = 0 if state == "OK" else (1 if state == "SOFT" else 2)
+                self.metrics.gauge(
+                    "RM_TTTM_DELTA_STATE",
+                    state_int,
+                    tags={"asset": asset_u},
+                )
             except Exception:
                 pass
+
+            try:
+                RM_TTTM_DELTA_USD.labels(asset=asset_u).set(delta_usd)
+                state_int = 0 if state == "OK" else (1 if state == "SOFT" else 2)
+                RM_TTTM_DELTA_STATE.labels(asset=asset_u).set(state_int)
+            except Exception:
+                pass
+        self.tttm_exposure_state = result
+
+    def _tttm_state_for_asset(self, asset: str) -> Optional[Dict[str, Any]]:
+        if not asset:
+            return None
+        return self.tttm_exposure_state.get(str(asset).upper())
 
     def _pick_mm_hedge_venue(self, asset: str) -> tuple[str, str, str] | None:
         """
@@ -5647,6 +5718,9 @@ class RiskManager:
             strat = str(strat_hint).upper() or "TT"
             branch = str(opp.get("branch") or strat).upper()
             ctx["branch"] = branch
+            base_asset = self._pair_base(pair)
+            if base_asset:
+                ctx["base_asset"] = base_asset
             q, amt = self._normalize_notional_tuple(opp)  # ta fonction déjà existante
             ctx["notional_quote"] = {"quote": q, "amount": float(amt)}
             ok, why = self._budget_allows(strat, amt)
@@ -5654,8 +5728,39 @@ class RiskManager:
             if not ok:
                 return (False, why, ctx)
 
+            # Gating VaR-lite TT/TM global par asset.
+            if branch in ("TT", "TM"):
+                base_asset = ctx.get("base_asset") or ctx.get("asset")
+                tttm = self._tttm_state_for_asset(base_asset)
+                if tttm:
+                    state = str(tttm.get("state") or "OK").upper()
+                    delta_usd = float(tttm.get("delta_usd") or 0.0)
+
+                    if state == "HARD":
+                        try:
+                            self.metrics.increment(
+                                "RM_TTTM_DELTA_HARD_LIMIT",
+                                tags={"asset": str(base_asset).upper(), "branch": branch.lower()},
+                            )
+                        except Exception:
+                            pass
+                        ctx["tttm_delta_state"] = "HARD"
+                        ctx["tttm_delta_usd"] = delta_usd
+                        return False, "RM_TTTM_DELTA_HARD_LIMIT", ctx
+
+                    if state == "SOFT":
+                        try:
+                            self.metrics.increment(
+                                "RM_TTTM_DELTA_SOFT_LIMIT",
+                                tags={"asset": str(base_asset).upper(), "branch": branch.lower()},
+                            )
+                        except Exception:
+                            pass
+                        ctx["tttm_delta_state"] = "SOFT"
+                        ctx["tttm_delta_usd"] = delta_usd
+
             if branch == "MM":
-                base_asset = self._pair_base(pair)
+                base_asset = ctx.get("base_asset") or self._pair_base(pair)
                 ctx["base_asset"] = base_asset
                 mm_state = self._rm_mm_delta_status_for_asset(base_asset)
                 if mm_state:
@@ -6427,6 +6532,11 @@ class RiskManager:
                     except Exception:
                         logger.debug("[RiskManager] mm_delta refresh failed (dry_run)", exc_info=False)
                     try:
+                        now = time.time()
+                        self._refresh_tttm_exposure_state(now)
+                    except Exception:
+                        logger.debug("[RiskManager] tttm exposure refresh failed (dry_run)", exc_info=False)
+                    try:
                         self._refresh_alias_collat_from_mbf(now=self.last_capital_update_ts)
                     except Exception:
                         self.logger.debug("[RM] _refresh_alias_collat_from_mbf failed", exc_info=False)
@@ -6450,7 +6560,8 @@ class RiskManager:
                         logger.debug("[RiskManager] mm_delta refresh failed", exc_info=False)
 
                     try:
-                        self._refresh_tttm_exposure_state(time.time())
+                        now = time.time()
+                        self._refresh_tttm_exposure_state(now)
                     except Exception:
                         logger.debug("[RiskManager] tttm exposure refresh failed", exc_info=False)
 
@@ -12018,3 +12129,112 @@ def _mk_rebal_mgr_if_missing(rm):
                 logging.exception("Unhandled exception")
 
     return rm.rebal_mgr
+
+class _DummyMetrics:
+    def gauge(self, *_args, **_kwargs):
+        return None
+
+    def increment(self, *_args, **_kwargs):
+        return None
+
+
+class RiskManagerTTTMTests(unittest.TestCase):
+    def _mk_rm(self, soft=100.0, hard=200.0) -> RiskManager:
+        rm = RiskManager.__new__(RiskManager)
+        rm.tttm_exposure_state = {}
+        rm.tt_stuck_state = {}
+        rm.tm_inflight_exposures = {}
+        rm.metrics = _DummyMetrics()
+        rm.logger = logging.getLogger("rm_test")
+        rm.cfg = SimpleNamespace(
+            rm=SimpleNamespace(
+                tttm_exposure_soft_usd=soft,
+                tttm_exposure_hard_usd=hard,
+                tttm_exposure_by_asset={},
+                tt_stuck_soft_usd=0.0,
+                tt_stuck_hard_usd=0.0,
+                tt_stuck_max_age_s=10.0,
+            )
+        )
+        rm.max_clock_skew_ms = 10_000.0
+        rm._fresh_enough = lambda *_args, **_kwargs: True
+        rm.get_book_snapshot = lambda *_args, **_kwargs: {}
+        rm._current_prudence = lambda *_args, **_kwargs: "OK"
+        rm._normalize_notional_tuple = (
+            lambda opp: (opp.get("quote") or "USDC", float(opp.get("notional_usdc") or 0.0))
+        )
+        rm._budget_allows = lambda *_args, **_kwargs: (True, "")
+        rm._pair_base = RiskManager._pair_base
+        return rm
+
+    def test_tt_stuck_basic(self):
+        rm = self._mk_rm(soft=100.0, hard=200.0)
+        now = time.time()
+        rm._register_tt_stuck_leg(
+            {
+                "asset": "ETH",
+                "side": "BUY",
+                "notional_usd": 100.0,
+                "exchange": "EX1",
+                "alias": "A1",
+                "pair": "ETHUSDC",
+                "created_ts": now,
+            }
+        )
+        rm._register_tt_stuck_leg(
+            {
+                "asset": "ETH",
+                "side": "BUY",
+                "notional_usd": 50.0,
+                "exchange": "EX1",
+                "alias": "A1",
+                "pair": "ETHUSDC",
+                "created_ts": now,
+            }
+        )
+
+        rm._refresh_tttm_exposure_state(now)
+        state = rm.tttm_exposure_state.get("ETH")
+        self.assertIsNotNone(state)
+        self.assertAlmostEqual(state.get("delta_usd"), 150.0)
+        self.assertEqual(state.get("state"), "HARD")
+
+    def test_tttm_gating_hard(self):
+        rm = self._mk_rm()
+        rm.tttm_exposure_state["BTC"] = {
+            "delta_usd": 300.0,
+            "soft_usd": 100.0,
+            "hard_usd": 200.0,
+            "state": "HARD",
+        }
+        opp = {
+            "pair": "BTCUSDC",
+            "branch": "tt",
+            "notional_usdc": 10.0,
+            "buy_exchange": "B1",
+            "sell_exchange": "B2",
+        }
+        admit, reason, ctx = rm._preflight_gate(opp)
+        self.assertFalse(admit)
+        self.assertEqual(reason, "RM_TTTM_DELTA_HARD_LIMIT")
+        self.assertEqual(ctx.get("tttm_delta_state"), "HARD")
+
+    def test_tttm_gating_soft(self):
+        rm = self._mk_rm()
+        rm.tttm_exposure_state["BTC"] = {
+            "delta_usd": 150.0,
+            "soft_usd": 100.0,
+            "hard_usd": 200.0,
+            "state": "SOFT",
+        }
+        opp = {
+            "pair": "BTCUSDC",
+            "branch": "tt",
+            "notional_usdc": 10.0,
+            "buy_exchange": "B1",
+            "sell_exchange": "B2",
+        }
+        admit, reason, ctx = rm._preflight_gate(opp)
+        self.assertTrue(admit)
+        self.assertEqual(reason, "")
+        self.assertEqual(ctx.get("tttm_delta_state"), "SOFT")
