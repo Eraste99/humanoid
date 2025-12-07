@@ -4767,6 +4767,9 @@ class ExecutionEngine:
         except Exception:
             bid, ask = 0.0, 0.0
 
+        px_buy = float(buy_leg.get("px_limit") or buy_leg.get("price") or 0.0)
+        px_sell = float(sell_leg.get("px_limit") or sell_leg.get("price") or 0.0)
+
         if bid > 0 and ask > 0:
             px_buy = self._price_ladder_maker(buy_leg.get("exchange"), pair_key, "BUY", bid, ask, idx=0)
             px_sell = self._price_ladder_maker(sell_leg.get("exchange"), pair_key, "SELL", bid, ask, idx=0)
@@ -4785,6 +4788,105 @@ class ExecutionEngine:
         meta_payload = payload.setdefault("meta", {}) or {}
         meta_payload.setdefault("branch", "MM")
         meta_payload.setdefault("strategy", "MM")
+
+        # Fragmentation optionnelle (plan + fragments logiques)
+        def _leg_notional_usdc(leg: Dict[str, Any]) -> float:
+            try:
+                vol = leg.get("volume_usdc")
+                if vol is not None:
+                    return float(vol)
+            except Exception:
+                pass
+            try:
+                qty = float(leg.get("qty") or leg.get("quantity") or 0.0)
+                px = float(leg.get("px_limit") or leg.get("price") or 0.0)
+                return float(qty * px) if qty > 0 and px > 0 else 0.0
+            except Exception:
+                return 0.0
+
+        try:
+            max_frags = int(getattr(self, "max_fragments", 0) or 0) or None
+        except Exception:
+            max_frags = None
+
+        if max_frags and max_frags > 1:
+            vol_buy = _leg_notional_usdc(buy_leg)
+            vol_sell = _leg_notional_usdc(sell_leg)
+            total_budget = min(vol_buy, vol_sell)
+
+            try:
+                _, quote = SymbolUtils.split_base_quote(pair_key)
+            except Exception:
+                quote = "USDC"
+            min_fragment_map = getattr(self, "min_fragment_quote", {}) or {}
+            min_frag_quote = float(min_fragment_map.get(quote, min_fragment_map.get("USDC", 0.0)) or 0.0)
+
+            if total_budget > 0 and min_frag_quote > 0:
+                frag_plan = None
+                mm_fragments = None
+                try:
+                    frag_pad = float(getattr(self, "fragment_safety_pad", 0.0) or 0.0)
+                    weights = fraglib.normalize_frontload_weights(
+                        getattr(self, "frontload_weights", [0.5, 0.35, 0.15]) or [0.5, 0.35, 0.15],
+                        max_fragments=max_frags,
+                    )
+                    group_size = int(getattr(self, "frontload_group_size", 3) or 3)
+
+                    plan = fraglib.build_fragment_plan(
+                        total_quote=total_budget,
+                        desired_count=max_frags,
+                        weights=weights,
+                        max_fragments=max_frags,
+                        min_fragment_quote=min_frag_quote,
+                        group_size=group_size,
+                        source="ENGINE_MM",
+                        avg_fragment_quote=None,
+                    )
+
+                    slices, valid = self._plan_to_slices(
+                        plan=plan,
+                        total_usdc=total_budget,
+                        min_fragment_usdc=min_frag_quote,
+                        max_fragments=max_frags,
+                    )
+
+                    if valid and slices:
+                        frag_plan = plan
+                        fragments_buy: List[Dict[str, Any]] = []
+                        fragments_sell: List[Dict[str, Any]] = []
+                        for amt, grp, idx, weight in slices:
+                            adj_amt = float(amt) * max(0.0, 1.0 - frag_pad)
+                            if adj_amt < min_frag_quote:
+                                continue
+                            frag_meta = {"group": grp, "idx": idx, "weight": weight}
+                            fragments_buy.append(
+                                {
+                                    "side": "BUY",
+                                    "volume_usdc": adj_amt,
+                                    "px_limit": px_buy,
+                                    "meta": frag_meta,
+                                }
+                            )
+                            fragments_sell.append(
+                                {
+                                    "side": "SELL",
+                                    "volume_usdc": adj_amt,
+                                    "px_limit": px_sell,
+                                    "meta": frag_meta,
+                                }
+                            )
+
+                        if fragments_buy and fragments_sell:
+                            mm_fragments = {"buy": fragments_buy, "sell": fragments_sell}
+
+                except Exception:
+                    frag_plan = None
+                    mm_fragments = None
+
+                if frag_plan:
+                    meta_payload["mm_frag_plan"] = frag_plan
+                if mm_fragments:
+                    payload["mm_fragments"] = mm_fragments
 
         return payload
 

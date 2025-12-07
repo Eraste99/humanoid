@@ -171,6 +171,11 @@ RM_ALIAS_COLLAT_LOW_TOTAL = get_counter(
     "Alias collateral LOW state occurrences during gating",
     labelnames=("exchange", "alias", "branch"),
 )
+RM_MM_COLLAT_CRIT_DROP_TOTAL = get_counter(
+    "rm_mm_collat_crit_drop_total",
+    "MM bundles dropped because alias collateral state is CRIT",
+    labelnames=("exchange", "alias"),
+)
 
 
 # --- MM obs: budgets, preemptions, wallet inventory ------------------------
@@ -244,6 +249,11 @@ RM_TT_HEDGE_USD = get_counter(
 RM_MM_HEDGE_FAILED_TOTAL = get_counter(
     "rm_mm_hedge_failed_total",
     "MM delta hedge failures",
+    labelnames=("asset",),
+)
+RM_TT_HEDGE_FAILED_TOTAL = get_counter(
+    "rm_tt_hedge_failed_total",
+    "TT stuck hedge failures",
     labelnames=("asset",),
 )
 
@@ -945,17 +955,35 @@ class RiskManager:
 
         # Tailles/slots MM par profil (définies dans BotConfig.rm)
         rm_cfg = _cfg_rm(self)
-        slot_cfg = getattr(rm_cfg, "mm_slot_notional_usdc_by_profile", {}) or {}
+        try:
+            from modules.bot_config import RiskManagerCfg
+            rm_defaults = RiskManagerCfg()
+        except Exception:
+            rm_defaults = None
+
+        slot_cfg_raw = getattr(rm_cfg, "mm_slot_notional_usdc_by_profile", None)
+        if not isinstance(slot_cfg_raw, dict) or not slot_cfg_raw:
+            slot_cfg_raw = getattr(rm_defaults, "mm_slot_notional_usdc_by_profile", {}) if rm_defaults else {}
+        slot_cfg = slot_cfg_raw or {}
+
         self.mm_slot_notional_usdc_by_profile: Dict[str, float] = {
             str(k).upper(): self._as_float_or(v, 0.0)
             for k, v in slot_cfg.items()
         }
-        pair_ratio_cfg = getattr(rm_cfg, "mm_pair_cap_ratio_by_profile", {}) or {}
+        pair_ratio_cfg_raw = getattr(rm_cfg, "mm_pair_cap_ratio_by_profile", None)
+        if not isinstance(pair_ratio_cfg_raw, dict) or not pair_ratio_cfg_raw:
+            pair_ratio_cfg_raw = getattr(rm_defaults, "mm_pair_cap_ratio_by_profile", {}) if rm_defaults else {}
+        pair_ratio_cfg = pair_ratio_cfg_raw or {}
+
         self.mm_pair_cap_ratio_by_profile: Dict[str, float] = {
             str(k).upper(): self._as_float_or(v, 0.0)
             for k, v in pair_ratio_cfg.items()
         }
-        slots_per_pair_cfg = getattr(rm_cfg, "mm_slots_per_pair_by_profile", {}) or {}
+        slots_per_pair_cfg_raw = getattr(rm_cfg, "mm_slots_per_pair_by_profile", None)
+        if not isinstance(slots_per_pair_cfg_raw, dict) or not slots_per_pair_cfg_raw:
+            slots_per_pair_cfg_raw = getattr(rm_defaults, "mm_slots_per_pair_by_profile", {}) if rm_defaults else {}
+        slots_per_pair_cfg = slots_per_pair_cfg_raw or {}
+
         self.mm_slots_per_pair_by_profile: Dict[str, int] = {
             str(k).upper(): self._as_int_or(v, 0)
             for k, v in slots_per_pair_cfg.items()
@@ -2177,13 +2205,23 @@ class RiskManager:
                 pass
 
             try:
-                await self.engine.hedge_delta_single(req)
+                result = await self.engine.hedge_delta_single(req)
             except Exception as exc:
                 self.logger.warning("[RM] engine hedge TT failed for %s: %s", asset, exc, exc_info=False)
+                try:
+                    RM_TT_HEDGE_FAILED_TOTAL.labels(asset=asset).inc()
+                except Exception:
+                    pass
                 self.tt_last_hedge_ts[asset] = now
                 continue
 
             self.tt_last_hedge_ts[asset] = now
+            # Même si l'appel ne lance pas d'exception, on compte les cas ok=False
+            if not (result or {}).get("ok"):
+                try:
+                    RM_TT_HEDGE_FAILED_TOTAL.labels(asset=asset).inc()
+                except Exception:
+                    pass
 
     def check_capital_drift(self, threshold_pct: float | None = None) -> None:
         """
@@ -3436,6 +3474,18 @@ class RiskManager:
                 if not info:
                     continue
                 st = str(info.get("state") or "OK").upper()
+
+                # Observabilité P0 : compter les cas LOW rencontrés pendant le gating.
+                if st == "LOW":
+                    try:
+                        RM_ALIAS_COLLAT_LOW_TOTAL.labels(
+                            exchange=key[0],
+                            alias=key[1],
+                            branch=branch,
+                        ).inc()
+                    except Exception:
+                        pass
+
                 if st == "CRIT":
                     worst_state = "CRIT"
                     worst_alias = key
@@ -3456,10 +3506,20 @@ class RiskManager:
                     worst_alias[0] if worst_alias else "NA",
                     worst_alias[1] if worst_alias else "NA",
                 )
+
+                # Compteur dédié pour les drops MM liés au collat CRIT.
+                if worst_alias:
+                    try:
+                        RM_MM_COLLAT_CRIT_DROP_TOTAL.labels(
+                            exchange=str(worst_alias[0]).upper(),
+                            alias=str(worst_alias[1]).upper(),
+                        ).inc()
+                    except Exception:
+                        pass
+
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason)
                 return False
-
 
         # 2) Légalité & REB lock
         if not self._is_bundle_legal(bundle):
@@ -4478,6 +4538,36 @@ class RiskManager:
         except Exception:
             logging.exception("Unhandled exception")
 
+    def _mm_global_budget_usdc(self, profile: str, ex: str, quote: str) -> float:
+        """
+        Budget MM global encore disponible côté wallet virtuel.
+
+        P0 : le profil est accepté pour compat future mais n'est pas différencié ;
+        on retourne simplement le solde courant virtuel.
+        """
+        exu = str(ex or "").upper()
+        q = str(quote or "").upper()
+        cur = float(self.virt_balances.get(exu, {}).get(q, 0.0))
+        return max(0.0, cur)
+
+    def _mm_pair_budget_remaining(self, profile: str, ex: str, pair: str, quote: str) -> float:
+        """
+        P0 : cap soft par paire, basé sur le budget disponible courant et le ratio
+        par profil, sans tracking cumulatif par paire. Une version future ajoutera
+        un suivi fin par paire.
+        """
+        prof = str(profile or "LARGE").upper()
+        exu = str(ex or "").upper()
+        pair_key = self._norm_pair(pair)
+
+        global_budget = self._mm_global_budget_usdc(prof, exu, quote)
+        ratio = self.mm_pair_cap_ratio_by_profile.get(
+            prof, self.mm_pair_cap_ratio_by_profile.get("LARGE", 1.0)
+        )
+        pair_cap = global_budget * max(0.0, min(1.0, ratio))
+
+        remaining = min(pair_cap, global_budget)
+        return max(0.0, remaining)
 
     def _update_inventory_metrics(self) -> None:
         """
@@ -10817,6 +10907,19 @@ class RiskManager:
             if mm_notional <= 0.0:
                 inc_rm_reject(reason="MM_BUDGET_EXHAUSTED")
                 return None
+
+            remaining = self._mm_pair_budget_remaining(profile, ex_for_mm, pair, mm_quote)
+            if remaining <= 0.0:
+                try:
+                    RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc()
+                except Exception:
+                    pass
+                inc_rm_reject(reason="MM_PAIR_CAP_EXCEEDED")
+                return None
+            if mm_notional > remaining:
+                inc_rm_reject(reason="MM_PAIR_CAP_EXCEEDED")
+                return None
+
             if not self._reserve_quote(ex_for_mm, mm_quote, mm_notional):
                 try:
                     RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc()
