@@ -1487,10 +1487,93 @@ class RiskManager:
             "[RM] Capital buffers mis à jour via MBF: "
             f"mode={mode}, total_usdc={total_usdc:.2f}"
         )
+
+        # Met à jour également la vue collat/marge par alias.
+        try:
+            self._refresh_alias_collat_from_buffers(snapshot)
+        except Exception:
+            self.logger.exception("[RM] _refresh_alias_collat_from_buffers failed")
         try:
             self._refresh_alias_collat_from_mbf(now=self.last_capital_update_ts)
         except Exception:
             self.logger.debug("[RM] _refresh_alias_collat_from_mbf failed", exc_info=False)
+
+    def _refresh_alias_collat_from_buffers(self, snapshot: Dict[str, Any]) -> None:
+        """
+        Construit une vue collat/marge par (exchange, alias) à partir de as_buffers_snapshot().
+
+        - collat_usd : somme des quotes considérées comme collat (cfg.rm.collat_quotes)
+        - min_usd    : minimum de sécurité (collat_default_min_usd ou override par alias)
+        - ratio      : collat_usd / min_usd
+        - state      : "OK" | "LOW" | "CRIT" selon les thresholds de config
+        """
+        import time as _time
+
+        rm_cfg = getattr(self.cfg, "rm", None)
+        if rm_cfg is None:
+            return
+
+        collat_quotes = getattr(rm_cfg, "collat_quotes", None) or ["USDC", "USDT", "USD", "EUR"]
+        collat_quotes = [str(q).upper() for q in collat_quotes if q]
+
+        default_min = float(getattr(rm_cfg, "collat_default_min_usd", 500.0) or 0.0)
+        ratio_low = float(getattr(rm_cfg, "collat_ratio_low", 1.1) or 1.1)
+        ratio_crit = float(getattr(rm_cfg, "collat_ratio_crit", 1.0) or 1.0)
+
+        alias_overrides = getattr(rm_cfg, "collat_alias_overrides", {}) or {}
+
+        pockets = snapshot.get("pockets_by_quote", {}) or {}
+        as_of_ts = float(snapshot.get("as_of_ts") or _time.time())
+
+        out: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        for ex, aliases in pockets.items():
+            ex_u = str(ex or "").upper()
+            if not ex_u:
+                continue
+            for alias, quotes in (aliases or {}).items():
+                alias_u = str(alias or "").upper()
+                if not alias_u:
+                    continue
+
+                collat_usd = 0.0
+                for quote, qdata in (quotes or {}).items():
+                    q_u = str(quote or "").upper()
+                    if q_u not in collat_quotes:
+                        continue
+                    try:
+                        available = float((qdata or {}).get("available", 0.0) or 0.0)
+                    except Exception:
+                        available = 0.0
+                    if available > 0.0:
+                        collat_usd += available
+
+                key = f"{ex_u}.{alias_u}"
+                ov = alias_overrides.get(key) or {}
+                min_usd = float(ov.get("min_usd", default_min) or 0.0)
+
+                if min_usd <= 0.0:
+                    ratio = float("inf")
+                    state = "OK"
+                else:
+                    ratio = collat_usd / min_usd
+                    if ratio < ratio_crit:
+                        state = "CRIT"
+                    elif ratio < ratio_low:
+                        state = "LOW"
+                    else:
+                        state = "OK"
+
+                out[(ex_u, alias_u)] = {
+                    "collat_usd": collat_usd,
+                    "min_usd": min_usd,
+                    "ratio": ratio,
+                    "state": state,
+                    "last_update_ts": as_of_ts,
+                }
+
+        self.alias_collat_state = out
+
 
     def update_capital_from_mbf(self, *, mode: str = "merged") -> None:
         """
@@ -1572,82 +1655,91 @@ class RiskManager:
                 except Exception:
                     pass
 
-    def _refresh_mm_delta_from_balances(self, now: float | None = None) -> None:
+    def _refresh_mm_delta_from_balances(
+            self,
+            now: float | None = None,
+            snapshot_rm: Optional[dict] = None,
+    ) -> None:
         """
         Mesure le delta global MM par asset en USD-like à partir du snapshot MBF.
         """
+        raw = snapshot_rm
         glue = getattr(self, "_mbf_glue", None) or getattr(self, "mbf", None)
-        if glue is None:
+        if raw is None and glue is None:
             return
 
-        try:
-            if hasattr(glue, "snapshot"):
-                raw = glue.snapshot(mode="merged", cached_only=True)
-            elif hasattr(glue, "as_rm_snapshot"):
-                try:
-                    raw = glue.as_rm_snapshot(mode="merged", cached_only=True)
-                except TypeError:
-                    raw = glue.as_rm_snapshot(cached_only=True)
-            else:
+        if raw is None:
+            try:
+                if hasattr(glue, "as_rm_snapshot"):
+                    try:
+                        raw = glue.as_rm_snapshot(mode="merged", cached_only=True)
+                    except TypeError:
+                        raw = glue.as_rm_snapshot(cached_only=True)
+                elif hasattr(glue, "snapshot"):
+                    raw = glue.snapshot(mode="merged", cached_only=True)
+                else:
+                    return
+            except Exception as exc:
+                self.logger.debug("[RM] mm_delta snapshot MBF failed: %s", exc, exc_info=False)
                 return
-        except Exception as exc:
-            self.logger.debug("[RM] mm_delta snapshot MBF failed: %s", exc, exc_info=False)
-            return
+
 
         if not isinstance(raw, dict) or not raw:
             return
 
-        if "balances" in raw and isinstance(raw.get("balances"), dict):
-            balances = raw.get("balances") or {}
-        else:
-            balances = {
-                ex: per for ex, per in raw.items()
-                if ex != "meta" and isinstance(per, dict)
-            }
-
-        if not balances:
+        positions = raw.get("positions") if isinstance(raw.get("positions"), dict) else None
+        if positions is None:
+            balances = raw.get("balances") if isinstance(raw.get("balances"), dict) else None
+            if balances:
+                positions = {
+                    (ex, alias, asset): {"net": qty}
+                    for ex, per_alias in balances.items()
+                    for alias, assets in (per_alias or {}).items()
+                    for asset, qty in (assets or {}).items()
+                }
+        if not positions:
             return
 
         cfg_rm = getattr(self.cfg, "rm", None)
-        collat_quotes = [str(q).upper() for q in (getattr(cfg_rm, "collat_quotes", []) or [])]
-        mm_aliases = {str(getattr(self, "mm_alias", "MM") or "MM").upper()}
-        delta_usd: dict[str, float] = defaultdict(float)
+        delta_usd_by_asset: dict[str, float] = defaultdict(float)
 
-        for ex, per_alias in balances.items():
-            ex_u = str(ex).upper()
-            for alias, assets in (per_alias or {}).items():
-                alias_u = str(alias).upper()
-                if "MM" not in alias_u and alias_u not in mm_aliases:
+        for key, data in positions.items():
+            if not isinstance(data, dict):
+                continue
+            if isinstance(key, tuple) and len(key) >= 3:
+                ex, alias, asset = key[0], key[1], key[2]
+            else:
+                ex = data.get("exchange")
+                alias = data.get("alias")
+                asset = data.get("asset") or (key if isinstance(key, str) else None)
+
+            if not self._is_mm_alias(ex, alias):
+                continue
+
+            asset_u = str(asset or "").upper()
+            if not asset_u:
+                continue
+
+            try:
+                delta_usd = float(data.get("net_usd"))
+            except Exception:
+                try:
+                    delta_usd = float(data.get("net"))
+                except Exception:
                     continue
-                for asset, qty in (assets or {}).items():
-                    asset_u = str(asset).upper()
-                    if asset_u in collat_quotes:
-                        continue
-                    try:
-                        qty_f = float(qty or 0.0)
-                    except Exception:
-                        qty_f = 0.0
-                    if qty_f == 0.0:
-                        continue
 
-                    price_usd: Optional[float] = None
-                    for quote in ("USDC", "USDT"):
-                        sym = f"{asset_u}{quote}"
-                        price_usd = self._get_price(ex_u, sym)
-                        if price_usd is not None:
-                            break
-                    if price_usd is None:
-                        continue
+            delta_usd_by_asset[asset_u] += delta_usd
 
-                    delta_usd[asset_u] += qty_f * price_usd
+        if not delta_usd_by_asset:
+            return
 
-        now_ts = float(now) if now is not None else time.time()
+        now_ts = float(now) if now is not None else float(raw.get("as_of_ts") or time.time())
         default_soft = float(getattr(cfg_rm, "mm_delta_soft_usd", 0.0) or 0.0)
         default_hard = float(getattr(cfg_rm, "mm_delta_hard_usd", 0.0) or 0.0)
         overrides = getattr(cfg_rm, "mm_delta_by_asset", {}) or {}
 
         mm_state: dict[str, dict] = {}
-        for asset, d_usd in delta_usd.items():
+        for asset, d_usd in delta_usd_by_asset.items():
             override = overrides.get(asset) or overrides.get(asset.upper()) or {}
             soft_limit = float(override.get("soft_usd", default_soft) or default_soft)
             hard_limit = float(override.get("hard_usd", default_hard) or default_hard)
@@ -1663,8 +1755,8 @@ class RiskManager:
 
             mm_state[asset] = {
                 "delta_usd": d_usd,
-                "soft_limit_usd": soft_limit,
-                "hard_limit_usd": hard_limit,
+                "soft_usd": soft_limit,
+                "hard_usd": hard_limit,
                 "state": state,
                 "last_update_ts": now_ts,
             }
@@ -1676,6 +1768,22 @@ class RiskManager:
                 pass
 
         self.mm_delta_state = mm_state
+
+    def _is_mm_alias(self, exchange: Any, alias: Any) -> bool:
+        alias_u = str(alias or "").upper()
+        if not alias_u:
+            return False
+        cfg_mm_alias = str(getattr(self, "mm_alias", "MM") or "MM").upper()
+        return "MM" in alias_u or alias_u == cfg_mm_alias
+
+    def _rm_mm_delta_status_for_asset(self, asset: str) -> Optional[Dict[str, Any]]:
+        """
+        Retourne l'état mm_delta pour un asset (upper) ou None si absent.
+        """
+        if not asset:
+            return None
+        a = str(asset).upper()
+        return self.mm_delta_state.get(a)
 
     def _register_tt_stuck_leg(self, leg_info: dict) -> None:
         """
@@ -1878,7 +1986,7 @@ class RiskManager:
         except Exception:
             delta = 0.0
         try:
-            hard_limit = float(state.get("hard_limit_usd") or 0.0)
+            hard_limit = float(state.get("hard_usd") or state.get("hard_limit_usd") or 0.0)
         except Exception:
             hard_limit = 0.0
 
@@ -3239,6 +3347,48 @@ class RiskManager:
         if not meta.get("capital_mode") or meta.get("capital_mode") == "UNKNOWN":
             meta["capital_mode"] = "OK"
             bundle["meta"] = meta
+
+        # 1-bis) Collat / marge alias-aware pour MM : on coupe si collat CRIT sur un alias du bundle.
+        if branch == "MM":
+            try:
+                aliases = self._iter_bundle_aliases(bundle)
+            except Exception:
+                aliases = []
+
+            worst_state = "OK"
+            worst_alias: Optional[Tuple[str, str]] = None
+
+            coll_state = getattr(self, "alias_collat_state", {}) or {}
+            for ex, alias in aliases or []:
+                key = (str(ex).upper(), str(alias).upper())
+                info = coll_state.get(key)
+                if not info:
+                    continue
+                st = str(info.get("state") or "OK").upper()
+                if st == "CRIT":
+                    worst_state = "CRIT"
+                    worst_alias = key
+                    break
+                if st == "LOW" and worst_state == "OK":
+                    worst_state = "LOW"
+                    worst_alias = key
+
+            if worst_state == "CRIT":
+                reason = (
+                    f"MM_COLLAT_CRIT:{worst_alias[0]}.{worst_alias[1]}"
+                    if worst_alias else
+                    "MM_COLLAT_CRIT"
+                )
+                logging.info(
+                    "RM: drop bundle %s branch=MM pour collat CRIT sur alias %s.%s",
+                    trace_id,
+                    worst_alias[0] if worst_alias else "NA",
+                    worst_alias[1] if worst_alias else "NA",
+                )
+                if self._shadow:
+                    self._shadow.on_bundle_drop(bundle, reason)
+                return False
+
 
         # 2) Légalité & REB lock
         if not self._is_bundle_legal(bundle):
@@ -5495,12 +5645,39 @@ class RiskManager:
             elif isinstance(exp, str):
                 strat_hint = exp
             strat = str(strat_hint).upper() or "TT"
+            branch = str(opp.get("branch") or strat).upper()
+            ctx["branch"] = branch
             q, amt = self._normalize_notional_tuple(opp)  # ta fonction déjà existante
             ctx["notional_quote"] = {"quote": q, "amount": float(amt)}
             ok, why = self._budget_allows(strat, amt)
 
             if not ok:
                 return (False, why, ctx)
+
+            if branch == "MM":
+                base_asset = self._pair_base(pair)
+                ctx["base_asset"] = base_asset
+                mm_state = self._rm_mm_delta_status_for_asset(base_asset)
+                if mm_state:
+                    st = str(mm_state.get("state") or "").upper()
+                    delta_usd = float(mm_state.get("delta_usd") or 0.0)
+                    soft = float(mm_state.get("soft_usd") or mm_state.get("soft_limit_usd") or 0.0)
+                    hard = float(mm_state.get("hard_usd") or mm_state.get("hard_limit_usd") or 0.0)
+
+                    if st == "HARD":
+                        try:
+                            self.metrics.increment("RM_MM_DELTA_HARD_LIMIT", tags={"asset": base_asset})
+                        except Exception:
+                            pass
+                        return (False, "RM_MM_DELTA_HARD_LIMIT", ctx)
+
+                    if st == "SOFT":
+                        ctx["mm_delta_state"] = "SOFT"
+                        ctx["mm_delta_usd"] = delta_usd
+                        try:
+                            self.metrics.increment("RM_MM_DELTA_SOFT_LIMIT", tags={"asset": base_asset})
+                        except Exception:
+                            pass
 
             return (True, "", ctx)
         finally:
