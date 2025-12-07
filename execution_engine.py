@@ -4731,6 +4731,64 @@ class ExecutionEngine:
             base = max(best_bid, 0.0)
             return max(0.0, base - (k * tick))
 
+
+
+    def _build_mm_ladder(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Canonicalise un bundle MM "mono-pair / mono-CEX" en un quote par côté,
+        sans fragmentation (un seul niveau de prix par côté).
+
+        Contrat M2-A :
+        - payload contient déjà un champ "legs" normalisé (2 jambes),
+        - on ne traite que MM mono-CEX / mono-pair à 2 makers (BUY + SELL),
+        - on retourne le payload (potentiellement modifié), pas une nouvelle structure.
+        """
+
+        if not getattr(self, "risk_manager", None):
+            return payload
+
+        legs = payload.get("legs") or []
+        if len(legs) != 2:
+            return payload
+
+        try:
+            pair_key = self._fmt_pair(payload.get("pair_key") or legs[0].get("symbol"))
+        except Exception:
+            pair_key = str(payload.get("pair_key") or legs[0].get("symbol", "")).replace("-", "").upper()
+
+        buy_leg = next((l for l in legs if str(l.get("side", "")).upper() == "BUY"), None)
+        sell_leg = next((l for l in legs if str(l.get("side", "")).upper() == "SELL"), None)
+
+        if not buy_leg or not sell_leg:
+            return payload
+
+        try:
+            bid, ask = self.risk_manager.get_top_of_book(buy_leg.get("exchange"), pair_key)
+        except Exception:
+            bid, ask = 0.0, 0.0
+
+        if bid > 0 and ask > 0:
+            px_buy = self._price_ladder_maker(buy_leg.get("exchange"), pair_key, "BUY", bid, ask, idx=0)
+            px_sell = self._price_ladder_maker(sell_leg.get("exchange"), pair_key, "SELL", bid, ask, idx=0)
+
+            if px_buy > 0:
+                buy_leg["px_limit"] = px_buy
+            if px_sell > 0:
+                sell_leg["px_limit"] = px_sell
+
+        for leg in (buy_leg, sell_leg):
+            meta = leg.setdefault("meta", {}) or {}
+            meta["maker"] = True
+            meta.setdefault("branch", "MM")
+            meta.setdefault("strategy", "MM")
+
+        meta_payload = payload.setdefault("meta", {}) or {}
+        meta_payload.setdefault("branch", "MM")
+        meta_payload.setdefault("strategy", "MM")
+
+        return payload
+
+
     # ======= Queue-position (USD devant à notre prix) =======
     # ======= Queue-position (QUOTE devant à notre prix) =======
     # ======= Queue-position (QUOTE devant à notre prix) =======
@@ -5302,7 +5360,7 @@ class ExecutionEngine:
         )
         return slices
 
-    def _build_mm_ladder(
+    def _build_mm_ladder_fragments(
             self,
             *,
             pair: str,
@@ -6034,9 +6092,13 @@ class ExecutionEngine:
         if not buy_leg or not sell_leg:
             self._reject(pair_key, payload, "bundle sans BUY/SELL")
             return
-        
+
         branch = str(meta_payload.get("branch") or meta_payload.get("strategy") or "").upper()
         strategy = str(meta_payload.get("strategy", "")).upper()
+
+        if (branch == "MM" or strategy == "MM") and legs:
+            payload = self._build_mm_ladder(payload)
+            legs = payload.get("legs") or legs
 
         is_rebal = (
                 payload.get("type") == "rebalancing"
@@ -6075,8 +6137,20 @@ class ExecutionEngine:
                 return
 
             # Bundle marqué MM mais pas sous forme dual mono-CEX propre
-            self._reject(pair_key, payload, "mm_dual_shape_invalid")
-            return
+            payload = self._build_mm_ladder(payload)
+            legs = payload.get("legs") or legs
+            if len(legs) != 2:
+                self._reject(pair_key, payload, "mm_dual_shape_invalid")
+                return
+
+            buy_leg = next((l for l in legs if str(l.get("side", "")).upper() == "BUY"), None)
+            sell_leg = next((l for l in legs if str(l.get("side", "")).upper() == "SELL"), None)
+            if not buy_leg or not sell_leg:
+                self._reject(pair_key, payload, "mm_dual_shape_invalid")
+                return
+
+            branch = "MM"
+            strategy = "TM"
 
         # Canonise le marquage REB au niveau payload.meta
         if is_rebal:
