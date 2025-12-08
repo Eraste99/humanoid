@@ -524,6 +524,26 @@ class LogWriter:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_pair_history_pair ON pair_history(pair);")
 
+        # ---------------- rotation_decisions ----------------
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rotation_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT,
+                pair TEXT,
+                mode TEXT,
+                old_tier TEXT,
+                new_tier TEXT,
+                old_active INTEGER,
+                new_active INTEGER,
+                reason_code TEXT,
+                metrics_snapshot TEXT
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_decisions_pair ON rotation_decisions(pair);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_rotation_decisions_ts ON rotation_decisions(ts);")
+
         # ---------------- opportunities ----------------
         cur.execute(
             """
@@ -649,8 +669,19 @@ class LogWriter:
 
             },
         )
-        self._ensure_columns(conn, "pair_history", {"latency_ms_avg": "REAL"})
+        self._ensure_columns(conn, "pair_history", {"latency_ms_avg": "REAL", "tier": "TEXT"})
         self._ensure_columns(conn, "opportunities", {"trade_mode": "TEXT", "route_id": "TEXT"})
+        self._ensure_columns(conn, "rotation_decisions", {
+            "ts": "TEXT",
+            "pair": "TEXT",
+            "mode": "TEXT",
+            "old_tier": "TEXT",
+            "new_tier": "TEXT",
+            "old_active": "INTEGER",
+            "new_active": "INTEGER",
+            "reason_code": "TEXT",
+            "metrics_snapshot": "TEXT",
+        })
         # trades: colonnes dérivées P0
         self._ensure_columns(conn, "trades", {
             "net_profit_sign": "INTEGER",
@@ -737,20 +768,50 @@ class LogWriter:
                                 d.get("opportunity_freq"),
                                 d.get("score"),
                                 d.get("latency_ms_avg"),
+                                d.get("tier"),
                             )
                         )
-                    cur.executemany(
-                        """
-                        INSERT INTO pair_history (
-                            timestamp, pair, spread, volume, slippage_est, slippage_real,
-                            volatility, trade_result, net_profitability, opportunity_freq, score, latency_ms_avg
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        rows,
-                    )
+                        cur.executemany(
+                            """
+                            INSERT INTO pair_history (
+                                timestamp, pair, spread, volume, slippage_est, slippage_real,
+                                volatility, trade_result, net_profitability, opportunity_freq, score, latency_ms_avg, tier
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            rows,
+                        )
                     conn.commit()
             except Exception as e:
                 print(f"[LogWriter] Erreur écriture pair_history : {e}")
+
+    def insert_rotation_decision(self, **fields) -> None:
+        """Insère une ligne d'audit dans rotation_decisions."""
+        payload = dict(fields or {})
+        metrics = payload.get("metrics_snapshot")
+        if isinstance(metrics, (dict, list)):
+            try:
+                payload["metrics_snapshot"] = json.dumps(metrics, default=float)
+            except Exception:
+                payload["metrics_snapshot"] = json.dumps(metrics, default=str)
+        elif metrics is not None:
+            payload["metrics_snapshot"] = str(metrics)
+
+        with self._lock:
+            self._rotate_if_needed()
+            with self._conn() as conn:
+                try:
+                    cur = conn.cursor()
+                    cur.execute("PRAGMA table_info(rotation_decisions);")
+                    cols = {row[1] for row in cur.fetchall()}
+                    if "ts" not in payload:
+                        payload["ts"] = datetime.utcnow().isoformat()
+                    p = {k: v for k, v in payload.items() if k in cols}
+                    keys = ", ".join(p.keys())
+                    qmarks = ", ".join(["?"] * len(p))
+                    cur.execute(f"INSERT INTO rotation_decisions ({keys}) VALUES ({qmarks})", list(p.values()))
+                    conn.commit()
+                except Exception:
+                    logger.exception("insert_rotation_decision failed")
 
     def fetch_records(self, kind: str, day: str | None = None, limit: int = 1000) -> list[dict]:
         """

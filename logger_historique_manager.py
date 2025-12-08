@@ -70,7 +70,7 @@ from typing import Any, Dict, List, Optional
 from modules.logger_historique.log_writer import LogWriter
 from modules.logger_historique.base_trade_logger import BaseTradeLogger
 from modules.logger_historique.pair_history_tracker import PairHistoryTracker, TrackerConfig
-from modules.obs_metrics import update_storage_metrics
+from modules.obs_metrics import update_storage_metrics, PAIR_ROTATION_AGE_SECONDS, PAIR_ROTATION_LAST_TS
 import os, time
 import hashlib, json, time
 from pathlib import Path
@@ -440,6 +440,10 @@ class LoggerHistoriqueManager:
         db_dir = str(Path(out_dir))
         self._writer = LogWriter(db_dir=db_dir)
         self._tracker = PairHistoryTracker(tracker_config)
+        try:
+            self._tracker.rotation_logger = getattr(self, "log_rotation_decision", None)
+        except Exception:
+            logger.debug("rotation_logger hook not attached")
         self._trade_logger = BaseTradeLogger(
             log_type="trades",
             trade_filter=trade_filter or (lambda _t: True),
@@ -2900,10 +2904,16 @@ class LoggerHistoriqueManager:
                             "pair_score": pscore,
                             "pair_rank": prank,
                             "meta": meta,
+                            "tier": None,
                         }
                     )
-            return out
+                    try:
+                        out[-1]["tier"] = self.get_tier(asset)
+                    except Exception:
+                        out[-1]["tier"] = None
 
+
+            return out
         return await asyncio.to_thread(_fetch)
 
     # ---------------- vues/quotas par branche (TT/TM/REB) ----------------
@@ -2915,11 +2925,23 @@ class LoggerHistoriqueManager:
         # fallback global
         return list(self._tracker.get_active_pairs())
 
+    def get_active_pairs_by_mode(self, mode: str) -> List[str]:
+        """Proxy explicite vers le tracker pour la branche demandée."""
+        if hasattr(self._tracker, "get_active_pairs_by_mode"):
+            return self._tracker.get_active_pairs_by_mode(mode)
+        return list(self._tracker.get_active_pairs())
+
     def get_priority_pairs(self, mode: str, k: int | None = None) -> List[str]:
         """Top-k prioritaire pour un mode (TT/TM/REB)."""
         if hasattr(self._tracker, "get_priority_pairs_by_mode"):
             return self._tracker.get_priority_pairs_by_mode(mode, k)
         # fallback = tronquer la liste globale
+        base = list(self._tracker.get_active_pairs())
+        return base[: (k or len(base))]
+
+    def get_priority_pairs_by_mode(self, mode: str, k: int | None = None) -> List[str]:
+        if hasattr(self._tracker, "get_priority_pairs_by_mode"):
+            return self._tracker.get_priority_pairs_by_mode(mode, k)
         base = list(self._tracker.get_active_pairs())
         return base[: (k or len(base))]
 
@@ -2937,6 +2959,73 @@ class LoggerHistoriqueManager:
             return self._tracker.get_rank_map_by_mode(mode)
         # fallback global
         return self._tracker.get_rank_map()
+
+    def get_rank_map_by_mode(self, mode: str) -> Dict[str, int]:
+        if hasattr(self._tracker, "get_rank_map_by_mode"):
+            return self._tracker.get_rank_map_by_mode(mode)
+        return self._tracker.get_rank_map()
+
+    def log_rotation_decision(
+        self,
+        *,
+        pair: str,
+        mode: str,
+        old_tier: Optional[str] = None,
+        new_tier: Optional[str] = None,
+        old_active: Optional[bool] = None,
+        new_active: Optional[bool] = None,
+        reason_code: Optional[str] = None,
+        metrics_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Journalise une décision de rotation (audit)."""
+        p = (pair or "").replace("-", "").upper()
+        m = (mode or "").upper()
+        snapshot: Dict[str, Any] = dict(metrics_snapshot or {})
+        try:
+            if not snapshot and hasattr(self._tracker, "rotation_metrics_snapshot"):
+                snapshot = self._tracker.rotation_metrics_snapshot(p)
+        except Exception:
+            logger.exception("rotation_metrics_snapshot failed for %s", p)
+
+        payload = {
+            "pair": p,
+            "mode": m,
+            "old_tier": old_tier if old_tier is not None else self.get_tier(p),
+            "new_tier": new_tier if new_tier is not None else self.get_tier(p),
+            "old_active": old_active,
+            "new_active": new_active,
+            "reason_code": reason_code,
+            "metrics_snapshot": snapshot or None,
+        }
+        try:
+            self._writer.insert_rotation_decision(**payload)
+        except Exception:
+            logger.exception("log_rotation_decision failed for %s/%s", p, m)
+
+    def set_tier(self, pair: str, tier: Optional[str]) -> None:
+        try:
+            if hasattr(self._tracker, "set_tier"):
+                self._tracker.set_tier(pair, tier)
+        except Exception:
+            logger.exception("set_tier failed for %s", pair)
+
+    def get_tier(self, pair: str) -> Optional[str]:
+        try:
+            if hasattr(self._tracker, "get_tier"):
+                return self._tracker.get_tier(pair)
+        except Exception:
+            logger.exception("get_tier failed for %s", pair)
+        return None
+
+    def get_mm_score(self, pair: str) -> float:
+        if hasattr(self._tracker, "get_score_mm"):
+            return float(self._tracker.get_score_mm(pair))
+        return float(self._tracker.get_score(pair))
+
+    def get_scores_for_pair(self, pair: str) -> Dict[str, float]:
+        if hasattr(self._tracker, "get_scores_for_pair"):
+            return self._tracker.get_scores_for_pair(pair)
+        return {"score": float(self.get_score(pair))}
 
     def rotate_now(self) -> None:
         """Force une rotation immédiate (le tracker applique ses quotas par branche)."""
@@ -2993,6 +3082,26 @@ class LoggerHistoriqueManager:
 
         }
         # flags santé pipeline PnL (M5-C3) — version légère
+
+        try:
+            now_ts = time.time()
+            last_rot = float(getattr(self._tracker, "last_rotation_ts", 0.0) or 0.0)
+            last_score_ref = float(getattr(self._tracker, "last_scores_refresh_ts", 0.0) or 0.0)
+            st["rotation_status"] = {
+                "last_rotation_ts": last_rot,
+                "last_rotation_age_s": max(0.0, now_ts - last_rot) if last_rot else 0.0,
+                "last_scores_refresh_ts": last_score_ref,
+                "last_scores_refresh_age_s": max(0.0, now_ts - last_score_ref) if last_score_ref else 0.0,
+            }
+            try:
+                if last_rot:
+                    PAIR_ROTATION_LAST_TS.set(int(last_rot))
+                    PAIR_ROTATION_AGE_SECONDS.set(max(0.0, now_ts - last_rot))
+            except Exception:
+                pass
+        except Exception:
+            logging.exception("rotation_status update failed")
+            # flags santé pipeline PnL (M5-C3) — version légère
         try:
             st["pnl_pipeline_flags"] = self.get_pnl_pipeline_flags()
         except Exception:

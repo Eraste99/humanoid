@@ -110,9 +110,17 @@ class TrackerConfig:
     route_fail_penalty: float = 2.0
 
     # --- quotas par branche (facultatifs; None => pas de quota explicite) ---
+    # --- quotas par branche (facultatifs; None => pas de quota explicite) ---
     max_active_TT: Optional[int] = None
     max_active_TM: Optional[int] = None
     max_active_REB: Optional[int] = None
+    max_active_MM: Optional[int] = None
+
+    # --- scoring Maker-Maker (MM) ---
+    mm_w_pnl: float = 0.001  # pondération du PnL maker sur 24h (USDC)
+    mm_w_winrate: float = 20.0  # pondération du winrate maker (0..1)
+    mm_penalty_latency: float = 1.5  # multiplicateur appliqué à _latency_penalty
+    mm_penalty_slippage: float = 1.0  # multiplicateur appliqué au slippage moyen (fraction)
 
     # --- contrainte d'univers par mode (facultatif) ---
     constrain_universe_by_mode: bool = False
@@ -134,7 +142,8 @@ class PairHistoryTracker:
 
         # Métriques courantes
         self.volatility_by_pair: Dict[str, Dict[str, Any]] = {}
-        self.slippage_by_pair: Dict[str, float] = {}   # slippage courant instantané / EMA
+        self.slippage_by_pair: Dict[str, float] = {}  # slippage courant instantané / EMA
+        self.tier_by_pair: Dict[str, Optional[str]] = {}
 
         # États & dérivés
         self.last_trade_result: Dict[str, str] = {}  # "success"|"fail"|"unknown"
@@ -144,21 +153,59 @@ class PairHistoryTracker:
 
         # Scores & sélections
         self.pair_scores: Dict[str, float] = {}
+        self.pair_scores_mm: Dict[str, float] = {}
         self.route_scores: Dict[Tuple[str, str], float] = {}
         self.best_route_by_pair: Dict[str, Optional[str]] = {}
 
         self.active_pairs: List[str] = []
         self.paused_until: Dict[str, float] = {}
-        self.last_rotation: float = 0.0
+        self.last_rotation: float = 0.0  # compat: alias de last_rotation_ts
+        self.last_rotation_ts: float = 0.0
+        self.last_scores_refresh_ts: float = 0.0
 
         # --- Nouveautés par mode ---
-        self.active_pairs_by_mode: Dict[str, List[str]] = {"TT": [], "TM": [], "REB": []}
+        self.active_pairs_by_mode: Dict[str, List[str]] = {"TT": [], "TM": [], "REB": [], "MM": []}
         self.max_active_by_mode: Dict[str, Optional[int]] = {
             "TT": self.cfg.max_active_TT,
             "TM": self.cfg.max_active_TM,
             "REB": self.cfg.max_active_REB,
+            "MM": self.cfg.max_active_MM,
         }
-        self.universe_by_mode: Dict[str, Set[str]] = {"TT": set(), "TM": set(), "REB": set()}
+        self.universe_by_mode: Dict[str, Set[str]] = {"TT": set(), "TM": set(), "REB": set(), "MM": set()}
+        self.rotation_logger = None  # callback optionnel injecté par le LHM
+
+    def _all_known_pairs(self) -> Set[str]:
+        """Retourne l'ensemble des paires connues (historiques, scores, actives, univers)."""
+        seen: Set[str] = set()
+        seen.update({_norm_pair(p) for p in self.pair_scores.keys()})
+        seen.update({_norm_pair(p) for p in self.pair_scores_mm.keys()})
+        seen.update({_norm_pair(p) for p in self.opps_by_pair.keys()})
+        seen.update({_norm_pair(p) for p in self.trades_by_pair.keys()})
+        seen.update({_norm_pair(p) for p in self.active_pairs})
+        for arr in self.active_pairs_by_mode.values():
+            seen.update({_norm_pair(p) for p in arr})
+        for uni in self.universe_by_mode.values():
+            seen.update({_norm_pair(p) for p in uni})
+        for pair, _route in self.opps_by_route.keys():
+            seen.add(_norm_pair(pair))
+        for pair, _route in self.trades_by_route.keys():
+            seen.add(_norm_pair(pair))
+        for pair in self.tier_by_pair.keys():
+            seen.add(_norm_pair(pair))
+        return seen
+
+        # ---------- tiers ----------
+
+    def set_tier(self, pair: str, tier: Optional[str]) -> None:
+        pk = _norm_pair(pair)
+        tier_norm = str(tier).upper() if tier is not None else None
+        if tier_norm:
+            self.tier_by_pair[pk] = tier_norm
+        else:
+            self.tier_by_pair.pop(pk, None)
+
+    def get_tier(self, pair: str) -> Optional[str]:
+        return self.tier_by_pair.get(_norm_pair(pair))
 
     # ---------- ingestion API ----------
 
@@ -246,6 +293,9 @@ class PairHistoryTracker:
             "ts": ts,
             "executed_volume_usdc": _to_float(trade.get("executed_volume_usdc")),
             "net_profit": _to_float(trade.get("net_profit")),
+            "net_profit_sign": trade.get("net_profit_sign"),
+            "pnl_missing": trade.get("pnl_missing"),
+            "pnl_derived_from_bps": trade.get("pnl_derived_from_bps"),
             "status": str(trade.get("status", "unknown")),
             "trade_mode": (str(trade.get("trade_mode") or "").upper() or None),
             "e2e_ms": e2e,
@@ -407,6 +457,7 @@ class PairHistoryTracker:
     def _win_rate_24h(self, pair: str, now: float) -> Tuple[float, int]:
         thr = now - 86400
         wins = losses = 0
+        ignored = 0
 
         for t in self.trades_by_pair.get(pair, []):
             # fenêtre glissante 24h
@@ -415,6 +466,7 @@ class PairHistoryTracker:
 
             # [M5-A3-4] Si le trade est marqué comme PnL manquant, on l'ignore pour le win-rate
             if t.get("pnl_missing") is True:
+                ignored += 1
                 continue
 
             np = t.get("net_profit")
@@ -434,11 +486,83 @@ class PairHistoryTracker:
                 else:
                     losses += 1
             else:
-                # on ignore proprement (métriques LHM déjà là pour suivre ces cas)
-                pass
+                ignored += 1  # on ignore proprement (métriques LHM déjà là pour suivre ces cas)
 
         tot = wins + losses
         return ((wins / tot) if tot else 0.0, tot)
+
+    def _pnl_24h(self, pair: str, now: float) -> float:
+        thr = now - 86400
+        pnl = 0.0
+        for t in self.trades_by_pair.get(pair, []):
+            if t.get("ts", 0) < thr:
+                continue
+            if t.get("pnl_missing") is True:
+                continue
+            np = t.get("net_profit")
+            if isinstance(np, (int, float)):
+                pnl += float(np)
+        return pnl
+
+    def _maker_trades_last24h(self, pair: str, now: float) -> List[Dict[str, Any]]:
+        """Filtre les trades maker (optionnellement mode MM) sur 24h."""
+        thr = now - 86400
+        out: List[Dict[str, Any]] = []
+        for t in self.trades_by_pair.get(pair, []):
+            if t.get("ts", 0) < thr:
+                continue
+            if str(t.get("leg_role") or "").lower() != "maker":
+                continue
+            mode = str(t.get("trade_mode") or "").upper()
+            if mode and mode != "MM":
+                continue
+            out.append(t)
+        return out
+
+    def calc_score_mm(self, pair: str, now: float) -> float:
+        """Score maker-maker simplifié basé sur PnL/winrate/slippage/latence."""
+        trades = self._maker_trades_last24h(pair, now)
+        if not trades:
+            return -10.0
+
+        pnl = 0.0
+        wins = losses = 0
+
+        for t in trades:
+            if t.get("pnl_missing") is True:
+                continue
+
+            np = t.get("net_profit")
+            if isinstance(np, (int, float)):
+                pnl += float(np)
+                if np > 0:
+                    wins += 1
+                elif np < 0:
+                    losses += 1
+                continue
+
+            sign = t.get("net_profit_sign")
+            if sign in (1, -1):
+                if sign > 0:
+                    wins += 1
+                else:
+                    losses += 1
+
+        tot = wins + losses
+        win_rate = (wins / tot) if tot else 0.0
+
+        slip = self.slippage_by_pair.get(pair, 0.0)
+        latency_pen = self._latency_penalty(pair)
+
+        score = 0.0
+        score += self.cfg.mm_w_pnl * pnl
+        score += self.cfg.mm_w_winrate * win_rate
+        if slip:
+            score -= self.cfg.mm_penalty_slippage * slip * 100.0
+        if latency_pen:
+            score -= self.cfg.mm_penalty_latency * latency_pen
+
+        return round(score, 3)
 
 
     def _latency_penalty(self, pair: str) -> float:
@@ -467,11 +591,23 @@ class PairHistoryTracker:
         wins = losses = 0
         for t in self.trades_by_route.get(key, []):
             if t["ts"] >= thr:
-                np = _to_float(t.get("net_profit"))
-                if np > 0:
-                    wins += 1
-                elif np < 0:
-                    losses += 1
+                if t.get("pnl_missing") is True:
+                    continue
+
+                np = t.get("net_profit")
+                if isinstance(np, (int, float)) and np != 0:
+                    if np > 0:
+                        wins += 1
+                    else:
+                        losses += 1
+                    continue
+
+                sign = t.get("net_profit_sign")
+                if sign in (1, -1):
+                    if sign > 0:
+                        wins += 1
+                    else:
+                        losses += 1
         return wins, losses
 
     def _route_latency_penalty(self, key: Tuple[str, str]) -> float:
@@ -591,6 +727,20 @@ class PairHistoryTracker:
         bonus = getattr(self.cfg, f"bonus_mode_{mode}", 0.0)
         return round(base_score + bonus * bias, 3)
 
+    def refresh_pair_scores(self, now: Optional[float] = None) -> None:
+        now = now or _now()
+        for pair in self._all_known_pairs():
+            try:
+                self.pair_scores[pair] = self._calc_score(pair, now)
+            except Exception:
+                logger.warning("refresh_pair_scores failed for %s", pair, exc_info=True)
+            try:
+                self.pair_scores_mm[pair] = self.calc_score_mm(pair, now)
+            except Exception:
+                logger.warning("refresh_pair_scores (MM) failed for %s", pair, exc_info=True)
+        self.last_scores_refresh_ts = float(now)
+
+
     def _apply_mode_universe(self, pairs: Iterable[str], mode: str) -> List[str]:
         if not self.cfg.constrain_universe_by_mode:
             return list(pairs)
@@ -598,6 +748,33 @@ class PairHistoryTracker:
         if not universe:
             return list(pairs)
         return [p for p in pairs if p in universe]
+
+    def _emit_rotation_log(self, pair: str, mode: str, *, old_active: Optional[bool], new_active: Optional[bool],
+                           reason_code: str) -> None:
+        cb = getattr(self, "rotation_logger", None)
+        if not callable(cb):
+            return
+        try:
+            cb(
+                pair=pair,
+                mode=mode,
+                old_tier=self.get_tier(pair),
+                new_tier=self.get_tier(pair),
+                old_active=old_active,
+                new_active=new_active,
+                reason_code=reason_code,
+            )
+        except Exception:
+            logger.exception("rotation_logger failed for %s/%s", pair, mode)
+
+    def _log_rotation_deltas(self, prev: Dict[str, List[str]], curr: Dict[str, List[str]]) -> None:
+        for mode in ("TT", "TM", "REB"):
+            before = set(prev.get(mode, []) or [])
+            after = set(curr.get(mode, []) or [])
+            for p in after - before:
+                self._emit_rotation_log(p, mode, old_active=False, new_active=True, reason_code="ROTATE_ACTIVATE")
+            for p in before - after:
+                self._emit_rotation_log(p, mode, old_active=True, new_active=False, reason_code="ROTATE_DEACTIVATE")
 
     # pair_history_tracker.py — dans class PairHistoryTracker
 
@@ -611,9 +788,11 @@ class PairHistoryTracker:
         seen: Set[str] = set(self.pair_scores.keys())
         seen.update(self.opps_by_pair.keys())
         seen.update(self.trades_by_pair.keys())
+        seen.update(self.tier_by_pair.keys())
         if not seen:
             return []
         return [self._collect_pair_metrics_single(pk) for pk in sorted(seen)]
+
 
     def _collect_pair_metrics_single(self, pair_key: str) -> dict:
         pk = _norm_pair(pair_key)
@@ -627,6 +806,7 @@ class PairHistoryTracker:
             "route_score": None,
             "route_latency_ema_ms": None,
             "last_trade_result": self.last_trade_result.get(pk, "unknown"),
+            "tier": self.get_tier(pk),
         }
         best = None
         best_score = None
@@ -641,7 +821,6 @@ class PairHistoryTracker:
             out["route_latency_ema_ms"] = dict(self.lat_ema_by_route.get((pk, best), {}))
         return out
 
-
     def rotate_pairs(self, *, now: float | None = None) -> dict:
         """
         Rotation douce des paires actives par mode (TT/TM/REB) avec quotas.
@@ -649,20 +828,45 @@ class PairHistoryTracker:
         """
         now = now or _now()
         rep = {"TT": [], "TM": [], "REB": [], "banned": [], "timestamp": now}
-        # Calcul des classements par mode (déjà alimentés continuellement ailleurs)
-        rank_TT = self.get_priority_pairs_by_mode("TT", k=self.cfg.max_active_TT or self.cfg.max_active)
-        rank_TM = self.get_priority_pairs_by_mode("TM", k=self.cfg.max_active_TM or self.cfg.max_active)
-        rank_REB = self.get_priority_pairs_by_mode("REB", k=self.cfg.max_active_REB or self.cfg.max_active)
-        # Appliquer
-        self.active_pairs_by_mode["TT"] = set(rank_TT)
-        self.active_pairs_by_mode["TM"] = set(rank_TM)
-        self.active_pairs_by_mode["REB"] = set(rank_REB)
-        rep["TT"], rep["TM"], rep["REB"] = rank_TT, rank_TM, rank_REB
+        prev_active = {m: list(v) for m, v in self.active_pairs_by_mode.items()}
+        self.refresh_pair_scores(now)
+
+        base_pairs = list(self._all_known_pairs())
+        base_pairs.sort(key=lambda p: self.pair_scores.get(p, 0.0), reverse=True)
+
+        for mode in ("TT", "TM", "REB"):
+            candidates = self._apply_mode_universe(base_pairs, mode)
+            candidates = [p for p in candidates if not self.is_paused(p)]
+            limit = self.max_active_by_mode.get(mode)
+            if not limit:
+                limit = self.cfg.max_active
+            self.active_pairs_by_mode[mode] = candidates[:limit]
+            rep[mode] = list(self.active_pairs_by_mode[mode])
+
+        ordered_union: List[str] = []
+        for p in base_pairs:
+            if p in ordered_union:
+                continue
+            if any(p in self.active_pairs_by_mode[m] for m in ("TT", "TM", "REB")):
+                ordered_union.append(p)
+        self.active_pairs = ordered_union
+        self.last_rotation_ts = float(now)
+        self.last_rotation = self.last_rotation_ts
+        try:
+            self._log_rotation_deltas(prev_active, self.active_pairs_by_mode)
+        except Exception:
+            logger.exception("rotation logging failed")
+        from modules.obs_metrics import PAIR_ROTATION_LAST_TS, PAIR_ROTATION_AGE_SECONDS
+
+        try:
+            PAIR_ROTATION_LAST_TS.set(int(self.last_rotation_ts))
+            PAIR_ROTATION_AGE_SECONDS.set(max(0.0, float(_now()) - float(self.last_rotation_ts)))
+        except Exception:
+            pass
         # Rapport punitions/pauses (si implémentés)
         pauses = getattr(self, "paused_until", {})
         rep["paused"] = {p: t for p, t in pauses.items() if t > now}
         return rep
-
 
     # ---------- vues ----------
 
@@ -676,6 +880,16 @@ class PairHistoryTracker:
     def get_score(self, pair: str) -> float:
         return float(self.pair_scores.get(_norm_pair(pair), 0.0))
 
+    def get_score_mm(self, pair: str) -> float:
+        return float(self.pair_scores_mm.get(_norm_pair(pair), 0.0))
+
+    def get_scores_for_pair(self, pair: str) -> Dict[str, float]:
+        p = _norm_pair(pair)
+        return {
+            "score": float(self.pair_scores.get(p, 0.0)),
+            "score_mm": float(self.pair_scores_mm.get(p, 0.0)),
+        }
+
     def get_rank_map(self) -> Dict[str, int]:
         return {p: i + 1 for i, p in enumerate(self.active_pairs)}
 
@@ -686,6 +900,12 @@ class PairHistoryTracker:
         if not mode:
             return self.get_active_pairs()
         mode = mode.upper()
+        if mode == "MM":
+            # Vue prioritaire basée sur le score MM trié
+            ranked = [p for p, _s in sorted(self.pair_scores_mm.items(), key=lambda kv: kv[1], reverse=True)]
+            limit = self.max_active_by_mode.get("MM") or self.cfg.max_active
+            ranked = ranked[:limit]
+            return [p for p in ranked if not self.is_paused(p)]
         return list(self.active_pairs_by_mode.get(mode, []))
 
     def get_priority_pairs_by_mode(self, mode: str, k: Optional[int] = None) -> List[str]:
@@ -711,7 +931,7 @@ class PairHistoryTracker:
         """
         for mode, val in kw.items():
             m = (mode or "").upper()
-            if m not in ("TT", "TM", "REB"):
+            if m not in ("TT", "TM", "REB", "MM"):
                 continue
             if val is None:
                 continue
@@ -731,6 +951,27 @@ class PairHistoryTracker:
 
     def set_constrain_universe_by_mode(self, enabled: bool) -> None:
         self.cfg.constrain_universe_by_mode = bool(enabled)
+
+    # ---------- routes & snapshots ----------
+
+    def rotation_metrics_snapshot(self, pair: str, now: Optional[float] = None) -> Dict[str, Any]:
+        """Snapshot d'audit pour les décisions de rotation (PnL/winrate/score)."""
+        p = _norm_pair(pair)
+        now = now or _now()
+        win_rate, n_trades = self._win_rate_24h(p, now)
+        base_score = float(self.pair_scores.get(p, 0.0))
+        return {
+            "pair": p,
+            "score": base_score,
+            "score_mm": float(self.pair_scores_mm.get(p, 0.0)),
+            "score_by_mode": {m: self._mode_specific_score(p, base_score, m) for m in ("TT", "TM", "REB")},
+            "rank": self.get_rank_map().get(p),
+            "rank_by_mode": {m: self.get_rank_map_by_mode(m).get(p) for m in ("TT", "TM", "REB")},
+            "win_rate_24h": win_rate,
+            "trades_24h": n_trades,
+            "net_profit_24h": self._pnl_24h(p, now),
+            "tier": self.get_tier(p),
+        }
 
     # ---------- routes & snapshots ----------
 
@@ -772,8 +1013,8 @@ class PairHistoryTracker:
             "last_trade_result": self.last_trade_result.get(p, "unknown"),
             "win_rate_24h": win_rate,
             "trades_24h": n_trades,
+            "tier": self.get_tier(p),
         }
-
     def get_pair_snapshot_enriched(self, pair: str, now_s: Optional[float] = None) -> Dict[str, Any]:
         base = self.get_pair_snapshot(pair)  # API existante
         base = dict(base or {})
@@ -841,6 +1082,13 @@ class PairHistoryTracker:
             "top_scores": {p: self.pair_scores.get(p) for p in self.active_pairs},
             "rotation_interval": self.cfg.rotation_interval,
             "last_rotation": self.last_rotation or 0.0,
+            "rotation_status": {
+                "last_rotation_ts": self.last_rotation_ts or 0.0,
+                "last_rotation_age_s": max(0.0, (_now() - self.last_rotation_ts) if self.last_rotation_ts else 0.0),
+                "last_scores_refresh_ts": self.last_scores_refresh_ts or 0.0,
+                "last_scores_refresh_age_s": max(0.0, (
+                            _now() - self.last_scores_refresh_ts) if self.last_scores_refresh_ts else 0.0),
+            },
             "best_routes": {p: self.best_route_by_pair.get(p) for p in self.active_pairs},
             "max_active_by_mode": dict(self.max_active_by_mode),
             "constrain_universe_by_mode": bool(self.cfg.constrain_universe_by_mode),
@@ -871,8 +1119,9 @@ class PairHistoryTracker:
         self.lat_ema_by_pair.pop(p, None)
         self.mode_bias_by_pair.pop(p, None)
         self.pair_scores.pop(p, None)
+        self.pair_scores_mm.pop(p, None)
         self.best_route_by_pair.pop(p, None)
-
+        
         try:
             self.active_pairs.remove(p)
         except ValueError:
