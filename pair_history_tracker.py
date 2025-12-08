@@ -9,7 +9,9 @@ Nouveautés tri-CEX:
 - Expose best_route & route_latency_ema dans collect_pair_metrics / snapshots.
 
 Nouveautés "par branche":
-- Quotas par mode (TT/TM/REB) avec active_pairs_by_mode et rotation par mode.
+- Quotas par mode (TT/TM/REB) pour l'instrumentation.
+  REB est un "sous-mode" de TM utilisé pour le rebalancing, pas une branche
+  de trading indépendante.
 - APIs: get_active_pairs_by_mode, get_priority_pairs_by_mode, get_rank_map_by_mode,
         set_max_active_by_mode.
 - (Optionnel) Contrainte d'univers par mode: set_universe_for_mode, set_constrain_universe_by_mode.
@@ -293,9 +295,6 @@ class PairHistoryTracker:
             "ts": ts,
             "executed_volume_usdc": _to_float(trade.get("executed_volume_usdc")),
             "net_profit": _to_float(trade.get("net_profit")),
-            "net_profit_sign": trade.get("net_profit_sign"),
-            "pnl_missing": trade.get("pnl_missing"),
-            "pnl_derived_from_bps": trade.get("pnl_derived_from_bps"),
             "status": str(trade.get("status", "unknown")),
             "trade_mode": (str(trade.get("trade_mode") or "").upper() or None),
             "e2e_ms": e2e,
@@ -307,8 +306,13 @@ class PairHistoryTracker:
             "sell_ex": _norm_ex(sell_ex),
             "route": route,
             "leg_role": trade.get("leg_role"),
-        }
 
+            # --- flags PnL en provenance du LHM (optionnels) ---
+            # Si absents, ils restent à None et seront simplement ignorés.
+            "pnl_missing": trade.get("pnl_missing"),
+            "net_profit_sign": trade.get("net_profit_sign"),
+            "pnl_derived_from_bps": trade.get("pnl_derived_from_bps"),
+        }
         self.trades_by_pair[pair].append(entry)
         if route:
             self.trades_by_route[(pair, route)].append(entry)
@@ -405,6 +409,15 @@ class PairHistoryTracker:
     def _refresh_mode_bias(self, pair: str, mode: Optional[str], ts: float) -> None:
         if not mode:
             return
+
+        # ---------- PATCH 4.3 : REB = sous-mode TM ----------
+        # Toute activité "REB" est considérée comme du TM pour le biais par mode.
+        # On garde la clé "REB" dans le dict pour compat / métriques, mais on
+        # n'incrémente plus jamais explicitement son biais.
+        if mode == "REB":
+            mode = "TM"
+        # ---------- fin PATCH 4.3 ----------
+
         b = self.mode_bias_by_pair.setdefault(pair, {"TT": 0.0, "TM": 0.0, "REB": 0.0, "ts": ts})
         age = max(0.0, ts - float(b.get("ts", ts)))
         ttl = float(self.cfg.bias_ttl_s)
@@ -728,18 +741,30 @@ class PairHistoryTracker:
         return round(base_score + bonus * bias, 3)
 
     def refresh_pair_scores(self, now: Optional[float] = None) -> None:
+        """
+        Recalcule self.pair_scores et self.pair_scores_mm pour toutes les paires connues.
+        Les paires connues proviennent de _all_known_pairs() (opps, trades, actives, univers...).
+        """
         now = now or _now()
-        for pair in self._all_known_pairs():
-            try:
-                self.pair_scores[pair] = self._calc_score(pair, now)
-            except Exception:
-                logger.warning("refresh_pair_scores failed for %s", pair, exc_info=True)
-            try:
-                self.pair_scores_mm[pair] = self.calc_score_mm(pair, now)
-            except Exception:
-                logger.warning("refresh_pair_scores (MM) failed for %s", pair, exc_info=True)
-        self.last_scores_refresh_ts = float(now)
 
+        # On repart de zéro pour éviter de traîner des paires mortes
+        self.pair_scores.clear()
+        self.pair_scores_mm.clear()
+
+        for pair in self._all_known_pairs():
+            pk = _norm_pair(pair)
+            if not pk:
+                continue
+            try:
+                self.pair_scores[pk] = self._calc_score(pk, now)
+            except Exception:
+                logger.warning("refresh_pair_scores failed for %s", pk, exc_info=True)
+            try:
+                self.pair_scores_mm[pk] = self.calc_score_mm(pk, now)
+            except Exception:
+                logger.warning("refresh_pair_scores (MM) failed for %s", pk, exc_info=True)
+
+        self.last_scores_refresh_ts = float(now)
 
     def _apply_mode_universe(self, pairs: Iterable[str], mode: str) -> List[str]:
         if not self.cfg.constrain_universe_by_mode:
@@ -824,49 +849,74 @@ class PairHistoryTracker:
     def rotate_pairs(self, *, now: float | None = None) -> dict:
         """
         Rotation douce des paires actives par mode (TT/TM/REB) avec quotas.
-        Met à jour les sets self.active_pairs_by_mode[mode] et renvoie un rapport.
+        Utilise _calc_score pour construire un score de base, puis un score spécifique par mode.
+        Met à jour self.active_pairs_by_mode[mode] et self.active_pairs, et renvoie un rapport.
         """
         now = now or _now()
-        rep = {"TT": [], "TM": [], "REB": [], "banned": [], "timestamp": now}
-        prev_active = {m: list(v) for m, v in self.active_pairs_by_mode.items()}
-        self.refresh_pair_scores(now)
+        self.last_rotation = now
 
-        base_pairs = list(self._all_known_pairs())
-        base_pairs.sort(key=lambda p: self.pair_scores.get(p, 0.0), reverse=True)
+        # 1) Recalcul des scores globaux
+        self.refresh_pair_scores(now=now)
+
+        # Ensemble des paires scorées
+        candidates: Set[str] = set(self.pair_scores.keys())
+
+        rep: Dict[str, Any] = {"TT": [], "TM": [], "REB": [], "banned": [], "timestamp": now}
+        new_active_by_mode: Dict[str, List[str]] = {}
 
         for mode in ("TT", "TM", "REB"):
-            candidates = self._apply_mode_universe(base_pairs, mode)
-            candidates = [p for p in candidates if not self.is_paused(p)]
-            limit = self.max_active_by_mode.get(mode)
-            if not limit:
-                limit = self.cfg.max_active
-            self.active_pairs_by_mode[mode] = candidates[:limit]
-            rep[mode] = list(self.active_pairs_by_mode[mode])
-
-        ordered_union: List[str] = []
-        for p in base_pairs:
-            if p in ordered_union:
+            # Appliquer éventuellement l'univers par mode
+            base = list(candidates)
+            base = self._apply_mode_universe(base, mode)
+            if not base:
+                new_active_by_mode[mode] = []
+                rep[mode] = []
                 continue
-            if any(p in self.active_pairs_by_mode[m] for m in ("TT", "TM", "REB")):
-                ordered_union.append(p)
-        self.active_pairs = ordered_union
-        self.last_rotation_ts = float(now)
-        self.last_rotation = self.last_rotation_ts
-        try:
-            self._log_rotation_deltas(prev_active, self.active_pairs_by_mode)
-        except Exception:
-            logger.exception("rotation logging failed")
-        from modules.obs_metrics import PAIR_ROTATION_LAST_TS, PAIR_ROTATION_AGE_SECONDS
 
-        try:
-            PAIR_ROTATION_LAST_TS.set(int(self.last_rotation_ts))
-            PAIR_ROTATION_AGE_SECONDS.set(max(0.0, float(_now()) - float(self.last_rotation_ts)))
-        except Exception:
-            pass
-        # Rapport punitions/pauses (si implémentés)
+            # Score spécifique par mode
+            scored: List[Tuple[str, float]] = []
+            for p in base:
+                base_score = self.pair_scores.get(p, 0.0)
+                mode_score = self._mode_specific_score(p, base_score, mode)
+                scored.append((p, mode_score))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+
+            # Quota par mode
+            max_k = self.max_active_by_mode.get(mode) or self.cfg.max_active or len(scored)
+
+            selected: List[str] = []
+            for p, sc in scored:
+                if self.is_paused(p):
+                    continue
+                selected.append(p)
+                if len(selected) >= max_k:
+                    break
+
+            new_active_by_mode[mode] = selected
+            rep[mode] = selected
+
+        # Mise à jour des vues par mode (on garde l'ordre, donc des listes)
+        self.active_pairs_by_mode["TT"] = new_active_by_mode.get("TT", [])
+        self.active_pairs_by_mode["TM"] = new_active_by_mode.get("TM", [])
+        self.active_pairs_by_mode["REB"] = new_active_by_mode.get("REB", [])
+
+        # Vue globale: union triée par score global décroissant
+        union_active: Set[str] = set()
+        for arr in self.active_pairs_by_mode.values():
+            union_active.update(arr)
+        self.active_pairs = sorted(
+            union_active,
+            key=lambda p: self.pair_scores.get(p, 0.0),
+            reverse=True,
+        )
+
+        # Rapport pauses
         pauses = getattr(self, "paused_until", {})
         rep["paused"] = {p: t for p, t in pauses.items() if t > now}
+
         return rep
+
 
     # ---------- vues ----------
 
@@ -1121,7 +1171,7 @@ class PairHistoryTracker:
         self.pair_scores.pop(p, None)
         self.pair_scores_mm.pop(p, None)
         self.best_route_by_pair.pop(p, None)
-        
+
         try:
             self.active_pairs.remove(p)
         except ValueError:

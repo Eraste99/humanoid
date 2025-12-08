@@ -304,9 +304,15 @@ class OpportunityScanner:
         # --- dépendances / config ---
         self.cfg = cfg
         self.risk_manager = risk_manager
+
         self.rm = risk_manager  # compat legacy
         self.router = market_router
         self.history = history_logger
+        # LHM optionnel: peut être injecté après coup
+        # On initialise à None pour éviter les AttributeError au boot.
+        self.logger_historique_manager = None
+        # Sink optionnel pour l'historique d'opps (set_history_logger)
+        self._hist_logger = None
         self.logger = logging.getLogger("OpportunityScanner")
         if self.router is None:
             raise RuntimeError("Scanner: market_router is required")
@@ -587,6 +593,23 @@ class OpportunityScanner:
         if tier not in allowed_tiers:
             return False
 
+        # --- PATCH 4.2 : garde-fou univers MM via LHM / PairHistory ---
+        try:
+            mgr = getattr(self, "logger_historique_manager", None)
+            if mgr is not None and hasattr(mgr, "get_active_pairs"):
+                # vue PairHistory "top MM"
+                mm_active = set(mgr.get_active_pairs("MM") or [])
+                # si PairHistory ne fournit rien, on ne restreint pas
+                if mm_active and (p not in mm_active) and (p not in seed_pairs):
+                    return False
+        except Exception:
+            # Best-effort: en cas de problème on retombe sur le comportement legacy
+            try:
+                self.logger.exception("[Scanner][MM] mm_guard_by_pairhistory failed", exc_info=True)
+            except Exception:
+                pass
+        # --- fin PATCH 4.2 ---
+
         rot = getattr(self, "_rot_mm", None)
         if rot:
             if getattr(rot, "is_banned", lambda _p: False)(p):
@@ -844,22 +867,32 @@ class OpportunityScanner:
         if self._universe is not None and pair not in self._universe:
             return
         try:
+            mgr = getattr(self, "logger_historique_manager", None)
             priority = None
-            if self.scanner_mode in {"TT", "TM"} and hasattr(
-                    self.logger_historique_manager, "get_priority_pairs_by_mode"
-            ):
-                priority = self.logger_historique_manager.get_priority_pairs_by_mode(
-                    self.scanner_mode
-                )
-            elif hasattr(self.logger_historique_manager, "get_priority_pairs"):
-                priority = self.logger_historique_manager.get_priority_pairs()
 
-            if priority and pair not in priority:
-                return
-            if hasattr(self.logger_historique_manager, "is_paused") and self.logger_historique_manager.is_paused(pair):
-                return
+            if mgr is not None:
+                # 1) si possible, priorité par mode (TT/TM)
+                if self.scanner_mode in {"TT", "TM"}:
+                    get_prio_by_mode = getattr(mgr, "get_priority_pairs_by_mode", None)
+                    if callable(get_prio_by_mode):
+                        priority = get_prio_by_mode(self.scanner_mode)
+
+                # 2) fallback sur priorité globale si rien trouvé
+                if priority is None:
+                    get_prio = getattr(mgr, "get_priority_pairs", None)
+                    if callable(get_prio):
+                        priority = get_prio()
+
+                if priority and pair not in priority:
+                    return
+
+                is_paused = getattr(mgr, "is_paused", None)
+                if callable(is_paused) and is_paused(pair):
+                    return
+
         except Exception:
             logging.exception("Unhandled exception")
+
 
         # Stocker le snapshot puis quotas
         self.orderbooks.setdefault(ex, {})[pair] = data
@@ -919,7 +952,12 @@ class OpportunityScanner:
 
         if not rank_map:
             try:
-                ranked = getattr(self.logger_historique_manager, "get_ranked_pairs", lambda: [])()
+                mgr = getattr(self, "logger_historique_manager", None)
+                ranked = []
+                if mgr is not None:
+                    get_ranked = getattr(mgr, "get_ranked_pairs", None)
+                    if callable(get_ranked):
+                        ranked = get_ranked() or []
                 rank_map = {
                     _norm_pair(p): i + 1
                     for i, p in enumerate(ranked)
@@ -933,6 +971,7 @@ class OpportunityScanner:
             for p, r in (rank_map or {}).items()
             if _norm_pair(p) in base and isinstance(r, (int, float))
         }
+
 
         base_pairs = [p for p in base if p]
         internal_norm = {
@@ -1174,17 +1213,30 @@ class OpportunityScanner:
                     self._audition_deadlines[p] = now + ttl
 
         for p in to_pause:
+            # Pause côté LHM si possible
             try:
-                if hasattr(self.logger_historique_manager, "pause_pair") and self.autopause_duration_s > 0:
-                    self.logger_historique_manager.pause_pair(p, duration=int(self.autopause_duration_s))
-                    self.logger.info("[Scanner] Autopause audition %s (TTL=%ss)", p, int(ttl))
+                mgr = getattr(self, "logger_historique_manager", None)
+                if mgr is not None and self.autopause_duration_s > 0:
+                    pause_pair = getattr(mgr, "pause_pair", None)
+                    if callable(pause_pair):
+                        pause_pair(p, duration=int(self.autopause_duration_s))
+                        self.logger.info(
+                            "[Scanner] Autopause audition %s (TTL=%ss)", p, int(ttl)
+                        )
             except Exception:
                 logging.exception("Unhandled exception")
+
+            # Mise à jour locale des structures audition
             self._audition_pairs.discard(p)
             self._audition_deadlines.pop(p, None)
+
+            # Persist tier removal côté LHM
             try:
-                if hasattr(self.logger_historique_manager, "set_tier"):
-                    self.logger_historique_manager.set_tier(p, None)
+                mgr = getattr(self, "logger_historique_manager", None)
+                if mgr is not None:
+                    set_tier = getattr(mgr, "set_tier", None)
+                    if callable(set_tier):
+                        set_tier(p, None)
             except Exception:
                 self.logger.exception("[Scanner] persist tier removal failed", exc_info=True)
 
@@ -2395,7 +2447,8 @@ class OpportunityScanner:
                                       (self.average_spread * D(self.opportunity_count - 1)) + (D(spread_net) * D(100))
                               ) / D(self.opportunity_count)
 
-        rec = getattr(self.logger_historique_manager, "record_opportunity", None)
+        mgr = getattr(self, "logger_historique_manager", None)
+        rec = getattr(mgr, "record_opportunity", None) if mgr is not None else None
         if callable(rec):
             try:
                 if asyncio.iscoroutinefunction(rec):

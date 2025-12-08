@@ -535,6 +535,13 @@ class LoggerHistoriqueManager:
         # Utilisés pour enrichir le statut pnl_pipeline (OK/WARN/CRIT).
         self._last_queue_plateau_ts: Optional[float] = None
         self._last_db_stall_ts: Optional[float] = None
+        # -------- Tiers & décisions de rotation (M6-C) ----------
+        # Tiers courants par paire (vue in-memory, écrasée par la dernière décision connue)
+        self._pair_tiers: dict[str, str] = {}
+        # Buffer best-effort pour les écritures DB (pair_tiers)
+        self._pending_tier_rows: list[dict[str, Any]] = []
+        # Buffer best-effort pour les décisions de rotation (table rotation_decisions)
+        self._pending_rotation_decisions: list[dict[str, Any]] = []
 
 
 
@@ -2919,31 +2926,36 @@ class LoggerHistoriqueManager:
     # ---------------- vues/quotas par branche (TT/TM/REB) ----------------
     def get_active_pairs(self, mode: str | None = None) -> List[str]:
         """Liste des paires actives; filtrée par branche si `mode` est fourni."""
-        # Fallback si le tracker n'a pas get_active_pairs_by_mode
-        if hasattr(self._tracker, "get_active_pairs_by_mode"):
-            return self._tracker.get_active_pairs_by_mode(mode)
-        # fallback global
-        return list(self._tracker.get_active_pairs())
+        try:
+            if hasattr(self._tracker, "get_active_pairs_by_mode"):
+                return self._tracker.get_active_pairs_by_mode(mode)
+            # fallback global
+            return list(self._tracker.get_active_pairs())
+        except Exception:
+            logger.exception("get_active_pairs failed", exc_info=True)
+            return []
 
-    def get_active_pairs_by_mode(self, mode: str) -> List[str]:
-        """Proxy explicite vers le tracker pour la branche demandée."""
-        if hasattr(self._tracker, "get_active_pairs_by_mode"):
-            return self._tracker.get_active_pairs_by_mode(mode)
-        return list(self._tracker.get_active_pairs())
+    def get_priority_pairs(self, mode: str | None = None, k: int | None = None) -> List[str]:
+        """
+        Top-k prioritaire:
+        - si mode est fourni: vue TT/TM/REB correspondante,
+        - sinon: vue globale (toutes branches confondues).
 
-    def get_priority_pairs(self, mode: str, k: int | None = None) -> List[str]:
-        """Top-k prioritaire pour un mode (TT/TM/REB)."""
-        if hasattr(self._tracker, "get_priority_pairs_by_mode"):
-            return self._tracker.get_priority_pairs_by_mode(mode, k)
-        # fallback = tronquer la liste globale
-        base = list(self._tracker.get_active_pairs())
-        return base[: (k or len(base))]
+        Compatible avec les anciens appels sans argument (mode=None).
+        """
+        try:
+            if hasattr(self._tracker, "get_priority_pairs_by_mode"):
+                return self._tracker.get_priority_pairs_by_mode(mode, k)
+            # fallback: tronquer la liste globale
+            base = list(self._tracker.get_active_pairs())
+            return base[: (k or len(base))]
+        except Exception:
+            logger.exception("get_priority_pairs failed", exc_info=True)
+            return []
 
     def get_priority_pairs_by_mode(self, mode: str, k: int | None = None) -> List[str]:
-        if hasattr(self._tracker, "get_priority_pairs_by_mode"):
-            return self._tracker.get_priority_pairs_by_mode(mode, k)
-        base = list(self._tracker.get_active_pairs())
-        return base[: (k or len(base))]
+        """Alias explicite attendu par certains scanners (TT/TM/REB)."""
+        return self.get_priority_pairs(mode, k)
 
     def get_ranked_pairs(self) -> List[str]:
         """Alias attendu par certains scanners; ordre croissant de rank global."""
@@ -2951,71 +2963,146 @@ class LoggerHistoriqueManager:
             rm = self.get_rank_map(None)
             return [p for p, _r in sorted(rm.items(), key=lambda kv: kv[1])]
         except Exception:
-            return list(self._tracker.get_active_pairs())
+            return self.get_active_pairs()
 
     def get_rank_map(self, mode: str | None = None) -> Dict[str, int]:
         """Map {pair -> rang} pour un mode donné (ou global si None)."""
-        if hasattr(self._tracker, "get_rank_map_by_mode"):
-            return self._tracker.get_rank_map_by_mode(mode)
-        # fallback global
-        return self._tracker.get_rank_map()
-
-    def get_rank_map_by_mode(self, mode: str) -> Dict[str, int]:
-        if hasattr(self._tracker, "get_rank_map_by_mode"):
-            return self._tracker.get_rank_map_by_mode(mode)
-        return self._tracker.get_rank_map()
-
-    def log_rotation_decision(
-        self,
-        *,
-        pair: str,
-        mode: str,
-        old_tier: Optional[str] = None,
-        new_tier: Optional[str] = None,
-        old_active: Optional[bool] = None,
-        new_active: Optional[bool] = None,
-        reason_code: Optional[str] = None,
-        metrics_snapshot: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Journalise une décision de rotation (audit)."""
-        p = (pair or "").replace("-", "").upper()
-        m = (mode or "").upper()
-        snapshot: Dict[str, Any] = dict(metrics_snapshot or {})
         try:
-            if not snapshot and hasattr(self._tracker, "rotation_metrics_snapshot"):
-                snapshot = self._tracker.rotation_metrics_snapshot(p)
+            if hasattr(self._tracker, "get_rank_map_by_mode"):
+                return self._tracker.get_rank_map_by_mode(mode)
+            # fallback global
+            return self._tracker.get_rank_map()
         except Exception:
-            logger.exception("rotation_metrics_snapshot failed for %s", p)
+            logger.exception("get_rank_map failed", exc_info=True)
+            return {}
 
-        payload = {
-            "pair": p,
-            "mode": m,
-            "old_tier": old_tier if old_tier is not None else self.get_tier(p),
-            "new_tier": new_tier if new_tier is not None else self.get_tier(p),
-            "old_active": old_active,
-            "new_active": new_active,
-            "reason_code": reason_code,
-            "metrics_snapshot": snapshot or None,
-        }
-        try:
-            self._writer.insert_rotation_decision(**payload)
-        except Exception:
-            logger.exception("log_rotation_decision failed for %s/%s", p, m)
+    def log_rotation_decision(self, **payload: Any) -> None:
+        """
+        Trace une décision de rotation (Scanner / PairHistory / MM).
 
-    def set_tier(self, pair: str, tier: Optional[str]) -> None:
+        - Enrichit avec les tags de contexte (g.*).
+        - Ajoute la tier courante LHM si 'pair' est présent et que 'tier' n'est pas déjà fourni.
+        - Enqueue un event JSONL pour forensic.
+        - Bufferise une ligne pour la table rotation_decisions (flushée plus tard).
+        """
         try:
-            if hasattr(self._tracker, "set_tier"):
-                self._tracker.set_tier(pair, tier)
+            ts_ms = int(time.time() * 1000)
+            obj: dict[str, Any] = dict(payload or {})
+            obj.setdefault("timestamp_ms", ts_ms)
+
+            # Tier courante injectée automatiquement si possible
+            pair = obj.get("pair")
+            if pair and "tier" not in obj:
+                try:
+                    current_tier = self.get_tier(pair)
+                    if current_tier is not None:
+                        obj["tier"] = current_tier
+                except Exception:
+                    logger.exception("log_rotation_decision: get_tier failed for %s", pair, exc_info=True)
+
+            # Enrichissement contextuel (region, pod, branche, etc.)
+            obj = self._with_context_tags(obj)
+
+            # 1) JSONL best-effort (stream 'events')
+            try:
+                self._enqueue_jsonl(
+                    "events",
+                    {
+                        "stream": "events",
+                        "log_type": "rotation_decision",
+                        "payload": obj,
+                        "ingested_ms": ts_ms,
+                    },
+                )
+            except Exception:
+                # On ne veut surtout pas que l'absence de JSONL casse le hot-path
+                logger.exception("log_rotation_decision: jsonl enqueue failed")
+
+            # 2) Buffer DB (table rotation_decisions)
+            self._pending_rotation_decisions.append(obj)
         except Exception:
-            logger.exception("set_tier failed for %s", pair)
+            logger.exception("log_rotation_decision failed", exc_info=True)
+
+
+    # ----- API tiers exposée au Scanner / RM -----
+
+    def set_tier(self, pair: str, tier: str | None, *, source: str = "scanner") -> None:
+        """
+        LHM = source of truth des tiers.
+
+        - Met à jour la vue in-memory _pair_tiers.
+        - Enqueue une ligne pour la table pair_tiers (persistée lors des flush).
+        - Pousse la valeur vers le PairHistoryTracker (miroir read-only pour les métriques).
+        """
+        try:
+            if not pair:
+                return
+
+            # Normalisation minimale de la clé de paire pour la cohérence cross-modules
+            pk = (str(pair).replace("-", "")).upper()
+
+            # --- Vue in-memory SoT ---
+            if not tier:
+                self._pair_tiers.pop(pk, None)
+            else:
+                self._pair_tiers[pk] = str(tier).upper()
+
+            # --- Buffer DB (table pair_tiers) ---
+            row = {
+                "timestamp_ms": int(time.time() * 1000),
+                "pair": pk,
+                "tier": str(tier).upper() if tier else None,
+                "source": str(source or "scanner"),
+            }
+            self._pending_tier_rows.append(row)
+
+            # --- Miroir PairHistoryTracker (pour les métriques / snapshots) ---
+            tracker = getattr(self, "_tracker", None)
+            if tracker is not None:
+                set_tier_fn = getattr(tracker, "set_tier", None)
+                if callable(set_tier_fn):
+                    try:
+                        set_tier_fn(pk, tier)
+                    except Exception:
+                        logger.exception("set_tier: tracker.set_tier failed for %s", pk, exc_info=True)
+
+        except Exception:
+            logger.exception("set_tier failed for %s", pair, exc_info=True)
 
     def get_tier(self, pair: str) -> Optional[str]:
+        """
+        Retourne le tier courant pour une paire.
+
+        - Source of truth = _pair_tiers (LHM).
+        - Fallback éventuel: lecture dans le PairHistoryTracker pour compat / diagnostic.
+        """
         try:
-            if hasattr(self._tracker, "get_tier"):
-                return self._tracker.get_tier(pair)
+            if not pair:
+                return None
+            pk = (str(pair).replace("-", "")).upper()
+
+            # SoT LHM
+            tier = self._pair_tiers.get(pk)
+            if tier is not None:
+                return tier
+
+            # Compat / fallback: miroir PairHistoryTracker si présent
+            tracker = getattr(self, "_tracker", None)
+            if tracker is not None:
+                get_tier_fn = getattr(tracker, "get_tier", None)
+                if callable(get_tier_fn):
+                    try:
+                        t = get_tier_fn(pk)
+                        if t:
+                            return t
+                    except Exception:
+                        logger.exception("get_tier: tracker.get_tier failed for %s", pk, exc_info=True)
+
+            return None
         except Exception:
-            logger.exception("get_tier failed for %s", pair)
-        return None
+            logger.exception("get_tier failed for %s", pair, exc_info=True)
+            return None
+
 
     def get_mm_score(self, pair: str) -> float:
         if hasattr(self._tracker, "get_score_mm"):
@@ -3049,6 +3136,33 @@ class LoggerHistoriqueManager:
                 self._tracker.set_max_active(total)
         except Exception:
             logging.exception("Unhandled exception")
+
+        # ----- API pauses/tiers exposée au Scanner / RM -----
+
+    def pause_pair(self, pair: str, duration: int | None = None) -> None:
+        """
+        Met en pause une paire via le PairHistoryTracker.
+        Utilisé notamment par le Scanner pour l'autopause audition.
+        """
+        fn = getattr(self._tracker, "pause_pair", None)
+        if callable(fn):
+            try:
+                fn(pair, duration=duration)
+            except Exception:
+                logger.exception("pause_pair failed for %s", pair, exc_info=True)
+
+    def is_paused(self, pair: str) -> bool:
+        """
+        Retourne True si la paire est actuellement en pause côté tracker.
+        """
+        fn = getattr(self._tracker, "is_paused", None)
+        if callable(fn):
+            try:
+                return bool(fn(pair))
+            except Exception:
+                logger.exception("is_paused failed for %s", pair, exc_info=True)
+        return False
+
 
     # ---------------- exports / backup / rétention ----------------
     async def export_trades_csv(self, output_path: str = "logs/trades_export.csv") -> str:
