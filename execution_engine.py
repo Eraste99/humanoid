@@ -1502,9 +1502,8 @@ class ExecutionEngine:
         self.mm_cancel_rate_limit_per_pair = int(getattr(self.config, "mm_cancel_rate_limit_per_pair", 20))
         self._mm_place_buckets: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
         self._mm_cancel_buckets: dict[tuple[str, str], list[float]] = collections.defaultdict(list)
-        self._mm_active_by_pair: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
-        self._mm_expiry_by_cid: dict[str, tuple[str, str, float]] = {}
-
+        self._mm_active_by_pair: dict[tuple[str, str, str], set[str]] = collections.defaultdict(set)
+        self._mm_expiry_by_cid: dict[str, tuple[str, str, str, float]] = {}
         self.max_parallel_pairs_mm = int(getattr(self.config, "max_parallel_pairs_mm", 1))
 
         # ==== Concurrence / pacing global par branche ====
@@ -5136,13 +5135,22 @@ class ExecutionEngine:
         window.append(now)
         return False
 
-    def _mm_register(self, *, client_id: str, exchange: str, pair_key: str, ttl_ms: int,
-                     bundle_id: str | None = None) -> None:
+    def _mm_register(
+            self,
+            *,
+            client_id: str,
+            exchange: str,
+            pair_key: str,
+            ttl_ms: int,
+            bundle_id: str | None = None,
+            account_alias: str | None = None,
+    ) -> None:
         """Track MM makers for TTL & preemption."""
-        key = (exchange.upper(), pair_key.upper())
+        alias = str(account_alias or "").upper()
+        key = (exchange.upper(), alias, pair_key.upper())
         self._mm_active_by_pair[key].add(client_id)
         expiry = time.time() + max(0.0, ttl_ms) / 1000.0
-        self._mm_expiry_by_cid[client_id] = (exchange.upper(), pair_key.upper(), expiry)
+        self._mm_expiry_by_cid[client_id] = (exchange.upper(), alias, pair_key.upper(), expiry)
         if ttl_ms > 0:
             self._spawn(self._mm_cancel_on_ttl(client_id, expiry, bundle_id=bundle_id), name=f"mm-ttl-{client_id[-6:]}")
 
@@ -5153,7 +5161,7 @@ class ExecutionEngine:
         info = self._mm_expiry_by_cid.get(client_id)
         if not info:
             return
-        ex, pair_key, _ = info
+        ex, alias, pair_key, _ = info
         # cancel if still active
         await self._mm_cancel_open_makers([client_id], reason="ttl")
         try:
@@ -5218,7 +5226,15 @@ class ExecutionEngine:
         await self._exec_single(order)  # passe par la file + guards existants
         try:
             ttl_override = int(ttl_ms) if ttl_ms is not None else int(getattr(self, "mm_ttl_ms", 0))
-            self._mm_register(client_id=clid, exchange=ex, pair_key=sym, ttl_ms=ttl_override, bundle_id=bundle_id)
+            account_alias = (order.get("meta") or {}).get("account_alias")
+            self._mm_register(
+                client_id=clid,
+                exchange=ex,
+                pair_key=sym,
+                ttl_ms=ttl_override,
+                bundle_id=bundle_id,
+                account_alias=account_alias,
+            )
         except Exception:
             pass
         return clid
@@ -5338,10 +5354,19 @@ class ExecutionEngine:
             resp["reason"] = "exception"
             return resp
 
-    def _mm_active_for(self, exchange: str, pair_key: str) -> list[str]:
-        return list(self._mm_active_by_pair.get((exchange.upper(), pair_key.upper()), set()))
+    def _mm_active_for(self, exchange: str, pair_key: str, account_alias: str | None = None) -> list[str]:
+        ex = exchange.upper()
+        pair = pair_key.upper()
+        alias = str(account_alias or "").upper()
+        if account_alias is None:
+            res: set[str] = set()
+            for (ex_key, alias_key, pair_key_), cids in self._mm_active_by_pair.items():
+                if ex_key == ex and pair_key_ == pair:
+                    res.update(cids)
+            return list(res)
+        return list(self._mm_active_by_pair.get((ex, alias, pair), set()))
 
-    async def _mm_cancel_open_makers(self, client_ids: list[str]) -> None:
+    async def _mm_cancel_open_makers(self, client_ids: list[str], reason: str = "") -> None:
         """
         Annule proprement les makers restants (NEW/ACK/PARTIAL) par client_id.
         """
@@ -5350,13 +5375,18 @@ class ExecutionEngine:
             if not fsm or fsm.state in {"FILLED", "REJECTED", "CANCELED"}:
                 continue
             ex, sym = self._client_symbol_map.get(cid, (None, None))
+            alias_from_expiry = None
+            try:
+                _, alias_from_expiry, _, _ = self._mm_expiry_by_cid.get(cid, (None, None, None, None))
+            except Exception:
+                alias_from_expiry = None
             if ex and sym:
-                key = (ex, sym)
+                key = (ex, alias_from_expiry or "", sym)
                 if self._mm_throttle(exchange=ex, pair_key=sym, kind="cancel"):
                     continue
 
                 try:
-                    await self._cancel_order(ex, sym, cid)
+                    await self._cancel_order(ex, sym, cid, reason=reason)
                     try:
                         from obs_metrics import MM_MAKERS_CANCELED_TOTAL
 
@@ -5371,6 +5401,87 @@ class ExecutionEngine:
                     # cleanup tracking if present
                     self._mm_active_by_pair.get(key, set()).discard(cid)
                     self._mm_expiry_by_cid.pop(cid, None)
+
+    async def cancel_mm_quotes_on_exchange(
+            self,
+            exchange: str,
+            pair: str | None = None,
+            account_alias: str | None = None,
+            reason: str = "",
+    ) -> int:
+        ex = self._norm_ex(exchange)
+        pair_u = pair.upper() if pair else None
+        alias_u = str(account_alias or "").upper()
+        candidates: list[str] = []
+
+        for (ex_key, alias_key, pair_key), cids in list(self._mm_active_by_pair.items()):
+            if ex_key != ex:
+                continue
+            if pair_u and pair_key != pair_u:
+                continue
+            if account_alias is not None and alias_key != alias_u:
+                continue
+            candidates.extend(list(cids))
+
+        if not candidates:
+            try:
+                logger.debug(
+                    "[ExecutionEngine] cancel_mm_quotes_on_exchange: no active MM orders ex=%s pair=%s alias=%s",
+                    ex,
+                    pair_u or "*",
+                    alias_u or "*",
+                )
+            except Exception:
+                pass
+            return 0
+
+        sent = 0
+        for cid in candidates:
+            ex_sym = self._client_symbol_map.get(cid, (None, None))
+            ex_cid, sym = ex_sym
+            alias_for_cid = None
+            try:
+                _, alias_for_cid, _, _ = self._mm_expiry_by_cid.get(cid, (None, None, None, None))
+            except Exception:
+                alias_for_cid = None
+            if ex_cid != ex or not sym:
+                continue
+            if pair_u and sym != pair_u:
+                continue
+            if self._mm_throttle(exchange=ex, pair_key=sym, kind="cancel"):
+                continue
+
+            meta = {
+                "branch": "MM",
+                "strategy": "MM",
+                "preempted": True,
+                "preempt_reason": reason,
+            }
+            try:
+                await self._cancel_order(ex, sym, cid, reason=reason or "mm_preempt")
+                try:
+                    await self._hist(
+                        "cancel",
+                        {
+                            "exchange": ex,
+                            "symbol": sym,
+                            "client_id": cid,
+                            "status": "preempt_sent",
+                            "meta": meta,
+                            "reason": reason,
+                        },
+                    )
+                except Exception:
+                    pass
+                sent += 1
+            except Exception:
+                logging.exception("Unhandled exception canceling MM quote")
+            finally:
+                key = (ex, str(alias_for_cid or alias_u), sym)
+                self._mm_active_by_pair.get(key, set()).discard(cid)
+                self._mm_expiry_by_cid.pop(cid, None)
+
+        return sent
 
     async def _preempt_mm_for_pair(self, exchanges: list[str], pair_key: str, by: str) -> None:
         """Cancel MM makers on the given pair/venues when a higher priority branch executes."""

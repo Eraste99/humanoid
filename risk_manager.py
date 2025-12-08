@@ -1088,6 +1088,8 @@ class RiskManager:
 
         # Préemption & caps notionnels par stratégie/CEX (devise de cotation)
         self.preempt_mm_for_tt_tm = bool(getattr(self.bot_cfg, "preempt_mm_for_tt_tm", True))
+        self.mm_preempt_cooldown_s = float(getattr(self.bot_cfg, "mm_preempt_cooldown_s", 1.0))
+        self._mm_last_preempt_ts: Dict[tuple[str, str, str], float] = {}
         self.per_strategy_notional_cap   = _cfg_dict(self.bot_cfg, "per_strategy_notional_cap", {})
         # --- budgets virtuels par quote (USDC/EUR) ---
         # ex: {"BINANCE":{"USDC": 25000.0, "EUR": 0.0}, ...}
@@ -2774,26 +2776,49 @@ class RiskManager:
             return "TT"
         return "NONE"
 
-    def _cancel_open_mm_quotes_on_exchange(self, ex: str, *, reason: str = "preempt_tt_tm") -> None:
-        """
-        Préempte la liquidité MM côté Engine (si supporté).
-        Tolérant: no-op si la méthode n'existe pas.
-        """
-        try:
-            RM_MM_PREEMPTED_TOTAL.labels(by=str(reason or "UNKNOWN").upper()).inc()
-        except Exception:
-            pass
-        eng = getattr(self, "engine", None)
-        if not eng:
-            return
-        for name in ("cancel_mm_quotes_on_exchange", "cancel_makers_on_exchange", "cancel_mm_on_exchange"):
-            if hasattr(eng, name):
-                try:
-                    getattr(eng, name)(exchange=str(ex).upper(), reason=reason)
-                except Exception:
-                    logging.exception("Unhandled exception")
-                break
+    async def _cancel_open_mm_quotes_on_exchange(
+        self,
+        exchange: str,
+        pair: str | None = None,
+        account_alias: str | None = None,
+        *,
+        reason: str = "",
+    ) -> int:
+        """Préempte la liquidité MM via l'executor, avec cooldown fail-soft."""
 
+        cooldown = float(getattr(self, "mm_preempt_cooldown_s", 1.0))
+        pair_key = self._norm_pair(pair) if pair else None
+        alias_u = str(account_alias or "").upper()
+        key = (str(exchange or "").upper(), pair_key or "*", alias_u or "*")
+        now = time.time()
+        last = getattr(self, "_mm_last_preempt_ts", {}).get(key, 0.0)
+        if now - last < cooldown:
+            return 0
+        self._mm_last_preempt_ts[key] = now
+
+        executor = getattr(self, "executor", None) or getattr(self, "engine", None)
+        if executor is None or not hasattr(executor, "cancel_mm_quotes_on_exchange"):
+            logging.warning("[RiskManager] executor without MM cancel API, skip preempt")
+            return 0
+
+        try:
+            res = await executor.cancel_mm_quotes_on_exchange(
+                exchange=str(exchange).upper(),
+                pair=pair_key,
+                account_alias=alias_u or None,
+                reason=reason,
+            )
+            count = int(res) if res is not None else -1
+        except Exception:
+            logging.exception("[RiskManager] MM preempt cancel failed")
+            count = -1
+
+        if count >= 0:
+            try:
+                RM_MM_PREEMPTED_TOTAL.labels(by=str(reason or "UNKNOWN").upper()).inc(count)
+            except Exception:
+                pass
+        return count
     # === RM: capital net & profil ===
 
     def compute_capital_net_per_subaccount(self, gross_equity: float, fee_reserve_total: float) -> float:
@@ -2855,7 +2880,12 @@ class RiskManager:
         if desired_notional <= cap:
             return max(0.0, desired_notional)
         if strategy in ("TT", "TM") and self.preempt_mm_for_tt_tm:
-            self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
+            try:
+                asyncio.create_task(
+                    self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
+                )
+            except Exception:
+                logging.exception("Unhandled while scheduling MM preempt")
         return max(0.0, cap)
 
     def _get_caps_for_bundle(
@@ -3113,7 +3143,12 @@ class RiskManager:
         if desired_notional <= cap:
             return max(0.0, desired_notional)
         if strategy in ("TT", "TM") and getattr(self, "preempt_mm_for_tt_tm", False):
-            self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
+            try:
+                asyncio.create_task(
+                    self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
+                )
+            except Exception:
+                logging.exception("Unhandled while scheduling MM preempt")
         return max(0.0, cap)
 
     def _apply_caps_and_preempt_bundle(
@@ -3122,32 +3157,179 @@ class RiskManager:
             caps_local: Dict[str, Any],
             eligible: Any,
             profile: str,
-    ):
-        """Contrat bundle-centric (Ticket 10) — utilisé par engine_enqueue_bundle.
+    ) -> tuple[bool, Dict[str, Any], str]:
+        """
+        Contrat bundle-centric (Ticket 10) — utilisé par engine_enqueue_bundle.
 
         Rôle :
-        - S'assurer qu'on a un caps_local cohérent pour le bundle.
-        - Préparer un reason lisible en cas de rejet caps côté RM.
+        - valider / normaliser caps_local,
+        - appliquer les caps globaux MM (virtual wallet + headroom par paire),
+        - renvoyer (ok, caps_local, trade_mode).
 
         NB : la limitation réelle de concurrence par branche reste appliquée
-        côté Engine via bundle_concurrency/headroom_min ; ici on se contente
-        d'un pré-check très léger pour la traçabilité.
+        côté Engine via bundle_concurrency/headroom_min ; ici on fait un
+        pré-check léger mais bloquant pour MM.
         """
         meta = bundle.get("meta") or {}
         trade_mode = str(meta.get("mode") or getattr(self, "trade_mode", "NORMAL") or "NORMAL").upper()
 
+        # --- 0) Hygiène de base sur caps_local ---------------------------------
         if not isinstance(caps_local, dict):
-            return False, RM_CAPS_INVALID, trade_mode
+            logging.warning(
+                "[RM] caps_local invalid for bundle (type=%s) trace_id=%s",
+                type(caps_local),
+                meta.get("trace_id") or "NA",
+            )
+            # On drop le bundle : caps non interprétables.
+            return False, caps_local, trade_mode
 
         inflight_cap = caps_local.get("inflight_cap")
         try:
             if isinstance(inflight_cap, (int, float)) and inflight_cap <= 0:
-                return False, RM_CAPS_ZERO, trade_mode
+                # Branche désactivée ou aucun headroom configuré pour ce profil/branche.
+                logging.info(
+                    "[RM] branch disabled by inflight_cap<=0: branch=%s profile=%s inflight_cap=%s",
+                    str(meta.get("branch") or bundle.get("branch") or "NA"),
+                    str(profile or meta.get("profile") or getattr(self, "capital_profile", "LARGE")),
+                    inflight_cap,
+                )
+                return False, caps_local, trade_mode
         except Exception:
             # On ne bloque pas si on ne sait pas interpréter le cap.
             pass
 
-        return True, ""
+        # --- 1) Gating spécifique MM : headroom par paire + virtual wallet -----
+        branch_u = str(meta.get("branch") or bundle.get("branch") or bundle.get("strategy") or "").upper()
+        if branch_u in {"MM", "MAKER_MM"}:
+            profile_u = str(
+                profile
+                or meta.get("profile")
+                or getattr(self, "capital_profile", "LARGE")
+                or "LARGE"
+            ).upper()
+
+            exchange = str(
+                meta.get("exchange")
+                or bundle.get("exchange")
+                or meta.get("ex")
+                or bundle.get("ex")
+                or ""
+            ).upper()
+            quote = str(meta.get("quote") or bundle.get("quote") or "USDC").upper()
+            pair_key = (
+                    meta.get("pair")
+                    or meta.get("symbol")
+                    or bundle.get("pair")
+                    or bundle.get("symbol")
+            )
+            pair_norm = self._norm_pair(pair_key or "")
+
+            # Si on n'a pas assez d'infos, on reste fail-soft (on ne casse pas le flux MM).
+            if not (exchange and quote and pair_norm and profile_u):
+                logging.warning(
+                    "[RM] MM bundle without full context for wallet gating; skip M3-B checks: "
+                    "profile=%s ex=%s pair=%s quote=%s trace_id=%s",
+                    profile_u,
+                    exchange,
+                    pair_norm,
+                    quote,
+                    meta.get("trace_id") or "NA",
+                )
+                return True, caps_local, trade_mode
+
+            # Notional du bundle en USD-like.
+            try:
+                bundle_notional = float(self._estimate_bundle_notional_usd(bundle) or 0.0)
+            except Exception:
+                bundle_notional = 0.0
+
+            if bundle_notional <= 0.0:
+                # Rien à réserver → on laisse passer.
+                return True, caps_local, trade_mode
+
+            # 1.a) Cap par paire via mm_pair_headroom
+            try:
+                headroom_pair = float(self._mm_pair_headroom(profile_u, exchange, pair_norm, quote) or 0.0)
+            except Exception:
+                headroom_pair = 0.0
+
+            if bundle_notional > headroom_pair:
+                logging.info(
+                    "[RM] MM_PAIR_CAP_EXHAUSTED: profile=%s ex=%s pair=%s quote=%s "
+                    "notional=%.4f headroom=%.4f",
+                    profile_u,
+                    exchange,
+                    pair_norm,
+                    quote,
+                    bundle_notional,
+                    headroom_pair,
+                )
+                # TODO (optionnel) : instrumenter RM_MM_BUDGET_EXHAUSTED_TOTAL ici.
+                # Exemple à adapter à la signature réelle de la métrique :
+                # try:
+                #     RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(
+                #         profile_u, exchange, quote, "PAIR_CAP"
+                #     ).inc()
+                # except Exception:
+                #     pass
+                return False, caps_local, trade_mode
+
+            # 1.b) Réservation dans le wallet global MM
+            wallet_ok = False
+            try:
+                wallet_ok = bool(
+                    self._mm_wallet_reserve(
+                        exchange,
+                        quote,
+                        bundle_notional,
+                        dry_run=False,
+                        reason="bundle_admission",
+                        profile=profile_u,
+                    )
+                )
+            except Exception:
+                wallet_ok = False
+
+            if not wallet_ok:
+                logging.info(
+                    "[RM] MM_GLOBAL_BUDGET_EXHAUSTED: profile=%s ex=%s quote=%s pair=%s "
+                    "notional=%.4f remaining_wallet=%.4f",
+                    profile_u,
+                    exchange,
+                    quote,
+                    pair_norm,
+                    bundle_notional,
+                    float(self._mm_wallet_remaining(exchange, quote)),
+                )
+                # TODO (optionnel) : instrumenter RM_MM_BUDGET_EXHAUSTED_TOTAL ici.
+                # Exemple à adapter :
+                # try:
+                #     RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(
+                #         profile_u, exchange, quote, "GLOBAL_WALLET"
+                #     ).inc()
+                # except Exception:
+                #     pass
+                return False, caps_local, trade_mode
+
+            # 1.c) Mise à jour du registre mm_pair_spent_usdc (notional inflight par paire)
+            key = (profile_u, exchange, pair_norm)
+            prev_spent = float(self.mm_pair_spent_usdc.get(key, 0.0))
+            self.mm_pair_spent_usdc[key] = prev_spent + bundle_notional
+            logging.debug(
+                "[RM] MM wallet reserve: profile=%s ex=%s pair=%s quote=%s bundle_notional=%.4f "
+                "spent_before=%.4f spent_after=%.4f wallet_remaining=%.4f",
+                profile_u,
+                exchange,
+                pair_norm,
+                quote,
+                bundle_notional,
+                prev_spent,
+                self.mm_pair_spent_usdc[key],
+                float(self._mm_wallet_remaining(exchange, quote)),
+            )
+
+        # --- 2) Pour les autres branches : on laisse caps_local inchangé -------
+        return True, caps_local, trade_mode
 
     def _record_mm_disabled(
         self,
@@ -7318,7 +7500,11 @@ class RiskManager:
         if not self.enable_mm:
             try:
                 # best-effort : adapte la venue si besoin
-                self._cancel_open_mm_quotes_on_exchange("BINANCE", reason=f"rm_overlay:{self.rm_mode}")
+                asyncio.create_task(
+                    self._cancel_open_mm_quotes_on_exchange(
+                        "BINANCE", reason=f"rm_overlay:{self.rm_mode}"
+                    )
+                )
             except Exception:
                 pass
 
