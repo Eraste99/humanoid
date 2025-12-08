@@ -1158,6 +1158,18 @@ LHM_SLO_QUEUE_DEPTH_MAX_TARGET = _metric(
     'Target max JSONL queue depth (records) for CRIT/WARN SLO',
 )
 
+# PairHistory rotation freshness
+PAIR_ROTATION_LAST_TS = _metric(
+    Gauge,
+    'pair_rotation_last_ts_seconds',
+    'Timestamp of the last PairHistory rotation (epoch seconds)',
+)
+PAIR_ROTATION_AGE_SECONDS = _metric(
+    Gauge,
+    'pair_rotation_age_seconds',
+    'Age in seconds since the last PairHistory rotation',
+)
+
 LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET = _metric(
     Gauge,
     'lhm_slo_pipeline_lag_max_seconds_target',

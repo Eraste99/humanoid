@@ -338,6 +338,8 @@ class ScannerCfg:
     workers: int = 1
     backpressure_log_every: int = 1000
     max_opportunities: int = 1000
+    # Mode principal du Scanner (TT/TM/MIXED)
+    scanner_mode: str = "MIXED"
 
     # P0: dedup & fenêtres de scan
     dedup_window_s: float = 0.18  # cible P0 ≈ 0.12–0.20 s
@@ -368,6 +370,7 @@ class ScannerCfg:
     enable_mm_hints: bool = True
     binance_depth_level: int = 50
     mm_rotation_enabled: bool = False
+    mm_use_pairhistory: bool = True
     mm_seed_pairs: Tuple[str, ...] = ()
     mm_depth_min_quote: float = 200.0
     mm_qpos_max_ahead_quote: float = 5000.0
@@ -392,6 +395,8 @@ class RiskManagerCfg:
         "USDC": {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
         "EUR":  {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
     })
+
+
 
     # Ticket 10 — Caps d'inflight business par profil / branche
     # Profil = NANO/MICRO/SMALL/MID/LARGE (source: g.capital_profile)
@@ -464,6 +469,16 @@ class RiskManagerCfg:
             "allow_auto_downgrade": True,
         },
     })
+    # Expo TT/TM globale (VaR-lite)
+    tttm_exposure_soft_usd: float = 2000.0
+    tttm_exposure_hard_usd: float = 5000.0
+    # Overrides optionnels par asset: "BTC", "ETH", etc.
+    tttm_exposure_by_asset: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    # Gestion des stuck legs TT
+    tt_stuck_soft_usd: float = 1000.0
+    tt_stuck_hard_usd: float = 3000.0
+    tt_stuck_max_age_s: float = 10.0
 
     # Ticket 6 — Cap notional global par combo (TT+TM+REB) par profil (en quote USDC/EUR)
     # Aligné sur la borne “tail-risk” (_profile_cap_notional dans le RM).
@@ -507,6 +522,8 @@ class RiskManagerCfg:
     collat_ratio_warn: float = 1.1
     collat_ratio_crit: float = 1.0
     collat_quotes: List[str] = field(default_factory=lambda: ["USDC", "USDT", "USD", "EUR"])
+    # Collat / marge alias-aware (vue par alias pour le RiskManager)
+    collat_ratio_low: float = 1.1
 
     sfc_slippage_source: str = "fills"  # fills|hybrid|off
     prefilter_slip_bps: float = 2.0
@@ -1340,6 +1357,7 @@ class BotConfig:
 
         # --- Scanner cfg ------------------------------------------------------
         cfg.scanner.workers = _Env.get_int("SCANNER_WORKERS", cfg.scanner.workers)
+        cfg.scanner.scanner_mode = (_Env.get("SCANNER_MODE", cfg.scanner.scanner_mode) or cfg.scanner.scanner_mode)
         cfg.scanner.enable_mm_hints = _Env.get_bool("SCANNER_ENABLE_MM_HINTS", cfg.scanner.enable_mm_hints)
         cfg.scanner.binance_depth_level = _Env.get_int(
             "SCANNER_BINANCE_DEPTH_LEVEL", cfg.scanner.binance_depth_level
@@ -1486,6 +1504,53 @@ class BotConfig:
         cfg.rm.collat_quotes = _Env.get_list(
             "RM_COLLAT_QUOTES", cfg.rm.collat_quotes
         )
+
+        cfg.rm.collat_ratio_low = _Env.get_float(
+            "RM_COLLAT_RATIO_LOW",
+            cfg.rm.collat_ratio_low,
+        )
+
+        # Expo TT/TM globale (VaR-lite)
+        cfg.rm.tttm_exposure_soft_usd = _Env.get_float(
+            "RM_TTTM_EXPOSURE_SOFT_USD",
+            cfg.rm.tttm_exposure_soft_usd,
+        )
+        cfg.rm.tttm_exposure_hard_usd = _Env.get_float(
+            "RM_TTTM_EXPOSURE_HARD_USD",
+            cfg.rm.tttm_exposure_hard_usd,
+        )
+        # Overrides par asset via JSON optionnel (ex: {"BTC":{"soft_usd":5000,"hard_usd":15000}})
+        cfg.rm.tttm_exposure_by_asset = _Env.get_dict(
+            "RM_TTTM_EXPOSURE_BY_ASSET",
+            cfg.rm.tttm_exposure_by_asset,
+        )
+
+        # Stuck legs TT
+        cfg.rm.tt_stuck_soft_usd = _Env.get_float(
+            "RM_TT_STUCK_SOFT_USD",
+            cfg.rm.tt_stuck_soft_usd,
+        )
+        cfg.rm.tt_stuck_hard_usd = _Env.get_float(
+            "RM_TT_STUCK_HARD_USD",
+            cfg.rm.tt_stuck_hard_usd,
+        )
+        cfg.rm.tt_stuck_max_age_s = _Env.get_float(
+            "RM_TT_STUCK_MAX_AGE_S",
+            cfg.rm.tt_stuck_max_age_s,
+        )
+
+        # Liste de quotes considérées comme collat, ex: "USDC,USDT,USD,EUR"
+        collat_q_env = _Env.get("RM_COLLAT_QUOTES", None)
+        if collat_q_env:
+            try:
+                cfg.rm.collat_quotes = [
+                    s.strip().upper()
+                    for s in str(collat_q_env).split(",")
+                    if s.strip()
+                ]
+            except Exception:
+                pass
+
 
         cfg.rm.global_kill_switch = _Env.get_bool("GLOBAL_KILL_SWITCH", cfg.rm.global_kill_switch)
         cfg.rm.daily_strategy_budget_quote = _Env.get_dict("DAILY_STRATEGY_BUDGET_QUOTE",

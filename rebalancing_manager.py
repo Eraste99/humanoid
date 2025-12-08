@@ -238,7 +238,7 @@ class RebalancingManager:
         self._last_combo_cap_ratio: Optional[float] = None
         self._last_rebal_cap_status: Optional[str] = None
         self._reb_active_slots: deque = deque(maxlen=512)
-
+        self._rebalancing_assets: Dict[Tuple[str, str], float] = {}
 
         # Snapshots ingérés par le RM
         # OB: latest_orderbooks[EX][SYMBOL] = {"bid":..., "ask":..., "ts": ...}
@@ -313,6 +313,60 @@ class RebalancingManager:
             [t for t in self._reb_active_slots if (now - t) < ttl],
             maxlen=self._reb_active_slots.maxlen,
         )
+        self._prune_rebal_assets(now)
+
+    def _prune_rebal_assets(self, now: float) -> None:
+        ttl = float(self._reb_slot_ttl_s or 0.0)
+        if ttl <= 0:
+            self._rebalancing_assets.clear()
+            return
+        kept: Dict[Tuple[str, str], float] = {}
+        for key, ts in list(self._rebalancing_assets.items()):
+            if (now - ts) < ttl:
+                kept[key] = ts
+        self._rebalancing_assets = kept
+
+    def _register_rebalancing_assets(self, operations: List[Dict[str, Any]], now: float) -> None:
+        if not operations:
+            return
+
+        def _extract_assets(op: Dict[str, Any]) -> List[Tuple[str, str]]:
+            assets: List[Tuple[str, str]] = []
+            try:
+                ex = str(op.get("exchange") or op.get("ex") or op.get("venue") or "NA").upper()
+            except Exception:
+                ex = "NA"
+
+            possible_assets: List[str] = []
+            for key in ("asset", "base", "ccy"):
+                val = op.get(key)
+                if val:
+                    possible_assets.append(str(val).upper())
+            pair = op.get("pair") or op.get("symbol")
+            if pair:
+                pk = str(pair).replace("-", "").upper()
+                possible_assets.append(pk)
+                for q in self.quote_currencies or []:
+                    if pk.endswith(str(q).upper()) and len(pk) > len(q):
+                        possible_assets.append(pk[: -len(str(q))])
+
+            for asset in possible_assets:
+                if asset:
+                    assets.append((ex, asset))
+            return assets
+
+        for op in operations:
+            for key in _extract_assets(op or {}):
+                self._rebalancing_assets[key] = now
+
+    def is_asset_under_rebalancing(self, exchange: str, asset: str) -> bool:
+        now = _now()
+        self._prune_rebal_assets(now)
+        exu = str(exchange or "NA").upper()
+        au = str(asset or "").upper()
+        if not au:
+            return False
+        return (exu, au) in self._rebalancing_assets or ("NA", au) in self._rebalancing_assets
 
     def _estimate_plan_notional(self, operations: List[Dict[str, Any]]) -> float:
         total = 0.0
@@ -814,6 +868,7 @@ class RebalancingManager:
             self.rebal_plan_clipped_by_caps += 1
         self._emit_ts.extend([now] * len(selected))
         self._reb_active_slots.extend([now] * len(selected))
+        self._register_rebalancing_assets(selected, now)
 
         plan_notional = self._estimate_plan_notional(selected)
         self._last_combo_cap_ratio = None

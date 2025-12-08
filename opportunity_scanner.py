@@ -212,6 +212,7 @@ class _Rotation:
         self.audition: List[str] = []
         self._promoted_at: Dict[str, float] = {}
         self._banned_until: Dict[str, float] = {}
+        self._state_change_cb = None
 
     def ban(self, pair: str) -> None:
         now = time.time()
@@ -225,7 +226,13 @@ class _Rotation:
             SC_BANNED.labels("MM").inc()
         except Exception:
             pass
-
+        cb = getattr(self, "_state_change_cb", None)
+        if callable(cb):
+            try:
+                cb(pair, "banned")
+            except Exception:
+                pass
+            
     def is_banned(self, pair: str) -> bool:
         return time.time() < self._banned_until.get(pair, 0.0)
 
@@ -256,6 +263,8 @@ class _Rotation:
         SC_ROTATION_PRIMARY_SIZE.labels("MM").set(len(self.primary))
         SC_ROTATION_AUDITION_SIZE.labels("MM").set(len(self.audition))
 
+    def set_state_change_cb(self, fn):
+        self._state_change_cb = fn
 
 
 class OpportunityScanner:
@@ -377,6 +386,11 @@ class OpportunityScanner:
         self._enabled_ex = set(x.upper() for x in self.cfg.g.enabled_exchanges)
         self._routes = {(a.upper(), b.upper()) for (a, b) in self.cfg.g.allowed_routes}
 
+        # Mode principal (TT/TM/MIXED)
+        self.scanner_mode = str(getattr(s, "scanner_mode", "MIXED") or "MIXED").upper()
+        if self.scanner_mode not in {"TT", "TM", "MIXED"}:
+            self.scanner_mode = "MIXED"
+
         # ------------------------------------------------------
         # 5) Sizing/exec (piloté par cfg ; fallback RM si besoin)
         # ------------------------------------------------------
@@ -479,10 +493,22 @@ class OpportunityScanner:
                 hysteresis_min=int(getattr(s, "mm_rotation_hysteresis_min", 2)),
                 ban_ttl_min=int(getattr(s, "mm_rotation_ban_ttl_min", 3)),
             )
+            try:
+                self._rot_mm.set_state_change_cb(
+                    lambda pair, status: self._log_rotation_decision(
+                        pair=pair,
+                        mode="MM",
+                        old_active=None,
+                        new_active=False,
+                        reason_code="MM_BAN" if status == "banned" else "MM_ROTATE",
+                    )
+                )
+            except Exception:
+                self.logger.exception("[Scanner][MM] unable to attach rotation logger", exc_info=True)
         # ------------------------------------
         # 8) Feeds auxiliaires & caches
         # ------------------------------------
-        self._slip_cache = {}     # {(EX,PAIR): {"bps": float|None, "ts": float}}
+        # self._slip_cache = {}     # {(EX,PAIR): {"bps": float|None, "ts": float}}
         self._slip_threshold_bps = {}  # par pair
         self._fees_cache = {}     # {(EX,PAIR): {"taker": float|None, "maker": float|None, "ts": float}}
 
@@ -818,10 +844,18 @@ class OpportunityScanner:
         if self._universe is not None and pair not in self._universe:
             return
         try:
-            if hasattr(self.logger_historique_manager, "get_priority_pairs"):
+            priority = None
+            if self.scanner_mode in {"TT", "TM"} and hasattr(
+                    self.logger_historique_manager, "get_priority_pairs_by_mode"
+            ):
+                priority = self.logger_historique_manager.get_priority_pairs_by_mode(
+                    self.scanner_mode
+                )
+            elif hasattr(self.logger_historique_manager, "get_priority_pairs"):
                 priority = self.logger_historique_manager.get_priority_pairs()
-                if priority and pair not in priority:
-                    return
+
+            if priority and pair not in priority:
+                return
             if hasattr(self.logger_historique_manager, "is_paused") and self.logger_historique_manager.is_paused(pair):
                 return
         except Exception:
@@ -861,42 +895,57 @@ class OpportunityScanner:
 
     # ---------------- Pull utils ----------------
     def _top_pairs(self) -> List[str]:
-        """Priorisation mixte: Logger (priorité) + scoring interne en renfort; conserve la découverte via audition TTL."""
+        """Priorisation canonique PairHistory, raffinée par le score interne Scanner."""
         base = set(self._universe or self.pairs or [])
         if not base:
             return []
 
-        # 1) scoring interne récent
         self._refresh_internal_scores(window_s=180.0)
         internal = self._internal_scores
         max_int = max(internal.values(), default=0.0) or 1.0
 
-        # 2) ranking Logger
-        ranked = None
+        rank_map: Dict[str, int] = {}
         try:
-            ranked = getattr(self.logger_historique_manager, "get_ranked_pairs", lambda: None)()
+            if self.scanner_mode in {"TT", "TM"} and hasattr(
+                self.logger_historique_manager, "get_rank_map_by_mode"
+            ):
+                rank_map = self.logger_historique_manager.get_rank_map_by_mode(
+                    self.scanner_mode
+                )
+            elif hasattr(self.logger_historique_manager, "get_rank_map"):
+                rank_map = self.logger_historique_manager.get_rank_map(None)
         except Exception:
-            ranked = None
-        ranked = [_norm_pair(p) for p in (ranked or []) if _norm_pair(p) in base]
+            rank_map = {}
 
-        # 3) construire score combiné
-        WL = self.priority_weight_logger
-        WS = self.priority_weight_scanner
-        combo_scores: Dict[str, float] = {}
+        if not rank_map:
+            try:
+                ranked = getattr(self.logger_historique_manager, "get_ranked_pairs", lambda: [])()
+                rank_map = {
+                    _norm_pair(p): i + 1
+                    for i, p in enumerate(ranked)
+                    if _norm_pair(p) in base
+                }
+            except Exception:
+                rank_map = {}
 
-        rank_score: Dict[str, float] = {}
-        if ranked:
-            n = len(ranked)
-            for i, p in enumerate(ranked):
-                rank_score[p] = float(n - i) / float(n)
+        rank_map = {
+            _norm_pair(p): int(r)
+            for p, r in (rank_map or {}).items()
+            if _norm_pair(p) in base and isinstance(r, (int, float))
+        }
 
-        for p in base:
-            s_int = (internal.get(p, 0.0) / max_int) if max_int > 0 else 0.0
-            s_lhm = rank_score.get(p, 0.0)
-            combo_scores[p] = WL * s_lhm + WS * s_int
+        base_pairs = [p for p in base if p]
+        internal_norm = {
+            p: (internal.get(p, 0.0) / max_int) if max_int > 0 else 0.0 for p in base_pairs
+        }
 
-        ordered = sorted(combo_scores.items(), key=lambda kv: kv[1], reverse=True)
-        return [p for p, _ in ordered[: self.max_pairs_per_tick]]
+        def _sort_key(pk: str) -> tuple:
+            rk = rank_map.get(pk)
+            has_rank = rk is not None
+            return (0 if has_rank else 1, rk if rk is not None else float("inf"), -internal_norm.get(pk, 0.0))
+
+        ordered = sorted(base_pairs, key=_sort_key)
+        return ordered[: self.max_pairs_per_tick]
 
     def _fee_cost_fast(self, buy_ex: str, sell_ex: str, pair: str) -> float:
         """Pré-filtre rapide STRICT: (frais taker buy + sell) + max(slippage buy/sell) — pas de valeurs inventées."""
@@ -1039,6 +1088,23 @@ class OpportunityScanner:
         self._audition_pairs = norm(audition)
         self._sandbox_pairs = norm(sandbox)
 
+        try:
+            tier_map = {
+                "CORE": self._core_pairs,
+                "PRIMARY": self._primary_pairs,
+                "AUDITION": self._audition_pairs,
+                "SANDBOX": self._sandbox_pairs,
+            }
+            if hasattr(self.logger_historique_manager, "set_tier"):
+                for tier_name, pairs in tier_map.items():
+                    for pair in pairs:
+                        try:
+                            self.logger_historique_manager.set_tier(pair, tier_name)
+                        except Exception:
+                            self.logger.exception("[Scanner] persist tier failed", exc_info=True)
+        except Exception:
+            self.logger.exception("[Scanner] tier persistence failed")
+
         # Univers = union (si core/sandbox vides → rétro-compat 2 tiers)
         universe = list(dict.fromkeys(core + primary + audition + sandbox)) or list(
             dict.fromkeys((primary or []) + (audition or [])))
@@ -1116,6 +1182,11 @@ class OpportunityScanner:
                 logging.exception("Unhandled exception")
             self._audition_pairs.discard(p)
             self._audition_deadlines.pop(p, None)
+            try:
+                if hasattr(self.logger_historique_manager, "set_tier"):
+                    self.logger_historique_manager.set_tier(p, None)
+            except Exception:
+                self.logger.exception("[Scanner] persist tier removal failed", exc_info=True)
 
     # --- HELPERS MM — CANONIQUE (UNIFIÉ) ---
 
@@ -1277,13 +1348,100 @@ class OpportunityScanner:
         }
         return score, hints
 
+    def _log_rotation_decision(self, **kwargs) -> None:
+        mgr = getattr(self, "logger_historique_manager", None) or getattr(self, "history", None)
+        fn = getattr(mgr, "log_rotation_decision", None)
+        if callable(fn):
+            try:
+                fn(**kwargs)
+            except Exception:
+                self.logger.exception("[Scanner] log_rotation_decision failed", exc_info=True)
+
     def _rotation_tick_mm(self, *, candidate_pairs: List[str]) -> None:
         """
         Tick de rotation MM : injection simple d'un ranking (ici l'ordre reçu).
         """
-        ranked_pairs = list(candidate_pairs)
-        self._rot_mm.update(ranked_pairs=ranked_pairs, allow_promote=True)
+        rot = getattr(self, "_rot_mm", None)
+        if rot is None:
+            return
 
+        def _snapshot_state() -> dict:
+            banned = set()
+            try:
+                banned = {p for p, ts in getattr(rot, "_banned_until", {}).items() if rot.is_banned(p)}
+            except Exception:
+                banned = set()
+            return {
+                "primary": set(getattr(rot, "primary", []) or []),
+                "audition": set(getattr(rot, "audition", []) or []),
+                "banned": banned,
+            }
+
+        before = _snapshot_state()
+        ranked_pairs = list(candidate_pairs)
+
+        use_pairhistory = bool(getattr(self.cfg, "mm_use_pairhistory", True))
+        if use_pairhistory and hasattr(self.logger_historique_manager, "get_priority_pairs_by_mode" ):
+            try:
+                ranked_from_history = self.logger_historique_manager.get_priority_pairs_by_mode("MM")
+                if ranked_from_history:
+                    ranked_pairs = list(dict.fromkeys(ranked_from_history + ranked_pairs))
+            except Exception:
+                logger.exception("[Scanner][MM] pairhistory ranking unavailable", exc_info=True)
+
+        self._rot_mm.update(ranked_pairs=ranked_pairs, allow_promote=True)
+        try:
+            after = _snapshot_state()
+            self._log_mm_rotation_changes(before, after)
+        except Exception:
+            self.logger.exception("[Scanner][MM] rotation logging failed", exc_info=True)
+
+    def _log_mm_rotation_changes(self, before: Dict[str, Set[str]], after: Dict[str, Set[str]]) -> None:
+        def _state_of(pair: str, state: Dict[str, Set[str]]) -> Optional[str]:
+            if pair in state.get("banned", set()):
+                return "banned"
+            if pair in state.get("primary", set()):
+                return "primary"
+            if pair in state.get("audition", set()):
+                return "audition"
+            return None
+
+        all_pairs: Set[str] = set()
+        for st in (before, after):
+            for arr in st.values():
+                all_pairs.update(arr or set())
+
+        for pair in all_pairs:
+            old = _state_of(pair, before)
+            new = _state_of(pair, after)
+            if old == new:
+                continue
+
+            old_active = old in {"primary", "audition"}
+            new_active = new in {"primary", "audition"}
+
+            if new == "banned":
+                reason = "MM_BAN"
+            elif old == "banned" and new_active:
+                reason = "MM_UNBAN"
+            elif new == "primary":
+                reason = "MM_PROMOTE"
+            elif new == "audition" and old != "primary":
+                reason = "MM_AUDITION"
+            elif old == "primary" and new == "audition":
+                reason = "MM_DEMOTE"
+            elif old_active and not new_active:
+                reason = "MM_ROTATE_OUT"
+            else:
+                reason = "MM_ROTATE"
+
+            self._log_rotation_decision(
+                pair=pair,
+                mode="MM",
+                old_active=old_active,
+                new_active=new_active,
+                reason_code=reason,
+            )
     # ---------- Quotas & charge ---------------------------------------------
     def _cohort_of(self, pair: str) -> str:
         """
