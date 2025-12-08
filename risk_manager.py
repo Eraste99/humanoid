@@ -36,7 +36,7 @@ from __future__ import annotations
 import asyncio, time, inspect
 import time, uuid, random
 import threading
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from modules.obs_metrics import inc_blocked
 import logging
 from collections import defaultdict
@@ -224,6 +224,30 @@ RM_TTTM_DELTA_SOFT_HIT = get_counter(
     "rm_tttm_delta_soft_hit_total",
     "Soft-limit TT/TM delta hits observed during gating",
     labelnames=("asset", "branch"),
+)
+
+# Reason codes spécifiques REB
+RM_REB_FACTORY_REJECT = "RM_REB_FACTORY_REJECT"
+REB_HINT_IGNORED_SMALL_SIZE = "REB_HINT_IGNORED_SMALL_SIZE"
+REB_HINT_IGNORED_BAD_CONTEXT = "REB_HINT_IGNORED_BAD_CONTEXT"
+REB_HINT_IGNORED_UNIMPLEMENTED = "REB_HINT_IGNORED_UNIMPLEMENTED"
+REB_HINT_EXEC_INTERNAL_TRANSFER = "REB_HINT_EXEC_INTERNAL_TRANSFER"
+REB_HINT_EXEC_REB_TM_NEUTRAL = "REB_HINT_EXEC_REB_TM_NEUTRAL"
+REB_REJECT_CAP_EXCEEDED = "REB_REJECT_CAP_EXCEEDED"
+REB_SIM_REJECT_BPS = "REB_SIM_REJECT_BPS"
+REB_SIM_REJECT_LATENCY = "REB_SIM_REJECT_LATENCY"
+REB_SIM_REJECT_GUARD = "REB_SIM_REJECT_GUARD"
+
+RM_REB_HINTS_TOTAL = get_counter(
+    "rm_reb_hints_total",
+    "Total REB hints handled by type and action",
+    labelnames=("type", "action"),
+)
+
+RM_REB_FROM_HINTS_NOTIONAL_QUOTE_TOTAL = get_counter(
+    "rm_reb_from_hints_notional_quote_total",
+    "Total REB notional in quote currency submitted from hints",
+    labelnames=("profile", "quote"),
 )
 
 RM_MM_HEDGE_TOTAL = get_counter(
@@ -8619,9 +8643,12 @@ class RiskManager:
             await self._exec_internal_subaccount_transfer(op)
         elif t == "rebalancing_trade":
             await self._forward_rebalancing_trade(op)
-        elif t in ("overlay_compensation", "crypto_topup_hint", "bridge_pre_hint"):
-            # Hints purement informatifs pour l’instant (obs + décision hors RM).
-            return
+        elif t == "overlay_compensation":
+            await self._handle_overlay_compensation(op)
+        elif t == "crypto_topup_hint":
+            await self._handle_crypto_topup_hint(op)
+        elif t == "bridge_pre_hint":
+            await self._handle_bridge_pre_hint(op)
         else:
             legacy = self._legacy_convert(op)
             if legacy:
@@ -8636,6 +8663,314 @@ class RiskManager:
                             await self._exec_internal_subaccount_transfer(legacy)
                     except Exception:
                         logger.exception("[RiskManager] legacy internal transfer failed")
+
+    def _record_reb_hint_metric(self, *, hint_type: str, action: str) -> None:
+        try:
+            safe_inc(
+                RM_REB_HINTS_TOTAL,
+                "rm_reb_hints_total",
+                "risk_manager.reb_hint",
+                type=str(hint_type or "").lower(),
+                action=str(action or "").upper(),
+            )
+        except Exception:
+            pass
+
+    def _reb_hint_event(self, reason: str, *, status: str, hint: Optional[Dict[str, Any]] = None) -> None:
+        payload = {
+            "reason": str(reason or ""),
+            "status": str(status or "").lower(),
+            "hint_type": str((hint or {}).get("type") or "").lower(),
+        }
+
+        for key in ("exchange", "from_exchange", "to_exchange"):
+            val = (hint or {}).get(key)
+            if val:
+                payload.setdefault(key, str(val).upper())
+
+        try:
+            self._hist_rm_event("reb.hint", payload)
+        except Exception:
+            pass
+
+    async def _handle_overlay_compensation(self, op: Dict[str, Any]) -> None:
+        from_ex = str(
+            (op.get("from_exchange")
+             or (op.get("from") or {}).get("exchange")
+             or "")
+        ).upper()
+        to_ex = str(
+            (op.get("to_exchange")
+             or (op.get("to") or {}).get("exchange")
+             or "")
+        ).upper()
+
+        asset = str(
+            op.get("asset")
+            or op.get("valuation_quote")
+            or op.get("ccy")
+            or ""
+        ).upper()
+
+        exposure_quote = float(
+            op.get("exposure_quote")
+            or op.get("amount_quote")
+            or op.get("amount_usdc")
+            or op.get("notional")
+            or 0.0
+        )
+        qty = float(op.get("qty") or op.get("amount") or 0.0)
+        notional = exposure_quote if exposure_quote else qty
+
+        if notional == 0.0 or not asset:
+            try:
+                inc_rm_reject(reason=REB_HINT_IGNORED_BAD_CONTEXT)
+            except Exception:
+                pass
+            self._record_reb_hint_metric(hint_type="overlay", action="IGNORED")
+            self._reb_hint_event(REB_HINT_IGNORED_BAD_CONTEXT, status="ignored", hint=op)
+            logger.info(
+                "[RiskManager] overlay_compensation ignoré (missing_size_or_asset): %s",
+                op,
+            )
+            return
+
+        min_q = float(getattr(self, "rebal_fragment_min_quote", 0.0) or 0.0)
+        if abs(notional) < min_q:
+            try:
+                inc_rm_reject(reason=REB_HINT_IGNORED_SMALL_SIZE)
+            except Exception:
+                pass
+            self._record_reb_hint_metric(hint_type="overlay", action="IGNORED")
+            self._reb_hint_event(REB_HINT_IGNORED_SMALL_SIZE, status="ignored", hint=op)
+            logger.info(
+                "[RiskManager] overlay_compensation ignoré (too_small %.2f < %.2f): %s",
+                notional,
+                min_q,
+                op,
+            )
+            return
+
+        from_alias = str(
+            op.get("from_alias")
+            or (op.get("from") or {}).get("alias")
+            or op.get("alias_from")
+            or op.get("alias")
+            or "TT"
+        ).upper()
+        to_alias = str(
+            op.get("to_alias")
+            or (op.get("to") or {}).get("alias")
+            or op.get("alias_to")
+            or ("TM" if from_alias == "TT" else "TT")
+        ).upper()
+
+        if from_ex and to_ex and from_ex == to_ex and asset:
+            transfer_op = {
+                "exchange": from_ex,
+                "from_alias": from_alias,
+                "to_alias": to_alias,
+                "ccy": asset,
+                "amount": abs(notional),
+            }
+
+            from_wallet = (op.get("from") or {}).get("wallet") or op.get("from_wallet")
+            to_wallet = (op.get("to") or {}).get("wallet") or op.get("to_wallet")
+            if from_wallet or to_wallet:
+                transfer_op.update({
+                    "from_wallet": str(from_wallet or "").upper() or "SPOT",
+                    "to_wallet": str(to_wallet or "").upper() or "FUNDING",
+                })
+                self._record_reb_hint_metric(hint_type="overlay", action="INTERNAL_TRANSFER")
+                self._reb_hint_event(
+                    REB_HINT_EXEC_INTERNAL_TRANSFER,
+                    status="internal_transfer",
+                    hint=transfer_op,
+                )
+                await self._exec_internal_wallet_transfer(transfer_op)
+            else:
+                self._record_reb_hint_metric(hint_type="overlay", action="INTERNAL_TRANSFER")
+                self._reb_hint_event(
+                    REB_HINT_EXEC_INTERNAL_TRANSFER,
+                    status="internal_transfer",
+                    hint=transfer_op,
+                )
+                await self._exec_internal_subaccount_transfer(transfer_op)
+            return
+
+        try:
+            self._record_reb_hint_metric(hint_type="overlay", action="REB_TM_NEUTRAL_TRADE")
+            self._reb_hint_event(REB_HINT_EXEC_REB_TM_NEUTRAL, status="reb_trade", hint=op)
+            self._submit_reb_bundle_from_hint(op, hint_type="overlay")
+        except Exception:
+            logger.exception("[RiskManager] overlay_compensation bundle dispatch failed")
+
+    async def _handle_crypto_topup_hint(self, op: Dict[str, Any]) -> None:
+        ex = str(
+            op.get("exchange")
+            or (op.get("to") or {}).get("exchange")
+            or ""
+        ).upper()
+        asset = str(
+            op.get("asset")
+            or op.get("ccy")
+            or op.get("quote")
+            or op.get("valuation_quote")
+            or ""
+        ).upper()
+
+        target_alias = str(
+            op.get("alias")
+            or op.get("to_alias")
+            or (op.get("to") or {}).get("alias")
+            or "TT"
+        ).upper()
+
+        target_wallet = str(
+            op.get("wallet")
+            or op.get("to_wallet")
+            or (op.get("to") or {}).get("wallet")
+            or ""
+        ).upper()
+
+        current_balance = float(
+            op.get("current_balance")
+            or op.get("available")
+            or op.get("balance")
+            or 0.0
+        )
+        target_min = float(
+            op.get("target_min")
+            or op.get("min_balance")
+            or op.get("target")
+            or 0.0
+        )
+        suggested_topup = float(
+            op.get("suggested_topup")
+            or op.get("suggested")
+            or op.get("amount_usdc")
+            or op.get("amount")
+            or 0.0
+        )
+
+        missing = max(target_min - current_balance, 0.0)
+        needed = suggested_topup if suggested_topup > 0.0 else missing
+
+        if not ex or not asset:
+            try:
+                inc_rm_reject(reason=REB_HINT_IGNORED_BAD_CONTEXT)
+            except Exception:
+                pass
+            self._record_reb_hint_metric(hint_type="crypto_topup", action="IGNORED")
+            self._reb_hint_event(REB_HINT_IGNORED_BAD_CONTEXT, status="ignored", hint=op)
+            logger.info(
+                "[RiskManager] crypto_topup_hint ignoré (missing_ex_or_asset): %s",
+                op,
+            )
+            return
+
+        if needed <= 0.0:
+            try:
+                inc_rm_reject(reason=REB_HINT_IGNORED_BAD_CONTEXT)
+            except Exception:
+                pass
+            self._record_reb_hint_metric(hint_type="crypto_topup", action="IGNORED")
+            self._reb_hint_event(REB_HINT_IGNORED_BAD_CONTEXT, status="ignored", hint=op)
+            logger.info(
+                "[RiskManager] crypto_topup_hint ignoré (no_deficit): %s",
+                op,
+            )
+            return
+
+        min_q = float(getattr(self, "rebal_fragment_min_quote", 0.0) or 0.0)
+        if needed < min_q:
+            try:
+                inc_rm_reject(reason=REB_HINT_IGNORED_SMALL_SIZE)
+            except Exception:
+                pass
+            self._record_reb_hint_metric(hint_type="crypto_topup", action="IGNORED")
+            self._reb_hint_event(REB_HINT_IGNORED_SMALL_SIZE, status="ignored", hint=op)
+            logger.info(
+                "[RiskManager] crypto_topup_hint ignoré (too_small %.2f < %.2f): %s",
+                needed,
+                min_q,
+                op,
+            )
+            return
+
+        snap = self._balances_snapshot()
+        ex_balances = snap.get(ex, {}) or {}
+
+        best_alias = None
+        best_available = 0.0
+        for al, assets in ex_balances.items():
+            if str(al).upper() == target_alias:
+                continue
+            try:
+                avail = float((assets or {}).get(asset, 0.0) or 0.0)
+            except Exception:
+                avail = 0.0
+            if avail > best_available:
+                best_available = avail
+                best_alias = str(al).upper()
+
+        if best_alias and best_available > 0.0:
+            amt = min(needed, best_available)
+            transfer_op = {
+                "exchange": ex,
+                "from_alias": best_alias,
+                "to_alias": target_alias,
+                "ccy": asset,
+                "amount": amt,
+            }
+
+            from_wallet = str(
+                op.get("from_wallet")
+                or (op.get("from") or {}).get("wallet")
+                or target_wallet
+                or ""
+            ).upper()
+
+            if target_wallet or from_wallet:
+                transfer_op.update({
+                    "alias": target_alias,
+                    "from_wallet": from_wallet or "SPOT",
+                    "to_wallet": target_wallet or "FUNDING",
+                })
+                self._record_reb_hint_metric(hint_type="crypto_topup", action="INTERNAL_TRANSFER")
+                self._reb_hint_event(
+                    REB_HINT_EXEC_INTERNAL_TRANSFER,
+                    status="internal_transfer",
+                    hint=transfer_op,
+                )
+                await self._exec_internal_wallet_transfer(transfer_op)
+            else:
+                self._record_reb_hint_metric(hint_type="crypto_topup", action="INTERNAL_TRANSFER")
+                self._reb_hint_event(
+                    REB_HINT_EXEC_INTERNAL_TRANSFER,
+                    status="internal_transfer",
+                    hint=transfer_op,
+                )
+                await self._exec_internal_subaccount_transfer(transfer_op)
+            return
+
+        op = dict(op)
+        op.setdefault("topup_amount", needed)
+        try:
+            self._record_reb_hint_metric(hint_type="crypto_topup", action="REB_TM_NEUTRAL_TRADE")
+            self._reb_hint_event(REB_HINT_EXEC_REB_TM_NEUTRAL, status="reb_trade", hint=op)
+            self._submit_reb_bundle_from_hint(op, hint_type="crypto_topup")
+        except Exception:
+            logger.exception("[RiskManager] crypto_topup_hint bundle dispatch failed")
+
+    async def _handle_bridge_pre_hint(self, op: Dict[str, Any]) -> None:
+        try:
+            inc_rm_reject(reason=REB_HINT_IGNORED_UNIMPLEMENTED)
+        except Exception:
+            pass
+        self._record_reb_hint_metric(hint_type="bridge_pre", action="IGNORED")
+        self._reb_hint_event(REB_HINT_IGNORED_UNIMPLEMENTED, status="ignored", hint=op)
+        logger.info("[RiskManager] bridge_pre_hint ignoré (unimplemented): %s", op)
 
 
     def _mark_loop_success(self, loop_name: str) -> None:
@@ -11283,6 +11618,274 @@ class RiskManager:
     # ---------------------------------------------------------------------
     # REMPLACEMENT 2/3
     # ---------------------------------------------------------------------
+    def _build_reb_bundle_from_hint(
+            self,
+            hint: Dict[str, Any],
+            *,
+            hint_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        hint_type_u = str(hint_type or hint.get("hint_type") or "").lower()
+        h = hint or {}
+
+        # Cap REB : inflight_rebal_by_profile (option pacer down-clamp)
+        profile = str(getattr(self, "capital_profile", "LARGE") or "LARGE").upper()
+        try:
+            rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+            caps_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) or {}
+            inflight_cap = int(caps_reb.get(profile) or caps_reb.get(profile.title()) or caps_reb.get("LARGE") or 0)
+        except Exception:
+            inflight_cap = 0
+
+        pacer_factor = 1.0
+        pacer = getattr(self, "pacer", None)
+        if pacer and hasattr(pacer, "factor_for_branch"):
+            try:
+                pacer_factor = float(pacer.factor_for_branch("REB"))
+            except Exception:
+                pacer_factor = 1.0
+            if pacer_factor > 1.0:
+                pacer_factor = 1.0
+            if pacer_factor < 0.0:
+                pacer_factor = 0.0
+        try:
+            inflight_cap = int(round(inflight_cap * pacer_factor))
+        except Exception:
+            inflight_cap = max(0, int(inflight_cap))
+
+        if inflight_cap <= 0:
+            raise RMError(REB_REJECT_CAP_EXCEEDED)
+
+        buy_ex = str(
+            h.get("buy_ex")
+            or h.get("to_exchange")
+            or (h.get("to") or {}).get("exchange")
+            or h.get("exchange")
+            or ""
+        ).upper()
+        sell_ex = str(
+            h.get("sell_ex")
+            or h.get("from_exchange")
+            or (h.get("from") or {}).get("exchange")
+            or ""
+        ).upper()
+
+        if hint_type_u == "crypto_topup" and not sell_ex:
+            sell_ex = buy_ex
+
+        asset = str(
+            h.get("asset")
+            or h.get("base")
+            or h.get("ccy")
+            or ""
+        ).upper()
+        quote = str(
+            h.get("valuation_quote")
+            or h.get("quote")
+            or _pair_quote(h.get("pair") or h.get("symbol") or "")
+            or "USDC"
+        ).upper()
+
+        pair = h.get("pair") or h.get("symbol")
+        if not pair and asset:
+            pair = f"{asset}{quote}"
+
+        if not pair or not buy_ex:
+            logger.info(
+                "[RiskManager] _build_reb_bundle_from_hint ignoré (missing_pair_or_route): %s",
+                hint,
+            )
+            return None
+
+        try:
+            pk = self._norm_pair(pair)
+        except Exception:
+            pk = pair
+
+        def _top_prices(exchange: str, default_bid: float = 0.0, default_ask: float = 0.0) -> Tuple[float, float]:
+            bid, ask = default_bid, default_ask
+            try:
+                b, a = self.get_top_of_book(exchange, pk)
+                bid = float(b or bid)
+                ask = float(a or ask)
+            except Exception:
+                books = getattr(self, "_last_books", {}) or {}
+                book = books.get(exchange, {}).get(pk, {}) or {}
+                try:
+                    bid = float(book.get("best_bid", bid) or bid)
+                    ask = float(book.get("best_ask", ask) or ask)
+                except Exception:
+                    pass
+            return bid, ask
+
+        sell_bid, _ = _top_prices(sell_ex)
+        _, buy_ask = _top_prices(buy_ex)
+
+        amount_quote = float(
+            h.get("notional_usdc")
+            or h.get("notional")
+            or h.get("exposure_quote")
+            or h.get("amount_quote")
+            or 0.0
+        )
+
+        qty = float(h.get("qty") or h.get("amount") or 0.0)
+
+        if hint_type_u == "crypto_topup":
+            try:
+                topup_qty = float(h.get("topup_amount") or 0.0)
+            except Exception:
+                topup_qty = 0.0
+            if topup_qty > 0.0:
+                qty = topup_qty
+            if amount_quote <= 0.0 and buy_ask > 0.0:
+                amount_quote = abs(qty) * buy_ask
+
+        if amount_quote <= 0.0 and sell_bid > 0.0 and buy_ask > 0.0 and qty != 0.0:
+            # Fallback: approx notional à partir de la quantité et du meilleur px disponible
+            amount_quote = abs(qty) * max(buy_ask, sell_bid)
+
+        if qty <= 0.0 and buy_ask > 0.0:
+            qty = abs(amount_quote) / buy_ask if amount_quote else 0.0
+
+        if qty <= 0.0 or buy_ask <= 0.0:
+            logger.info(
+                "[RiskManager] _build_reb_bundle_from_hint ignoré (missing_qty_or_price): %s",
+                hint,
+            )
+            return None
+
+        opp = {
+            "type": "rebalancing",
+            "pair": pair,
+            "buy_ex": buy_ex,
+            "sell_ex": sell_ex or buy_ex,
+            "qty": qty,
+            "notional_usdc": abs(amount_quote) if amount_quote else abs(qty) * buy_ask,
+            "buy_px": buy_ask,
+            "sell_px": sell_bid or buy_ask,
+        }
+
+        meta = dict(h.get("meta") or {})
+        meta.setdefault("branch", "REB")
+        meta.setdefault("strategy", "REB")
+        meta.setdefault("type", "rebalancing")
+        meta.setdefault("hint_type", hint_type_u)
+        meta.setdefault("allow_final_loss_bps", float(getattr(self, "rebal_allow_loss_bps", 0.0)))
+        meta.setdefault("allow_loss_bps", float(getattr(self, "rebal_allow_loss_bps", 0.0)))
+        opp["meta"] = meta
+
+        bundle = self._build_bundle(opp, strategy="REB")
+        if not bundle:
+            return None
+
+        meta = bundle.setdefault("meta", {}) or {}
+        meta.setdefault("branch", "REB")
+        meta.setdefault("strategy", "REB")
+        meta.setdefault("type", "rebalancing")
+        meta.setdefault("hint_type", hint_type_u)
+        meta.setdefault("allow_final_loss_bps", float(getattr(self, "rebal_allow_loss_bps", 0.0)))
+        meta.setdefault("allow_loss_bps", float(getattr(self, "rebal_allow_loss_bps", 0.0)))
+        bundle["meta"] = meta
+
+        tm_meta = bundle.setdefault("tm", {}) or {}
+        tm_meta.setdefault("mode", "NEUTRAL")
+        tm_meta.setdefault("hedge_ratio", 1.0)
+        bundle["tm"] = tm_meta
+
+        return bundle
+
+    def _map_reb_sim_reason(self, reason: str) -> str:
+        r = str(reason or "").upper()
+        if "BPS" in r or "EDGE" in r:
+            return REB_SIM_REJECT_BPS
+        if "LATENCY" in r or "QUEUEPOS" in r or "TTL" in r:
+            return REB_SIM_REJECT_LATENCY
+        if "CAP" in r:
+            return REB_REJECT_CAP_EXCEEDED
+        return REB_SIM_REJECT_GUARD
+
+    def _record_reb_notional_from_hint(self, bundle: Dict[str, Any]) -> None:
+        try:
+            route = bundle.get("route") or {}
+            meta = bundle.get("meta") or {}
+            profile = str(
+                bundle.get("profile")
+                or meta.get("profile")
+                or getattr(self, "capital_profile", "LARGE")
+                or "LARGE"
+            ).upper()
+            quote = str(route.get("quote") or meta.get("quote") or "NA").upper()
+
+            notional = 0.0
+            notional_quote = route.get("notional_quote")
+            if isinstance(notional_quote, dict):
+                notional = float(notional_quote.get("amount") or 0.0)
+            elif notional_quote is not None:
+                notional = float(notional_quote)
+
+            if notional <= 0.0:
+                try:
+                    notional = float(self._estimate_bundle_notional_usd(bundle))
+                except Exception:
+                    notional = 0.0
+
+            if notional <= 0.0:
+                return
+
+            RM_REB_FROM_HINTS_NOTIONAL_QUOTE_TOTAL.labels(
+                profile=profile,
+                quote=quote,
+            ).inc(abs(notional))
+        except Exception:
+            pass
+
+    def _submit_reb_bundle_from_hint(self, hint: Dict[str, Any], *, hint_type: str) -> bool:
+        """Fabrique puis soumet un bundle REB via la pipeline standard.
+
+        Retourne True si un bundle a été construit et soumis, False sinon.
+        """
+
+        builder = getattr(self, "_build_reb_bundle_from_hint", None)
+        if not callable(builder):
+            logger.info(
+                "[RiskManager] %s laissé en attente de bundle: %s",
+                f"{hint_type}_hint",
+                hint,
+            )
+            return False
+
+        mapped_reason: Optional[str] = None
+        try:
+            bundle = builder(dict(hint), hint_type=hint_type)
+        except RMError as exc:
+            mapped_reason = self._map_reb_sim_reason(getattr(exc, "reason", "") or str(exc))
+            bundle = None
+        except Exception:
+            mapped_reason = REB_SIM_REJECT_GUARD
+            bundle = None
+
+        if not bundle:
+            mapped_reason = mapped_reason or self._map_reb_sim_reason(RM_REB_FACTORY_REJECT)
+            try:
+                inc_rm_reject(reason=mapped_reason)
+                inc_rm_reject(reason=RM_REB_FACTORY_REJECT)
+            except Exception:
+                pass
+            self._reb_hint_event(mapped_reason, status="factory_reject", hint=hint)
+            logger.info(
+                "[RiskManager] %s rejeté par la fabrique: %s",
+                f"{hint_type}_hint",
+                hint,
+            )
+            return False
+
+        bundle.setdefault("branch", bundle.get("meta", {}).get("branch", "REB"))
+        self._record_reb_notional_from_hint(bundle)
+        self._reb_hint_event(REB_HINT_EXEC_REB_TM_NEUTRAL, status="bundle_submitted", hint=hint)
+        self._multicast_shadow(bundle)
+        return True
+
+    
     def _build_bundle(self, opp: Dict[str, Any], strategy: str) -> Optional[Dict[str, Any]]:
         """
         P0: construit un bundle exécutable standard (dict) en s'appuyant sur payloads.make_submit_bundle
