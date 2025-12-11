@@ -840,11 +840,17 @@ class PrivateWSReconciler:
         Retourne un dict minimal avec :
           - exchange, alias
           - status ("OK" | "AT_RISK" | "BROKEN" | "UNKNOWN")
+              * AT_RISK : on observe des misses/bursts ou un resync trop ancien,
+                mais la situation reste récupérable.
+              * BROKEN : le reconciler n'arrive plus à suivre (bursts sévères
+                et resync très vieux), l'alias est considéré cassé tant que
+                l'état persiste.
           - misses_recent, miss_rate_per_min
           - last_alias_resync_ts, age_since_last_alias_resync_s
           - wiring_ok, wiring
         """
         h = self.health(exchange, alias) or {}
+        
         return {
             "exchange": h.get("exchange", str(exchange).upper()),
             "alias": h.get("alias", str(alias).upper()),

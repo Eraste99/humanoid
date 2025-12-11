@@ -68,6 +68,10 @@ try:
         BF_HTTP_ERRORS_TOTAL,
         BF_FEE_TOKEN_LEVEL,
         BF_FEE_TOKEN_LOW_TOTAL,
+        BF_BALANCES_TTL_NORMAL_SECONDS,
+        BF_BALANCES_TTL_DEGRADED_SECONDS,
+        BF_BALANCES_TTL_BLOCK_SECONDS,
+        BF_BALANCES_HEALTH_STATE,
     )
 except Exception:  # pragma: no cover
     class _NoopMetric:
@@ -78,7 +82,7 @@ except Exception:  # pragma: no cover
 
     BF_API_LATENCY_MS = BF_API_ERRORS_TOTAL = BF_CACHE_AGE_SECONDS = BF_LAST_SUCCESS_TS = FEE_TOKEN_BALANCE = _NoopMetric()
     BF_HTTP_LATENCY_SECONDS = BF_HTTP_ERRORS_TOTAL = BF_FEE_TOKEN_LEVEL = BF_FEE_TOKEN_LOW_TOTAL = _NoopMetric()
-
+    BF_BALANCES_TTL_NORMAL_SECONDS = BF_BALANCES_TTL_DEGRADED_SECONDS = BF_BALANCES_TTL_BLOCK_SECONDS = BF_BALANCES_HEALTH_STATE = _NoopMetric()
 try:
     from modules.observability_pacer import PACER
 except Exception:
@@ -176,6 +180,14 @@ class MultiBalanceFetcher:
         self.COINBASE_API = getattr(self.cfg, "coinbase_api_base", self.COINBASE_API_DEFAULT)
         self.BYBIT_API    = getattr(self.cfg, "bybit_api_base", self.BYBIT_API_DEFAULT)
 
+        # TTL balances par défaut (fallback BF) + cache SLO par exchange
+        bf_cfg = getattr(self, "_bf_cfg", self.cfg)
+        self._bal_ttl_default_normal = float(getattr(bf_cfg, "BALANCES_TTL_S_NORMAL", 10.0))
+        self._bal_ttl_default_degraded = float(getattr(bf_cfg, "BALANCES_TTL_S_DEGRADED", 30.0))
+        self._bal_ttl_default_block = float(getattr(bf_cfg, "BALANCES_TTL_S_BLOCK", 120.0))
+        self._bal_ttl_by_ex: Dict[str, Dict[str, float]] = {}
+        self._balances_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
         # Comptes par alias (upper)
         self.binance_accounts = { _upper(k): v for k, v in (binance_accounts or {}).items() }
         self.coinbase_accounts= { _upper(k): v for k, v in (coinbase_at_accounts or {}).items() }
@@ -261,6 +273,8 @@ class MultiBalanceFetcher:
         if not hasattr(self, "cfg"):
             self.cfg = None
 
+        self._refresh_balance_ttls_from_slo()
+
     # =========================== Lifecycle ===================================
 
     async def update_ws_account_balances(self, exchange: str, alias: str, balances: Dict[str, float]) -> None:
@@ -340,6 +354,89 @@ class MultiBalanceFetcher:
 
         return "ok", 2.0 * low_thr
 
+    def _refresh_balance_ttls_from_slo(self) -> None:
+        """Construit le cache TTL balances par exchange depuis cfg.slo (fallback BF)."""
+        self._bal_ttl_by_ex.clear()
+
+        cfg = getattr(self, "cfg", None)
+        g = getattr(cfg, "g", None)
+        mode_key = str(getattr(g, "deployment_mode", "SPLIT")).upper() if g else "SPLIT"
+
+        slo_map = getattr(cfg, "slo", None) if cfg else None
+        if not slo_map:
+            log.warning(
+                "[BalanceFetcher] aucun balances_ttl_s_* trouvé dans cfg.slo[mode=%s], fallback sur TTL BF par défaut",
+                mode_key,
+            )
+            return
+
+        per_ex = slo_map.get(mode_key) or {}
+
+        for ex, path_slo in (per_ex or {}).items():
+            exu = str(ex).upper()
+            pvt = getattr(path_slo, "private", None)
+            if pvt is None:
+                continue
+
+            t_norm = float(getattr(pvt, "balances_ttl_s_normal", 0.0) or 0.0)
+            t_deg = float(getattr(pvt, "balances_ttl_s_degraded", 0.0) or 0.0)
+            t_blk = float(getattr(pvt, "balances_ttl_s_block", 0.0) or 0.0)
+
+            if t_norm <= 0.0 or t_deg <= 0.0 or t_blk <= 0.0:
+                continue
+            if not (t_norm <= t_deg <= t_blk):
+                log.warning(
+                    "[BalanceFetcher] TTL balances incohérents pour %s (mode=%s): normal=%s, degraded=%s, block=%s",
+                    exu,
+                    mode_key,
+                    t_norm,
+                    t_deg,
+                    t_blk,
+                )
+                continue
+
+            self._bal_ttl_by_ex[exu] = {
+                "normal": t_norm,
+                "degraded": t_deg,
+                "block": t_blk,
+            }
+            try:
+                BF_BALANCES_TTL_NORMAL_SECONDS.labels(exchange=exu).set(t_norm)
+                BF_BALANCES_TTL_DEGRADED_SECONDS.labels(exchange=exu).set(t_deg)
+                BF_BALANCES_TTL_BLOCK_SECONDS.labels(exchange=exu).set(t_blk)
+            except Exception:
+                pass
+
+        if not self._bal_ttl_by_ex:
+            log.warning(
+                "[BalanceFetcher] aucun balances_ttl_s_* trouvé dans cfg.slo[mode=%s], fallback sur TTL BF par défaut",
+                mode_key,
+            )
+
+    @staticmethod
+    def _classify_balance_health(age_s: float, t_norm: float, t_deg: float, t_blk: float) -> str:
+        if age_s <= t_norm:
+            return "NORMAL"
+        if age_s <= t_deg:
+            return "DEGRADED"
+        if age_s <= t_blk:
+            return "BLOCK"
+        return "BLOCK"
+
+    def _get_bal_ttls_for_exchange(self, ex: str) -> Tuple[float, float, float]:
+        exu = str(ex).upper()
+        per_ex = self._bal_ttl_by_ex.get(exu)
+        if per_ex is not None:
+            return (
+                per_ex["normal"],
+                per_ex["degraded"],
+                per_ex["block"],
+            )
+        return (
+            self._bal_ttl_default_normal,
+            self._bal_ttl_default_degraded,
+            self._bal_ttl_default_block,
+        )
 
     async def run_alerts(self) -> None:
         """
@@ -1031,12 +1128,44 @@ class MultiBalanceFetcher:
                     alias_map[_upper(quote)] = float(amt or 0.0)
 
         meta_fee: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        meta_bal_health: Dict[str, Dict[str, Any]] = {}
         now = time.time()
         age_s = float("inf")
         for (ex, al), rec in list(getattr(self, "_snap", {}).items()):
             ts = float(rec.get("ts", 0.0) or 0.0)
             if ts > 0.0:
                 age_s = min(age_s, max(0.0, now - ts)) if age_s != float("inf") else max(0.0, now - ts)
+            bal_age = max(0.0, now - ts) if ts > 0.0 else float("inf")
+            t_norm, t_deg, t_blk = self._get_bal_ttls_for_exchange(ex)
+            state = self._classify_balance_health(bal_age, t_norm, t_deg, t_blk)
+            prev = self._balances_health.get((ex, al), {}).get("state")
+            last_change_ts = self._balances_health.get((ex, al), {}).get("last_change_ts", now)
+            if prev != state:
+                last_change_ts = now
+            self._balances_health[(ex, al)] = {
+                "state": state,
+                "last_age_s": bal_age,
+                "ttl_normal_s": t_norm,
+                "ttl_degraded_s": t_deg,
+                "ttl_block_s": t_blk,
+                "last_change_ts": last_change_ts,
+            }
+            try:
+                BF_BALANCES_HEALTH_STATE.labels(exchange=ex, alias=al).set(
+                    0 if state == "NORMAL" else 1 if state == "DEGRADED" else 2
+                )
+                BF_BALANCES_TTL_NORMAL_SECONDS.labels(exchange=ex).set(t_norm)
+                BF_BALANCES_TTL_DEGRADED_SECONDS.labels(exchange=ex).set(t_deg)
+                BF_BALANCES_TTL_BLOCK_SECONDS.labels(exchange=ex).set(t_blk)
+            except Exception:
+                pass
+            meta_bal_health[f"{ex}.{al}"] = {
+                "state": state,
+                "age_s": bal_age,
+                "ttl_normal_s": t_norm,
+                "ttl_degraded_s": t_deg,
+                "ttl_block_s": t_blk,
+            }
             for token, info in (rec.get("fee_tokens") or {}).items():
                 tkn = str(token).upper()
                 meta_fee.setdefault(tkn, {})
@@ -1052,7 +1181,11 @@ class MultiBalanceFetcher:
             "mode": view,
             "as_of_ts": time.time(),
             "pockets_by_quote": pockets,
-            "meta": {"fee_tokens": meta_fee, "age_s": age_s if age_s != float("inf") else None},
+            "meta": {
+                "fee_tokens": meta_fee,
+                "age_s": age_s if age_s != float("inf") else None,
+                "balances_health": meta_bal_health,
+            },
         }
     def get_available_quote_simple(
         self,
@@ -1280,6 +1413,7 @@ class MultiBalanceFetcher:
         meta_vip: Dict[str, Any] = {}
         meta_fee: Dict[str, Dict[str, Any]] = {}
         meta_ws_accounts: Dict[str, Dict[str, Any]] = {}
+        meta_bal_health: Dict[str, Dict[str, Any]] = {}
 
         # Copie défensive des balances (pour éviter les mutations externes)
         balances: Dict[str, Dict[str, Dict[str, float]]] = {
@@ -1320,6 +1454,37 @@ class MultiBalanceFetcher:
                     # On ne casse jamais le snapshot RM sur erreur de télémétrie WS
                     pass
 
+            t_norm, t_deg, t_blk = self._get_bal_ttls_for_exchange(ex)
+            state = self._classify_balance_health(age, t_norm, t_deg, t_blk)
+            prev = self._balances_health.get((ex, al), {}).get("state")
+            last_change_ts = self._balances_health.get((ex, al), {}).get("last_change_ts", now)
+            if prev != state:
+                last_change_ts = now
+            self._balances_health[(ex, al)] = {
+                "state": state,
+                "last_age_s": age,
+                "ttl_normal_s": t_norm,
+                "ttl_degraded_s": t_deg,
+                "ttl_block_s": t_blk,
+                "last_change_ts": last_change_ts,
+            }
+            meta_bal_health[f"{ex}.{al}"] = {
+                "state": state,
+                "age_s": age,
+                "ttl_normal_s": t_norm,
+                "ttl_degraded_s": t_deg,
+                "ttl_block_s": t_blk,
+            }
+            try:
+                BF_BALANCES_HEALTH_STATE.labels(exchange=ex, alias=al).set(
+                    0 if state == "NORMAL" else 1 if state == "DEGRADED" else 2
+                )
+                BF_BALANCES_TTL_NORMAL_SECONDS.labels(exchange=ex).set(t_norm)
+                BF_BALANCES_TTL_DEGRADED_SECONDS.labels(exchange=ex).set(t_deg)
+                BF_BALANCES_TTL_BLOCK_SECONDS.labels(exchange=ex).set(t_blk)
+            except Exception:
+                pass
+
             # Si la vue choisie n'a pas encore de snapshot pour ce couple,
             # on backfill avec les balances "réelles" connues pour garder
             # la rétro-compat (utile en mode cached_only).
@@ -1332,6 +1497,7 @@ class MultiBalanceFetcher:
             "vip": meta_vip,
             "fee_tokens": meta_fee,
             "ws_accounts": meta_ws_accounts,
+            "balances_health": meta_bal_health,
             "view": view,
             "cached_only": bool(cached_only),
         }

@@ -35,7 +35,7 @@ from __future__ import annotations
     """
 import asyncio, time, inspect
 import time, uuid, random
-import threading
+import threading,meta
 from typing import Dict, Any, List, Optional, Tuple
 from modules.obs_metrics import inc_blocked
 import logging
@@ -977,6 +977,8 @@ class RiskManager:
         # Expositions TM "inflight" (P0: peut rester vide).
         # Clé: asset UPPER -> List[{"notional_usd": float, "side": "LONG"|"SHORT", "created_ts": float, "max_exposure_s": float}]
         self.tm_inflight_exposures: Dict[str, List[Dict[str, Any]]] = {}
+        self.tm_exposure_ttl_ms_by_exchange: Dict[str, int] = {}
+        self._tm_ttl_slo_warned = False
 
         # Tailles/slots MM par profil (définies dans BotConfig.rm)
         rm_cfg = _cfg_rm(self)
@@ -1062,15 +1064,8 @@ class RiskManager:
         self.tm_exposure_ttl_ms = _cfg_int(self.cfg, "tm_exposure_ttl_ms", 2500)
         self.tm_exposure_ttl_hedge_ratio = _cfg_float(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50)
         self.tm_nn_hedge_ratio = _cfg_float(self.cfg, "tm_nn_hedge_ratio", 0.65)
+        self._refresh_tm_exposure_ttl_from_slo()
 
-        # --- TM TTL & hedge policy (source unique pour l'Engine) ---
-        # Ces champs sont les SEULES sources de vérité pour TM :
-        # - tm_exposure_ttl_ms : TTL d'exposition TM (ms)
-        # - tm_exposure_ttl_hedge_ratio : ratio hedge en mode NEUTRAL
-        # - tm_nn_hedge_ratio : ratio hedge cible en mode NON_NEUTRAL
-        self.tm_exposure_ttl_ms = _cfg_int(self.cfg, "tm_exposure_ttl_ms", 2500)
-        self.tm_exposure_ttl_hedge_ratio = _cfg_float(self.cfg, "tm_exposure_ttl_hedge_ratio", 0.50)
-        self.tm_nn_hedge_ratio = _cfg_float(self.cfg, "tm_nn_hedge_ratio", 0.65)
 
         # Sink optionnel pour les drops de bundles (shadow, simu, recorder…)
         # Horizon métier maximum d'exposition TM NON_NEUTRAL (secondes).
@@ -1385,8 +1380,13 @@ class RiskManager:
         # Overlay consolidé par trade_mode (normalisé, clamp down uniquement)
         self._overlay_by_trade_mode = {
             "NORMAL": {"tt_min_bps_delta": 0.0, "tm_min_bps_delta": 0.0, "cap_factor": 1.0, "ioc_only": False},
-            "CONSTRAINED": {"tt_min_bps_delta": 0.0, "tm_min_bps_delta": 0.0, "cap_factor": 0.8, "mm_enable": True,
-                            "ioc_only": False},
+            "CONSTRAINED": {
+                "tt_min_bps_delta": float(getattr(self.cfg, "RM_CONSTR_TT_MIN_BPS_DELTA", +1.0)),
+                "tm_min_bps_delta": float(getattr(self.cfg, "RM_CONSTR_TM_MIN_BPS_DELTA", +1.0)),
+                "cap_factor": float(getattr(self.cfg, "RM_CONSTR_CAP_FACTOR", 0.5)),
+                "mm_enable": True,
+                "ioc_only": bool(getattr(self.cfg, "RM_CONSTR_IOC_ONLY", False)),
+            },
             "SEVERE": dict(self._overlay.get("SEVERE", {})),
             "OPPORTUNISTE": {},  # fusionné avec le sous-mode opportuniste (OPP_VOLUME / OPP_VOL)
         }
@@ -1413,6 +1413,8 @@ class RiskManager:
         # Clés toujours en UPPER pour être robustes.
         self._alias_balance_age_s: Dict[Tuple[str, str], float] = {}
         self._alias_balance_status: Dict[Tuple[str, str], str] = {}
+        # Vue consolidée (balances SLO + WS) projetée depuis MBF.meta[].
+        self._alias_private_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self.alias_collat_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         # Cache local des statuts comptes WS (Hub + Reconciler) vus via MBF.as_rm_snapshot().
@@ -2008,16 +2010,92 @@ class RiskManager:
             state["delta_usd"] = delta_usd
             state["last_update_ts"] = now
 
+    def _refresh_tm_exposure_ttl_from_slo(self) -> None:
+        cfg = getattr(self, "cfg", None)
+        slo_map = getattr(cfg, "slo", None)
+        self.tm_exposure_ttl_ms_by_exchange = {}
+
+        if slo_map is None:
+            return
+
+        mode_key = str(getattr(getattr(cfg, "g", None), "deployment_mode", "SPLIT") or "SPLIT").upper()
+        per_ex = slo_map.get(mode_key) or {}
+
+        for ex, path_slo in per_ex.items():
+            pvt = getattr(path_slo, "private", None)
+            if pvt is None:
+                continue
+            ttl_ms = int(getattr(pvt, "tm_exposure_ttl_ms", 0) or 0)
+            if ttl_ms <= 0:
+                continue
+            self.tm_exposure_ttl_ms_by_exchange[str(ex).upper()] = ttl_ms
+
+        if not self.tm_exposure_ttl_ms_by_exchange and not self._tm_ttl_slo_warned:
+            self._tm_ttl_slo_warned = True
+            try:
+                logger.warning(
+                    "[RiskManager] tm_exposure_ttl_ms SLO absent pour mode=%s, fallback sur config globale",
+                    mode_key,
+                )
+            except Exception:
+                pass
+
+        self._push_tm_exposure_ttl_metrics()
+
+    def _push_tm_exposure_ttl_metrics(self) -> None:
+        try:
+            from . import obs_metrics  # type: ignore
+        except Exception:
+            return
+
+        metric = getattr(obs_metrics, "RM_TM_EXPOSURE_TTL_MS", None)
+        if metric is None:
+            return
+
+        ttl_default = int(getattr(self, "tm_exposure_ttl_ms", 0) or 0)
+
+        for ex_u, ttl_ms in (self.tm_exposure_ttl_ms_by_exchange or {}).items():
+            try:
+                metric.labels(exchange=ex_u).set(float(ttl_ms))
+            except Exception:
+                continue
+
+        try:
+            metric.labels(exchange="DEFAULT").set(float(ttl_default))
+        except Exception:
+            pass
+
+    def _get_tm_exposure_ttl_ms_for_exchange(self, exchange: str) -> int:
+        ex_u = str(exchange or "").upper()
+        try:
+            return int(self.tm_exposure_ttl_ms_by_exchange.get(ex_u, self.tm_exposure_ttl_ms))
+        except Exception:
+            return int(getattr(self, "tm_exposure_ttl_ms", 0) or 0)
+
     def _refresh_tm_inflight_exposures(self, now: float) -> None:
-        """
-        P0: stub pour expositions TM "inflight".
-        On laisse self.tm_inflight_exposures vide ou inchangé.
+        """Met à jour l'état des expositions TM inflight et leur fraîcheur SLO."""
 
-        Un ticket ultérieur pourra peupler cette structure à partir
-        de l'historique de bundles TM et des TTL TM.
+        for asset, entries in list(self.tm_inflight_exposures.items()):
+            kept: list[Dict[str, Any]] = []
+            for entry in entries or []:
+                opened_ts = float(entry.get("opened_ts") or entry.get("created_ts") or 0.0)
+                max_expo_s = float(entry.get("max_exposure_s") or 0.0)
+                age_s = max(0.0, now - opened_ts) if opened_ts > 0 else 0.0
+                entry["age_s"] = age_s
 
-        """
-        return
+                ttl_ms = self._get_tm_exposure_ttl_ms_for_exchange(entry.get("exchange"))
+                ttl_s = max(0.0, float(ttl_ms) / 1000.0)
+                entry["ttl_s"] = ttl_s
+                entry["stale"] = bool(ttl_s > 0.0 and age_s > ttl_s)
+
+                if max_expo_s > 0.0 and age_s > max_expo_s:
+                    continue
+                kept.append(entry)
+
+            if kept:
+                self.tm_inflight_exposures[asset] = kept
+            else:
+                self.tm_inflight_exposures.pop(asset, None)
 
     def _refresh_tttm_exposure_state(self, now: float) -> None:
         """
@@ -2046,6 +2124,9 @@ class RiskManager:
 
         for asset in assets:
             asset_u = str(asset).upper()
+            prev_state = self.tttm_exposure_state.get(asset_u) or {}
+            prev_soft_breach = bool(prev_state.get("soft_breach"))
+            prev_hard_breach = bool(prev_state.get("hard_breach"))
 
             # TT component
             tt_state = self.tt_stuck_state.get(asset_u) or {}
@@ -2054,6 +2135,9 @@ class RiskManager:
             # TM component (P0: somme notional_usd * signe)
             tm_list = self.tm_inflight_exposures.get(asset_u) or []
             tm_delta_usd = 0.0
+            stale_notional_usd = 0.0
+            stale_exposures: list[Dict[str, Any]] = []
+            breach_by_exchange: Dict[str, float] = {}
             for entry in tm_list:
                 notional_usd = float(entry.get("notional_usd") or 0.0)
                 side = str(entry.get("side") or "").upper()
@@ -2061,6 +2145,12 @@ class RiskManager:
                     continue
                 signed = notional_usd if side in ("LONG", "BUY") else -notional_usd
                 tm_delta_usd += signed
+                if bool(entry.get("stale")):
+                    stale_notional_usd += abs(notional_usd)
+                    ex_u = str(entry.get("exchange") or "").upper()
+                    if ex_u:
+                        breach_by_exchange[ex_u] = breach_by_exchange.get(ex_u, 0.0) + abs(notional_usd)
+                    stale_exposures.append(entry)
 
             delta_usd = tt_delta_usd + tm_delta_usd
             # Seuils de config
@@ -2071,10 +2161,13 @@ class RiskManager:
             soft = float(ov.get("soft_usd", soft_default) or 0.0)
             hard = float(ov.get("hard_usd", hard_default) or 0.0)
 
+            soft_breach = soft > 0.0 and stale_notional_usd > soft
+            hard_breach = hard > 0.0 and stale_notional_usd > hard
+
             abs_d = abs(delta_usd)
-            if hard > 0.0 and abs_d > hard:
+            if hard_breach or (hard > 0.0 and abs_d > hard):
                 state = "HARD"
-            elif soft > 0.0 and abs_d > soft:
+            elif soft_breach or (soft > 0.0 and abs_d > soft):
                 state = "SOFT"
             else:
                 state = "OK"
@@ -2086,6 +2179,10 @@ class RiskManager:
                 "soft_usd": soft,
                 "hard_usd": hard,
                 "state": state,
+                "soft_breach": soft_breach,
+                "hard_breach": hard_breach,
+                "stale_notional_usd": stale_notional_usd,
+                "stale_exposures": stale_exposures,
                 "last_update_ts": now,
             }
             # Metrics optionnelles (si infra metrics déjà en place)
@@ -2103,6 +2200,19 @@ class RiskManager:
                 )
             except Exception:
                 pass
+            try:
+                from . import obs_metrics  # type: ignore
+                ttl_breach_metric = getattr(obs_metrics, "RM_TM_EXPOSURE_TTL_BREACH_TOTAL", None)
+            except Exception:
+                ttl_breach_metric = None
+
+            if ttl_breach_metric:
+                if hard_breach and not prev_hard_breach:
+                    for ex_u in breach_by_exchange or {}:
+                        ttl_breach_metric.labels(exchange=ex_u, asset=asset_u, level="hard").inc()
+                elif soft_breach and not prev_soft_breach:
+                    for ex_u in breach_by_exchange or {}:
+                        ttl_breach_metric.labels(exchange=ex_u, asset=asset_u, level="soft").inc()
 
             try:
                 RM_TTTM_DELTA_USD.labels(asset=asset_u).set(delta_usd)
@@ -3758,6 +3868,23 @@ class RiskManager:
         priority = int(meta.get("priority") or 0)
         trace_id = meta.get("trace_id") or bundle.get("trace_id") or "NA"
         quote = str(meta.get("quote") or "USDC").upper()
+        if not self._is_flow_allowed_under_current_mode(meta):
+            flow_kind = str(meta.get("flow_kind") or "core").lower()
+            risk_effect = str(meta.get("risk_effect") or "risk_increasing").lower()
+            logging.getLogger(__name__).warning(
+                "[RM][FILTER] flow_dropped_by_mode trade_mode=%s flow_kind=%s risk_effect=%s trace_id=%s",
+                getattr(self, "trade_mode", "NORMAL"),
+                flow_kind,
+                risk_effect,
+                trace_id,
+            )
+            if self._shadow:
+                try:
+                    self._shadow.on_bundle_drop(bundle, "FLOW_FILTERED_BY_MODE")
+                except Exception:
+                    pass
+            return False
+
 
         # Macro 7-C — Contexte RM / Engine / Pacer attaché au bundle pour debug
         try:
@@ -4605,6 +4732,22 @@ class RiskManager:
         if k in ("MAKER_MM", "MM"):  return "MM"
         return "UNKNOWN"
 
+    def _is_flow_allowed_under_current_mode(self, meta: dict) -> bool:
+        mode = str(getattr(self, "trade_mode", "NORMAL") or "NORMAL").upper()
+        flow_kind = str(meta.get("flow_kind") or "").lower() or "core"
+        risk_effect = str(meta.get("risk_effect") or "risk_increasing").lower()
+
+        if mode == "SEVERE":
+            if risk_effect == "risk_increasing":
+                return False
+            return True
+
+        if mode == "CONSTRAINED":
+            if flow_kind == "opportunistic":
+                return False
+            return True
+
+        return True
 
     def _dispatch_bundle(self, bundle: dict) -> None:
         async def _runner():
@@ -5199,12 +5342,15 @@ class RiskManager:
 
         meta = (raw.get("meta") or {}) if isinstance(raw, dict) else {}
         age_map = meta.get("age_s") or {}
+        balances_health = meta.get("balances_health") or {}
 
         if not isinstance(age_map, dict):
             return
 
+        now = time.time()
         self._alias_balance_age_s.clear()
         self._alias_balance_status.clear()
+        self._alias_private_health = {}
 
         for key, age in age_map.items():
             try:
@@ -5221,17 +5367,26 @@ class RiskManager:
                 age_s = 0.0
 
             self._alias_balance_age_s[(ex_u, alias_u)] = age_s
-            status = self._classify_balance_age(age_s)
+            bh_raw = balances_health.get(f"{ex_u}.{alias_u}") if isinstance(balances_health, dict) else None
+            bh_state = str((bh_raw or {}).get("state") or "").upper() if isinstance(bh_raw, dict) else ""
+            if bh_state == "NORMAL":
+                status = "OK"
+            elif bh_state == "DEGRADED":
+                status = "DEGRADED"
+            elif bh_state == "BLOCK":
+                status = "BLOCKED"
+            else:
+                status = self._classify_balance_age(age_s)
             self._alias_balance_status[(ex_u, alias_u)] = status
 
             # On loggue les cas non-OK pour dashboards / alertes.
             if status in ("DEGRADED", "BLOCKED"):
                 self._obs_balance_ttl_stale(ex_u, alias_u, age_s, status)
 
-            # Projection des statuts comptes WS (Hub + Reconciler) depuis MBF.meta["ws_accounts"].
-            # On conserve un cache local par (exchange, alias) pour les décisions RM.
+        # Projection des statuts comptes WS (Hub + Reconciler) depuis MBF.meta["ws_accounts"].
+        # On conserve un cache local par (exchange, alias) pour les décisions RM.
         try:
-            meta = (raw or {}).get("meta") or {}
+
             ws_accounts = meta.get("ws_accounts") or {}
         except Exception:
             ws_accounts = {}
@@ -5257,6 +5412,30 @@ class RiskManager:
                 # En cas de format inattendu, on n'expose pas ce statut mais on
                 # laisse la TTL classique jouer son rôle.
                 continue
+                # Vue consolidée balances/WS pour RM et debug.
+        keys = set(self._alias_balance_age_s.keys()) | set(self._alias_ws_accounts_status.keys())
+        for ex_u, alias_u in keys:
+            key_str = f"{ex_u}.{alias_u}"
+            bh_raw = balances_health.get(key_str) if isinstance(balances_health, dict) else None
+            ws_meta = self._alias_ws_accounts_status.get((ex_u, alias_u)) or {}
+            status_rm = self._alias_balance_status.get((ex_u, alias_u), "UNKNOWN")
+            try:
+                age_s = float(self._alias_balance_age_s.get((ex_u, alias_u), 0.0) or 0.0)
+            except Exception:
+                age_s = 0.0
+
+            self._alias_private_health[(ex_u, alias_u)] = {
+                "balance_status": status_rm,
+                "balance_age_s": age_s,
+                "bf_balances_state": str((bh_raw or {}).get("state") or "").upper() if isinstance(bh_raw,
+                                                                                                  dict) else None,
+                "bf_ttl_normal_s": (bh_raw or {}).get("ttl_normal_s") if isinstance(bh_raw, dict) else None,
+                "bf_ttl_degraded_s": (bh_raw or {}).get("ttl_degraded_s") if isinstance(bh_raw, dict) else None,
+                "bf_ttl_block_s": (bh_raw or {}).get("ttl_block_s") if isinstance(bh_raw, dict) else None,
+                "ws_accounts": dict(ws_meta) if isinstance(ws_meta, dict) else {},
+                "last_update_ts": now,
+            }
+
         # Après mise à jour des caches TTL + comptes WS, on propage
         # cette information vers la surcouche "capital en mouvement".
         self._update_capital_move_state_from_ttl()
@@ -5309,6 +5488,49 @@ class RiskManager:
 
         for key in done:
             self._alias_capital_move_state.pop(key, None)
+
+    def _get_private_path_health(self, exchange: str, alias: str) -> Dict[str, Any]:
+        ex_u = str(exchange or "").upper()
+        alias_u = str(alias or "").upper()
+        return self._alias_private_health.get((ex_u, alias_u), {})
+
+    def _classify_private_path_severity(self, priv: Dict[str, Any]) -> Tuple[int, Set[str]]:
+        """Classe la sévérité privée (balances + WS) pour un chemin (ex, alias).
+
+        Retourne (severity_level, reason_flags) où:
+        - severity_level: 0 = OK, 1 = SOFT_CLAMP, 2 = HARD_BLOCK
+        - reason_flags: ensemble de codes (BAL_DEGRADED, BAL_BLOCKED, PWS_WARN, ...)
+        """
+
+        severity = 0
+        flags: Set[str] = set()
+
+        status = str(priv.get("balance_status") or "").upper()
+        if status == "BLOCKED":
+            severity = 2
+            flags.add("BAL_BLOCKED")
+        elif status == "DEGRADED":
+            severity = 1
+            flags.add("BAL_DEGRADED")
+
+        ws_meta = priv.get("ws_accounts") or {}
+        if isinstance(ws_meta, dict):
+            hub_status = str(ws_meta.get("hub_status") or "").upper()
+            reco_status = str(ws_meta.get("reco_status") or "").upper()
+            capital_at_risk = bool(ws_meta.get("capital_at_risk"))
+
+            if capital_at_risk:
+                severity = 2 if severity == 1 else max(severity, 1)
+                flags.add("CAPITAL_AT_RISK")
+
+            if "CRITICAL" in {hub_status, reco_status}:
+                severity = max(severity, 2)
+                flags.add("PWS_CRITICAL")
+            elif "WARN" in {hub_status, reco_status}:
+                severity = max(severity, 1)
+                flags.add("PWS_WARN")
+
+        return severity, flags
 
     def get_private_alias_status_snapshot(self) -> Dict[str, Dict[str, Any]]:
         """Retourne un snapshot alias-centric du marché privé pour obs/dashboard.
@@ -5364,6 +5586,11 @@ class RiskManager:
         except Exception:
             move_cache = {}
 
+        try:
+            private_cache = dict(getattr(self, "_alias_private_health", {}) or {})
+        except Exception:
+            private_cache = {}
+
         if not alias_age and not ws_cache and not move_cache:
             # Rien à exposer pour l'instant : on renvoie uniquement le contexte global.
             return {
@@ -5375,13 +5602,14 @@ class RiskManager:
 
         # Union de toutes les clés vues côté balances/WS/capital_move.
         all_keys: Set[Tuple[str, str]] = set()
-        for d in (alias_age, alias_status, ws_cache, move_cache):
+        for d in (alias_age, alias_status, ws_cache, move_cache, private_cache):
             try:
                 all_keys.update(d.keys())
             except Exception:
                 continue
 
         now = time.time()
+        private_health_snapshot: Dict[str, Any] = {}
 
         for raw_key in all_keys:
             try:
@@ -5427,7 +5655,10 @@ class RiskManager:
                 elif effective_status == "DEGRADED":
                     effective_status = "BLOCKED"
 
-            # 5) Construction de la vue par (exchange, alias)
+            # 5) SLO balances côté MBF (si dispo)
+            private_meta = private_cache.get((ex_u, alias_u)) or {}
+
+            # 6) Construction de la vue par (exchange, alias)
             per_ex = snapshot.setdefault(ex, {})
             per_ex[alias] = {
                 "age_s": age_s,
@@ -5447,7 +5678,20 @@ class RiskManager:
                 "capital_at_risk": capital_at_risk,
             }
 
-        # 6) Ajout du contexte global RM/Trade mode.
+        private_health_snapshot[f"{ex}.{alias}"] = {
+            "balance_status": private_meta.get("balance_status", ttl_status),
+            "balance_age_s": private_meta.get("balance_age_s", age_s),
+            "bf_balances_state": private_meta.get("bf_balances_state"),
+            "bf_ttl_normal_s": private_meta.get("bf_ttl_normal_s"),
+            "bf_ttl_degraded_s": private_meta.get("bf_ttl_degraded_s"),
+            "bf_ttl_block_s": private_meta.get("bf_ttl_block_s"),
+            "ws_accounts": private_meta.get("ws_accounts") or ws_meta,
+        }
+
+        if private_health_snapshot:
+            snapshot["private_health_snapshot"] = private_health_snapshot
+
+        # 7) Ajout du contexte global RM/Trade mode.
         snapshot["_meta"] = {
             "rm_mode": str(getattr(self, "rm_mode", "NORMAL")).upper(),
             "trade_mode": str(getattr(self, "trade_mode", "NORMAL")).upper(),
@@ -5500,6 +5744,8 @@ class RiskManager:
             sinon un dict:
                 {
                     "status": "DEGRADED" | "BLOCKED",
+                    "severity_level": 0 | 1 | 2,
+                    "reason_flags": List[str],
                     "exchange": "BINANCE",
                     "alias": "TT",
                     "age_s": 123.4,
@@ -5527,30 +5773,34 @@ class RiskManager:
 
         worst: Optional[Dict[str, Any]] = None
         worst_rank: int = -1
-        ttl_rank = {"UNKNOWN": 0, "OK": 0, "DEGRADED": 1, "BLOCKED": 2}
+
         now = time.time()
 
         ws_cache = getattr(self, "_alias_ws_accounts_status", {}) or {}
 
         for ex, alias in aliases:
             key = (ex.upper(), alias.upper())
-            age_s = self._alias_balance_age_s.get(key)
-            status = self._alias_balance_status.get(key, "UNKNOWN")
+            priv = self._get_private_path_health(ex, alias)
+            ws_meta = ws_cache.get(key) or {}
+
+            if priv:
+                age_s = priv.get("balance_age_s")
+                status = str(priv.get("balance_status") or "UNKNOWN").upper()
+                ws_meta = priv.get("ws_accounts") or ws_meta
+            else:
+                age_s = self._alias_balance_age_s.get(key)
+                status = str(self._alias_balance_status.get(key, "UNKNOWN")).upper()
+                priv = {
+                    "balance_status": status,
+                    "balance_age_s": age_s,
+                    "ws_accounts": ws_meta,
+                }
             if age_s is None:
                 continue
 
-            ws_meta = ws_cache.get(key) or {}
-            capital_at_risk = bool(ws_meta.get("capital_at_risk"))
+            severity_level, reason_flags = self._classify_private_path_severity(priv)
 
-            # Escalade du statut TTL en fonction:
-            # - d'un éventuel transfert interne "capital en mouvement"
-            # - du risque comptes WS (capital_at_risk)
-            effective_status = status
 
-            # Surcouche "capital en mouvement" : si un transfert interne
-            # important vient d'être émis sur (exchange, alias), on force au
-            # minimum un statut DEGRADED le temps que MBF remonte une balance
-            # fraîche pour cet alias.
             capital_move = False
             move_state = getattr(self, "_alias_capital_move_state", {}).get(key, None)
             if move_state:
@@ -5558,30 +5808,28 @@ class RiskManager:
                 if deadline_ts > 0.0 and now < deadline_ts:
                     capital_move = True
 
-            if capital_move and effective_status in ("UNKNOWN", "OK"):
-                effective_status = "DEGRADED"
+            if capital_move:
+                severity_level = max(severity_level, 1)
+                reason_flags.add("CAPITAL_MOVE")
 
-            # Puis on applique l'escalade classique liée au risque WS.
-            if capital_at_risk:
-                if effective_status in ("UNKNOWN", "OK"):
-                    effective_status = "DEGRADED"
-                elif effective_status == "DEGRADED":
-                    effective_status = "BLOCKED"
-
-            rank = ttl_rank.get(effective_status, 0)
-            if rank <= 0:
+            if severity_level <= 0:
                 continue
+            derived_status = status
+            if severity_level == 2:
+                derived_status = "BLOCKED"
+            elif severity_level == 1:
+                derived_status = "DEGRADED"
 
             ws_info = {
-                "capital_at_risk": capital_at_risk,
-                "hub_status": ws_meta.get("hub_status"),
-                "reco_status": ws_meta.get("reco_status"),
-                "last_resync_ts": ws_meta.get("last_resync_ts"),
+                "capital_at_risk": bool((ws_meta or {}).get("capital_at_risk")),
+                "hub_status": (ws_meta or {}).get("hub_status"),
+                "reco_status": (ws_meta or {}).get("reco_status"),
+                "last_resync_ts": (ws_meta or {}).get("last_resync_ts"),
             }
 
-            if rank > worst_rank:
-                worst_rank = rank
-                alias_cap_factor = self._get_alias_ttl_cap_factor(effective_status, branch)
+            if severity_level > worst_rank:
+                worst_rank = severity_level
+                alias_cap_factor = self._get_alias_ttl_cap_factor(derived_status, branch)
                 try:
                     alias_cap_factor = float(alias_cap_factor)
                 except Exception:
@@ -5592,11 +5840,14 @@ class RiskManager:
                     alias_cap_factor = 1.0
 
                 worst = {
-                    "status": effective_status,
+                    "status": derived_status,
+                    "severity_level": severity_level,
+                    "reason_flags": sorted(reason_flags),
                     "exchange": ex.upper(),
                     "alias": alias.upper(),
                     "age_s": float(age_s),
                     "ws_accounts": ws_info,
+                    "capital_at_risk": bool(ws_info.get("capital_at_risk")),
                     "alias_cap_factor": alias_cap_factor,
                 }
 
@@ -6212,6 +6463,62 @@ class RiskManager:
                 "[RiskManager] _record_exposure_for_bundle: erreur métrique",
                 exc_info=False,
             )
+
+            if branch_u in ("TM", "REB"):
+                try:
+                    pk = self._norm_pair(
+                        route.get("pair") or meta.get("pair") or bundle.get("pair") or bundle.get("symbol") or "")
+                    asset = self._pair_base(pk)
+                    maker_leg = None
+                    for leg in bundle.get("legs") or []:
+                        if not isinstance(leg, dict):
+                            continue
+                        if leg.get("meta", {}).get("maker"):
+                            maker_leg = leg
+                            break
+
+                    if maker_leg is None:
+                        for leg in bundle.get("legs") or []:
+                            if isinstance(leg, dict):
+                                maker_leg = leg
+                                break
+
+                    exchange = str(
+                        (maker_leg or {}).get("exchange")
+                        or meta.get("exchange")
+                        or meta.get("venue")
+                        or route.get("buy_ex")
+                        or route.get("exchange")
+                        or ""
+                    ).upper()
+                    alias = str(
+                        (maker_leg or {}).get("account_alias")
+                        or meta.get("account_alias")
+                        or meta.get("alias")
+                        or ""
+                    ).upper()
+                    side = str((maker_leg or {}).get("side") or meta.get("side") or "").upper()
+                    max_expo_s = float(
+                        (meta.get("tm") or {}).get("max_exposure_s")
+                        or getattr(self, "tm_nn_max_exposure_s", 3.0)
+                    )
+
+                    notional_usd = float(notional)
+                    asset_u = str(asset or "").upper()
+
+                    if asset_u and exchange and notional_usd > 0.0:
+                        entry = {
+                            "asset": asset_u,
+                            "exchange": exchange,
+                            "alias": alias,
+                            "side": side,
+                            "notional_usd": notional_usd,
+                            "opened_ts": time.time(),
+                            "max_exposure_s": max_expo_s,
+                        }
+                        self.tm_inflight_exposures.setdefault(asset_u, []).append(entry)
+                except Exception:
+                    logger.debug("[RiskManager] tm inflight exposure record failed", exc_info=False)
 
 
     def _preflight_gate(self, opp: dict) -> tuple[bool, str, dict]:
@@ -7660,6 +7967,26 @@ class RiskManager:
         # Macro 7-D : observabilité des changements de mode Pacer
         if prev != raw:
             try:
+                logging.getLogger(__name__).info(
+                    "[RM][MODE] pacer_mode_transition %s->%s source=%s",
+                    prev,
+                    raw,
+                    str(source or "engine_pacer"),
+                )
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc(
+                        "rm_mode_transitions_total",
+                        kind="pacer_mode",
+                        old=prev,
+                        new=raw,
+                    )
+            except Exception:
+                pass
+            try:
                 if hasattr(self, "obs_inc"):
                     self.obs_inc(
                         "rm_pacer_mode_changes_total",
@@ -7690,6 +8017,7 @@ class RiskManager:
           ----------------------------------------
           SEVERE       *              → SEVERE
           *            SEVERE         → SEVERE
+          CONSTRAINED  *              → CONSTRAINED
           *            CONSTRAINED    → CONSTRAINED
           OPP_VOLUME   NORMAL         → OPPORTUNISTE
           OPP_VOL      NORMAL         → OPPORTUNISTE
@@ -7704,12 +8032,70 @@ class RiskManager:
 
         if rm_mode == "SEVERE" or pacer_mode == "SEVERE":
             return "SEVERE"
-        if pacer_mode == "CONSTRAINED":
+        if rm_mode == "CONSTRAINED" or pacer_mode == "CONSTRAINED":
             return "CONSTRAINED"
         if pacer_mode == "NORMAL" and rm_mode in ("OPP_VOLUME", "OPP_VOL"):
             return "OPPORTUNISTE"
         return "NORMAL"
 
+    @property
+    def private_plane_state(self) -> str:
+        """
+        Vue simplifiée de la santé du plan privé.
+
+        - GREEN        : rm_mode in {NORMAL, OPP_VOLUME, OPP_VOL}
+        - CONSTRAINED  : rm_mode == CONSTRAINED
+        - SEVERE       : rm_mode == SEVERE
+        """
+        rm_mode = str(getattr(self, "rm_mode", "NORMAL")).upper()
+        if rm_mode == "SEVERE":
+            return "SEVERE"
+        if rm_mode == "CONSTRAINED":
+            return "CONSTRAINED"
+        return "GREEN"
+
+    def _check_private_public_mode_invariant(self) -> None:
+        """
+        Invariant ZERO_PUBLIC_GREEN_PRIVATE_ON_FIRE (runtime, best-effort).
+
+        - Si le plan privé est en alerte (rm_mode CONSTRAINED/SEVERE),
+          le plan public (trade_mode) ne doit PAS être NORMAL / OPPORTUNISTE.
+        """
+        rm_mode = str(getattr(self, "rm_mode", "NORMAL")).upper()
+        trade_mode = str(getattr(self, "trade_mode", "NORMAL")).upper()
+
+        if rm_mode in ("CONSTRAINED", "SEVERE") and trade_mode in ("NORMAL", "OPPORTUNISTE"):
+            msg = (
+                f"[RM][INVARIANT] private_public_mode_violation "
+                f"rm_mode={rm_mode} trade_mode={trade_mode}"
+            )
+
+            try:
+                import logging
+
+                logging.getLogger(__name__).error(msg)
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc(
+                        "rm_invariant_private_public_mode_violations_total",
+                        rm_mode=rm_mode,
+                        trade_mode=trade_mode,
+                    )
+            except Exception:
+                pass
+
+            try:
+                strict = bool(getattr(self.cfg, "RM_INVARIANT_STRICT", False))
+            except Exception:
+                strict = False
+
+            if strict:
+                from contracts.errors import InconsistentStateError
+
+                raise InconsistentStateError(msg)
 
     def _evaluate_incident_triggers(self) -> tuple[Optional[str], Optional[str]]:
         """
@@ -7918,13 +8304,30 @@ class RiskManager:
         mode = self._compute_trade_mode()
 
         if mode != prev:
-            logging.info(
-                "RM: trade_mode=%s (rm_mode=%s, pacer_mode=%s)",
-                mode,
-                str(getattr(self, "rm_mode", "NORMAL")).upper(),
-                str(getattr(self, "pacer_mode", "NORMAL")).upper(),
-            )
+            try:
+                logging.getLogger(__name__).info(
+                    "[RM][MODE] trade_mode_transition %s->%s rm_mode=%s pacer_mode=%s",
+                    prev,
+                    mode,
+                    str(getattr(self, "rm_mode", "NORMAL")).upper(),
+                    str(getattr(self, "pacer_mode", "NORMAL")).upper(),
+                )
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc(
+                        "rm_mode_transitions_total",
+                        kind="trade_mode",
+                        old=prev,
+                        new=mode,
+                    )
+            except Exception:
+                pass
+
         self.trade_mode = mode
+        self._check_private_public_mode_invariant()
 
 
     def _tick_mode(self) -> None:
@@ -7934,6 +8337,7 @@ class RiskManager:
         now = time.time()
         cur = self.rm_mode
         prev_rm_mode = getattr(self, "_last_rm_mode_obs", cur)
+        old_rm_mode = cur
         prev_trade_mode = getattr(self, "_last_trade_mode_obs", getattr(self, "trade_mode", "NORMAL"))
         exit_reason = "transition"
 
@@ -7994,6 +8398,29 @@ class RiskManager:
         except Exception:
             # Fallback : ne jamais casser la FSM pour un problème de consolidation
             self.trade_mode = getattr(self, "trade_mode", "NORMAL") or "NORMAL"
+
+        new_rm_mode = getattr(self, "rm_mode", "NORMAL")
+        if old_rm_mode != new_rm_mode:
+            try:
+                logging.getLogger(__name__).info(
+                    "[RM][MODE] rm_mode_transition %s->%s reason=%s",
+                    old_rm_mode,
+                    new_rm_mode,
+                    exit_reason,
+                )
+            except Exception:
+                pass
+
+            try:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc(
+                        "rm_mode_transitions_total",
+                        kind="rm_mode",
+                        old=old_rm_mode,
+                        new=new_rm_mode,
+                    )
+            except Exception:
+                pass
 
         try:
             from . import obs_metrics  # type: ignore
@@ -11952,7 +12379,17 @@ class RiskManager:
         strategy_u = str(strategy or "").upper()
         if strategy_u in ("TT", "TM"):
             base_asset = self._pair_base(pk)
-            tttm_state = self.tttm_exposure_state.get(base_asset, {}).get("state", "OK")
+            tttm_entry = self.tttm_exposure_state.get(base_asset, {}) or {}
+            tttm_state = str(tttm_entry.get("state", "OK") or "OK").upper()
+            if tttm_entry.get("hard_breach"):
+                tttm_state = "HARD"
+            elif tttm_entry.get("soft_breach") and tttm_state == "OK":
+                tttm_state = "SOFT"
+
+            if tttm_entry.get("hard_breach"):
+                meta.setdefault("tm_exposure_mode", "HARD_BREACH")
+            elif tttm_entry.get("soft_breach"):
+                meta.setdefault("tm_exposure_mode", "SOFT_BREACH")
             if tttm_state == "HARD":
                 inc_rm_reject(reason=RM_TTTM_DELTA_HARD_LIMIT)
                 return None
@@ -12049,7 +12486,7 @@ class RiskManager:
 
         # Paramètres d'horizon TM utilisés comme fallback si le RM n'a pas encore posé max_exposure_s.
         # TTL canonique configuré, éventuellement modulé par prudence VM (down-clamp only).
-        ttl_ms_cfg = int(getattr(self, "tm_exposure_ttl_ms", 2500))
+        ttl_ms_cfg = int(self._get_tm_exposure_ttl_ms_for_exchange(buy_ex or sell_ex))
         ttl_ms_effective = ttl_ms_cfg
         try:
             prud = self._current_prudence(pk)
@@ -13008,6 +13445,7 @@ class RiskManager:
                 "paused_symbols": [k for k, v in self._paused.items() if v],
                 "dynamic_min_required": self.dynamic_min_required,
                 "rm_mode": getattr(self, "rm_mode", "NORMAL"),
+                "private_plane_state": self.private_plane_state,
                 "rm_mode_since": getattr(self, "_mode_since", 0.0),
                 "rm_mode_timeout_s": getattr(self, "_mode_timeout_s", 30 * 60),
                 "rm_daily_budgets": getattr(self, "daily_strategy_budget_quote", {}),

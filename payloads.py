@@ -10,10 +10,13 @@ Objectifs
 - Compat Pydantic v2/v1 (auto-détection).
 - Normalisation des symboles: "BTC-USDC" / "BTCUSDC" acceptés, clé compacte via pair_key.
 - Helpers de conversion (Scanner→Opportunity, RM→Decision, Decision/Intent→EngineAction).
-- "Lite validators" tolérants (DRY/DEV), sans masquer les erreurs en OFFICIAL.
+- - "Lite validators" tolérants (DRY/DEV), sans masquer les erreurs en OFFICIAL.
 - Métriques Prometheus optionnelles (no-op si prometheus_client absent).
 - Champs additifs rétro-compatibles pour bundles: frag/caps/tm_controls/split/shadow/notional_quote.
 - SimResult minimal pour RM⇄Sim.
+- Conventions meta utilisées par le RM :
+  - meta["flow_kind"] ∈ {"core", "opportunistic", "hedge", "rebalance", "unwind", "maintenance"}
+  - meta["risk_effect"] ∈ {"risk_increasing", "risk_neutral", "risk_reducing"}
 
 Patchs demandés (inclus)
 ------------------------

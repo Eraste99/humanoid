@@ -109,6 +109,8 @@ try:
         PWS_EVENTS_TOTAL,
         PWS_BACKOFF_SECONDS,
         PWS_HEARTBEAT_GAP_SECONDS,
+        PWS_HEARTBEAT_GAP_SLO_SECONDS,
+        PWS_HEALTH_STATE,
         PWS_HEARTBEAT_GAP_BREACH_TOTAL,
         PWS_DROPPED_TOTAL,
         PWS_ACK_LATENCY_MS,
@@ -136,6 +138,8 @@ except Exception:  # pragma: no cover
     PWS_EVENTS_TOTAL = _NoopMetric()
     PWS_BACKOFF_SECONDS = _NoopMetric()
     PWS_HEARTBEAT_GAP_SECONDS = _NoopMetric()
+    PWS_HEARTBEAT_GAP_SLO_SECONDS = _NoopMetric()
+    PWS_HEALTH_STATE = _NoopMetric()
     PWS_HEARTBEAT_GAP_BREACH_TOTAL = _NoopMetric()
     PWS_DROPPED_TOTAL = _NoopMetric()
     PWS_ACK_LATENCY_MS = _NoopMetric()
@@ -1351,26 +1355,33 @@ class PrivateWSHub:
             PWS_POOL_SIZE.labels(region="US").set(float(getattr(self.cfg, "PWS_POOL_SIZE_US", 1)))
         except Exception:
             pass
-        # Pools de connexion par région (EU/US) — sharding réel
-        try:
-            eu_size = int(getattr(self.cfg, "PWS_POOL_SIZE_EU", 1))
-            us_size = int(getattr(self.cfg, "PWS_POOL_SIZE_US", 1))
-        except Exception:
-            eu_size, us_size = 1, 1
-        self._pools: Dict[str, asyncio.Semaphore] = {
-            "EU": asyncio.Semaphore(max(1, eu_size)),
-            "US": asyncio.Semaphore(max(1, us_size)),
-        }
-        # Alias compat
-        self._pools_by_region = self._pools
+            # Pools de connexion par région (EU/US) — sharding réel
+            try:
+                eu_size = int(getattr(self.cfg, "PWS_POOL_SIZE_EU", 1))
+                us_size = int(getattr(self.cfg, "PWS_POOL_SIZE_US", 1))
+            except Exception:
+                eu_size, us_size = 1, 1
+            self._pools: Dict[str, asyncio.Semaphore] = {
+                "EU": asyncio.Semaphore(max(1, eu_size)),
+                "US": asyncio.Semaphore(max(1, us_size)),
+            }
+            # Alias compat
+            self._pools_by_region = self._pools
 
-        # Mapping région (clé "EX:ALIAS" > "EX" > défaut "EU")
-        self._region_map: Dict[str, str] = dict(getattr(self.cfg, "PWS_REGION_MAP", {}) or {})
+            # Mapping région (clé "EX:ALIAS" > "EX" > défaut "EU")
+            self._region_map: Dict[str, str] = dict(getattr(self.cfg, "PWS_REGION_MAP", {}) or {})
 
+            # Gap heartbeat PWS (SLO privé par exchange + fallback global)
+            self._pws_gap_slo_by_ex: Dict[str, float] = {}
+            pws = getattr(self, "_pws_cfg", self.cfg)
+            self._pws_gap_slo_default: float = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
+            self._refresh_pws_gap_slo_from_slo()
 
+            # Health state par (exchange, alias)
+            self._pws_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-    # ------------------------- QoS / métriques / drain -------------------------
-
+        # ------------------------- QoS / métriques / drain -------------------------
+        
     def set_qos_policy(self, priorities: dict) -> None:
         for k, v in (priorities or {}).items():
             if not isinstance(v, int) or v < 0:
@@ -1832,20 +1843,49 @@ class PrivateWSHub:
             pass
         return base_ms, cap_ms
 
+    def _refresh_pws_gap_slo_from_slo(self) -> None:
+        """Construit le cache de gaps heartbeat par exchange depuis cfg.slo."""
+        self._pws_gap_slo_by_ex.clear()
+
+        pws = getattr(self, "_pws_cfg", self.cfg)
+        self._pws_gap_slo_default = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
+
+        cfg = getattr(self, "cfg", None)
+        slo_map = getattr(cfg, "slo", None)
+        g = getattr(cfg, "g", None)
+        mode_key = str(getattr(g, "deployment_mode", "SPLIT")).upper()
+        per_ex = slo_map.get(mode_key) if slo_map else {}
+
+        for ex, path_slo in (per_ex or {}).items():
+            exu = str(ex).upper()
+            pvt = getattr(path_slo, "private", None)
+            if pvt is None:
+                continue
+            gap = float(getattr(pvt, "pws_heartbeat_gap_max_s", 0.0) or 0.0)
+            if gap > 0.0:
+                self._pws_gap_slo_by_ex[exu] = gap
+
+        if not self._pws_gap_slo_by_ex:
+            try:
+                log.warning(
+                    "[PrivateWSHub] aucun pws_heartbeat_gap_max_s dans cfg.slo[mode=%s], "
+                    "fallback sur PWS_HEARTBEAT_MAX_GAP_S",
+                    mode_key,
+                )
+            except Exception:
+                pass
 
     async def run_alerts(self) -> None:
         """
-        Boucle d'alerting (queue saturation + heartbeat gaps).
-        Seuils côté config:
-            - PWS_QUEUE_SATURATION_RATIO (def 0.85)
-            - PWS_HEARTBEAT_MAX_GAP_S (def 5.0)
-            - PWS_ALERT_PERIOD_S (def 5.0)
-        """
+               Boucle d'alerting (queue saturation + heartbeat gaps).
+               Seuils côté config:
+                   - PWS_QUEUE_SATURATION_RATIO (def 0.85)
+                   - PWS_HEARTBEAT_MAX_GAP_S (def 5.0)
+                   - PWS_ALERT_PERIOD_S (def 5.0)
+               """
         pws = getattr(self, "_pws_cfg", self.cfg)
         ratio_thr = float(getattr(pws, "PWS_QUEUE_SATURATION_RATIO", 0.85))
-        hb_max = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
         period = float(getattr(pws, "PWS_ALERT_PERIOD_S", 5.0))
-
 
         while getattr(self, "_started", False):
             now = _now()
@@ -1854,8 +1894,60 @@ class PrivateWSHub:
             try:
                 for (ex, al), last in list(self._last_hb.items()):
                     gap = max(0.0, now - float(last))
-                    # Optionnel: exposer la jauge de gap si distincte
-                    if gap > hb_max:
+                    hb_crit = self._pws_gap_slo_by_ex.get(ex, self._pws_gap_slo_default)
+                    hb_warn = 0.7 * hb_crit
+
+                    entry = self._pws_health.get((ex, al)) or {
+                        "state": "HEALTHY",
+                        "last_gap_s": 0.0,
+                        "gap_slo_s": hb_crit,
+                        "last_change_ts": now,
+                        "healthy_streak": 0,
+                        "warn_streak": 0,
+                        "critical_streak": 0,
+                    }
+
+                    if gap <= hb_warn:
+                        entry["healthy_streak"] = entry.get("healthy_streak", 0) + 1
+                        entry["warn_streak"] = 0
+                        entry["critical_streak"] = 0
+                    elif gap <= hb_crit:
+                        entry["warn_streak"] = entry.get("warn_streak", 0) + 1
+                        entry["healthy_streak"] = 0
+                        entry["critical_streak"] = 0
+                    else:
+                        entry["critical_streak"] = entry.get("critical_streak", 0) + 1
+                        entry["healthy_streak"] = 0
+                        entry["warn_streak"] = 0
+
+                    old_state = str(entry.get("state", "HEALTHY"))
+                    new_state = old_state
+
+                    if entry.get("critical_streak", 0) >= 1 and gap > hb_crit:
+                        new_state = "CRITICAL"
+                    elif entry.get("warn_streak", 0) >= 2 and gap > hb_warn:
+                        new_state = "WARN"
+                    elif entry.get("healthy_streak", 0) >= 2 and gap <= hb_warn:
+                        new_state = "HEALTHY"
+
+                    entry["last_gap_s"] = gap
+                    entry["gap_slo_s"] = hb_crit
+
+                    if new_state != old_state:
+                        entry["state"] = new_state
+                        entry["last_change_ts"] = now
+                    self._pws_health[(ex, al)] = entry
+
+                    try:
+                        PWS_HEARTBEAT_GAP_SECONDS.labels(ex, al).set(gap)
+                        PWS_HEARTBEAT_GAP_SLO_SECONDS.labels(ex, al).set(hb_crit)
+                        PWS_HEALTH_STATE.labels(ex, al).set(
+                            0 if new_state == "HEALTHY" else 1 if new_state == "WARN" else 2
+                        )
+                    except Exception:
+                        pass
+
+                    if new_state == "CRITICAL" and old_state != "CRITICAL":
                         try:
                             PWS_HEARTBEAT_GAP_BREACH_TOTAL.labels(ex, al).inc()
                         except Exception:
@@ -1864,7 +1956,7 @@ class PrivateWSHub:
                             severity="WARN",
                             reason="heartbeat_gap",
                             exchange=ex, alias=al, kind="-",
-                            message=f"Heartbeat gap={gap:.2f}s > {hb_max:.2f}s",
+                            message=f"PrivateWS {ex}/{al} CRITICAL: gap={gap:.2f}s > slo={hb_crit:.2f}s",
                         )
             except Exception:
                 pass
@@ -2526,6 +2618,19 @@ class PrivateWSHub:
             "auto_rm_from_engine": bool(getattr(self, "_wiring_auto_rm_from_engine", False)),
         }
         accounts_ws = self.get_all_alias_ws_status()
+        health: Dict[str, Dict[str, Any]] = {}
+        try:
+            for (ex, al), vals in (self._pws_health or {}).items():
+                exu = _upper(ex)
+                alu = _upper(al)
+                health.setdefault(exu, {})[alu] = {
+                    "state": vals.get("state", "HEALTHY"),
+                    "gap_s": vals.get("last_gap_s", 0.0),
+                    "gap_slo_s": vals.get("gap_slo_s", self._pws_gap_slo_by_ex.get(exu, self._pws_gap_slo_default)),
+                    "last_change_ts": vals.get("last_change_ts", 0.0),
+                }
+        except Exception:
+            pass
         return {
             "module": "PrivateWSHub",
             "healthy": self._started,
@@ -2542,5 +2647,5 @@ class PrivateWSHub:
                 "has_bybit": "BYBIT" in self._transfer_clients,
                 "has_coinbase": "COINBASE" in self._transfer_clients or "COINBASE_AT" in self._transfer_clients,
             },
+            "private_ws_health": health,
         }
-

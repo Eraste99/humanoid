@@ -36,11 +36,17 @@ Notes :
 """
 from __future__ import annotations
 
+import logging
 import time
 import random
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    from modules.bot_config import BotConfig
+
+logger = logging.getLogger(__name__)
 
 # --------- Metrics (Prometheus) optional import ---------
 try:
@@ -51,6 +57,9 @@ try:
         ENGINE_PACER_DELAY_MS,
         ENGINE_PACER_INFLIGHT_MAX,
         ENGINE_PACER_MODE,
+        PACER_ACK_HI_MS,
+        PACER_ACK_SEV_MS,
+        PACER_ACK_TARGET_MS,
         PACER_STATE,
         PACER_CLAMP_SECONDS,
     )
@@ -70,8 +79,12 @@ except Exception:  # pragma: no cover
     ENGINE_PACER_DELAY_MS = _NoOp()
     ENGINE_PACER_INFLIGHT_MAX = _NoOp()
     ENGINE_PACER_MODE = _NoOp()
+    PACER_ACK_HI_MS = _NoOp()
+    PACER_ACK_SEV_MS = _NoOp()
+    PACER_ACK_TARGET_MS = _NoOp()
     PACER_STATE = _NoOp()
     PACER_CLAMP_SECONDS = _NoOp()
+
 
 # --------- Default regional targets ---------
 # Cibles (hautes/sévères) utilisées pour normaliser les gaps → score de sévérité S∈[0,1].
@@ -151,16 +164,20 @@ class EnginePacer:
         jitter_ms: int = 1,
         targets_overrides: Optional[Dict[str, Dict[str, float]]] = None,
         region_map: Optional[Dict[str, str]] = None,
+        bot_cfg: Optional["BotConfig"] = None,
     ):
         self._lock = threading.RLock()
+        self._bot_cfg = bot_cfg
         self._default_region = self._norm_region(region)
         self._regions: Dict[str, RegionState] = {}
         self._targets: Dict[str, Dict[str, float]] = dict(_DEFAULT_TARGETS)
+        self._targets_overrides: Dict[str, Dict[str, float]] = {}
         if targets_overrides:
             for k, v in targets_overrides.items():
-                self._targets[self._norm_region(k)] = {**self._targets.get(self._norm_region(k), {}), **v}
+                rg = self._norm_region(k)
+                self._targets_overrides[rg] = {**self._targets_overrides.get(rg, {}), **(v or {})}
         self._profile = self._norm_profile(capital_profile)
-
+        
         # clamps globaux (peuvent être serrés par le profil)
         self._min_ms = int(min_ms)
         self._max_ms = int(max_ms)
@@ -179,7 +196,10 @@ class EnginePacer:
 
 
         # mapping exchange -> region (hint pour l’Engine si besoin)
-        self._region_map = dict(region_map) if region_map else {}
+        self._region_map = {k.upper(): self._norm_region(v) for k, v in (region_map or {}).items()}
+
+        # charge les cibles depuis les SLO si disponibles
+        self._refresh_targets_from_slo()
 
         # initialise l'état de la région par défaut
         self._ensure_region(self._default_region, cold_start=True)
@@ -236,7 +256,115 @@ class EnginePacer:
             return float(new)
         return (1.0 - alpha) * prev + alpha * float(new)
 
+    def _apply_target_overrides(self) -> None:
+        for rg, override in self._targets_overrides.items():
+            base = self._targets.get(rg, {})
+            self._targets[rg] = {**base, **override}
+
+    def _push_ack_metrics(self) -> None:
+        try:
+            for region, vals in self._targets.items():
+                labels = dict(region=region, profile=self._profile)
+                ack_target = vals.get("ack_target")
+                ack_hi = vals.get("ack_hi")
+                ack_sev = vals.get("ack_sev")
+                if ack_target is not None:
+                    PACER_ACK_TARGET_MS.labels(**labels).set(float(ack_target))
+                if ack_hi is not None:
+                    PACER_ACK_HI_MS.labels(**labels).set(float(ack_hi))
+                if ack_sev is not None:
+                    PACER_ACK_SEV_MS.labels(**labels).set(float(ack_sev))
+        except Exception:
+            pass
+
+    def _refresh_targets_from_slo(self) -> None:
+        """
+        Reconstruit les cibles par région à partir des SLO privés.
+        """
+        with self._lock:
+            self._targets = dict(_DEFAULT_TARGETS)
+
+            cfg = self._bot_cfg
+            if cfg is None:
+                self._apply_target_overrides()
+                self._push_ack_metrics()
+                return
+
+            try:
+                mode_key = str(getattr(getattr(cfg, "g", None), "deployment_mode", "")).upper()
+            except Exception:
+                mode_key = ""
+
+            if not hasattr(cfg, "slo"):
+                logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur _DEFAULT_TARGETS", mode_key)
+                self._apply_target_overrides()
+                self._push_ack_metrics()
+                return
+
+            slo_map = getattr(cfg, "slo", {}) or {}
+
+            per_ex = slo_map.get(mode_key)
+            if per_ex is None:
+                logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur _DEFAULT_TARGETS", mode_key)
+                self._apply_target_overrides()
+                self._push_ack_metrics()
+                return
+
+            if not self._region_map:
+                logger.warning(
+                    "[EnginePacer] Region map vide, fallback sur region par défaut=%s pour agrégation SLO",
+                    self._default_region,
+                )
+
+            agg: Dict[str, Dict[str, Optional[float]]] = {}
+            for ex, path_slo in per_ex.items():
+                private = getattr(path_slo, "private", None)
+                if not private:
+                    continue
+
+                region = self._region_map.get(str(ex).upper(), self._default_region)
+                vals = agg.setdefault(region, {"ack_target": None, "ack_hi": None, "ack_sev": None})
+
+                for key, attr in (("ack_target", "ack_target_ms"), ("ack_hi", "ack_hi_ms"), ("ack_sev", "ack_sev_ms")):
+                    try:
+                        raw_val = float(getattr(private, attr, 0.0))
+                    except Exception:
+                        continue
+                    if raw_val <= 0:
+                        continue
+                    current = vals.get(key)
+                    vals[key] = max(current, raw_val) if current is not None else raw_val
+
+            agg = {r: v for r, v in agg.items() if any(val is not None for val in v.values())}
+            if not agg:
+                logger.warning(
+                    "[EnginePacer] Aucun chemin SLO privé trouvé pour mode=%s, fallback sur _DEFAULT_TARGETS",
+                    mode_key,
+                )
+                self._apply_target_overrides()
+                self._push_ack_metrics()
+                return
+
+            for region, vals in agg.items():
+                base = dict(self._targets.get(region, self._targets.get(self._default_region, {})))
+                if vals.get("ack_target") is not None:
+                    base["ack_target"] = vals["ack_target"]
+                if vals.get("ack_hi") is not None:
+                    base["ack_hi"] = vals["ack_hi"]
+                if vals.get("ack_sev") is not None:
+                    base["ack_sev"] = vals["ack_sev"]
+                self._targets[region] = base
+
+            # ré-applique les overrides éventuels
+            self._apply_target_overrides()
+            self._push_ack_metrics()
+
     # ------------------ public API ------------------
+
+    def set_bot_config(self, cfg: "BotConfig") -> None:
+        with self._lock:
+            self._bot_cfg = cfg
+        self._refresh_targets_from_slo()
 
     def set_capital_profile(self, profile: str) -> None:
         """Changer le profil de capital (clamps)."""
@@ -245,6 +373,7 @@ class EnginePacer:
             # clamp immédiatement les régions en cours
             for rg, st in self._regions.items():
                 self._apply_clamps(rg, st)
+            self._push_ack_metrics()
 
     def set_inflight_ceiling(self, cap: Optional[int]) -> None:
         """
@@ -271,11 +400,16 @@ class EnginePacer:
         with self._lock:
             base = self._targets.get(rg, {})
             self._targets[rg] = {**base, **(overrides or {})}
+            self._targets_overrides[rg] = {**self._targets_overrides.get(rg, {}), **(overrides or {})}
+            self._push_ack_metrics()
 
     def set_region_map(self, ex_to_region: Dict[str, str]) -> None:
         """Déclarer le mapping exchange -> region (utile pour routing côté Engine)."""
         with self._lock:
-            self._region_map = {k: self._norm_region(v) for k, v in (ex_to_region or {}).items()}
+            self._region_map = {k.upper(): self._norm_region(v) for k, v in (ex_to_region or {}).items()}
+        if self._bot_cfg is not None:
+            self._refresh_targets_from_slo()
+
 
     # ------------------ update / policy ------------------
 

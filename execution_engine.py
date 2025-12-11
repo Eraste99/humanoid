@@ -1855,6 +1855,53 @@ class ExecutionEngine:
         }
         return True
 
+    def _check_invariant_rm_engine_modes(
+            self,
+            rm_mode: Optional[str],
+            trade_mode: Optional[str],
+            mode_overrides: dict,
+            meta: dict,
+    ) -> None:
+        """
+        Best-effort : vérifier que les modes RM/Engine sont cohérents et que
+        l'invariant privé/public n'est pas violé au moment de l'envoi.
+
+        - rm_mode / trade_mode peuvent venir du RM (mode_overrides) ou du fallback.
+        """
+        try:
+            rm_mode_u = (rm_mode or "").upper() or "NORMAL"
+            trade_mode_u = (trade_mode or "").upper() or "NORMAL"
+
+            if rm_mode_u in ("CONSTRAINED", "SEVERE") and trade_mode_u in ("NORMAL", "OPPORTUNISTE"):
+                import logging
+
+                msg = (
+                    f"[ENGINE][INVARIANT] private_public_mode_violation "
+                    f"rm_mode={rm_mode_u} trade_mode={trade_mode_u} "
+                    f"trace_id={meta.get('trace_id') or 'NA'}"
+                )
+                logging.getLogger(__name__).error(msg)
+
+                if hasattr(self, "obs_inc"):
+                    try:
+                        self.obs_inc(
+                            "engine_invariant_private_public_mode_violations_total",
+                            rm_mode=rm_mode_u,
+                            trade_mode=trade_mode_u,
+                            exchange=(meta.get("exchange") or meta.get("ex") or "").upper() or None,
+                            alias=(
+                                          meta.get("account_alias")
+                                          or meta.get("alias")
+                                          or meta.get("subaccount")
+                                          or ""
+                                  ).upper()
+                                  or None,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            # Ne jamais casser la pipeline sur un check d'observabilité
+            pass
 
     # execution_engine.py — dans class ExecutionEngine
     def _rm_ioc_mm_overrides(
@@ -1865,6 +1912,10 @@ class ExecutionEngine:
             post_only: bool,
             meta: Optional[dict] = None,
     ) -> tuple[str, bool, bool, bool]:
+        """
+               Voir aussi _check_invariant_rm_engine_modes() pour les checks best-effort
+               d'alignement rm_mode / trade_mode côté Engine.
+        """
         """
         Applique les overrides TIF/MM issus du RiskManager (overlay de mode),
         éventuellement enrichis par les flags du PACER.
@@ -1932,6 +1983,7 @@ class ExecutionEngine:
                 except Exception:
                     trade_mode = None
 
+        self._check_invariant_rm_engine_modes(rm_mode, trade_mode, mode_overrides, meta)
         # Flags PACER enrichis côté Engine (fusion stage="engine_fused")
         pacer_mm_frozen = bool(mode_overrides.get("pacer_mm_frozen", False))
 
@@ -4137,6 +4189,10 @@ class ExecutionEngine:
             while self.running:
                 payload = None
                 try:
+                    try:
+                        self._reprioritize_queue_for_safety()
+                    except Exception:
+                        pass
                     payload = await asyncio.wait_for(self.order_queue.get(), timeout=1.0)
                 except asyncio.TimeoutError:
                     continue
@@ -4197,6 +4253,53 @@ class ExecutionEngine:
         except asyncio.CancelledError:
             logger.info(f"[ExecutionEngine/W{wid}] annulé.")
 
+    def _reprioritize_queue_for_safety(self) -> None:
+        """
+        En modes dégradés (CONSTRAINED/SEVERE), on fait passer les flows de
+        réduction de risque (hedge/unwind/risk_reducing) en tête de file.
+
+        Best-effort : ne casse jamais la file si l'inspection échoue.
+        """
+
+        try:
+            q = getattr(self.order_queue, "_queue", None)
+            if q is None or len(q) <= 1:
+                return
+
+            items = list(q)
+            for idx, job in enumerate(items):
+                if not isinstance(job, dict):
+                    continue
+                meta = job.get("meta") or {}
+                trade_mode = str(
+                    meta.get("trade_mode")
+                    or meta.get("mode")
+                    or (meta.get("mode_overrides") or {}).get("trade_mode")
+                    or ""
+                ).upper()
+
+                if trade_mode not in ("CONSTRAINED", "SEVERE"):
+                    continue
+
+                risk_effect = str(meta.get("risk_effect") or "").lower()
+                flow_kind = str(meta.get("flow_kind") or "").lower()
+                is_safety = risk_effect == "risk_reducing" or flow_kind in ("hedge", "unwind")
+                if not is_safety:
+                    continue
+
+                if idx == 0:
+                    return
+
+                try:
+                    item = items.pop(idx)
+                    items.insert(0, item)
+                    q.clear()
+                    q.extend(items)
+                except Exception:
+                    pass
+                return
+        except Exception:
+            return
 
     # --------------------------- WS order updates ---------------------------
     def handle_order_update(self, event: Dict[str, Any]):
@@ -8086,6 +8189,46 @@ class ExecutionEngine:
             post_only_flag = bool(order.get("post_only"))
             skip_maker = False
 
+        try:
+            rm_mode = str(
+                mode_overrides.get("rm_mode")
+                or meta.get("rm_mode")
+                or meta.get("mode")
+                or ""
+            ).upper() or "UNKNOWN"
+            trade_mode = str(
+                mode_overrides.get("trade_mode")
+                or meta.get("trade_mode")
+                or meta.get("mode")
+                or ""
+            ).upper() or "UNKNOWN"
+            pacer_mode = str(
+                mode_overrides.get("pacer_mode") or meta.get("pacer_mode") or ""
+            ).upper() or "UNKNOWN"
+            mm_enabled = mode_overrides.get("mm_enabled")
+            if mm_enabled is None:
+                mm_enabled = bool(maker_flag)
+            ioc_only = bool(mode_overrides.get("ioc_only", tif_u.upper() == "IOC"))
+            flow_kind = meta.get("flow_kind")
+            risk_effect = meta.get("risk_effect")
+            logger.info(
+                "[Engine] submit_order ex=%s alias=%s symbol=%s side=%s qty=%s rm_mode=%s pacer_mode=%s trade_mode=%s mm_enabled=%s ioc_only=%s flow_kind=%s risk_effect=%s",
+                ex,
+                alias,
+                order.get("symbol") or meta.get("symbol"),
+                order.get("side"),
+                order.get("quantity") or order.get("qty") or order.get("size"),
+                rm_mode,
+                pacer_mode,
+                trade_mode,
+                mm_enabled,
+                ioc_only,
+                flow_kind,
+                risk_effect,
+            )
+        except Exception:
+            pass
+
         # Si RM a coupé le leg maker → rejet métier propre + métrique
         if skip_maker and maker_flag:
             try:
@@ -9258,6 +9401,35 @@ async def _cancel_order(self: "ExecutionEngine", exchange: str, symbol: str, cli
         alias, strat = None, None
         try:
             _, alias, strat = self._order_keys_hint.get(client_id, (ex_u, None, None))
+        except Exception:
+            pass
+
+        try:
+            rm = getattr(self, "risk_manager", None)
+            rm_mode = str(getattr(self, "rm_mode", None) or getattr(rm, "rm_mode", "") or "UNKNOWN").upper()
+            trade_mode = str(getattr(self, "trade_mode", None) or getattr(rm, "trade_mode", "") or "UNKNOWN").upper()
+            pacer_mode = str(getattr(self, "pacer_mode", None) or getattr(rm, "pacer_mode", "") or "UNKNOWN").upper()
+            mm_enabled = getattr(self, "enable_mm", None)
+            if mm_enabled is None and rm is not None:
+                mm_enabled = getattr(rm, "enable_mm", None)
+            ioc_only = getattr(self, "_ioc_only", None)
+            if ioc_only is None and rm is not None:
+                ioc_only = getattr(rm, "_ioc_only", None)
+            logging.getLogger(__name__).info(
+                "[Engine] cancel_order ex=%s alias=%s symbol=%s cid=%s reason=%s rm_mode=%s pacer_mode=%s trade_mode=%s mm_enabled=%s ioc_only=%s flow_kind=%s risk_effect=%s",
+                ex_u,
+                alias,
+                symbol,
+                client_id,
+                reason,
+                rm_mode,
+                pacer_mode,
+                trade_mode,
+                mm_enabled,
+                ioc_only,
+                None,
+                None,
+            )
         except Exception:
             pass
 

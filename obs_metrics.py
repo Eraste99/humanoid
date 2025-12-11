@@ -321,6 +321,31 @@ BF_API_LATENCY_MS = _metric(
 BF_CACHE_AGE_SECONDS = _metric(Gauge, 'bf_cache_age_seconds', 'Age of balances cache (seconds)', ['exchange', 'alias'])
 BF_LAST_SUCCESS_TS = _metric(Gauge, 'bf_last_success_ts_seconds', 'Last successful BF ts (epoch seconds)', ['exchange', 'alias'])
 FEE_TOKEN_BALANCE = _metric(Gauge, 'fee_token_balance', 'Fee token balance', ['exchange', 'alias', 'token'])
+BF_BALANCES_TTL_NORMAL_SECONDS = _metric(
+    Gauge,
+    'bf_balances_ttl_normal_seconds',
+    'SLO TTL for balances (normal) per exchange',
+    ['exchange'],
+)
+BF_BALANCES_TTL_DEGRADED_SECONDS = _metric(
+    Gauge,
+    'bf_balances_ttl_degraded_seconds',
+    'SLO TTL for balances (degraded) per exchange',
+    ['exchange'],
+)
+BF_BALANCES_TTL_BLOCK_SECONDS = _metric(
+    Gauge,
+    'bf_balances_ttl_block_seconds',
+    'SLO TTL for balances (block) per exchange',
+    ['exchange'],
+)
+BF_BALANCES_HEALTH_STATE = _metric(
+    Gauge,
+    'bf_balances_health_state',
+    'Balance fetcher health state (0=NORMAL,1=DEGRADED,2=BLOCK)',
+    ['exchange', 'alias'],
+)
+
 CONTRACTS_HELPERS_CALLS_TOTAL = _metric(
     Counter,
     'contracts_helpers_calls_total',
@@ -544,6 +569,18 @@ RM_BALANCES_STALE_TOTAL = _metric(
     'rm_balances_stale_total',
     'Stale balance occurrences detected by RM',
     ['exchange', 'alias', 'status'],
+)
+RM_TM_EXPOSURE_TTL_MS = _metric(
+    Gauge,
+    'rm_tm_exposure_ttl_ms',
+    'Configured TM exposure TTL in ms per exchange (SLO private)',
+    ['exchange'],
+)
+RM_TM_EXPOSURE_TTL_BREACH_TOTAL = _metric(
+    Counter,
+    'rm_tm_exposure_ttl_breach_total',
+    'Number of times TM exposure TTL was breached',
+    ['exchange', 'asset', 'level'],
 )
 RM_CAPITAL_MOVE_VISIBILITY_LATENCY_S = _metric(
     Histogram,
@@ -773,6 +810,24 @@ ENGINE_PACER_MODE = _metric(
     Gauge,
     'engine_pacer_mode',
     'Engine pacer mode (0=NORMAL,1=CONSTRAINED,2=SEVERE)',
+    ['region', 'profile'],
+)
+PACER_ACK_TARGET_MS = _metric(
+    Gauge,
+    'engine_pacer_ack_target_ms',
+    'Pacer ack target SLO (ms)',
+    ['region', 'profile'],
+)
+PACER_ACK_HI_MS = _metric(
+    Gauge,
+    'engine_pacer_ack_hi_ms',
+    'Pacer ack hi SLO (ms)',
+    ['region', 'profile'],
+)
+PACER_ACK_SEV_MS = _metric(
+    Gauge,
+    'engine_pacer_ack_sev_ms',
+    'Pacer ack severe SLO (ms)',
     ['region', 'profile'],
 )
 ENGINE_DRAIN_LATENCY_MS = _metric(
@@ -1024,7 +1079,24 @@ PWS_EVENT_LAG_MS = _metric(Histogram, 'pws_event_lag_ms', 'PrivateWS event lag (
 PWS_TRANSFERS_TOTAL = _metric(Counter, 'pws_transfers_total', 'PrivateWS internal transfers', ['exchange'])
 PWS_EVENTS_TOTAL = _metric(Counter, 'pws_events_total', 'PrivateWS events received', ['exchange', 'kind'])
 PWS_BACKOFF_SECONDS = _metric(Gauge, 'pws_backoff_seconds', 'PrivateWS backoff seconds', ['exchange'])
-PWS_HEARTBEAT_GAP_SECONDS = _metric(Gauge, 'pws_heartbeat_gap_seconds', 'PrivateWS heartbeat gap seconds', ['exchange'])
+PWS_HEARTBEAT_GAP_SECONDS = _metric(
+    Gauge,
+    'pws_heartbeat_gap_seconds',
+    'PrivateWS heartbeat gap seconds',
+    ['exchange', 'alias'],
+)
+PWS_HEARTBEAT_GAP_SLO_SECONDS = _metric(
+    Gauge,
+    'pws_heartbeat_gap_slo_seconds',
+    'PrivateWS heartbeat gap SLO (seconds)',
+    ['exchange', 'alias'],
+)
+PWS_HEALTH_STATE = _metric(
+    Gauge,
+    'pws_health_state',
+    'PrivateWS health state (0=HEALTHY,1=WARN,2=CRITICAL)',
+    ['exchange', 'alias'],
+)
 PWS_DROPPED_TOTAL = _metric(Counter, 'pws_dropped_total', 'PrivateWS dropped events', ['exchange', 'reason'])
 PWS_ACK_LATENCY_MS = _metric(Histogram, 'pws_ack_latency_ms', 'Ack latency from private WS (ms)', ['exchange'], buckets=BUCKETS_MS)
 PWS_FILL_LATENCY_MS = _metric(Histogram, 'pws_fill_latency_ms', 'Fill latency from private WS (ms)', ['exchange'], buckets=BUCKETS_MS)
@@ -2395,8 +2467,7 @@ def set_engine_running(flag: bool) -> None:
 
 __all__ = ['BUCKETS_MS',"LAT_ACK_MS", "LAT_FILL_FIRST_MS", "LAT_FILL_ALL_MS", "LAT_E2E_MS","LOGGERH_FILE_ROTATIONS_TOTAL",
     "LAT_EVENTS_TOTAL", "LAT_PIPELINE_EVENTS_TOTAL","OBS_READY", "obs_is_ready",
-    "PAIR_HISTORY_ROWS_TOTAL", "PAIR_HISTORY_COMPUTE_MS", 'set_region', 'set_deployment_mode', 'lbl_exchange', 'lbl_region', 'lbl_mode', 'start_time_skew_probe', 'start_loop_lag_probe', 'update_time_skew', 'TIME_SKEW_MS', 'TIME_SKEW_STATUS', 'EVENT_LOOP_LAG_MS', 'report_nonfatal', 'inc_blocked', 'NONFATAL_ERRORS_TOTAL', 'BLOCKED_TOTAL', 'BF_API_ERRORS_TOTAL', 'BF_API_LATENCY_MS', 'BF_CACHE_AGE_SECONDS', 'BF_LAST_SUCCESS_TS', 'FEE_TOKEN_BALANCE', 'mark_bf_latency', 'RPC_LATENCY_MS', 'RPC_ERR_TOTAL', 'RPC_RETRIES_TOTAL', 'RPC_PAYLOAD_REJECTED_TOTAL', 'ROUTER_QUEUE_DEPTH', 'ROUTER_PAIR_QUEUE_DEPTH', 'ROUTER_QUEUE_HIGH_WATERMARK_TOTAL', 'ROUTER_QUEUE_DEPTH_BY_EX', 'ROUTER_DROPPED_TOTAL', 'ROUTER_COMBO_SKEW_MS', 'ROUTER_TO_SCANNER_MS', 'ROUTER_TO_SCANNER_ERRORS_TOTAL', 'mark_router_to_scanner', 'SCANNER_DECISION_MS', 'SCANNER_GLOBAL_LOAD', 'SCANNER_RATE_LIMITED_TOTAL', 'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SC_STRATEGY_SCORE', 'SC_ELIGIBLE', 'SC_BANNED', 'SC_PROMOTED_PRIMARY', 'SC_ROTATION_PRIMARY_SIZE', 'SC_ROTATION_AUDITION_SIZE', 'RM_DECISION_MS', 'mark_scanner_to_rm', 'INVENTORY_USD', 'RM_REJECT_TOTAL', 'PAIR_HEALTH_PENALTY_TOTAL', 'VOL_EWMA_BPS', 'VOL_P95_BPS', 'FEE_MISMATCH_TOTAL', 'FEES_EXPECTED_BPS', 'FEES_REALIZED_BPS', 'FEESYNC_LAST_TS', 'FEESYNC_ERRORS', 'REBAL_DETECTED_TOTAL', 'REBAL_PLAN_QUANTUM_QUOTE', 'RM_PAUSED_COUNT', 'LAST_BOOKS_FRESH_TS', 'LAST_BALANCES_FRESH_TS', 'DYNAMIC_MIN_BPS', 'mark_books_fresh', 'mark_balances_fresh', 'set_rm_paused_count', 'set_dynamic_min', 'inc_rm_reject', 'mark_rm_to_engine', 'MM_FILLS_BOTH', 'MM_SINGLE_FILL_HEDGED', 'MM_PANIC_HEDGE_TOTAL', 'ENGINE_SUBMIT_TO_ACK_MS', 'ENGINE_ACK_TO_FILL_MS', 'ENGINE_CANCELLATIONS_TOTAL', 'ENGINE_RETRIES_TOTAL', 'ENGINE_QUEUEPOS_BLOCKED_TOTAL', 'ENGINE_SUBMIT_QUEUE_DEPTH', 'INFLIGHT_GAUGE', 'PNL_LIVE_DAY_USD', 'TRADES_LIVE_DAY_TOTAL', 'DERIVED_NET_PROFIT_SIGN_TOTAL', 'MISSING_NET_PROFIT_TOTAL', 'ENGINE_PACER_DELAY_MS', 'ENGINE_PACER_INFLIGHT_MAX', 'ENGINE_PACER_MODE', 'ENGINE_DRAIN_LATENCY_MS', 'ENGINE_PACING_BACKPRESSURE_TOTAL', 'inc_engine_pacing_backpressure', 'WS_RECONNECTS_TOTAL', 'WS_BACKOFF_SECONDS', 'WS_CONNECTIONS_OPEN', 'PACER_STATE', 'PACER_CLAMP_SECONDS', 'ENGINE_MUTE_TOTAL', 'FEE_TOKEN_LEVEL', 'FEE_TOKEN_TARGET_PERCENT', 'PWS_DEDUP_HITS_TOTAL', 'PWS_RECONNECTS_TOTAL', 'PWS_EVENT_LAG_MS', 'PWS_TRANSFERS_TOTAL', 'PWS_EVENTS_TOTAL', 'PWS_BACKOFF_SECONDS', 'PWS_HEARTBEAT_GAP_SECONDS', 'PWS_DROPPED_TOTAL', 'PWS_ACK_LATENCY_MS', 'PWS_FILL_LATENCY_MS', 'WS_FAILOVER_TOTAL', 'PWS_POOL_SIZE', 'PWS_QUEUE_DEPTH', 'PWS_QUEUE_CAP', 'WS_RECO_RUN_MS', 'WS_RECO_ERRORS_TOTAL', 'RECONCILE_MISS_TOTAL', 'RECONCILE_RESYNC_TOTAL', 'RECONCILE_RESYNC_LATENCY_MS', 'COLD_RESYNC_TOTAL', 'COLD_RESYNC_RUN_MS', 'recon_run_ms', 'recon_error', 'recon_on_resync', 'recon_observe_latency', 'pws_on_failover', 'pws_set_pool_size', 'LOGGERH_WRITE_MS', 'LOGGERH_QUEUE_PLATEAU_TOTAL', 'LHM_JSONL_INGESTED_TOTAL', 'LHM_JSONL_DROPPED_TOTAL', 'LHM_JSONL_QUEUE_SIZE', 'LOGGERH_TRADE_QUEUE_SIZE', 'LOGGERH_JSONL_ROTATIONS_TOTAL', 'LOGGERH_LAST_FLUSH_TS_SECONDS', 'LOGGERH_LAST_ROTATION_TS_SECONDS', 'loggerh_observe_write_ms', 'lhm_on_ingested', 'lhm_on_dropped', 'lhm_set_queue_size', 'lhm_on_rotation', 'loggerh_set_last_flush_now', 'loggerh_set_last_rotation_now', 'STORAGE_USAGE_PCT', 'STORAGE_BYTES_FREE', 'STORAGE_ALERTS_TOTAL', 'LOGGERH_JSONL_BYTES', 'LOGGERH_DB_STALLS_TOTAL', 'LOGGERH_DB_FILE_BYTES', 'update_storage_metrics',  'SIM_DECISION_MS', 'SIMULATED_VWAP_DEVIATION_BPS', 'sim_on_run', 'PAYLOAD_REJECTED_TOTAL', 'ObsServer', 'StatusHTTPServer', 'MainMetrics', 'BOT_STARTUPS_TOTAL', 'BOT_STATE', 'start_servers_from_env', 'WS_RECONNECTS_TOTAL', 'RM_DECISION_MS', 'RM_PREFLIGHT_MS', 'RM_DECISIONS_TOTAL', 'RM_SKIPS_TOTAL', 'RM_QUEUE_DEPTH', 'RM_REVALIDATE_MS', 'RM_FRAGMENT_PROFIT_MS', 'PAIR_HEALTH_PENALTY_TOTAL', 'POOL_GATE_THROTTLES_TOTAL', 'RM_FINAL_DECISIONS_TOTAL', 'RM_ADMITTED_TOTAL', 'RM_DROPPED_TOTAL',
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "VOL_PRICE_VOL_MICRO",
+    "PAIR_HISTORY_ROWS_TOTAL", "PAIR_HISTORY_COMPUTE_MS", 'set_region', 'set_deployment_mode', 'lbl_exchange', 'lbl_region', 'lbl_mode', 'start_time_skew_probe', 'start_loop_lag_probe', 'update_time_skew', 'TIME_SKEW_MS', 'TIME_SKEW_STATUS', 'EVENT_LOOP_LAG_MS', 'report_nonfatal', 'inc_blocked', 'NONFATAL_ERRORS_TOTAL', 'BLOCKED_TOTAL', 'BF_API_ERRORS_TOTAL', 'BF_API_LATENCY_MS', 'BF_CACHE_AGE_SECONDS', 'BF_LAST_SUCCESS_TS', 'FEE_TOKEN_BALANCE', 'BF_BALANCES_TTL_NORMAL_SECONDS', 'BF_BALANCES_TTL_DEGRADED_SECONDS', 'BF_BALANCES_TTL_BLOCK_SECONDS', 'BF_BALANCES_HEALTH_STATE', 'mark_bf_latency', 'RPC_LATENCY_MS', 'RPC_ERR_TOTAL', 'RPC_RETRIES_TOTAL', 'RPC_PAYLOAD_REJECTED_TOTAL', 'ROUTER_QUEUE_DEPTH', 'ROUTER_PAIR_QUEUE_DEPTH', 'ROUTER_QUEUE_HIGH_WATERMARK_TOTAL', 'ROUTER_QUEUE_DEPTH_BY_EX', 'ROUTER_DROPPED_TOTAL', 'ROUTER_COMBO_SKEW_MS', 'ROUTER_TO_SCANNER_MS', 'ROUTER_TO_SCANNER_ERRORS_TOTAL', 'mark_router_to_scanner', 'SCANNER_DECISION_MS', 'SCANNER_GLOBAL_LOAD', 'SCANNER_RATE_LIMITED_TOTAL', 'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SC_STRATEGY_SCORE', 'SC_ELIGIBLE', 'SC_BANNED', 'SC_PROMOTED_PRIMARY', 'SC_ROTATION_PRIMARY_SIZE', 'SC_ROTATION_AUDITION_SIZE', 'RM_DECISION_MS', 'mark_scanner_to_rm', 'INVENTORY_USD', 'RM_REJECT_TOTAL', 'PAIR_HEALTH_PENALTY_TOTAL', 'VOL_EWMA_BPS', 'VOL_P95_BPS', 'FEE_MISMATCH_TOTAL', 'FEES_EXPECTED_BPS', 'FEES_REALIZED_BPS', 'FEESYNC_LAST_TS', 'FEESYNC_ERRORS', 'REBAL_DETECTED_TOTAL', 'REBAL_PLAN_QUANTUM_QUOTE', 'RM_PAUSED_COUNT', 'LAST_BOOKS_FRESH_TS', 'LAST_BALANCES_FRESH_TS', 'DYNAMIC_MIN_BPS', 'mark_books_fresh', 'mark_balances_fresh', 'set_rm_paused_count', 'set_dynamic_min', 'inc_rm_reject', 'mark_rm_to_engine', 'MM_FILLS_BOTH', 'MM_SINGLE_FILL_HEDGED', 'MM_PANIC_HEDGE_TOTAL', 'ENGINE_SUBMIT_TO_ACK_MS', 'ENGINE_ACK_TO_FILL_MS', 'ENGINE_CANCELLATIONS_TOTAL', 'ENGINE_RETRIES_TOTAL', 'ENGINE_QUEUEPOS_BLOCKED_TOTAL', 'ENGINE_SUBMIT_QUEUE_DEPTH', 'INFLIGHT_GAUGE', 'PNL_LIVE_DAY_USD', 'TRADES_LIVE_DAY_TOTAL', 'DERIVED_NET_PROFIT_SIGN_TOTAL', 'MISSING_NET_PROFIT_TOTAL', 'ENGINE_PACER_DELAY_MS', 'ENGINE_PACER_INFLIGHT_MAX', 'ENGINE_PACER_MODE', 'PACER_ACK_TARGET_MS', 'PACER_ACK_HI_MS', 'PACER_ACK_SEV_MS', 'ENGINE_DRAIN_LATENCY_MS', 'ENGINE_PACING_BACKPRESSURE_TOTAL', 'inc_engine_pacing_backpressure', 'WS_RECONNECTS_TOTAL', 'WS_BACKOFF_SECONDS', 'WS_CONNECTIONS_OPEN', 'PACER_STATE', 'PACER_CLAMP_SECONDS', 'ENGINE_MUTE_TOTAL', 'FEE_TOKEN_LEVEL', 'FEE_TOKEN_TARGET_PERCENT', 'PWS_DEDUP_HITS_TOTAL', 'PWS_RECONNECTS_TOTAL', 'PWS_EVENT_LAG_MS', 'PWS_TRANSFERS_TOTAL', 'PWS_EVENTS_TOTAL', 'PWS_BACKOFF_SECONDS', 'PWS_HEARTBEAT_GAP_SECONDS', 'PWS_DROPPED_TOTAL', 'PWS_ACK_LATENCY_MS', 'PWS_FILL_LATENCY_MS', 'WS_FAILOVER_TOTAL', 'PWS_POOL_SIZE', 'PWS_QUEUE_DEPTH', 'PWS_QUEUE_CAP', 'WS_RECO_RUN_MS', 'WS_RECO_ERRORS_TOTAL', 'RECONCILE_MISS_TOTAL', 'RECONCILE_RESYNC_TOTAL', 'RECONCILE_RESYNC_LATENCY_MS', 'COLD_RESYNC_TOTAL', 'COLD_RESYNC_RUN_MS', 'recon_run_ms', 'recon_error', 'recon_on_resync', 'recon_observe_latency', 'pws_on_failover', 'pws_set_pool_size', 'LOGGERH_WRITE_MS', 'LOGGERH_QUEUE_PLATEAU_TOTAL', 'LHM_JSONL_INGESTED_TOTAL', 'LHM_JSONL_DROPPED_TOTAL', 'LHM_JSONL_QUEUE_SIZE', 'LOGGERH_TRADE_QUEUE_SIZE', 'LOGGERH_JSONL_ROTATIONS_TOTAL', 'LOGGERH_LAST_FLUSH_TS_SECONDS', 'LOGGERH_LAST_ROTATION_TS_SECONDS', 'loggerh_observe_write_ms', 'lhm_on_ingested', 'lhm_on_dropped', 'lhm_set_queue_size', 'lhm_on_rotation', 'loggerh_set_last_flush_now', 'loggerh_set_last_rotation_now', 'STORAGE_USAGE_PCT', 'STORAGE_BYTES_FREE', 'STORAGE_ALERTS_TOTAL', 'LOGGERH_JSONL_BYTES', 'LOGGERH_DB_STALLS_TOTAL', 'LOGGERH_DB_FILE_BYTES', 'update_storage_metrics',  'SIM_DECISION_MS', 'SIMULATED_VWAP_DEVIATION_BPS', 'sim_on_run', 'PAYLOAD_REJECTED_TOTAL', 'ObsServer', 'StatusHTTPServer', 'MainMetrics', 'BOT_STARTUPS_TOTAL', 'BOT_STATE', 'start_servers_from_env', 'WS_RECONNECTS_TOTAL', 'RM_DECISION_MS', 'RM_PREFLIGHT_MS', 'RM_DECISIONS_TOTAL', 'RM_SKIPS_TOTAL', 'RM_QUEUE_DEPTH', 'RM_REVALIDATE_MS', 'RM_FRAGMENT_PROFIT_MS', 'PAIR_HEALTH_PENALTY_TOTAL', 'POOL_GATE_THROTTLES_TOTAL', 'RM_FINAL_DECISIONS_TOTAL', 'RM_ADMITTED_TOTAL', 'RM_DROPPED_TOTAL',                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "VOL_PRICE_VOL_MICRO",
            "VOL_SPREAD_VOL_MICRO",
            "VOL_PRICE_PCTL",
            "VOL_SPREAD_PCTL",
@@ -2472,4 +2543,8 @@ __all__ += [
     "set_slip_age_seconds",
     "FEE_SNAPSHOT_AGE_SECONDS",
     "TOTAL_COST_BPS",
+    'BF_BALANCES_TTL_NORMAL_SECONDS',
+    'BF_BALANCES_TTL_DEGRADED_SECONDS',
+    'BF_BALANCES_TTL_BLOCK_SECONDS',
+    'BF_BALANCES_HEALTH_STATE',
 ]

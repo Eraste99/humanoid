@@ -1343,6 +1343,27 @@ class BotConfig:
             "RM_PWS_ACK_LATENCY_SEVERE_MS",
             getattr(cfg, "RM_PWS_ACK_LATENCY_SEVERE_MS", 450.0),
         )
+        # Params CONSTRAINED / invariant RM
+        cfg.RM_CONSTR_TT_MIN_BPS_DELTA = _Env.get_float(
+            "RM_CONSTR_TT_MIN_BPS_DELTA",
+            getattr(cfg, "RM_CONSTR_TT_MIN_BPS_DELTA", 1.0),
+        )
+        cfg.RM_CONSTR_TM_MIN_BPS_DELTA = _Env.get_float(
+            "RM_CONSTR_TM_MIN_BPS_DELTA",
+            getattr(cfg, "RM_CONSTR_TM_MIN_BPS_DELTA", 1.0),
+        )
+        cfg.RM_CONSTR_CAP_FACTOR = _Env.get_float(
+            "RM_CONSTR_CAP_FACTOR",
+            getattr(cfg, "RM_CONSTR_CAP_FACTOR", 0.5),
+        )
+        cfg.RM_CONSTR_IOC_ONLY = _Env.get_bool(
+            "RM_CONSTR_IOC_ONLY",
+            getattr(cfg, "RM_CONSTR_IOC_ONLY", False),
+        )
+        cfg.RM_INVARIANT_STRICT = _Env.get_bool(
+            "RM_INVARIANT_STRICT",
+            getattr(cfg, "RM_INVARIANT_STRICT", False),
+        )
         cfg.RM_PWS_FILL_LATENCY_CONSTRAINED_MS = _Env.get_float(
             "RM_PWS_FILL_LATENCY_CONSTRAINED_MS",
             getattr(cfg, "RM_PWS_FILL_LATENCY_CONSTRAINED_MS", 700.0),
