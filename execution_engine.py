@@ -79,7 +79,11 @@ try:
 except Exception:
     ZoneInfo = None
 
-_REGION_TZ = {"EU": "Europe/Rome", "US": "America/New_York"}
+_REGION_TZ = {
+    "EU": "Europe/Rome",
+    "US": "America/New_York",
+    "JP": "Asia/Tokyo",  # Japan / Tokyo
+}
 
 # RM_* : décisions métier / risque prises par le RiskManager.
 # ENGINE_* : rejets techniques ou incapacité du moteur / CEX (backpressure, erreurs réseau, etc.).
@@ -127,7 +131,8 @@ class PnLAggregator:
             LoggerHistoriqueManager / LogWriter).
         """
     def __init__(self):
-        self._last_local_day = {"EU": None, "US": None, "UTC": None}
+        # On suit EU, US, JP + UTC pour les resets journaliers
+        self._last_local_day = {"EU": None, "US": None, "JP": None, "UTC": None}
 
     def _now_local_day(self, region: str) -> str:
         dt_utc = datetime.now(timezone.utc)
@@ -135,20 +140,21 @@ class PnLAggregator:
             return dt_utc.strftime("%Y-%m-%d")
         try:
             tz = ZoneInfo(_REGION_TZ.get(region, "Europe/Rome"))
-            return dt_utc.astimezone(tz).strftime("%Y-%m-%d")
+            dt_loc = dt_utc.astimezone(tz)
         except Exception:
-            return dt_utc.strftime("%Y-%m-%d")
+            dt_loc = dt_utc
+        return dt_loc.strftime("%Y-%m-%d")
 
     def _ensure_resets(self):
         try:
             from obs_metrics import PNL_LIVE_DAY_USD
-            for reg in ("EU", "US", "UTC"):
+            for reg in ("EU", "US", "JP", "UTC"):
                 day = self._now_local_day(reg if reg != "UTC" else "UTC")
                 if self._last_local_day.get(reg) != day:
                     self._last_local_day[reg] = day
                     # reset logique: on met à 0 (labels variés)
-                    for br in ("TT","TM","MM","REB"):
-                        for mode in ("EU_ONLY","SPLIT"):
+                    for br in ("TT", "TM", "MM", "REB"):
+                        for mode in ("EU_ONLY", "SPLIT"):
                             try:
                                 PNL_LIVE_DAY_USD.labels(region=reg, branch=br, mode=mode).set(0.0)
                             except Exception:
@@ -187,7 +193,21 @@ class PnLAggregator:
         status = str(rec.get("status") or rec.get("source") or "").upper()
         if status in {"REJECTED", "CANCELED", "ERROR"}:
             return  # pas de PnL
-        branch = str(rec.get("trade_mode") or "").upper() or "TT"
+
+        # [PATCH-MM-TRADE_MODE] Dérivation best-effort de la branche quand trade_mode manque
+        raw_branch = str(rec.get("trade_mode") or "").upper()
+        if not raw_branch:
+            # 1) Strategy / branch logiques passées depuis RM / Engine
+            s = str(rec.get("strategy") or rec.get("branch") or "").upper()
+            if s in {"TT", "TM", "REB", "MM"}:
+                raw_branch = s
+            else:
+                # 2) Fallback sur les hints d’historisation (_hist_kind / kind)
+                k = str(rec.get("_hist_kind") or rec.get("kind") or "").upper()
+                if k in {"MM", "MAKER_MM", "MM_INV"}:
+                    raw_branch = "MM"
+
+        branch = raw_branch or "TT"
         mode = str(rec.get("deployment_mode") or "").upper() or "EU_ONLY"
         region = str(rec.get("pod_region") or "").upper() or "EU"
 
@@ -1008,9 +1028,16 @@ class ExecutionEngine:
         eucb = getattr(self.config, "pacer_targets_eucb", None)
         eu = getattr(self.config, "pacer_targets_eu", None)
         us = getattr(self.config, "pacer_targets_us", None)
-        if eu:   targets_overrides["EU"] = eu
-        if us:   targets_overrides["US"] = us
-        if eucb: targets_overrides["EU-CB"] = eucb
+        jp = getattr(self.config, "pacer_targets_jp", None)  # nouveau pour Japan/Tokyo
+
+        if eu:
+            targets_overrides["EU"] = eu
+        if us:
+            targets_overrides["US"] = us
+        if eucb:
+            targets_overrides["EU-CB"] = eucb
+        if jp:
+            targets_overrides["JP"] = jp
 
         # mapping exchange -> région (utile si SPLIT)
         region_map = getattr(self.config, "engine_pod_map", {"BINANCE": "EU", "BYBIT": "EU", "COINBASE": "US"})
@@ -4131,6 +4158,8 @@ class ExecutionEngine:
                         continue
 
                     if t_lower == "rebalancing_trade":
+                        # Legacy REB payloads sont normalisés en bundle canonique avant l'exécution,
+                        # afin de partager exactement le même pipeline que les bundles RM.
                         payload = self._convert_rebalancing_trade_to_bundle(payload)
 
                     if t_lower in ("arbitrage", "arbitrage_bundle"):
@@ -4508,6 +4537,7 @@ class ExecutionEngine:
             "expected_net_spread": float(opp.get("net_bps", 0.0) or 0.0) / 1e4,
             "timeout_s": getattr_float(self.config, "order_timeout_s", 2.5),
             "meta": {
+                "branch": "REB",
                 "strategy": "TM",
                 "type": "rebalancing",
                 "allow_loss_bps": getattr_float(self.config, "rebal_allow_loss_bps", 0.0),
@@ -6299,6 +6329,21 @@ class ExecutionEngine:
         # Hydrate best/best_ts etc.
         self._hydrate_prices_for_legs(legs)
 
+        # Canonicalise REB bundles (legacy ou RM) pour partager exactement le même pipeline
+        # d'exécution. Les bundles REB doivent être de type "bundle" avec branch="REB",
+        # strategy="TM", tm.mode="NEUTRAL" et hedge_ratio=1.0. On applique les valeurs
+        # par défaut si elles sont manquantes sans écraser une configuration explicite.
+        if str(meta_payload.get("type") or "").lower() == "rebalancing":
+            payload["type"] = "bundle"
+            meta_payload.setdefault("branch", "REB")
+            meta_payload.setdefault("strategy", "TM")
+            meta_payload.setdefault("allow_loss_bps", getattr_float(self.config, "rebal_allow_loss_bps", 0.0))
+            tm_meta = meta_payload.setdefault("tm", {}) or {}
+            tm_meta.setdefault("mode", "NEUTRAL")
+            tm_meta.setdefault("hedge_ratio", 1.0)
+            meta_payload["tm"] = tm_meta
+            payload["meta"] = meta_payload
+
         # Identify BUY / SELL legs
         buy_leg = next((l for l in legs if str(l.get("side", "")).upper() == "BUY"), None)
         sell_leg = next((l for l in legs if str(l.get("side", "")).upper() == "SELL"), None)
@@ -6372,6 +6417,7 @@ class ExecutionEngine:
             meta.setdefault("rebalancing", True)
             # On documente clairement que tout REB via l'Engine = TM NEUTRAL
             meta.setdefault("rebal_strategy", "TM_NEUTRAL")
+            meta.setdefault("branch", "REB")
 
         if is_rebal:
             strategy = "TM"
@@ -6465,6 +6511,10 @@ class ExecutionEngine:
             float((buy_leg.get("meta") or {}).get("allow_loss_bps", 0) or 0),
             float((sell_leg.get("meta") or {}).get("allow_loss_bps", 0) or 0),
         )
+        # REB: allow_loss_bps peut être piloté par une config dédiée, sans impacter TT/TM.
+        if is_rebal:
+            allow_loss_bps = max(allow_loss_bps, float(getattr_float(self.config, "rebal_allow_loss_bps", 0.0)))
+            payload.setdefault("meta", {}).setdefault("allow_loss_bps", allow_loss_bps)
 
         # Ticket 9 — aucune décision économique REB dans l'Engine :
         # le coût net des rebalancings cross-CEX est arbitré côté RiskManager
@@ -6487,6 +6537,8 @@ class ExecutionEngine:
         # Revalidation arbitrage
         # Revalidation arbitrage (RM = owner économique du min_required_bps)
         # Ici : sonde "drift-only" (enforce_min_required=False) côté Engine.
+        # Différence standard vs REB : allow_final_loss_bps peut être différent (config rebal_allow_loss_bps),
+        # mais l'appel RM et les guards restent identiques.
         try:
             ok_arbi = self.risk_manager.revalidate_arbitrage(
                 buy_ex=buy_leg["exchange"],
@@ -6507,7 +6559,9 @@ class ExecutionEngine:
             self._reject(pair_key, payload, "rm_revalidate_type_error")
             return
 
-        if not ok_arbi and (not is_rebal):
+            # REB doit passer par les mêmes guards RM que TM : la seule différence
+            # autorisée est l'allow_final_loss_bps potentiellement spécifique REB.
+        if not ok_arbi:
             self._reject(pair_key, payload, "revalidation arbitrage (dérive/net)", plane="RM_BPS")
             return
 
@@ -8775,7 +8829,14 @@ class ExecutionEngine:
                 "type": "single",
                 "meta": meta,
             }
-            inc_engine_trade("executed", "single", "rebalancing" if (meta.get("type") == "rebalancing") else "standard")
+            trade_label = "rebalancing" if (meta.get("type") == "rebalancing") else "standard"
+            if trade_label == "rebalancing":
+                result.setdefault("branch", "REB")
+                try:
+                    (result.setdefault("meta", {})).setdefault("type", "rebalancing")
+                except Exception:
+                    pass
+            inc_engine_trade("executed", "single", trade_label)
             await self._on_filled(result, order_type="single", is_rebal=(meta.get("type") == "rebalancing"))
             await self._hist("trade", result)
             self._tm_hedges.pop(client_id, None)
@@ -8873,7 +8934,8 @@ class ExecutionEngine:
             logger.error(f"❌ Exec {ex} fail: {e}")
             self.stats.total_failed += 1
             self.stats.error_count += 1
-            inc_engine_trade("failed", "single", "standard")
+            trade_label = "rebalancing" if (meta.get("type") == "rebalancing") else "standard"
+            inc_engine_trade("failed", "single", trade_label)
         finally:
             pass
 
@@ -8931,6 +8993,20 @@ async def _hist(self: "ExecutionEngine", kind: str, data: dict) -> None:
     try:
         rec = dict(data or {})
         rec.setdefault("_kind", str(kind))
+        if kind == "trade":
+            meta = rec.get("meta") or {}
+            is_rebal = (
+                    str(rec.get("branch", "")).upper() == "REB"
+                    or str(rec.get("trade_mode", "")).upper() == "REB"
+                    or meta.get("type") == "rebalancing"
+                    or str(rec.get("_hist_kind", "")).upper() == "REB"
+            )
+            if is_rebal:
+                rec.setdefault("branch", "REB")
+                try:
+                    (rec.setdefault("meta", {})).setdefault("type", "rebalancing")
+                except Exception:
+                    pass
         if callable(self.history_sink):
             # asynchrone permis: on pousse côté sink si présent
 
@@ -9083,6 +9159,9 @@ async def _on_filled(self: "ExecutionEngine", result: dict, *, order_type: str, 
             self.stats.total_rebalancing_executed += 1
         self.stats.last_executed_trade = dict(result or {})
         self.stats.trade_count += 1
+
+        # REB (TM neutral issu du RM) garde un chemin métrique dédié pour permettre
+        # la ventilation des volumes exécutés et du PnL par branche.
 
         # ==== Listeners (déjà triés par priorité à l'enregistrement) ====
         for l in self.listeners:

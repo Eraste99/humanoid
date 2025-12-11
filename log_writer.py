@@ -47,9 +47,10 @@ except Exception:
     ZoneInfo = None
 
 _REGION_TZ = {
-        "EU": "Europe/Rome",
-        "US": "America/New_York",
-    }
+    "EU": "Europe/Rome",
+    "US": "America/New_York",
+    "JP": "Asia/Tokyo",  # Japan / Tokyo
+}
 
 def _derive_time_fields(ts_iso_or_ms, pod_region: str):
     # ts peut être epoch-ms (int/float) ou ISO (str) ; fallback: now UTC

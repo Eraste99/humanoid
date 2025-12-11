@@ -280,12 +280,13 @@ class MarketDataRouter:
         # rétro-compat si d’autres parties lisent self.latest
         self.latest = self._latest_books
 
-        # paramètres d’alignement dynamique
         self.base_max_delta = timedelta(milliseconds=base_max_delta_ms)
         self.min_delta = timedelta(milliseconds=min_delta_ms)
         self.max_delta_cap = timedelta(milliseconds=max_delta_cap_ms)
         self.skew_margin_ms = int(skew_margin_ms)
-        self.stale_source = timedelta(milliseconds=stale_source_ms)
+        # TTL brut pour staleness Router (ms) + version timedelta
+        self.stale_source_ms = int(stale_source_ms)
+        self.stale_source = timedelta(milliseconds=self.stale_source_ms)
 
         # housekeeping
         self.purge_threshold = timedelta(seconds=purge_threshold_s)
@@ -1427,7 +1428,35 @@ class MarketDataRouter:
                         continue
 
                     # --- PATCH C2: guard staleness + métriques reason-codées ---
+                    # Base legacy : TTL brut (ms) injecté via stale_source_ms / BotConfig.router.stale_ms.
                     stale_limit_ms = getattr_int(self, "stale_source_ms", 1200)
+
+                    # Alignement avec contrat SLO public (cfg.slo[mode][exchange].public.l2_fresh_max_s)
+                    try:
+                        cfg = getattr(self, "bot_cfg", None)
+                        slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+                        if slo_map:
+                            g_cfg = getattr(cfg, "g", None)
+                            mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                            per_ex = slo_map.get(mode_key) or {}
+                            exu = str(ev.get("exchange") or "").upper()
+                            path_slo = per_ex.get(exu)
+                            if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                                l2_fresh_max_s = float(
+                                    getattr(path_slo.public, "l2_fresh_max_s", 0.0) or 0.0
+                                )
+                                if l2_fresh_max_s > 0.0:
+                                    slo_limit_ms = int(l2_fresh_max_s * 1000.0)
+                                    # On ne permet jamais un seuil plus large que le contrat SLO.
+                                    stale_limit_ms = min(stale_limit_ms, slo_limit_ms)
+                    except Exception:
+                        # En cas de souci de résolution SLO, on garde le fallback legacy.
+                        logger.warning(
+                            "[Router] unable to resolve SLO-based stale_limit_ms, "
+                            "falling back to stale_source_ms",
+                            exc_info=False,
+                        )
+
                     ts_ex_ms = int(ev.get("exchange_ts_ms") or 0)
                     if ts_ex_ms and (int(time.time() * 1000) - ts_ex_ms) > stale_limit_ms:
                         try:
@@ -1437,6 +1466,7 @@ class MarketDataRouter:
                         self._events_ignored_stale += 1
                         continue
                     # --- /PATCH C2 ---
+
 
                     self._coalesce_enqueue(ev)
 

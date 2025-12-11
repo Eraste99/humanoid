@@ -385,6 +385,7 @@ class ScannerCfg:
 # --- Risk Manager ---
 @dataclass
 class RiskManagerCfg:
+    # Utilisé par le chantier M6-B (REB via hints, RM → Simu → Engine)
     enable_tt: bool = True
     enable_tm: bool = True
     enable_mm: bool = False
@@ -767,10 +768,12 @@ class PrivateWSHubCfg:
 
 @dataclass
 class RebalancingCfg:
+    # Utilisé par le chantier M6-B (REB via hints, RM → Simu → Engine)
     rebal_quantum_min_quote: float = 50.0
     # Cadence REB max (opérations/min). Doit rester bornée par inflight_rebal
     # multiplié par un ratio simple (cf. _sanity_check_rm_caps, ratio=3 par défaut).
     rebal_max_ops_per_min: int = 6
+    rebal_ops_per_min_ratio: float = 3.0
     rebal_priority: List[str] = field(default_factory=lambda: ["CASH","CRYPTO","OVERLAY"])
     rebal_hint_ttl_s: int = 120
     rebal_snapshots_missing_error_s: float = 45.0
@@ -981,6 +984,56 @@ class TestsCfg:
     WS_LIVE_CLOSE_TIMEOUT_S: int = 3
 
 # ------------------------------
+# Contrat SLO / TTL public ↔ privé
+# ------------------------------
+@dataclass(frozen=True)
+class SLOPublicPath:
+    """
+    SLO côté "public" (market data) pour un chemin (mode, exchange).
+    - l2_fresh_max_s : âge max des orderbooks L2 pour dire "OK" côté Scanner/Router.
+    - slip_ttl_s     : TTL max des points de slippage (SlippageHandler).
+    - vol_ttl_s      : TTL max des snapshots de volatilité (VolatilityMonitor).
+    """
+    l2_fresh_max_s: float
+    slip_ttl_s: float
+    vol_ttl_s: float
+
+
+@dataclass(frozen=True)
+class SLOPrivatePath:
+    """
+    SLO côté "privé" (trading plane) pour un chemin (mode, exchange).
+    - ack_target_ms / ack_hi_ms / ack_sev_ms : cibles latence ack p95 (Engine/Pacer).
+    - order_timeout_s                       : timeout dur de l'Engine (submit→ack/fill).
+    - tm_exposure_ttl_ms                    : TTL d'exposition TM avant hedge forcé.
+    - balances_ttl_*                        : TTL des soldes avant dégradé / block.
+    - pws_heartbeat_gap_max_s              : gap max heartbeat PrivateWS avant alerte.
+    """
+    ack_target_ms: float
+    ack_hi_ms: float
+    ack_sev_ms: float
+    order_timeout_s: float
+    tm_exposure_ttl_ms: float
+    balances_ttl_s_normal: float
+    balances_ttl_s_degraded: float
+    balances_ttl_s_block: float
+    pws_heartbeat_gap_max_s: float
+
+
+@dataclass(frozen=True)
+class PathSLO:
+    """
+    SLO complet pour un chemin (mode, exchange).
+
+    Exemple de clé dans le contrat:
+        slo["EU_ONLY"]["BINANCE"]  → PathSLO(public=..., private=...)
+        slo["SPLIT"]["COINBASE"]   → PathSLO(public=..., private=...)
+    """
+    public: SLOPublicPath
+    private: SLOPrivatePath
+
+
+# ------------------------------
 # BotConfig racine
 # ------------------------------
 @dataclass
@@ -1089,8 +1142,8 @@ class BotConfig:
             },
         }
 
-    # ------------- Construction -------------
-    @staticmethod
+
+
 
 
     # ------------- Construction -------------
@@ -1480,6 +1533,15 @@ class BotConfig:
         cfg.rm.enable_mm = _Env.get_bool("ENABLE_MM", cfg.rm.enable_mm)
         cfg.rm.enable_reb = _Env.get_bool("ENABLE_REB", cfg.rm.enable_reb)
         cfg.rm.enable_maker_maker = _Env.get_bool("ENABLE_MAKER_MAKER", cfg.rm.enable_maker_maker)
+        # Branches RM (incluant REB) — alignées sur le chantier M6-B
+        cfg.rm.branch_priority = _Env.get_list(
+            "RM_BRANCH_PRIORITY",
+            cfg.rm.branch_priority or cfg.g.branch_priority,
+        )
+        cfg.rm.branch_budgets_quote = _Env.get_dict(
+            "RM_BRANCH_BUDGETS_QUOTE",
+            cfg.rm.branch_budgets_quote or cfg.g.branch_budgets_quote,
+        )
         cfg.rm.default_notional = _Env.get_float("RM_DEFAULT_NOTIONAL", cfg.rm.default_notional)
         cfg.rm.max_fragments = _Env.get_int("RM_MAX_FRAGMENTS", cfg.rm.max_fragments)
         cfg.rm.mm_alias_name = _Env.get("RM_MM_ALIAS_NAME", cfg.rm.mm_alias_name)
@@ -1696,6 +1758,9 @@ class BotConfig:
 
         cfg.rebal.rebal_quantum_min_quote = _Env.get_float("REBAL_QUANTUM_MIN_QUOTE", cfg.rebal.rebal_quantum_min_quote)
         cfg.rebal.rebal_max_ops_per_min = _Env.get_int("REBAL_MAX_OPS_PER_MIN", cfg.rebal.rebal_max_ops_per_min)
+        cfg.rebal.rebal_ops_per_min_ratio = _Env.get_float(
+            "REBAL_OPS_PER_MIN_RATIO", cfg.rebal.rebal_ops_per_min_ratio
+        )
         cfg.rebal.rebal_priority = _Env.get_list("REBAL_PRIORITY", cfg.rebal.rebal_priority)
         cfg.rebal.rebal_hint_ttl_s = _Env.get_int("REBAL_HINT_TTL_S", cfg.rebal.rebal_hint_ttl_s)
         cfg.rebal.rebal_snapshots_missing_error_s = _Env.get_float("REBAL_SNAPSHOTS_MISSING_ERROR_S",
@@ -2042,6 +2107,12 @@ class BotConfig:
                 ops_per_min = int(getattr(rebal_cfg, "rebal_max_ops_per_min", 0) or 0)
                 # Règle simple : cadence REB bornée par inflight_rebal * ratio (par défaut 3).
                 ratio = float(getattr(rebal_cfg, "rebal_ops_per_min_ratio", 3.0) or 3.0)
+                if ratio <= 0:
+                    _err(
+                        f"rebal_ops_per_min_ratio={ratio} doit être > 0 pour dimensionner la cadence REB"
+                    )
+                    ratio = 1.0
+
                 max_allowed = int(max_reb_inflight * ratio)
                 if ops_per_min > max_allowed:
                     _err(
@@ -2305,6 +2376,10 @@ class BotConfig:
             "REBAL_SNAPSHOTS_ERROR_COOLDOWN_S": "rebal.rebal_snapshots_error_cooldown_s",
             "rebal_quantum_quote_map": "rebal.rebal_quantum_quote_map",
             "REBAL_QUANTUM_QUOTE_MAP": "rebal.rebal_quantum_quote_map",
+            "rebal_ops_per_min_ratio": "rebal.rebal_ops_per_min_ratio",
+            "REBAL_OPS_PER_MIN_RATIO": "rebal.rebal_ops_per_min_ratio",
+            "RM_BRANCH_PRIORITY": "rm.branch_priority",
+            "RM_BRANCH_BUDGETS_QUOTE": "rm.branch_budgets_quote",
             # Private WS Hub
             "PWS_PACER_EU": "pws.PWS_PACER_EU",
             "PWS_PACER_US": "pws.PWS_PACER_US",
@@ -2358,6 +2433,121 @@ class BotConfig:
         if alias:
             return self.get_by_dotpath(alias)
         raise AttributeError(item)
+
+    @property
+    def slo(self) -> Dict[str, Dict[str, PathSLO]]:
+        """
+        Contrat SLO / TTL public ↔ privé, structuré comme:
+            slo[deployment_mode][exchange] -> PathSLO
+
+        - deployment_mode: "EU_ONLY" ou "SPLIT"
+        - exchange:        "BINANCE", "BYBIT", "COINBASE", ...
+
+        Objectif:
+        - unifier ce que le *public* a le droit d'appeler "OK"
+          (fraîcheur L2, slip.age, vol.age),
+        - avec ce que le *privé* peut réellement garantir
+          (latence acks, timeouts Engine, TTL balances, staleness PrivateWS).
+
+        Ce contrat est construit à partir des paramètres existants
+        de BotConfig (router, engine, slip, vol, RM balances, PWS).
+        """
+        # --- SLO acks par région (mêmes ordres de grandeur que EnginePacer) ---
+        # NB : ces valeurs pourront être harmonisées plus tard en lisant BotConfig
+        # côté EnginePacer au lieu de _DEFAULT_TARGETS.
+        ack_by_region: Dict[str, Tuple[float, float, float]] = {
+            # region: (ack_target_ms, ack_hi_ms, ack_sev_ms)
+            "EU":     (90.0, 120.0, 150.0),
+            "US":     (150.0, 180.0, 210.0),
+            "EU-CB":  (180.0, 210.0, 240.0),
+            "EU_CB":  (180.0, 210.0, 240.0),  # alias toléré
+            # Fallback générique
+            "DEFAULT": (90.0, 120.0, 150.0),
+        }
+
+        # --- Source unique TTL slip/vol (déjà pilotés par env via cfg.slip/vol.ttl_s) ---
+        slip_ttl_s = float(getattr(getattr(self, "slip", None), "ttl_s", 2.0))
+        vol_ttl_s  = float(getattr(getattr(self, "vol",  None), "ttl_s", 5.0))
+
+        # --- Fraîcheur L2 max : intersection Router / Engine / slip ---
+        # On s'assure par construction que:
+        #   l2_fresh_max_s <= slip_ttl_s
+        #   l2_fresh_max_s <= 0.8 * order_timeout_s
+        try:
+            router_stale_s = float(getattr(self.router, "stale_ms", 1200)) / 1000.0
+        except Exception:
+            router_stale_s = 1.2
+
+        try:
+            anchor_stale_s = float(getattr(self.engine, "anchor_max_staleness_ms", 1200)) / 1000.0
+        except Exception:
+            anchor_stale_s = router_stale_s
+
+        order_timeout_s = float(getattr(self.engine, "order_timeout_s", 3.0))
+        # borne "dur" : on ne veut pas que le public considère OK au-delà de 80% du timeout Engine
+        hard_cap_s = max(0.0, order_timeout_s * 0.8)
+
+        l2_fresh_max_s = min(router_stale_s, anchor_stale_s, hard_cap_s, slip_ttl_s)
+
+        # --- TTL balances (déjà injectées par from_env en overlay RM) ---
+        # Defaults alignés sur RM_BALANCE_TTL_S_* dans from_env()
+        balances_ttl_s_normal = float(getattr(self, "RM_BALANCE_TTL_S_NORMAL", 60.0))
+        balances_ttl_s_degraded = float(getattr(self, "RM_BALANCE_TTL_S_DEGRADED", 180.0))
+        balances_ttl_s_block = float(getattr(self, "RM_BALANCE_TTL_S_BLOCK", 600.0))
+
+        # --- TTL TM exposure / hedge ---
+        tm_exposure_ttl_ms = float(getattr(self.engine, "tm_exposure_ttl_ms", 1500.0))
+
+        # --- Staleness privé WS : gap heartbeat max ---
+        pws_heartbeat_gap_max_s = float(
+            getattr(self.pws, "PWS_HEARTBEAT_MAX_GAP_S", 30.0)
+        )
+
+        # --- Construction du contrat par mode / exchange ---
+        slo: Dict[str, Dict[str, PathSLO]] = {}
+        deployment_modes = ("EU_ONLY", "SPLIT")
+
+        # On normalise les exchanges à UPPER (BINANCE/BYBIT/COINBASE…)
+        enabled_exchanges = [ex.upper() for ex in getattr(self.g, "enabled_exchanges", [])]
+
+        for mode in deployment_modes:
+            per_ex: Dict[str, PathSLO] = {}
+
+            for ex in enabled_exchanges:
+                # Région d'exécution de l'exchange (EU / US / EU-CB…)
+                region = str(self.g.engine_pod_map.get(ex, self.g.pod_region)).upper()
+                if region == "EU_CB" and ex == "COINBASE":
+                    region_key = "EU-CB"
+                else:
+                    region_key = region
+
+                ack_target_ms, ack_hi_ms, ack_sev_ms = ack_by_region.get(
+                    region_key,
+                    ack_by_region["DEFAULT"],
+                )
+
+                public = SLOPublicPath(
+                    l2_fresh_max_s=l2_fresh_max_s,
+                    slip_ttl_s=slip_ttl_s,
+                    vol_ttl_s=vol_ttl_s,
+                )
+                private = SLOPrivatePath(
+                    ack_target_ms=ack_target_ms,
+                    ack_hi_ms=ack_hi_ms,
+                    ack_sev_ms=ack_sev_ms,
+                    order_timeout_s=order_timeout_s,
+                    tm_exposure_ttl_ms=tm_exposure_ttl_ms,
+                    balances_ttl_s_normal=balances_ttl_s_normal,
+                    balances_ttl_s_degraded=balances_ttl_s_degraded,
+                    balances_ttl_s_block=balances_ttl_s_block,
+                    pws_heartbeat_gap_max_s=pws_heartbeat_gap_max_s,
+                )
+
+                per_ex[ex] = PathSLO(public=public, private=private)
+
+            slo[mode] = per_ex
+
+        return slo
 
 
 

@@ -356,25 +356,68 @@ class VolatilityMonitor:
         series = self._series_for_pair(self.price_history, pair, exchange)
         return self._relative_volatility(self._window_values(series, duration, now))
 
-
-    def get_volatility(self, exchange: str, pair_key: str) -> Optional[float]:
+    def get_volatility(
+            self,
+            exchange: str,
+            pair_key: str,
+            ttl_s: Optional[float] = None,
+    ) -> Optional[float]:
         """
         P1/P2: retourne la volatilité *relative* si mesure fraîche (TTL), sinon None.
-        (Le mapping vers bps sera ajouté après P2, comme demandé.)
+
+        Priorité TTL :
+          1) ttl_s explicite passé à l'appel.
+          2) Contrat SLO public :
+                cfg.slo[deployment_mode][exchange].public.vol_ttl_s
+          3) Fallback legacy : cfg.vol.ttl_s (injecté dans self._ttl_s).
         """
-        ex = str(exchange).upper()
-        pk = str(pair_key).upper()
+        ex = str(exchange or "").upper()
+        pk = _norm_pair(pair_key)
         rec = getattr(self, "_last_vol", {}).get((ex, pk))
         if not rec:
             return None
 
+        # --- Résolution du TTL (SLO public → fallback cfg.vol.ttl_s) ------------
+        if ttl_s is not None:
+            ttl = float(ttl_s)
+        else:
+            ttl = None
+            try:
+                cfg = getattr(self, "cfg", None)
+                slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+                if slo_map:
+                    g_cfg = getattr(cfg, "g", None)
+                    mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                    per_ex = slo_map.get(mode_key) or {}
+                    path_slo = per_ex.get(ex)
+                    if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                        vol_ttl_s = float(
+                            getattr(path_slo.public, "vol_ttl_s", 0.0) or 0.0
+                        )
+                        if vol_ttl_s > 0.0:
+                            ttl = vol_ttl_s
+            except Exception:
+                logger.warning(
+                    "[VolatilityMonitor] unable to resolve SLO-based vol TTL, "
+                    "falling back to cfg.vol.ttl_s",
+                    exc_info=False,
+                )
+                ttl = None
+
+            if ttl is None:
+                # Source legacy : cfg.vol.ttl_s injecté dans self._ttl_s au __init__
+                ttl = float(getattr(self, "_ttl_s", 5.0))
+
+        # --- Application du TTL sur la dernière mesure --------------------------
         age_s = max(0.0, time.time() - float(rec.get("ts_recv_s", 0.0)))
-        ttl = float(getattr(self, "_ttl_s", 5.0))
         if age_s > ttl:
             return None
 
         vol_rel = rec.get("vol_rel")
-        return float(vol_rel) if vol_rel is not None else None
+        try:
+            return float(vol_rel) if vol_rel is not None else None
+        except Exception:
+            return None
 
     def get_spread_volatility(
         self,

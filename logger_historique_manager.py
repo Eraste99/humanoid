@@ -1163,12 +1163,28 @@ class LoggerHistoriqueManager:
             # Canonicalisation légère (exchanges, pair, symbol, etc.)
             e = self._canonicalize(e)
 
+            # [PATCH-MM-TRADE_MODE] Dérivation best-effort de trade_mode pour MM
+            if log_type == "trades":
+                raw_tm = (e.get("trade_mode") or "").upper()
+                if not raw_tm:
+                    # 1) Priorité à strategy / branch explicites
+                    s = str(e.get("strategy") or e.get("branch") or "").upper()
+                    if s == "MM":
+                        e["trade_mode"] = "MM"
+                    else:
+                        # 2) Fallback sur les hints d’historisation (kind / _hist_kind)
+                        k = str(e.get("_hist_kind") or e.get("kind") or "").upper()
+                        if k in {"MM", "MAKER_MM", "MM_INV"}:
+                            e["trade_mode"] = "MM"
+                    # si toujours rien, on laisse e["trade_mode"] absent → schema_invalid comme avant
+
             # [M5-A3-1] Contrat minimal TRADES (best-effort, non bloquant)
             if log_type == "trades":
                 self._validate_trade_schema(e)
 
             # Fallback signe (sans inventer de montant)
             self._fallback_net_profit_sign(e)
+
 
             enriched.append(e)
 
@@ -1800,7 +1816,12 @@ class LoggerHistoriqueManager:
             local_day_str = str(local_day).strip()
         else:
             # "Aujourd'hui" dans la timezone de la région
-            tz_name = {"EU": "Europe/Rome", "US": "America/New_York"}.get(region, "Europe/Rome")
+            # "Aujourd'hui" dans la timezone de la région
+            tz_name = {
+                "EU": "Europe/Rome",
+                "US": "America/New_York",
+                "JP": "Asia/Tokyo",
+            }.get(region, "Europe/Rome")
             if ZoneInfo is not None:
                 try:
                     dt_now_loc = datetime.now(ZoneInfo(tz_name))
@@ -1814,7 +1835,11 @@ class LoggerHistoriqueManager:
         max_lookback_days = int(getattr(self, "_pnl_reco_max_lookback_days", 0) or 0)
         if max_lookback_days > 0:
             try:
-                tz_name = {"EU": "Europe/Rome", "US": "America/New_York"}.get(region, "Europe/Rome")
+                tz_name = {
+                    "EU": "Europe/Rome",
+                    "US": "America/New_York",
+                    "JP": "Asia/Tokyo",
+                }.get(region, "Europe/Rome")
                 if ZoneInfo is not None:
                     dt_today_loc = datetime.now(ZoneInfo(tz_name)).date()
                 else:
@@ -1861,7 +1886,11 @@ class LoggerHistoriqueManager:
                 )
             else:
                 # Fallback: reconstruit [since_ms, until_ms] pour le jour local
-                tz_name = {"EU": "Europe/Rome", "US": "America/New_York"}.get(region, "Europe/Rome")
+                tz_name = {
+                    "EU": "Europe/Rome",
+                    "US": "America/New_York",
+                    "JP": "Asia/Tokyo",
+                }.get(region, "Europe/Rome")
                 dt_start_loc = datetime.strptime(local_day_str, "%Y-%m-%d")
                 if ZoneInfo is not None:
                     dt_start_loc = dt_start_loc.replace(tzinfo=ZoneInfo(tz_name))

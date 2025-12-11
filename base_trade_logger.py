@@ -345,12 +345,24 @@ class BaseTradeLogger:
         raw_mode = (trade.get("trade_mode") or "").upper() or None
         strategy = (trade.get("strategy") or "default")
         trade_mode = raw_mode
+
         if trade_mode is None:
+            # 1) Priorité à strategy explicite
             s_up = str(strategy).upper()
-            if s_up in ("TT", "TM"):
+            if s_up in ("TT", "TM", "MM"):
                 trade_mode = s_up
             elif trade.get("is_rebalancing"):
                 trade_mode = "REB"
+            else:
+                # 2) Fallbacks contract-constants sur les hints déjà existants
+                branch = str(trade.get("branch") or "").upper()
+                kind = str(trade.get("kind") or trade.get("_hist_kind") or "").upper()
+
+                if branch == "MM":
+                    trade_mode = "MM"
+                elif kind in {"MM", "MAKER_MM", "MM_INV"}:
+                    trade_mode = "MM"
+                # sinon on laisse trade_mode = None, comme avant
 
         trade_type = (
                 trade.get("trade_type") or trade.get("exec_mode") or trade.get("type") or

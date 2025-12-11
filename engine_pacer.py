@@ -80,6 +80,8 @@ _DEFAULT_TARGETS: Dict[str, Dict[str, float]] = {
     "US":    dict(ack_target=150.0, ack_hi=180.0, ack_sev=210.0, lag_hi=15.0, lag_sev=20.0, err_hi=0.005, err_sev=0.02, drain_hi=120.0, drain_sev=240.0),
     # EU-CB = Coinbase exécuté depuis EU (RTT transatlantique → ack plus tolérant)
     "EU-CB": dict(ack_target=180.0, ack_hi=210.0, ack_sev=240.0, lag_hi=15.0, lag_sev=20.0, err_hi=0.005, err_sev=0.02, drain_hi=120.0, drain_sev=240.0),
+# JP = pod Japan/Tokyo (à affiner après mesures RTT Tokyo↔CEX)
+    "JP":   dict(ack_target=150.0, ack_hi=180.0, ack_sev=210.0, lag_hi=15.0, lag_sev=20.0, err_hi=0.005, err_sev=0.02, drain_hi=120.0, drain_sev=240.0),
 }
 
 # --------- FSM thresholds / knobs ---------
@@ -186,6 +188,14 @@ class EnginePacer:
 
     @staticmethod
     def _norm_region(r: Optional[str]) -> str:
+        """
+        Normalise le libellé de région en tag interne.
+
+        - "EU", "eu", "eu_only"   → "EU"
+        - "US", "us-east"         → "US"
+        - "EU-CB", "eu_cb", ...   → "EU-CB"
+        - "JP", "TOKYO", "APAC"   → "JP"
+        """
         if not r:
             return "EU"
         r = str(r).upper().replace("_", "-")
@@ -193,6 +203,8 @@ class EnginePacer:
             return "EU-CB"
         if r.startswith("US"):
             return "US"
+        if r.startswith("JP") or r.startswith("TOKYO") or r.startswith("APAC"):
+            return "JP"
         return "EU"
 
     @staticmethod

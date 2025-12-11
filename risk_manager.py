@@ -11299,16 +11299,18 @@ class RiskManager:
 
         # --- 0) Freshness guards (TTL strict) ------------------------------------
         # On aligne le TTL sur les briques réellement utilisées :
-        # - Slippage : priorité au SlippageAndFeesCollector (slip_collector) si disponible,
+        # - Slippage : priorité au SlippageAndFeesCollector (slip_collector) si dispo,
         #   sinon slippage_handler legacy.
         # - Volatilité : priorité au vol_monitor, fallback éventuel sur vol_manager.
+        # Le contrat TTL "officiel" vient de BotConfig.slo[mode][exchange].public.
         slip_age_ok = True
         vol_age_ok = True
         slip_age_s = None
         vol_age_s = None
         slip_src = "none"
         vol_src = "none"
-        # TTL strict pour slip/vol (source unique : BotConfig.slip/vol.ttl_s)
+
+        # --- TTL de base (fallback legacy) : BotConfig.slip/vol.ttl_s ------------
         try:
             slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s", 2.0))
         except Exception:
@@ -11318,7 +11320,46 @@ class RiskManager:
         except Exception:
             vol_ttl_s = 5.0
 
-        # Slippage TTL (2s)
+        # --- Override TTL via contrat SLO, si disponible -------------------------
+        # On prend le min des TTL publics sur les 2 CEX de l'opportunité
+        try:
+            slo_map = getattr(self.bot_cfg, "slo", None)
+            if slo_map:
+                g_cfg = _cfg_g(self)
+                mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                per_ex = slo_map.get(mode_key) or {}
+
+                route = opp.get("route") or {}
+                buy_ex = (opp.get("buy_ex") or route.get("buy_ex") or "").upper()
+                sell_ex = (opp.get("sell_ex") or route.get("sell_ex") or "").upper()
+
+                public_slos = []
+                for ex in (buy_ex, sell_ex):
+                    if not ex:
+                        continue
+                    path_slo = per_ex.get(ex)
+                    if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                        public_slos.append(path_slo.public)
+
+                if public_slos:
+                    slip_ttl_s = min(
+                        float(getattr(ps, "slip_ttl_s", slip_ttl_s))
+                        for ps in public_slos
+                    )
+                    vol_ttl_s = min(
+                        float(getattr(ps, "vol_ttl_s", vol_ttl_s))
+                        for ps in public_slos
+                    )
+        except Exception:
+            # En cas de souci sur slo, on garde les TTL legacy BotConfig.slip/vol
+            if getattr(self, "log", None):
+                self.log.warning(
+                    "RM: unable to resolve SLO-based TTL for slip/vol, falling back "
+                    "to BotConfig.slip/vol.ttl_s",
+                    exc_info=False,
+                )
+
+        # Slippage TTL (contrat public)
         slip_col = getattr(self, "slip_collector", None)
         if slip_col and hasattr(slip_col, "last_age_seconds"):
             try:
@@ -11339,7 +11380,7 @@ class RiskManager:
         if slip_age_s is not None:
             slip_age_ok = slip_age_s <= slip_ttl_s
 
-        # Volatilité TTL (5s)
+        # Volatilité TTL (contrat public)
         vol_getter = getattr(self, "vol_monitor", None)
         if vol_getter and hasattr(vol_getter, "last_age_seconds"):
             try:
@@ -11363,11 +11404,14 @@ class RiskManager:
         if not (slip_age_ok and vol_age_ok):
             if getattr(self, "log", None):
                 self.log.debug(
-                    "RM.SKIP: stale slip/vol (TTL P2) slip_age_s=%.3f vol_age_s=%.3f slip_src=%s vol_src=%s",
+                    "RM.SKIP: stale slip/vol (TTL P2) slip_age_s=%.3f vol_age_s=%.3f "
+                    "slip_src=%s vol_src=%s slip_ttl_s=%.3f vol_ttl_s=%.3f",
                     float(slip_age_s or -1.0),
                     float(vol_age_s or -1.0),
                     slip_src,
                     vol_src,
+                    float(slip_ttl_s),
+                    float(vol_ttl_s),
                 )
             return
 
@@ -11885,7 +11929,7 @@ class RiskManager:
         self._multicast_shadow(bundle)
         return True
 
-    
+
     def _build_bundle(self, opp: Dict[str, Any], strategy: str) -> Optional[Dict[str, Any]]:
         """
         P0: construit un bundle exécutable standard (dict) en s'appuyant sur payloads.make_submit_bundle

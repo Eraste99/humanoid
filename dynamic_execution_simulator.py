@@ -547,6 +547,7 @@ class DynamicExecutionSimulator:
             )
 
         trade_id = self._mk_trade_id(strategy=strategy.upper(), combo_key=combo_key, pair=symbol)
+
         result = {
             "timestamp": datetime.utcnow().isoformat(),
             "trade_id": trade_id,
@@ -559,8 +560,9 @@ class DynamicExecutionSimulator:
             "exec_base_qty": round(total_exec_base, 8),
             "vwap_buy": round(vwap_buy, 6),
             "vwap_sell": round(vwap_sell, 6),
-            "spread_net_final": round(net_final_spread * 100, 4),   # %
-            "net_bps": round(net_final_spread * 1e4, 2),            # bps
+            "net_final_spread": round(net_final_spread, 6),
+            "spread_net_final": round(net_final_spread * 100, 4),  # %
+            "net_bps": round(net_final_spread * 1e4, 2),  # bps
             "fees": {"buy_pct": fees_buy_pct, "sell_pct": fees_sell_pct, "total_pct": float(total_fees_pct)},
             "slippage": {
                 "buy_taker_pct": slip_buy if strategy.upper() in ("TT", "TM") else 0.0,
@@ -581,6 +583,11 @@ class DynamicExecutionSimulator:
                 "usage_ratio": round(capital_usage_ratio, 4),
                 "over_budget": bool(over_budget),
             },
+        }
+        result["guards"] = {
+            "net_final_spread": result["net_final_spread"],
+            "usage_ratio": result["capital"]["usage_ratio"],
+            "status": result["status"],
         }
         if maker_price_used is not None:
             result["maker_price"] = round(maker_price_used, 6)
@@ -610,6 +617,28 @@ class DynamicExecutionSimulator:
     ) -> Optional[Dict[str, Any]]:
         """
         Simulation d'une seule branche (TT ou TM).
+
+        Activation du mode rebalancing (REB)
+        -----------------------------------
+        - via paramètre explicite ``rebalancing_mode=True``
+        - ou via ``opportunity["type"]`` / ``opportunity["meta"]["type"]``
+          appartenant à {"rebalancing", "rebalancing_trade"}
+
+        Dans les deux cas, la stratégie est forcée en "TM" et le résultat
+        porte ``result["mode"] == "rebalancing"``.
+
+        Contrat de sortie en mode REB
+        -----------------------------
+        Les champs suivants sont garantis dans ``result`` pour permettre
+        l'exploitation par le RiskManager (RM) lorsque ``mode == "rebalancing"``:
+        - ``net_final_spread`` : spread net final (fraction, après frais)
+        - ``spread_net_final`` : équivalent en %, conservé pour compatibilité
+        - ``capital.usage_ratio`` : ratio d'utilisation du budget fourni
+        - ``fragments.count`` et ``fragments.avg_fragment_usdc``
+        - ``capital.used_usdc`` : capital effectivement consommé
+        - ``status`` : indicateur de profitabilité ("rentable"/"non_rentable")
+        - ``guards`` (supplémentaire, non-breaking) pouvant agréger
+          ``net_final_spread``, ``usage_ratio`` et ``status``.
         """
         symbol = str(opportunity.get("pair", "UNKNOWN")).replace("-", "").upper()
         buy_ex = str(opportunity.get("buy_exchange", "")).upper()
@@ -617,9 +646,12 @@ class DynamicExecutionSimulator:
 
         meta = dict(opportunity.get("meta") or {})
         opp_type = str(opportunity.get("type") or meta.get("type") or "").lower()
+        # Contrat RM → Sim (REB) : les opportunités taggées rebalancing
+        # (type="rebalancing" ou "rebalancing_trade") ou le flag explicite
+        # rebalancing_mode déclenchent le mode TM spécifique REB.
         is_rebalancing_payload = opp_type in {"rebalancing", "rebalancing_trade"}
         rebalancing_mode = bool(rebalancing_mode or is_rebalancing_payload)
-
+        
         strategy = str(
             (strategy or opportunity.get("strategy") or meta.get("strategy") or "TT")
         ).upper()
@@ -750,8 +782,10 @@ class DynamicExecutionSimulator:
         except Exception:
             pass
 
-        # Prometheus: écart VWAP en bps si résultat dispo
+            # Prometheus: écart VWAP en bps si résultat dispo
         if result is not None:
+            if rebalancing_mode:
+                result["mode"] = "rebalancing"
             try:
                 vbuy = float(result.get("vwap_buy", 0.0) or 0.0)
                 vsell = float(result.get("vwap_sell", 0.0) or 0.0)
@@ -784,6 +818,34 @@ class DynamicExecutionSimulator:
                         logger.exception("[DynamicExecutionSimulator] event_sink callback error")
 
         return result
+
+    async def simulate_rebalancing(
+            self,
+            opportunity: Dict[str, Any],
+            buy_levels: List[Tuple[Any, Any]],
+            sell_levels: List[Tuple[Any, Any]],
+            *,
+            capital_available_usdc: float,
+            timeout: float = 2.0,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Point d'entrée explicite pour simuler une opportunité REB.
+
+        - Force ``rebalancing_mode=True`` et ``strategy="TM"``.
+        - Passe-through vers :py:meth:`simulate` sans modification de logique.
+        - Recommandé pour le RiskManager afin d'éviter d'avoir à gérer les
+          champs ``type`` ou ``strategy`` manuellement sur les payloads REB.
+        """
+
+        return await self.simulate(
+            opportunity=opportunity,
+            buy_levels_raw=buy_levels,
+            sell_levels_raw=sell_levels,
+            capital_available_usdc=capital_available_usdc,
+            strategy="TM",
+            rebalancing_mode=True,
+            timeout=timeout,
+        )
 
     # ------------------------- TT et TM en parallèle -------------------------
     # === dynamic_execution_simulator.py ===
@@ -1064,7 +1126,12 @@ class DynamicExecutionSimulator:
           - Timeouts indépendants par bras et annulation croisée,
           - EU_ONLY/SPLIT: pénalités latence appliquées,
           - Sortie normalisée: {ok, reason, sim_vwap_dev_bps, fills_expected_ratio, sim_latency_ms, guards}.
+
+        Ce helper n'est pas destiné au flux REB (rebalancing): utiliser
+        :py:meth:`simulate_rebalancing` ou directement :py:meth:`simulate`
+        avec ``rebalancing_mode=True``.
         """
+
         # --- 0) Limiteur de concurrence global -----------------------------------
         if not hasattr(self, "_sem"):
             max_conc = int(getattr(self, "max_concurrency", 64))

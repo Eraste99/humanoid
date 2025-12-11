@@ -816,8 +816,9 @@ class SlippageHandler:
 
         TTL:
           - si `ttl_s` est fourni à l'appel, on l'utilise directement,
-          - sinon on s'appuie sur `self._ttl_s` (configurée depuis cfg.slip.ttl_s,
-            donc pilotée par BotConfig / SLIP_TTL_S, défaut 2.0s).
+          - sinon on s'appuie d'abord sur le contrat SLO public :
+                cfg.slo[deployment_mode][exchange].public.slip_ttl_s
+            avec fallback sur self._ttl_s (cfg.slip.ttl_s, donc pilotée par BotConfig).
 
         side: "buy" | "sell" | None (None => max des deux si disponibles).
         """
@@ -827,14 +828,42 @@ class SlippageHandler:
         tsd = getattr(self, "_slip_ts", {})
 
         now = time.time()
+
+        # --- Résolution du TTL (SLO public → fallback cfg.slip.ttl_s) ------------
         if ttl_s is not None:
             ttl = float(ttl_s)
         else:
-            # Source unique: cfg.slip.ttl_s injecté dans self._ttl_s au __init__
-            ttl = float(getattr(self, "_ttl_s", 2.0))
+            ttl = None
+            try:
+                cfg = getattr(self, "cfg", None)
+                slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+                if slo_map:
+                    g_cfg = getattr(cfg, "g", None)
+                    mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                    per_ex = slo_map.get(mode_key) or {}
+                    path_slo = per_ex.get(ex)
+                    if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                        slip_ttl_s = float(
+                            getattr(path_slo.public, "slip_ttl_s", 0.0) or 0.0
+                        )
+                        if slip_ttl_s > 0.0:
+                            ttl = slip_ttl_s
+            except Exception:
+                # En cas de problème sur le contrat SLO, on retombe sur le TTL legacy.
+                logger.warning(
+                    "[SlippageHandler] unable to resolve SLO-based slip TTL, "
+                    "falling back to cfg.slip.ttl_s",
+                    exc_info=False,
+                )
+                ttl = None
 
+            if ttl is None:
+                # Source legacy : cfg.slip.ttl_s injecté dans self._ttl_s au __init__
+                ttl = float(getattr(self, "_ttl_s", 2.0))
+
+        # --- Application du TTL sur les snapshots -------------------------------
         if side is None:
-            vals = []
+            vals: list[float] = []
             for s in ("buy", "sell"):
                 v = bps.get((ex, pk, s))
                 t = tsd.get((ex, pk))
@@ -843,7 +872,7 @@ class SlippageHandler:
                     if age <= ttl:
                         vals.append(float(v))
                         # Optionnel: on pourrait pousser ici un age réel via set_slip_age_seconds
-                return max(vals) if vals else None
+            return max(vals) if vals else None
 
         v = bps.get((ex, pk, str(side).lower()))
         t = tsd.get((ex, pk))
