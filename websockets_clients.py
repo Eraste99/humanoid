@@ -37,7 +37,7 @@ import websockets  # pip install websockets
 from modules.retry_policy import with_retry, awith_retry, BackoffPolicy, ErrKind
 # --- imports locaux (pas d'effets globaux) ---
 import asyncio, json, random
-
+from contracts.payloads import MarketEvent
 
 
 # --- Prometheus: WS reconnect/backoff (fallback no-op si absent) ---
@@ -47,6 +47,7 @@ try:
         WS_BACKOFF_SECONDS,
         WS_CONNECTIONS_OPEN,
         WS_PUBLIC_DROPPED_TOTAL,
+        note_ws_public_cfg,
     )
 except Exception:  # pragma: no cover
     class _Noop:
@@ -58,6 +59,9 @@ except Exception:  # pragma: no cover
     WS_BACKOFF_SECONDS  = _Noop()
     WS_CONNECTIONS_OPEN = _Noop()
     WS_PUBLIC_DROPPED_TOTAL = _Noop()
+
+    def note_ws_public_cfg(*_a, **_k):
+        return None
 
 # --- Helpers d'observabilité WS publics (labels exchange / region / deployment_mode) ---
 try:
@@ -230,9 +234,26 @@ class WebSocketExchangeClient:
         self.enabled_exchanges = [e.upper() for e in (enabled_exchanges or ["BINANCE","COINBASE","BYBIT"])]
 
         # chunking
+        # chunking
         self.binance_chunk_size = max(1, int(binance_chunk_size))
         self.coinbase_chunk_size = max(1, int(coinbase_chunk_size))
-        self.bybit_chunk_size   = max(1, int(bybit_chunk_size))
+        self.bybit_chunk_size = max(1, int(bybit_chunk_size))
+
+        try:
+            note_ws_public_cfg(
+                ping_interval_s=self._ping_interval_s,
+                pong_timeout_s=self._pong_timeout_s,
+                connect_timeout_s=self._connect_timeout_s,
+                read_timeout_s=self._read_timeout_s,
+                out_queue_put_timeout_s=self._out_queue_put_timeout_s,
+                chunk_size_by_exchange={
+                    "BINANCE": self.binance_chunk_size,
+                    "COINBASE": self.coinbase_chunk_size,
+                    "BYBIT": self.bybit_chunk_size,
+                },
+            )
+        except Exception:
+            pass
 
         # depth / cadence exchange-specific
         self.depth_level = int(depth_level)
@@ -267,6 +288,7 @@ class WebSocketExchangeClient:
         self._supervisor_task: Optional["asyncio.Task"] = None
         self.tasks: List["asyncio.Task"] = []  # listeners actifs
         self._reload_event = asyncio.Event()
+        self._backoff_inflight = asyncio.Lock()
 
         # connexions / métriques
         self._open_connections = 0
@@ -318,9 +340,14 @@ class WebSocketExchangeClient:
         except AttributeError:
             # fallback simple si non présente
             self._inv_map = {}
-            for canon, m in self.pair_mapping.items():
-                for ex, exsym in (m or {}).items():
-                    self._inv_map[(ex.upper(), exsym)] = canon
+
+            def _ws_connect_kwargs(self) -> Dict[str, float]:
+                return {
+                    "ping_interval": self._ping_interval_s,
+                    "ping_timeout": self._pong_timeout_s,
+                    "close_timeout": self._read_timeout_s,
+                    "open_timeout": self._connect_timeout_s,
+                }
 
     def _unsubscribe_impl(self, batch: List[str]) -> None:
         # Hook d’implémentation spécifique CEX si nécessaire.
@@ -648,12 +675,11 @@ class WebSocketExchangeClient:
             }
             self._queue_control_event(payload)
 
-
     def on_close(self, *a, **k) -> None:
         # 1 socket de moins
         self._open_connections = max(0, self._open_connections - 1)
         self._connected = self._open_connections > 0
-        self.reconnect_with_backoff()
+
 
     def compute_backoff(self) -> float:
         d = float(self._ws_policy.next_delay(self._rng))
@@ -665,10 +691,6 @@ class WebSocketExchangeClient:
     def reconnect(self) -> None:
         self.reconnect_with_backoff()
 
-
-    async def _delayed_reload(self, delay: float) -> None:
-        await asyncio.sleep(max(0.0, float(delay)))
-        self._reload_event.set()
 
     # ------------------- Émission pipeline -------------------
     async def _emit_if_ready(self, exchange: str, ex_symbol: str) -> None:
@@ -687,20 +709,25 @@ class WebSocketExchangeClient:
             return
         self.last_update[ex][pk] = now_ms
         self.latency[ex][pk] = lat
-        event = {
-            "exchange": ex,
-            "pair_key": pk,
-            "ex_symbol": ex_symbol,
-            "best_bid": float(bid),
-            "best_ask": float(ask),
-            "bid_volume": float(bids[0][1]) if bids else 0.0,
-            "ask_volume": float(asks[0][1]) if asks else 0.0,
-            "orderbook": {"bids": bids, "asks": asks} if (bids or asks) else {},
-            "exchange_ts_ms": int(ex_ts) if ex_ts else None,
-            "recv_ts_ms": now_ms,
-            "latency_ms": lat,
-            "active": True,
-        }
+        try:
+            event = MarketEvent(
+                exchange=ex,
+                pair_key=pk,
+                ex_symbol=ex_symbol,
+                best_bid=float(bid),
+                best_ask=float(ask),
+                bid_volume=float(bids[0][1]) if bids else 0.0,
+                ask_volume=float(asks[0][1]) if asks else 0.0,
+                orderbook={"bids": bids, "asks": asks} if (bids or asks) else {},
+                exchange_ts_ms=int(ex_ts) if ex_ts else None,
+                recv_ts_ms=now_ms,
+                latency_ms=lat,
+                active=True,
+            ).model_dump(exclude_none=True)
+        except Exception:
+            logger.exception("[WS] market event validation failed", extra={"exchange": ex, "symbol": ex_symbol})
+            return
+
         key = (ex, ex_symbol, int(ex_ts or 0))
         if key in self._seen_events:
             return
@@ -829,7 +856,7 @@ class WebSocketExchangeClient:
         while self._running:
             did_close = False
             try:
-                async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=5) as ws:
+                async with websockets.connect(url, **self._ws_connect_kwargs()) as ws:
                     _set_tcp_nodelay(ws)
                     self.on_open(exchange="BINANCE")  # reset backoff + resub
                     self._metrics_conn_open("BINANCE")
@@ -869,9 +896,8 @@ class WebSocketExchangeClient:
                 }, exchange="BINANCE", reason="listener_error")
                 # backoff unifié (une seule fois)
                 self.on_close();
-                did_close = True
                 self._metrics_conn_closed("BINANCE")
-                self._metrics_reconnect("BINANCE", self.last_backoff, reason="listener_error")
+                await self._sleep_backoff("BINANCE", reason="listener_error")
 
             finally:
                 # si reload demandé -> fin immédiate sans double on_close()
@@ -897,8 +923,7 @@ class WebSocketExchangeClient:
         while self._running:
             did_close = False
             try:
-                async with websockets.connect(self.COINBASE_WS, ping_interval=20, ping_timeout=20,
-                                              close_timeout=5) as ws:
+                async with websockets.connect(self.COINBASE_WS, **self._ws_connect_kwargs()) as ws:
                     _set_tcp_nodelay(ws)
                     self.on_open(exchange="COINBASE")
                     self._metrics_conn_open("COINBASE")
@@ -963,8 +988,7 @@ class WebSocketExchangeClient:
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("COINBASE")
-                self._metrics_reconnect("COINBASE", self.last_backoff, reason="listener_error")
-
+                await self._sleep_backoff("COINBASE", reason="listener_error")
             finally:
                 if self._reload_event.is_set():
                     return
@@ -982,8 +1006,7 @@ class WebSocketExchangeClient:
         while self._running:
             did_close = False
             try:
-                async with websockets.connect(self.BYBIT_WS_SPOT, ping_interval=20, ping_timeout=20,
-                                              close_timeout=5) as ws:
+                async with websockets.connect(self.BYBIT_WS_SPOT, **self._ws_connect_kwargs()) as ws:
                     _set_tcp_nodelay(ws)
                     self.on_open(exchange="BYBIT")
                     self._metrics_conn_open("BYBIT")
@@ -1025,8 +1048,7 @@ class WebSocketExchangeClient:
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("BYBIT")
-                self._metrics_reconnect("BYBIT", self.last_backoff, reason="listener_error")
-
+                await self._sleep_backoff("BYBIT", reason="listener_error")
             finally:
                 if self._reload_event.is_set():
                     return
@@ -1146,60 +1168,27 @@ class WebSocketExchangeClient:
         return list(self._subscribed)
 
 
-    async def _areconnect_with_backoff_runner(self) -> None:
-        if getattr(self, "_reconnect_inflight", False):
-            return
-        self._reconnect_inflight = True
-        try:
-            # 1) delay initial: compute_backoff() si dispo, sinon 0.5
-            delay = 0.5
-            if hasattr(self, "compute_backoff"):
-                try:
-                    delay = max(0.05, float(self.compute_backoff()))
-                except Exception:
-                    pass
-
-            while not self._connected:
-
-                # 2) log structuré (compat avec ta seconde version)
-                try:
-                    open_conns = getattr(self, "_open_connections", -1)
-                    logger.info('{"ws_event":"backoff_computed","delay_s":%.3f,"open_conns":%d}', delay, open_conns)
-                except Exception:
-                    logging.exception("Unhandled exception during ws backoff logging")
-
-                # 3) préférence: _delayed_reload(delay) si dispo (non-bloquant)
-                if hasattr(self, "_delayed_reload"):
-                    await self._maybe_await(self._delayed_reload, delay)
-                else:
-                    # fallback: close → sleep (avec jitter) → open
-                    await self._maybe_await(self._do_close)
-                    await asyncio.sleep(delay + random.random() * delay)
-                    await self._maybe_await(self._do_open)
-
-                # 4) delay suivant: compute_backoff() si dispo, sinon exponentiel borné
-                next_delay = None
-                if hasattr(self, "compute_backoff"):
-                    try:
-                        next_delay = float(self.compute_backoff())
-                    except Exception:
-                        next_delay = None
-                delay = next_delay if next_delay is not None else min(delay * 2, 10.0)
-        finally:
-            self._reconnect_inflight = False
+    async def _sleep_backoff(self, exchange: str, *, reason: str) -> None:
+        """Applique le backoff configuré avant de retenter une reconnexion."""
+        async with self._backoff_inflight:
+            delay = float(self.compute_backoff())
+            try:
+                self._metrics_reconnect(exchange, delay, reason=reason)
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
 
     def reconnect_with_backoff(self) -> None:
-        """
-        Unifiée: single-flight, log structuré, compute_backoff/_delayed_reload si présents,
-        sinon boucle close/sleep/open avec backoff exponentiel + jitter. Non-bloquante.
-        """
+        """Entrée legacy : force un reload après un vrai backoff calculé."""
+        async def _runner() -> None:
+            await self._sleep_backoff("ALL", reason="manual_reconnect")
+            self._reload_event.set()
+
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._areconnect_with_backoff_runner())
-        except RuntimeError:
-            # hors event loop (thread superviseur) → exécuter proprement
-            asyncio.run(self._areconnect_with_backoff_runner())
-
+            loop.create_task(_runner())
+        except RuntimeError:  # pragma: no cover - hors boucle async
+            asyncio.run(_runner())
 
     def reload(self) -> None:
         """Déclenche un soft-reload sans changer la liste de paires."""

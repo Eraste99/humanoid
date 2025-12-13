@@ -10,13 +10,29 @@ Objectifs
 - Compat Pydantic v2/v1 (auto-détection).
 - Normalisation des symboles: "BTC-USDC" / "BTCUSDC" acceptés, clé compacte via pair_key.
 - Helpers de conversion (Scanner→Opportunity, RM→Decision, Decision/Intent→EngineAction).
-- - "Lite validators" tolérants (DRY/DEV), sans masquer les erreurs en OFFICIAL.
+- "Lite validators" tolérants (DRY/DEV), sans masquer les erreurs en OFFICIAL.
 - Métriques Prometheus optionnelles (no-op si prometheus_client absent).
 - Champs additifs rétro-compatibles pour bundles: frag/caps/tm_controls/split/shadow/notional_quote.
 - SimResult minimal pour RM⇄Sim.
 - Conventions meta utilisées par le RM :
   - meta["flow_kind"] ∈ {"core", "opportunistic", "hedge", "rebalance", "unwind", "maintenance"}
   - meta["risk_effect"] ∈ {"risk_increasing", "risk_neutral", "risk_reducing"}
+
+# -----------------------------------------------------------------------------
+# Convention meta (utilisée par RM/Engine)
+# -----------------------------------------------------------------------------
+# - meta["flow_kind"]:
+#     "core"         : flux de base du tri-CEX
+#     "opportunistic": flux alpha "luxe"
+#     "hedge"        : legs de hedge
+#     "rebalance"    : rééquilibrage de comptes
+#     "unwind"       : désarmement de positions
+#     "maintenance"  : flux techniques
+#
+# - meta["risk_effect"]:
+#     "risk_increasing" : augmente le risque net (par défaut)
+#     "risk_neutral"    : neutre ou quasi-neutre
+#     "risk_reducing"   : réduit le risque net (hedge/unwind)
 
 Patchs demandés (inclus)
 ------------------------
@@ -160,6 +176,13 @@ def _norm_pair_key(sym: str) -> str:
 def _norm_exchange(sym: str) -> str:
     return (sym or "").strip().upper()
 
+
+def encode_flow_meta(flow_kind: str | None = None, risk_effect: str | None = None) -> Dict[str, str]:
+    """Helper best-effort pour encoder un meta (flow_kind, risk_effect) canonique."""
+    fk = (flow_kind or "core").lower()
+    reff = (risk_effect or "risk_increasing").lower()
+    return {"flow_kind": fk, "risk_effect": reff}
+
 # >>> PATCH #3 — Helpers publics exposés
 def norm_symbol(sym: str, keep_dash: bool = True) -> str:
     """Wrapper public vers _norm_symbol (exposé dans __all__)."""
@@ -168,6 +191,17 @@ def norm_symbol(sym: str, keep_dash: bool = True) -> str:
 def pair_key(sym: str) -> str:
     """Wrapper public vers _norm_pair_key (exposé dans __all__)."""
     return _norm_pair_key(sym)
+
+
+def _normalize_symbol_and_pair(symbol: Optional[str], pair_key_value: Optional[str]) -> tuple[str, str]:
+    sym_norm = _norm_symbol(symbol) if symbol else ""
+    pk_norm = _norm_pair_key(pair_key_value) if pair_key_value else ""
+    if sym_norm and not pk_norm:
+        pk_norm = _norm_pair_key(sym_norm)
+    if pk_norm and not sym_norm:
+        sym_norm = _norm_symbol(pk_norm)
+    return sym_norm, pk_norm
+
 
 def _side_ok(x: Any) -> Side:
     """Mappe des variantes courantes vers Side Enum."""
@@ -185,6 +219,224 @@ def _pos(v: Any, name: str) -> float:
     if f <= 0:
         raise ValueError(f"{name} must be > 0")
     return f
+
+
+# -----------------------------------------------------------------------------
+# Contrats marché public (WS → Router → Vol/Slip/Health)
+# -----------------------------------------------------------------------------
+class MarketEvent(_Cfg, BaseModel):
+    schema_version: str = Field(default=SCHEMA_VERSION)
+    exchange: str
+    symbol: Optional[str] = None
+    pair_key: Optional[str] = None
+    ex_symbol: Optional[str] = None
+    best_bid: float = Field(..., gt=0)
+    best_ask: float = Field(..., gt=0)
+    bid_volume: Optional[float] = Field(default=None, ge=0)
+    ask_volume: Optional[float] = Field(default=None, ge=0)
+    orderbook: Dict[str, Any] = Field(default_factory=dict)
+    exchange_ts_ms: Optional[int] = Field(default=None, validation_alias="ts_ex_ms", serialization_alias="ts_ex_ms")
+    recv_ts_ms: Optional[int] = None
+    latency_ms: Optional[float] = None
+    active: bool = True
+
+    @field_validator("exchange", mode="before")
+    def _norm_exchange_field(cls, v: Any) -> str:
+        return _norm_exchange(v)
+
+    @field_validator("symbol", mode="before")
+    def _norm_symbol_field(cls, v: Any) -> Optional[str]:
+        return _norm_symbol(v) if v else v
+
+    @field_validator("pair_key", mode="before")
+    def _norm_pair_field(cls, v: Any) -> Optional[str]:
+        return _norm_pair_key(v) if v else v
+
+    @field_validator("exchange_ts_ms", "recv_ts_ms", mode="before")
+    def _norm_ts(cls, v: Any) -> Optional[int]:
+        return int(v) if v not in (None, "") else None
+
+    @field_validator("orderbook", mode="before")
+    def _fallback_orderbook(cls, v: Any) -> Dict[str, Any]:
+        return v or {}
+
+    @model_validator(mode="after")
+    def _set_symbol_and_pair(self):
+        sym, pk = _normalize_symbol_and_pair(self.symbol, self.pair_key)
+        object.__setattr__(self, "symbol", sym or None)
+        object.__setattr__(self, "pair_key", pk or None)
+        return self
+
+    def __init__(self, **data: Any):  # type: ignore[override]
+        super().__init__(**data)
+        if ConfigDict is None:
+            self.schema_version = getattr(self, "schema_version", None) or SCHEMA_VERSION
+            self.exchange = _norm_exchange(getattr(self, "exchange", None))
+            sym, pk = _normalize_symbol_and_pair(getattr(self, "symbol", None), getattr(self, "pair_key", None))
+            self.symbol = sym or None
+            self.pair_key = pk or None
+            ts_alias = getattr(self, "ts_ex_ms", None)
+            if ts_alias is not None and getattr(self, "exchange_ts_ms", None) in (None, ""):
+                self.exchange_ts_ms = int(ts_alias) if ts_alias not in (None, "") else None
+            if getattr(self, "orderbook", None) is None:
+                self.orderbook = {}
+            if getattr(self, "exchange_ts_ms", None) is not None:
+                self.ts_ex_ms = int(getattr(self, "exchange_ts_ms"))  # type: ignore[attr-defined]
+            try:
+                self.best_bid = float(getattr(self, "best_bid", 0))
+                self.best_ask = float(getattr(self, "best_ask", 0))
+                if getattr(self, "bid_volume", None) is not None:
+                    self.bid_volume = float(getattr(self, "bid_volume"))
+                if getattr(self, "ask_volume", None) is not None:
+                    self.ask_volume = float(getattr(self, "ask_volume"))
+            except Exception:
+                pass
+            if getattr(self, "active", None) is None:
+                self.active = True
+            if getattr(self, "orderbook", None) is None:
+                self.orderbook = {}
+
+
+class VolEvent(_Cfg, BaseModel):
+    schema_version: str = Field(default=SCHEMA_VERSION)
+    exchange: str
+    symbol: Optional[str] = None
+    pair_key: Optional[str] = None
+    best_bid: Optional[float] = Field(default=None, gt=0)
+    best_ask: Optional[float] = Field(default=None, gt=0)
+    mid: Optional[float] = Field(default=None, gt=0)
+    ema_vol_bps: Optional[float] = None
+    l1_spread_bps: Optional[float] = None
+    changed: bool = False
+    exchange_ts_ms: Optional[int] = Field(default=None, validation_alias="ts_ex_ms", serialization_alias="ts_ex_ms")
+    recv_ts_ms: Optional[int] = None
+    age_ms: Optional[float] = None
+    seq_no: Optional[int] = None
+    active: bool = True
+
+    @field_validator("exchange", mode="before")
+    def _norm_exchange_field(cls, v: Any) -> str:
+        return _norm_exchange(v)
+
+    @field_validator("symbol", mode="before")
+    def _norm_symbol_field(cls, v: Any) -> Optional[str]:
+        return _norm_symbol(v) if v else v
+
+    @field_validator("pair_key", mode="before")
+    def _norm_pair_field(cls, v: Any) -> Optional[str]:
+        return _norm_pair_key(v) if v else v
+
+    @field_validator("exchange_ts_ms", "recv_ts_ms", mode="before")
+    def _norm_ts(cls, v: Any) -> Optional[int]:
+        return int(v) if v not in (None, "") else None
+
+    @model_validator(mode="after")
+    def _set_symbol_and_pair(self):
+        sym, pk = _normalize_symbol_and_pair(self.symbol, self.pair_key)
+        object.__setattr__(self, "symbol", sym or None)
+        object.__setattr__(self, "pair_key", pk or None)
+        return self
+
+    def __init__(self, **data: Any):  # type: ignore[override]
+        super().__init__(**data)
+        if ConfigDict is None:
+            self.schema_version = getattr(self, "schema_version", None) or SCHEMA_VERSION
+            self.exchange = _norm_exchange(getattr(self, "exchange", None))
+            sym, pk = _normalize_symbol_and_pair(getattr(self, "symbol", None), getattr(self, "pair_key", None))
+            self.symbol = sym or None
+            self.pair_key = pk or None
+            ts_alias = getattr(self, "ts_ex_ms", None)
+            if ts_alias is not None and getattr(self, "exchange_ts_ms", None) in (None, ""):
+                self.exchange_ts_ms = int(ts_alias) if ts_alias not in (None, "") else None
+            if getattr(self, "exchange_ts_ms", None) is not None:
+                self.ts_ex_ms = int(getattr(self, "exchange_ts_ms"))  # type: ignore[attr-defined]
+
+
+class SlipEvent(_Cfg, BaseModel):
+    schema_version: str = Field(default=SCHEMA_VERSION)
+    exchange: str
+    symbol: Optional[str] = None
+    pair_key: Optional[str] = None
+    slip_metric_bps: Optional[float] = None
+    changed: bool = False
+    notional_hint: Optional[Any] = None
+    orderbook: Dict[str, Any] = Field(default_factory=dict)
+    top_bid_vol: Optional[float] = Field(default=None, ge=0)
+    top_ask_vol: Optional[float] = Field(default=None, ge=0)
+    exchange_ts_ms: Optional[int] = Field(default=None, validation_alias="ts_ex_ms", serialization_alias="ts_ex_ms")
+    recv_ts_ms: Optional[int] = None
+    active: bool = True
+
+    @field_validator("exchange", mode="before")
+    def _norm_exchange_field(cls, v: Any) -> str:
+        return _norm_exchange(v)
+
+    @field_validator("symbol", mode="before")
+    def _norm_symbol_field(cls, v: Any) -> Optional[str]:
+        return _norm_symbol(v) if v else v
+
+    @field_validator("pair_key", mode="before")
+    def _norm_pair_field(cls, v: Any) -> Optional[str]:
+        return _norm_pair_key(v) if v else v
+
+    @field_validator("exchange_ts_ms", "recv_ts_ms", mode="before")
+    def _norm_ts(cls, v: Any) -> Optional[int]:
+        return int(v) if v not in (None, "") else None
+
+    @field_validator("orderbook", mode="before")
+    def _fallback_orderbook(cls, v: Any) -> Dict[str, Any]:
+        return v or {}
+
+    @model_validator(mode="after")
+    def _set_symbol_and_pair(self):
+        sym, pk = _normalize_symbol_and_pair(self.symbol, self.pair_key)
+        object.__setattr__(self, "symbol", sym or None)
+        object.__setattr__(self, "pair_key", pk or None)
+        return self
+
+    def __init__(self, **data: Any):  # type: ignore[override]
+        super().__init__(**data)
+        if ConfigDict is None:
+            self.schema_version = getattr(self, "schema_version", None) or SCHEMA_VERSION
+            self.exchange = _norm_exchange(getattr(self, "exchange", None))
+            sym, pk = _normalize_symbol_and_pair(getattr(self, "symbol", None), getattr(self, "pair_key", None))
+            self.symbol = sym or None
+            self.pair_key = pk or None
+            ts_alias = getattr(self, "ts_ex_ms", None)
+            if ts_alias is not None and getattr(self, "exchange_ts_ms", None) in (None, ""):
+                self.exchange_ts_ms = int(ts_alias) if ts_alias not in (None, "") else None
+            if getattr(self, "orderbook", None) is None:
+                self.orderbook = {}
+            if getattr(self, "exchange_ts_ms", None) is not None:
+                self.ts_ex_ms = int(getattr(self, "exchange_ts_ms"))  # type: ignore[attr-defined]
+
+
+class HealthEvent(_Cfg, BaseModel):
+    schema_version: str = Field(default=SCHEMA_VERSION)
+    exchange: str
+    last_ex_ts_ms: int = 0
+    last_recv_ts_ms: int = 0
+    age_ms: float = 0.0
+    pairs_seen: List[str] = Field(default_factory=list)
+    changed: bool = False
+    seq: Optional[int] = None
+
+    @field_validator("exchange", mode="before")
+    def _norm_exchange_field(cls, v: Any) -> str:
+        return _norm_exchange(v)
+
+    @field_validator("last_ex_ts_ms", "last_recv_ts_ms", mode="before")
+    def _norm_ts(cls, v: Any) -> int:
+        return int(v or 0)
+
+    def __init__(self, **data: Any):  # type: ignore[override]
+        super().__init__(**data)
+        if ConfigDict is None:
+            self.schema_version = getattr(self, "schema_version", None) or SCHEMA_VERSION
+            self.exchange = _norm_exchange(getattr(self, "exchange", None))
+            self.last_ex_ts_ms = int(getattr(self, "last_ex_ts_ms", 0) or 0)
+            self.last_recv_ts_ms = int(getattr(self, "last_recv_ts_ms", 0) or 0)
+
 
 # -----------------------------------------------------------------------------
 # Fragmentation helpers (front-load canonique G1/G2/G3)
@@ -436,10 +688,19 @@ class Opportunity(_Cfg, BaseModel):
     ts: float = Field(default_factory=_now_s)
     meta: Dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _alias_pair(cls, values: Dict[str, Any]):
+        if isinstance(values, dict) and "symbol" not in values and "pair" in values:
+            values = dict(values)
+            values["symbol"] = values.get("pair")
+        return values
+
     @field_validator("symbol")
     @classmethod
     def _v_symbol(cls, v: str) -> str:
         return _norm_symbol(v, keep_dash=True)
+
 
 class RiskDecision(_Cfg, BaseModel):
     symbol: str
@@ -631,6 +892,82 @@ class SlippageSnapshot(_Cfg, BaseModel):
     @field_validator("symbol", mode="before")
     def _norm_symbol_field(cls, v: Any) -> str:
         return _norm_symbol(v)
+
+class DiscoveryResult(_Cfg, BaseModel):
+    """Synthèse d'une exécution de discovery (audit + métriques)."""
+
+    schema_version: str = Field(default=SCHEMA_VERSION)
+    stage_counts: Dict[str, int] = Field(default_factory=dict)
+    filtered_counts: Dict[str, int] = Field(default_factory=dict)
+    api_errors: Dict[str, int] = Field(default_factory=dict)
+    run_ms: Optional[float] = Field(default=None, ge=0)
+    top_pairs: List[str] = Field(default_factory=list)
+
+    def __init__(self, **data: Any):  # type: ignore[override]
+        super().__init__(**data)
+        try:
+            # Si pydantic n'est pas présent, les validators ne s'exécutent pas.
+            # On applique la normalisation manuellement pour garder un contrat propre.
+            self._clean_nulls(self)
+        except Exception:
+            pass
+
+    @model_validator(mode="after")
+    def _clean_nulls(cls, data):  # type: ignore[override]
+        """Normalisation compatible pydantic v1 (root_validator) et v2 (model_validator)."""
+
+        def _normalize_counts(raw):
+            out = {}
+            for k, v in (raw or {}).items():
+                try:
+                    out[str(k)] = max(0, int(v))
+                except Exception:
+                    continue
+            return out
+
+        def _normalize_filtered(raw):
+            out = {}
+            for k, v in (raw or {}).items():
+                try:
+                    val = max(0, int(v))
+                except Exception:
+                    continue
+                if val:
+                    out[str(k)] = val
+            return out
+
+        def _normalize_errors(raw):
+            out = {}
+            for k, v in (raw or {}).items():
+                try:
+                    out[_norm_exchange(k)] = max(0, int(v))
+                except Exception:
+                    continue
+            return out
+
+        def _normalize_pairs(raw):
+            out = []
+            for p in raw or []:
+                if not p:
+                    continue
+                out.append(_norm_symbol(p))
+            return out
+
+        # pydantic v2 → data est l'instance; v1 → dict values
+        if isinstance(data, DiscoveryResult):
+            obj = data
+            object.__setattr__(obj, "stage_counts", _normalize_counts(obj.stage_counts))
+            object.__setattr__(obj, "filtered_counts", _normalize_filtered(obj.filtered_counts))
+            object.__setattr__(obj, "api_errors", _normalize_errors(obj.api_errors))
+            object.__setattr__(obj, "top_pairs", _normalize_pairs(obj.top_pairs))
+            return obj
+
+        values = dict(data or {})
+        values["stage_counts"] = _normalize_counts(values.get("stage_counts"))
+        values["filtered_counts"] = _normalize_filtered(values.get("filtered_counts"))
+        values["api_errors"] = _normalize_errors(values.get("api_errors"))
+        values["top_pairs"] = _normalize_pairs(values.get("top_pairs"))
+        return values
 
 class VolatilitySnapshot(_Cfg, BaseModel):
     exchange: str
@@ -859,19 +1196,19 @@ def make_submit_bundle(*,
 __all__ = [
     "SCHEMA_VERSION", "SCHEMA_VERSION_MAJOR",
     "Side", "Action", "Liquidity",
+    "MarketEvent", "VolEvent", "SlipEvent", "HealthEvent",
     "Opportunity", "RiskDecision", "EngineAction",
     "SubmitLeg", "OrderIntent", "SubmitBundleRequest", "SubmitBundle", "CancelRequest",
     "OrderModel", "FillModel", "FillNormalized",
     "FeesSnapshot", "SlippageSnapshot", "VolatilitySnapshot",
-    "SimResult",
-    "opportunity_from_scanner", "decision_submit_from_rm", "engine_action_from_decision",
+    "DiscoveryResult", "SimResult",  "opportunity_from_scanner", "decision_submit_from_rm", "engine_action_from_decision",
     "submit_leg_from_intent", "engine_action_from_intent",
     "validate_payload_lite", "validate_opportunity_lite", "validate_decision_lite",
     "validate_engine_action_lite", "validate_order_lite", "validate_fill_lite",
     "validate_submit_bundle_lite", "validate_cancel_lite",
     "validate_fill_normalized_lite", "validate_order_intent_lite", "make_submit_bundle",
     # >>> PATCH #3 — helpers publics
-    "norm_symbol", "pair_key",
+    "norm_symbol", "pair_key","encode_flow_meta",
     # Fragmentation helpers
     "normalize_frontload_weights", "build_fragment_plan", "validate_fragment_plan",
 ]

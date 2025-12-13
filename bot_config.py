@@ -82,7 +82,8 @@ class _Env:
         except Exception:
             pass
         # fallback: CSV
-        return [t.strip() for t in v.split(',') if t.strip()]
+        separator = ',' if sep is None else sep
+        return [t.strip() for t in v.split(separator) if t.strip()]
 
     @staticmethod
     def get_dict(name: str, default: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
@@ -209,22 +210,50 @@ class Globals:
         "simulator": True,
     })
 
+@dataclass
+class FlowSafetyConfig:
+    """
+    Profils de sécurité des flows (hedge/unwind/core/opportunistic...).
+
+    - ALWAYS_ON : à préserver même en mode très dégradé (hedge/unwind).
+    - LUXURY    : à couper en premier (opportunistic).
+    - NORMAL    : flows standard soumis aux overlays.
+    """
+
+    profiles: Dict[str, str] = field(
+        default_factory=lambda: {
+            "hedge": "ALWAYS_ON",
+            "unwind": "ALWAYS_ON",
+            "rebalance": "NORMAL",
+            "core": "NORMAL",
+            "opportunistic": "LUXURY",
+            "maintenance": "NORMAL",
+        }
+    )
+
 
 # --- Router ---
 @dataclass
 class RouterCfg:
     coalesce_window_ms: int = 20
     stale_ms: int = 1200
-    shards_per_exchange: int = 2
+    # shards_per_exchange = (BINANCE, BYBIT, COINBASE)
+    shards_per_exchange: Tuple[int, int, int] = (2, 1, 1)
     out_queues_maxlen: int = 20000
-    mux_poll_ms: int = 2
+    # P0: quotas stream-centrics optionnels par kind (combo/vol/slip/health)
+    # ex: {"combo": 5000, "vol": 2000, "slip": 2000, "health": 2000}
+    out_queues_maxlen_by_kind: Dict[str, int] = field(default_factory=dict)
+    # P0: cadence cible ≈ 5 ms
+    mux_poll_ms: int = 5
     require_l2_first: bool = True
-    drop_policy: Dict[str,str] = field(default_factory=lambda: {
+    # P0: matrix de comportement par tier, pilotée par env (ROUTER_DROP_POLICY)
+    drop_policy: Dict[str, Any] = field(default_factory=lambda: {
         "CORE": "never",
         "PRIMARY": "conservative",
         "AUDITION": "best_effort",
         "SANDBOX": "drop_when_backlog",
     })
+    # P0: paramètres de backpressure Router (ROUTER_BACKPRESSURE)
     deque_maxlen_per_ex: Dict[str, int] = field(default_factory=lambda: {
         "DEFAULT": 8,
         "BINANCE": 8,
@@ -237,7 +266,9 @@ class RouterCfg:
         "BP_DEQUE_GROW": 8,
         "COOLDOWN_S": 5.0,
     })
-    cb_coalesce_bump_ms: int = 12
+    # P0: bump spécifique Coinbase en SPLIT (ROUTER_CB_COALESCE_BUMP_MS)
+    cb_coalesce_bump_ms: int = 10
+    # P0: plafond Hz par topic (ROUTER_TOPIC_MAX_HZ)
     topic_max_hz: Dict[str, float] = field(default_factory=dict)
 
 # --- WS Public ---
@@ -303,34 +334,6 @@ class DiscoveryCfg:
 
 
 # --- Scanner ---
-# ---------------------------------------------------------------------------
-# Router / Scanner & RiskManager configs
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RouterCfg:
-    coalesce_window_ms: int = 20
-    stale_ms: int = 1200
-    shards_per_exchange: Tuple[int, int, int] = (2, 1, 1)
-    out_queues_maxlen: int = 20000
-    # P0: quotas stream-centrics optionnels par kind (combo/vol/slip/health)
-    # ex: {"combo": 5000, "vol": 2000, "slip": 2000, "health": 2000}
-    out_queues_maxlen_by_kind: Dict[str, int] = field(default_factory=dict)
-    # P0: cadence cible ≈ 5 ms
-    mux_poll_ms: int = 5
-    require_l2_first: bool = True
-    # P0: matrix de comportement par tier, pilotée par env (ROUTER_DROP_POLICY)
-    drop_policy: Dict[str, Any] = field(default_factory=dict)
-    # P0: taille des deques internes par exchange (ROUTER_DEQUE_MAXLEN_PER_EX)
-    deque_maxlen_per_ex: Dict[str, int] = field(default_factory=dict)
-    # P0: paramètres de backpressure Router (ROUTER_BACKPRESSURE)
-    backpressure: Dict[str, Any] = field(default_factory=dict)
-    # P0: bump spécifique Coinbase en SPLIT (ROUTER_CB_COALESCE_BUMP_MS)
-    cb_coalesce_bump_ms: int = 10
-    # P0: plafond Hz par topic (ROUTER_TOPIC_MAX_HZ)
-    topic_max_hz: Dict[str, float] = field(default_factory=dict)
-
 
 @dataclass
 class ScannerCfg:
@@ -670,7 +673,7 @@ class EngineCfg:
         "MID": 24,
         "LARGE": 40,
     })
-
+    inflight_max_by_exchange: Dict[str, int] = field(default_factory=dict)
     # Capacité max d'ordres "inflight" par exchange ET par profil.
     # Par défaut, chaque CEX peut encaisser à lui seul le budget global du profil.
     # Plus tard, tu pourras brider un CEX en baissant ses valeurs via .env.
@@ -828,6 +831,9 @@ class VolatilityCfg:
     window_micro_m: int = 1
     window_long_m: int = 10
     winsor_pct: float = 0.01
+    midprice_to_bps: float = 1e4
+    to_bps_floor: float = 0.0
+    to_bps_cap: float = 250.0
     ema_alpha: float = 0.20
     soft_cap_bps: float = 80.0
     chaos_cap_bps: float = 150.0
@@ -1052,6 +1058,7 @@ class BotConfig:
     pws: PrivateWSHubCfg = field(default_factory=PrivateWSHubCfg)
     rebal: RebalancingCfg = field(default_factory=RebalancingCfg)
     reconciler: ReconcilerCfg = field(default_factory=ReconcilerCfg)
+    flow_safety: FlowSafetyConfig = field(default_factory=FlowSafetyConfig)
 
     balances: BalanceFetcherCfg = field(default_factory=BalanceFetcherCfg)
     slip: SlippageCfg = field(default_factory=SlippageCfg)
@@ -1379,6 +1386,11 @@ class BotConfig:
             getattr(cfg, "RM_FEE_TOKEN_MIN_PCT", 5.0),
         )
 
+        # Profils de sécurité pour les flows (optionnel, sert de carte de priorisation)
+        cfg.flow_safety.profiles = _Env.get_dict(
+            "FLOW_SAFETY_PROFILES",
+            cfg.flow_safety.profiles,
+        )
 
         # --- Discovery : configuration centrale de l'univers -----------------
         # Volumes minimaux 24h (USD) et par quote
@@ -1804,6 +1816,9 @@ class BotConfig:
 
         cfg.slip.ttl_s = _Env.get_int("SLIP_TTL_S", cfg.slip.ttl_s)  # alias historique
         cfg.vol.ttl_s = _Env.get_int("VOL_TTL_S", cfg.vol.ttl_s)  # alias historique
+        cfg.vol.midprice_to_bps = _Env.get_float("VOL_MIDPRICE_TO_BPS", cfg.vol.midprice_to_bps)
+        cfg.vol.to_bps_floor = _Env.get_float("VOL_TO_BPS_FLOOR", cfg.vol.to_bps_floor)
+        cfg.vol.to_bps_cap = _Env.get_float("VOL_TO_BPS_CAP", cfg.vol.to_bps_cap)
         cfg.rm.mm_ttl_ms = _Env.get_int("MM_TTL_MS", cfg.rm.mm_ttl_ms)
         cfg.vol.vm_size_factor_map = _Env.get_dict("VM_SIZE_FACTOR_MAP", cfg.vol.vm_size_factor_map)
         cfg.vol.vm_min_bps_boost_map = _Env.get_dict("VM_MIN_BPS_BOOST_MAP", cfg.vol.vm_min_bps_boost_map)

@@ -37,7 +37,7 @@ class TokenBucket:
       - update()/update_sync() pour changer rate/burst à chaud
     """
 
-    def __init__(self, rate_per_s: Optional[float]=None, burst: Optional[int]=None, name: str='', *, capacity: Optional[int]=None, rate: Optional[float]=None, fair: bool=False, min_sleep_s: float=0.005, max_sleep_s: float=0.05):
+    def __init__(self, rate_per_s: Optional[float]=None, burst: Optional[int]=None, name: str='', *, capacity: Optional[int]=None, rate: Optional[float]=None, fair: bool=False, min_sleep_s: float=0.005, max_sleep_s: float=0.05, on_ratelimit: Optional[Callable[[str], None]] = None):
         if rate_per_s is None and rate is not None:
             rate_per_s = float(rate)
         if burst is None and capacity is not None:
@@ -60,6 +60,7 @@ class TokenBucket:
         self.blocked: int = 0
         self._async_waiters: int = 0
         self._sync_waiters: int = 0
+        self._on_ratelimit = on_ratelimit
 
     def _now(self) -> float:
         return time.perf_counter()
@@ -70,6 +71,14 @@ class TokenBucket:
         if dt > 0:
             self.tokens = min(self.capacity, self.tokens + dt * self.rate)
             self.ts = now
+
+    def _notify_ratelimit(self, label: str) -> None:
+        try:
+            if self._on_ratelimit:
+                self._on_ratelimit(label)
+        except Exception:
+            # best-effort : l'observabilité ne doit pas casser le bucket
+            pass
 
     async def acquire(self, n: float=1.0, timeout: Optional[float]=None) -> None:
         if n <= 0:
@@ -95,7 +104,9 @@ class TokenBucket:
                     remain = deadline - self._now()
                     if remain <= 0 or wait > remain:
                         eta = self.next_available_in(n)
-                        raise asyncio.TimeoutError(f'{self.name}.acquire timeout (need={n}, eta~{eta:.3f}s, tokens~{self.next_tokens():.2f})')
+                        self._notify_ratelimit('async_timeout')
+                        raise asyncio.TimeoutError(
+                            f'{self.name}.acquire timeout (need={n}, eta~{eta:.3f}s, tokens~{self.next_tokens():.2f})')
                 await asyncio.sleep(wait)
         finally:
             if self.fair and registered:
@@ -103,19 +114,22 @@ class TokenBucket:
                     if self._async_waiters > 0:
                         self._async_waiters -= 1
 
-    async def try_acquire(self, n: float=1.0) -> bool:
+    async def try_acquire(self, n: float = 1.0) -> bool:
         if n <= 0:
             return True
         n = float(n)
         async with self._async_lock:
             if self.fair and (self._async_waiters > 0 or self._sync_waiters > 0):
+                self._notify_ratelimit('async_fair')
                 return False
             self._refill_unlocked()
             if self.tokens >= n:
                 self.tokens -= n
                 self.granted += int(n)
                 return True
+            self._notify_ratelimit('async_tokens')
             return False
+
 
     async def update(self, rate_per_s: Optional[float]=None, burst: Optional[int]=None) -> None:
         async with self._async_lock:
@@ -163,13 +177,16 @@ class TokenBucket:
         n = float(n)
         with self._thread_lock:
             if self.fair and (self._async_waiters > 0 or self._sync_waiters > 0):
+                self._notify_ratelimit('sync_fair')
                 return False
             self._refill_unlocked()
             if self.tokens >= n:
                 self.tokens -= n
                 self.granted += int(n)
                 return True
+            self._notify_ratelimit('sync_tokens')
             return False
+
 
     def wait(self, n: float=1.0, timeout: Optional[float]=None) -> None:
         if n <= 0:
@@ -195,8 +212,9 @@ class TokenBucket:
                     remain = deadline - self._now()
                     if remain <= 0 or sleep_s > remain:
                         eta = self.next_available_in(n)
-                        raise TimeoutError(f'{self.name}.wait timeout (need={n}, eta~{eta:.3f}s, tokens~{self.next_tokens():.2f})')
-                time.sleep(min(sleep_s, self.max_sleep_s))
+                        self._notify_ratelimit('sync_timeout')
+                        raise TimeoutError(
+                            f'{self.name}.wait timeout (need={n}, eta~{eta:.3f}s, tokens~{self.next_tokens():.2f})')
         finally:
             if self.fair and registered:
                 with self._thread_lock:

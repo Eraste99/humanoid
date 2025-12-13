@@ -459,13 +459,22 @@ class Boot:
 
         discovered: List[str] = []
         pairs_map: Dict[str, Any] = {}
+        disc_result = None
         if use_discovery:
             try:
 
-                pairs_map, discovered = await discover_pairs_3cex(self.cfg)
+                pairs_map, discovered, disc_result = await discover_pairs_3cex(self.cfg, include_result=True)
                 if top_n > 0 and len(discovered) > top_n:
                     discovered = discovered[:top_n]
                 self.log.info("[Boot] discovery: %d pairs (top_n=%d)", len(discovered), top_n)
+                if disc_result:
+                    self.log.info(
+                        "[Boot] discovery audit stages=%s filtered=%s api_errors=%s run_ms=%.1f",
+                        disc_result.stage_counts,
+                        disc_result.filtered_counts,
+                        disc_result.api_errors,
+                        float(disc_result.run_ms or 0.0),
+                    )
             except Exception as e:
                 self.log.warning("[Boot] discovery failed: %s → fallback config", e)
                 discovered = []
@@ -577,16 +586,23 @@ class Boot:
                 getattr(getattr(self.cfg, "router", object()), "require_l2_first", True)
             ),
             combos=combos,
+            bot_cfg=self.cfg,
+            router_cfg=getattr(self.cfg, "router", None),
         )
 
-        # --- Brancher la BotConfig sur le Router pour les quotas stream-centrics ---
-        # Permet au MarketDataRouter d'utiliser cfg.router.out_queues_maxlen[_by_kind]
-        # pour dimensionner les deques combo/vol/slip/health.
-        self.ctx.router.bot_cfg = self.cfg
+        try:
+            self._wire_volatility_monitor()
+        except Exception:
+            self.log.exception("[Boot] Wiring volatility monitor failed")
+
+        try:
+            self._wire_slippage_handler()
+        except Exception:
+            self.log.exception("[Boot] Wiring slippage handler failed")
 
         # Lance Router en tâche non-bloquante
         self._router_task = asyncio.create_task(self.ctx.router.start(), name="boot-router-start")
-
+        
         # Attente best-effort d’un signal de readiness (si exposé)
         _raw = getattr(self.cfg, "ROUTER_READY_TIMEOUT_S", None)
         router_ready_to = float(5.0 if (_raw is None or (isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})) else _raw)
@@ -601,6 +617,54 @@ class Boot:
         self.ready_router.set()
         self._mark_stage("router_started")
         self.log.info("[Boot] Router démarré. combos=%s", combos)
+
+    def _wire_volatility_monitor(self) -> None:
+        """Attache les files bus vol et forward scanner/config pour la Volatility."""
+        vol = getattr(self.ctx, "volatility", None)
+        router = getattr(self.ctx, "router", None)
+        if not vol or not router:
+            return
+
+        vol_cfg = getattr(self.cfg, "vol", None)
+        if vol_cfg and hasattr(vol, "set_bps_mapping"):
+            vol.set_bps_mapping(
+                midprice_to_bps=getattr(vol_cfg, "midprice_to_bps", 1e4),
+                floor_bps=getattr(vol_cfg, "to_bps_floor", 0.0),
+                cap_bps=getattr(vol_cfg, "to_bps_cap", 250.0),
+            )
+
+        if hasattr(vol, "set_scanner"):
+            scanner = getattr(self.ctx, "scanner", None) or self._scanner_proxy
+            try:
+                vol.set_scanner(scanner)
+            except Exception:
+                self.log.debug("[Boot] set_scanner on volatility monitor failed", exc_info=True)
+
+        queues: Dict[str, asyncio.Queue] = {}
+        for ex in getattr(router, "exchanges", []):
+            qmap = router.out_queues.get(MarketDataRouter._cex_key(ex), {})
+            q = qmap.get("vol") if isinstance(qmap, dict) else None
+            if q:
+                queues[str(ex).upper()] = q
+        if queues and hasattr(vol, "attach_bus_vol_queues"):
+            vol.attach_bus_vol_queues(queues)
+
+    def _wire_slippage_handler(self) -> None:
+        """Attache les files bus slip pour le SlippageHandler (mode bus only)."""
+        slip = getattr(self.ctx, "slippage", None)
+        router = getattr(self.ctx, "router", None)
+        if not slip or not router:
+            return
+
+        queues: Dict[str, asyncio.Queue] = {}
+        for ex in getattr(router, "exchanges", []):
+            qmap = router.out_queues.get(MarketDataRouter._cex_key(ex), {})
+            q = qmap.get("slip") if isinstance(qmap, dict) else None
+            if q:
+                queues[str(ex).upper()] = q
+
+        if queues and hasattr(slip, "attach_bus_slip_queues"):
+            slip.attach_bus_slip_queues(queues)
 
     # --- boot.py (dans class Boot) ---
     async def _start_rm(self) -> None:

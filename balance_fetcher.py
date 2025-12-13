@@ -187,6 +187,9 @@ class MultiBalanceFetcher:
         self._bal_ttl_default_block = float(getattr(bf_cfg, "BALANCES_TTL_S_BLOCK", 120.0))
         self._bal_ttl_by_ex: Dict[str, Dict[str, float]] = {}
         self._balances_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # Seuils observabilité WS/Reconciler pour dériver capital_at_risk
+        self._ws_miss_rate_thr = float(getattr(bf_cfg, "BF_WS_RECO_MISS_RATE_THR_PER_MIN", 30.0))
+        self._ws_resync_age_thr_s = float(getattr(bf_cfg, "BF_WS_RECO_RESYNC_AGE_THR_S", 6 * 3600.0))
 
         # Comptes par alias (upper)
         self.binance_accounts = { _upper(k): v for k, v in (binance_accounts or {}).items() }
@@ -1299,6 +1302,8 @@ class MultiBalanceFetcher:
         """
         Agrège les statuts comptes WS pour un (exchange, alias) à partir des
         providers Hub / Reconciler, et dérive un flag capital_at_risk.
+        Retourne toujours une structure minimale même si les providers ne
+        remontent pas de données pour l’alias demandé.
         """
         ex, al = _upper(exchange), _upper(alias)
 
@@ -1322,20 +1327,27 @@ class MultiBalanceFetcher:
         hub_status = (hub_snap or {}).get("status", "WS_UNKNOWN")
         reco_status = (reco_snap or {}).get("status", "UNKNOWN")
 
-        # Politique simple P0: on marque le capital « à risque » si le Hub est dégradé/down
-        # ou si le Reconciler voit des misses significatifs.
-        capital_at_risk = False
-        if hub_status in ("WS_DEGRADED", "WS_DOWN"):
-            capital_at_risk = True
-        if reco_status in ("AT_RISK", "BROKEN"):
-            capital_at_risk = True
+        miss_rate_per_min = float((reco_snap or {}).get("miss_rate_per_min", 0.0) or 0.0)
+        age_since_resync = float((reco_snap or {}).get("age_since_last_alias_resync_s", 0.0) or 0.0)
 
+        capital_at_risk = self._derive_capital_at_risk(
+            ws_status=hub_status,
+            reco_status=reco_status,
+            miss_rate_per_min=miss_rate_per_min,
+            age_since_last_alias_resync_s=age_since_resync,
+            thr_miss_rate=self._ws_miss_rate_thr,
+            thr_resync_age_s=self._ws_resync_age_thr_s,
+        )
         out: Dict[str, Any] = {
             "exchange": ex,
             "alias": al,
             "capital_at_risk": capital_at_risk,
             "hub_status": hub_status,
             "reco_status": reco_status,
+            "miss_rate_per_min": miss_rate_per_min,
+            "age_since_last_alias_resync_s": age_since_resync if age_since_resync > 0.0 else None,
+            "raw_hub": hub_snap or {},
+            "raw_reconciler": reco_snap or {},
         }
 
         if hub_snap:
@@ -1357,6 +1369,38 @@ class MultiBalanceFetcher:
 
         return out
 
+    @staticmethod
+    def _derive_capital_at_risk(
+            *,
+            ws_status: str,
+            reco_status: str,
+            miss_rate_per_min: float,
+            age_since_last_alias_resync_s: float | None,
+            thr_miss_rate: float,
+            thr_resync_age_s: float,
+    ) -> bool:
+        """Heuristique commune Hub/Reconciler pour déterminer capital_at_risk.
+
+        True si:
+          - Reconciler BROKEN ou WS DOWN
+          - Reconciler AT_RISK ou WS_DEGRADED avec miss_rate/resync_age au-delà
+            des seuils fournis.
+        """
+        ws_status_u = (ws_status or "WS_UNKNOWN").upper()
+        reco_status_u = (reco_status or "UNKNOWN").upper()
+
+        if reco_status_u in ("BROKEN",):
+            return True
+        if ws_status_u in ("WS_DOWN",):
+            return True
+
+        if reco_status_u in ("AT_RISK",) or ws_status_u in ("WS_DEGRADED",):
+            if float(miss_rate_per_min or 0.0) >= float(thr_miss_rate or 0.0):
+                return True
+            if float(age_since_last_alias_resync_s or 0.0) >= float(thr_resync_age_s or 0.0):
+                return True
+
+        return False
 
     def as_rm_snapshot(self, *, mode: str = "real", cached_only: bool = False) -> Dict[str, Any]:
         """
@@ -1364,35 +1408,53 @@ class MultiBalanceFetcher:
 
         Retourne toujours un dict de la forme :
             {
-                "mode": str,                       # "real" | "virtual" | "merged"
+                "mode": "real" | "virtual" | "merged",
                 "balances": {                      # vue capitale opérationnelle
-                    EXCHANGE: {
-                        ALIAS: {ASSET: float, ...},
-                        ...
-                    },
+                    EXCHANGE: {ALIAS: {ASSET: float, ...}, ...},
                     ...
                 },
-                                "meta": {                          # métriques de fraîcheur & fees & WS
+                 "meta": {                          # métriques de fraîcheur & fees & WS
                     "age_s": { "EX.ALIAS": float, ... },
-                    "vip": { "EX.ALIAS": {...}, ... },
                     "fee_tokens": {
-                        "BNB": { "EX.ALIAS": {...}, ... },
-                        ...
-                    },
-                    "ws_accounts": {               # statut comptes WS agrégé
-                        "EX.ALIAS": {
-                            "capital_at_risk": bool,
-                            "hub_status": str,
-                            "reco_status": str,
-                            ...
+                        TOKEN: {
+                            "EX.ALIAS": {
+                                "balance": float,
+                                "level": "low" | "ok" | "high",
+                                "low_watermark": float,
+                                "high_watermark": float,
+                            },
+                            ...,
                         },
-                        ...
+                    "vip": { "EX.ALIAS": {...}, ... },},
+                    "ws_accounts": {               # statut comptes WS agrégé
+                           "EX.ALIAS": {
+                            "hub_status": "WS_OK" | "WS_DEGRADED" | "WS_DOWN" | "WS_UNKNOWN",
+                            "reco_status": "OK" | "AT_RISK" | "BROKEN" | "UNKNOWN",
+                            "capital_at_risk": bool,
+                            "miss_rate_per_min": float | None,
+                            "age_since_last_alias_resync_s": float | None,
+                            "raw_hub": {...},         # optionnel
+                            "raw_reconciler": {...},  # optionnel
+                        },
+                        ...,
                     },
-                    "view": str,                   # vue demandée ("real"/"virtual"/"merged")
+                    "balances_health": {
+                        "EX.ALIAS": {
+                            "state": "NORMAL" | "DEGRADED" | "BLOCK",
+                            "age_s": float,
+                            "ttl_normal_s": float,
+                            "ttl_degraded_s": float,
+                            "ttl_block_s": float,
+                        },
+                        ...,
+
+                    },
+                    "view": "real" | "virtual" | "merged",
                     "cached_only": bool,
+                    "as_of_ts": float,  # horodatage monotonic
                 },
 
-        - `        - `mode` est aligné sur `get_balances_snapshot` (real/virtual/merged).
+        - `mode` est aligné sur `get_balances_snapshot` (real/virtual/merged).
         - `cached_only=True` ne déclenche aucune I/O : si rien n’est en cache,
           on renvoie juste des métadonnées cohérentes.
         - `meta["age_s"]` est la source UNIQUE des TTL balances par (exchange, alias)
@@ -1500,6 +1562,7 @@ class MultiBalanceFetcher:
             "balances_health": meta_bal_health,
             "view": view,
             "cached_only": bool(cached_only),
+            "as_of_ts": time.monotonic(),
         }
 
         return {

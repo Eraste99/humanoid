@@ -1,7 +1,7 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-import asyncio
+# -*- coding: utf-8 -*-
 from typing import Any, Dict, List, Tuple, Optional
+import asyncio
 import logging, time
 _LOG = logging.getLogger('RMCompat')
 _USD_ALIAS_WARN_EVERY_S = 60.0
@@ -20,6 +20,7 @@ __all__ = [
     "getattr_bool", "getattr_dict", "getattr_list",
     "_as_int_or", "_as_float_or","_as_bool_or","_as_str_or",
     "_as_dict_or_empty",
+    "_canonicalize_risk_meta",
 ]
 
 def _as_int_or(self, x: Any, default: int) -> int:  # noqa: D401
@@ -72,6 +73,35 @@ def getattr_list(obj: Any, name: str) -> List[Any]:
     v = getattr(obj, name, [])
     v = [] if v is None else v
     return list(v)
+
+
+def _canonicalize_risk_meta(meta: Optional[Dict[str, Any]],
+                            *,
+                            rm_mode: Optional[str] = None,
+                            trade_mode: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Best-effort: garantit la présence des métadonnées rm_mode / trade_mode et
+    normalise flow_kind / risk_effect via payloads.encode_flow_meta.
+
+    Les valeurs existantes dans meta ont la priorité; rm_mode / trade_mode sont
+    uppercased si fournis. N'attrape pas d'exception sur import pour rester
+    compat avec les usages Engine.
+    """
+    base = dict(meta or {})
+    if rm_mode:
+        base.setdefault("rm_mode", str(rm_mode).upper())
+    if trade_mode:
+        base.setdefault("trade_mode", str(trade_mode).upper())
+
+    try:
+        from payloads import encode_flow_meta  # type: ignore
+
+        flow = encode_flow_meta(base.get("flow_kind"), base.get("risk_effect"))
+        base.update(flow)
+    except Exception:
+        # Fallback silencieux si payloads n'est pas dispo dans le contexte
+        pass
+    return base
 
 
 
@@ -163,8 +193,23 @@ class RMCompat:
             amt_q = float(x['amount_usdc'])
         else:
             amt_q = 0.0
-        return {'type': 'arbitrage_bundle', 'pair': pair, 'strategy': 'TM', 'legs': [{'exchange': x['to_exchange'], 'alias': x.get('buy_alias') or 'TT', 'side': 'BUY', 'symbol': pair, 'volume_quote': amt_q, 'quote': quote}, {'exchange': x['from_exchange'], 'alias': x.get('sell_alias') or 'TT', 'side': 'SELL', 'symbol': pair, 'volume_quote': amt_q, 'quote': quote}], 'meta': {'type': 'rebalancing', 'allow_loss_bps': x.get('allow_loss_bps', 0.0)}}
-
+        meta = _canonicalize_risk_meta(
+            {'type': 'rebalancing', 'allow_loss_bps': x.get('allow_loss_bps', 0.0)},
+            rm_mode=x.get('rm_mode'),
+            trade_mode=x.get('trade_mode'),
+        )
+        return {
+            'type': 'arbitrage_bundle',
+            'pair': pair,
+            'strategy': 'TM',
+            'legs': [
+                {'exchange': x['to_exchange'], 'alias': x.get('buy_alias') or 'TT', 'side': 'BUY', 'symbol': pair,
+                 'volume_quote': amt_q, 'quote': quote},
+                {'exchange': x['from_exchange'], 'alias': x.get('sell_alias') or 'TT', 'side': 'SELL', 'symbol': pair,
+                 'volume_quote': amt_q, 'quote': quote},
+            ],
+            'meta': meta,
+        }
     def _normalize_single(self, order: Dict[str, Any]) -> Dict[str, Any]:
         """
         Entrée: {"type":"single","exchange","symbol","side","price"?,"qty"?, "volume_quote|volume_usdc|volume"?}
@@ -240,6 +285,9 @@ class RMCompat:
         Délègue au chemin ‘single’ de l’engine une fois qty/price prêts.
         Ton implémentation existante peut s’appeler _execute_single / execute_single / submit_single.
         """
+        leg['meta'] = _canonicalize_risk_meta(leg.get('meta'),
+                                              rm_mode=leg.get('rm_mode'),
+                                              trade_mode=leg.get('trade_mode'))
         if hasattr(self, '_execute_single'):
             return await self._execute_single(leg)
         if hasattr(self, 'execute_single'):

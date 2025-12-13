@@ -37,8 +37,11 @@ try:
         VOL_ANOMALY_TOTAL,
         VOL_SIGNAL_STATE,
         set_vol_age_seconds,
+        note_vol_ttl_seconds,
     )
 except Exception:  # pragma: no cover
+
+
     class _Noop:
         def labels(self, *_, **__):
             return self
@@ -59,9 +62,13 @@ except Exception:  # pragma: no cover
     VOL_ANOMALY_TOTAL = _Noop()
     VOL_SIGNAL_STATE = _Noop()
 
+
     def set_vol_age_seconds(*_, **__):
         return None
 
+
+    def note_vol_ttl_seconds(*_, **__):
+        return None
 
 def _to_float(x) -> float:
     try:
@@ -103,12 +110,16 @@ class VolatilityMonitor:
         self.cfg = cfg
         v = self.cfg.vol
 
-        # --- TTL & cœur vol depuis cfg ---
-        self._ttl_s          = getattr_int(v, "ttl_s", 5)
-        self._ema_alpha      = getattr_float(v, "ema_alpha", 0.20)
-        self._soft_cap_bps   = getattr_float(v, "soft_cap_bps", 80.0)
-        self._chaos_cap_bps  = getattr_float(v, "chaos_cap_bps", 150.0)
-        self._hysteresis     = getattr_float(v, "hysteresis", 0.25)
+        self._ttl_s = getattr_int(v, "ttl_s", 5)
+        self._ema_alpha = getattr_float(v, "ema_alpha", 0.20)
+        self._soft_cap_bps = getattr_float(v, "soft_cap_bps", 80.0)
+        self._chaos_cap_bps = getattr_float(v, "chaos_cap_bps", 150.0)
+        self._hysteresis = getattr_float(v, "hysteresis", 0.25)
+
+        try:
+            note_vol_ttl_seconds(self._ttl_s)
+        except Exception:
+            pass
 
         # --- Fenêtres: si l'appelant garde les defaults (60 / 2), on prend cfg.vol.window_*_m s'ils existent
         _DEF_LONG = 60
@@ -566,6 +577,9 @@ class VolatilityMonitor:
         self.update_count = 0
         self.last_update = None
 
+    def set_risk_manager(self, rm: Any) -> None:
+        self.risk_manager = rm
+
     def get_status(self) -> Dict[str, Any]:
         vols: List[float] = []
         now_dt = datetime.utcnow()
@@ -579,7 +593,7 @@ class VolatilityMonitor:
         last_ts = self.last_update.timestamp() if self.last_update else None
         age_s = (time.time() - last_ts) if last_ts else None
 
-        return {
+        st: Dict[str, Any] = {
             "module": "VolatilityMonitor",
             "healthy": True,
             "last_update": last_ts,
@@ -590,6 +604,19 @@ class VolatilityMonitor:
             "metrics": {"volatility_index": round(self.volatility_index, 6)},
             "submodules": {},
         }
+        rm = getattr(self, "risk_manager", None)
+        if rm is not None:
+            try:
+                modes = {
+                    "rm_mode": str(getattr(rm, "rm_mode", "UNKNOWN")),
+                    "trade_mode": str(getattr(rm, "trade_mode", "UNKNOWN")),
+                }
+                if hasattr(rm, "private_plane_state"):
+                    modes["private_plane_state"] = str(rm.private_plane_state)
+                st["modes"] = modes
+            except Exception:
+                pass
+        return st
 
     def stop_monitoring(self) -> None:
         logger.info("🛑 VolatilityMonitor stoppé.")

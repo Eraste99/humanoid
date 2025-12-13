@@ -509,6 +509,36 @@ class EnginePacer:
             st = self._ensure_region(rg)
             return self._derive_pacer_mode(st)
 
+    def get_pacer_snapshot(self, region: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Snapshot consolidé (read-only) du Pacer pour une région.
+
+        Structure retournée :
+            {
+                "region": str,
+                "pacer_mode": "NORMAL" | "CONSTRAINED" | "SEVERE",
+                "ack_p95_ms": float | None,
+                "err_rate": float | None,
+                "backpressure_level": float | None,
+                "inflight": int | None,
+                "as_of_ts": float,   # horodatage monotonic
+            }
+        """
+        rg = self._norm_region(region or self._default_region)
+        with self._lock:
+            st = self._ensure_region(rg)
+            pacer_mode = self._derive_pacer_mode(st)
+            has_samples = st.last_update_ts > 0.0
+
+            return {
+                "region": rg,
+                "pacer_mode": pacer_mode,
+                "ack_p95_ms": float(st.ack_ms) if has_samples else None,
+                "err_rate": float(st.err_rate) if has_samples else None,
+                "backpressure_level": None,
+                "inflight": int(st.inflight_max) if st.inflight_max is not None else None,
+                "as_of_ts": time.monotonic(),
+            }
 
     # ------------------ core logic ------------------
 

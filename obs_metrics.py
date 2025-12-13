@@ -411,6 +411,10 @@ ROUTER_DROPPED_TOTAL = _metric(Counter, 'router_dropped_total', 'Router dropped 
 ROUTER_COMBO_SKEW_MS = _metric(Histogram, 'router_combo_skew_ms', 'Router combo skew (ms)', ['route'], buckets=BUCKETS_MS)
 ROUTER_TO_SCANNER_MS = _metric(Histogram, 'router_to_scanner_ms', 'Latency Router→Scanner (ms)', ['route'], buckets=BUCKETS_MS)
 ROUTER_TO_SCANNER_ERRORS_TOTAL = _metric(Counter, 'router_to_scanner_errors_total', 'Errors Router→Scanner', ['route', 'reason'])
+ROUTER_CFG_STALE_MS = _metric(Gauge, 'router_cfg_stale_ms', 'Configured Router stale threshold (ms)')
+ROUTER_CFG_COALESCE_WINDOW_MS = _metric(Gauge, 'router_cfg_coalesce_window_ms', 'Configured Router coalesce window (ms)')
+ROUTER_CFG_REQUIRE_L2_FIRST = _metric(Gauge, 'router_cfg_require_l2_first', 'Router require_l2_first flag (1/0)')
+ROUTER_CFG_OUT_QUEUE_MAXLEN = _metric(Gauge, 'router_cfg_out_queue_maxlen', 'Router out queue maxlen by kind', ['kind'])
 
 def mark_router_to_scanner(route: str, ok: bool, dt_ms: float, reason: str = 'ok') -> None:
     try:
@@ -446,6 +450,115 @@ def mark_router_to_scanner_ts(
         # Observabilité best-effort, jamais bloquante
         pass
 
+def note_router_cfg(stale_ms: float, coalesce_window_ms: float, require_l2_first: bool, out_queue_maxlen: Dict[str, float] | float | None) -> None:
+    try:
+        safe_set(ROUTER_CFG_STALE_MS, 'router_cfg_stale_ms', 'note_router_cfg', float(stale_ms))
+        safe_set(ROUTER_CFG_COALESCE_WINDOW_MS, 'router_cfg_coalesce_window_ms', 'note_router_cfg', float(coalesce_window_ms))
+        safe_set(ROUTER_CFG_REQUIRE_L2_FIRST, 'router_cfg_require_l2_first', 'note_router_cfg', 1.0 if require_l2_first else 0.0)
+        if out_queue_maxlen is not None:
+            items = out_queue_maxlen.items() if isinstance(out_queue_maxlen, dict) else [("combo", float(out_queue_maxlen))]
+            for kind, size in items:
+                try:
+                    safe_set(
+                        ROUTER_CFG_OUT_QUEUE_MAXLEN,
+                        'router_cfg_out_queue_maxlen',
+                        'note_router_cfg',
+                        float(size),
+                        kind=_norm(kind),
+                    )
+                except Exception:
+                    OBS_NOOP_TOTAL.labels(metric='router_cfg_out_queue_maxlen', where='note_router_cfg').inc()
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='note_router_cfg', where='note_router_cfg').inc()
+
+
+def note_ws_public_cfg(
+    *,
+    ping_interval_s: float,
+    pong_timeout_s: float,
+    connect_timeout_s: float,
+    read_timeout_s: float,
+    out_queue_put_timeout_s: float | None = None,
+    chunk_size_by_exchange: Dict[str, float] | None = None,
+) -> None:
+    try:
+        safe_set(WS_PUBLIC_PING_INTERVAL_SECONDS_CONFIG, 'ws_public_ping_interval_seconds_config', 'note_ws_public_cfg', float(ping_interval_s))
+        safe_set(WS_PUBLIC_PONG_TIMEOUT_SECONDS_CONFIG, 'ws_public_pong_timeout_seconds_config', 'note_ws_public_cfg', float(pong_timeout_s))
+        safe_set(WS_PUBLIC_CONNECT_TIMEOUT_SECONDS_CONFIG, 'ws_public_connect_timeout_seconds_config', 'note_ws_public_cfg', float(connect_timeout_s))
+        safe_set(WS_PUBLIC_READ_TIMEOUT_SECONDS_CONFIG, 'ws_public_read_timeout_seconds_config', 'note_ws_public_cfg', float(read_timeout_s))
+        if out_queue_put_timeout_s is not None:
+            safe_set(
+                WS_PUBLIC_OUT_QUEUE_PUT_TIMEOUT_SECONDS_CONFIG,
+                'ws_public_out_queue_put_timeout_seconds_config',
+                'note_ws_public_cfg',
+                float(out_queue_put_timeout_s),
+            )
+        if chunk_size_by_exchange:
+            for ex, size in chunk_size_by_exchange.items():
+                try:
+                    safe_set(
+                        WS_PUBLIC_CHUNK_SIZE_CONFIG,
+                        'ws_public_chunk_size_config',
+                        'note_ws_public_cfg',
+                        float(size),
+                        exchange=_norm(ex),
+                    )
+                except Exception:
+                    OBS_NOOP_TOTAL.labels(metric='ws_public_chunk_size_config', where='note_ws_public_cfg').inc()
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='note_ws_public_cfg', where='note_ws_public_cfg').inc()
+
+
+def note_vol_ttl_seconds(ttl_s: float) -> None:
+    try:
+        safe_set(VOL_TTL_SECONDS_CONFIG, 'vol_ttl_seconds_config', 'note_vol_ttl_seconds', float(ttl_s))
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='vol_ttl_seconds_config', where='note_vol_ttl_seconds').inc()
+
+
+def note_slip_ttl_seconds(ttl_s: float) -> None:
+    try:
+        safe_set(SLIP_TTL_SECONDS_CONFIG, 'slip_ttl_seconds_config', 'note_slip_ttl_seconds', float(ttl_s))
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='slip_ttl_seconds_config', where='note_slip_ttl_seconds').inc()
+
+
+def note_scanner_cfg(scan_interval_s: float, min_required_bps: float, max_pairs_per_tick: float) -> None:
+    try:
+        safe_set(SCANNER_CFG_SCAN_INTERVAL_S, 'scanner_cfg_scan_interval_s', 'note_scanner_cfg', float(scan_interval_s))
+        safe_set(SCANNER_CFG_MIN_REQUIRED_BPS, 'scanner_cfg_min_required_bps', 'note_scanner_cfg', float(min_required_bps))
+        safe_set(SCANNER_CFG_MAX_PAIRS_PER_TICK, 'scanner_cfg_max_pairs_per_tick', 'note_scanner_cfg', float(max_pairs_per_tick))
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='note_scanner_cfg', where='note_scanner_cfg').inc()
+
+
+def discovery_note_stage(stage: str, count: int) -> None:
+    try:
+        DISCOVERY_PAIRS_TOTAL.labels(stage=_norm(stage)).inc(float(max(0, int(count))))
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='discovery_pairs_total', where='discovery_note_stage').inc()
+
+
+def discovery_note_filtered(reason: str, count: int) -> None:
+    try:
+        DISCOVERY_FILTERED_TOTAL.labels(reason=_norm(reason)).inc(float(max(0, int(count))))
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='discovery_filtered_total', where='discovery_note_filtered').inc()
+
+
+def discovery_note_api_error(exchange: str) -> None:
+    try:
+        DISCOVERY_API_ERRORS_TOTAL.labels(exchange=_norm(exchange)).inc()
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='discovery_api_errors_total', where='discovery_note_api_error').inc()
+
+
+def discovery_observe_run_ms(ms: float) -> None:
+    try:
+        safe_observe(DISCOVERY_RUN_MS, 'discovery_run_ms', 'discovery_observe_run_ms', float(ms))
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='discovery_run_ms', where='discovery_observe_run_ms').inc()
+
 
 SCANNER_DECISION_MS = _metric(Histogram, 'scanner_decision_ms', 'Scanner decision latency (ms)', buckets=BUCKETS_MS)
 SCANNER_EVAL_MS = _metric(
@@ -458,6 +571,19 @@ SCANNER_EVAL_MS = _metric(
 SCANNER_GLOBAL_LOAD = _metric(Gauge, 'scanner_global_load', 'Scanner global load (0..1)')
 SCANNER_RATE_LIMITED_TOTAL = _metric(Counter, 'scanner_rate_limited_total', 'Scanner rate limited hits', ['kind', 'cohort'])
 SCANNER_EMITTED_TOTAL = _metric(Counter, 'scanner_emitted_total', 'Opportunities emitted')
+SCANNER_CFG_SCAN_INTERVAL_S = _metric(Gauge, 'scanner_cfg_scan_interval_s', 'Configured scanner scan interval (seconds)')
+SCANNER_CFG_MIN_REQUIRED_BPS = _metric(Gauge, 'scanner_cfg_min_required_bps', 'Configured scanner min_required_bps (bps)')
+SCANNER_CFG_MAX_PAIRS_PER_TICK = _metric(Gauge, 'scanner_cfg_max_pairs_per_tick', 'Configured scanner max pairs per tick')
+DISCOVERY_PAIRS_TOTAL = _metric(Counter, 'discovery_pairs_total', 'Pairs observed during discovery', ['stage'])
+DISCOVERY_FILTERED_TOTAL = _metric(Counter, 'discovery_filtered_total', 'Pairs filtered during discovery', ['reason'])
+DISCOVERY_RUN_MS = _metric(Histogram, 'discovery_run_ms', 'Discovery run duration (ms)', buckets=BUCKETS_MS)
+DISCOVERY_API_ERRORS_TOTAL = _metric(Counter, 'discovery_api_errors_total', 'Discovery API errors', ['exchange'])
+VOL_TTL_SECONDS_CONFIG = _metric(Gauge, 'vol_ttl_seconds_config', 'Configured volatility TTL (seconds)')
+SLIP_TTL_SECONDS_CONFIG = _metric(Gauge, 'slip_ttl_seconds_config', 'Configured slippage TTL (seconds)')
+SLIP_SAMPLE_TOTAL = _metric(Counter, 'slip_sample_total', 'Slippage samples ingested')
+SLIP_DECISION_TOTAL = _metric(Counter, 'slip_decision_total', 'Slippage decisions recorded')
+SLIP_P95_BPS = _metric(Gauge, 'slip_p95_bps', 'Slippage p95 (bps)')
+SLIP_P99_BPS = _metric(Gauge, 'slip_p99_bps', 'Slippage p99 (bps)')
 SCANNER_REJECTIONS_TOTAL = _metric(Counter, 'scanner_rejections_total', 'Opportunities rejected', ['reason'])
 SC_STRATEGY_SCORE = _metric(Gauge, 'sc_strategy_score', 'Strategy score', ['pair', 'route', 'branch'])
 SC_ELIGIBLE = _metric(Gauge, 'sc_eligible', 'Pair eligibility flag', ['pair'])
@@ -931,6 +1057,38 @@ if "WS_CONNECTIONS_OPEN" not in globals():
 if "WS_PUBLIC_DROPPED_TOTAL" not in globals():
     WS_PUBLIC_DROPPED_TOTAL = Counter(
         "ws_public_dropped_total", "Evénements WS publics rejetés", ["exchange", "reason"]
+    )
+
+if "WS_PUBLIC_PING_INTERVAL_SECONDS_CONFIG" not in globals():
+    WS_PUBLIC_PING_INTERVAL_SECONDS_CONFIG = Gauge(
+        "ws_public_ping_interval_seconds_config",
+        "Configured ping interval (seconds) for public WS",
+    )
+if "WS_PUBLIC_PONG_TIMEOUT_SECONDS_CONFIG" not in globals():
+    WS_PUBLIC_PONG_TIMEOUT_SECONDS_CONFIG = Gauge(
+        "ws_public_pong_timeout_seconds_config",
+        "Configured pong timeout (seconds) for public WS",
+    )
+if "WS_PUBLIC_CONNECT_TIMEOUT_SECONDS_CONFIG" not in globals():
+    WS_PUBLIC_CONNECT_TIMEOUT_SECONDS_CONFIG = Gauge(
+        "ws_public_connect_timeout_seconds_config",
+        "Configured connect/open timeout (seconds) for public WS",
+    )
+if "WS_PUBLIC_READ_TIMEOUT_SECONDS_CONFIG" not in globals():
+    WS_PUBLIC_READ_TIMEOUT_SECONDS_CONFIG = Gauge(
+        "ws_public_read_timeout_seconds_config",
+        "Configured read/close timeout (seconds) for public WS",
+    )
+if "WS_PUBLIC_OUT_QUEUE_PUT_TIMEOUT_SECONDS_CONFIG" not in globals():
+    WS_PUBLIC_OUT_QUEUE_PUT_TIMEOUT_SECONDS_CONFIG = Gauge(
+        "ws_public_out_queue_put_timeout_seconds_config",
+        "Configured out_queue put timeout (seconds) for public WS",
+    )
+if "WS_PUBLIC_CHUNK_SIZE_CONFIG" not in globals():
+    WS_PUBLIC_CHUNK_SIZE_CONFIG = Gauge(
+        "ws_public_chunk_size_config",
+        "Configured chunk size by exchange for public WS",
+        ["exchange"],
     )
 
 # === WS publics v2 (exchange / region / deployment_mode) ===

@@ -1290,8 +1290,11 @@ class DynamicExecutionSimulator:
     def get_last_result(self) -> Optional[Dict[str, Any]]:
         return self.last_result
 
+    def set_risk_manager(self, rm: Any) -> None:
+        self.risk_manager = rm
+
     def get_status(self) -> Dict[str, Any]:
-        return {
+        st: Dict[str, Any] = {
             "module": "DynamicExecutionSimulator",
             "healthy": True,
             "last_update": self.last_simulation_time,
@@ -1310,6 +1313,19 @@ class DynamicExecutionSimulator:
             "last_restart_reason": self.last_restart_reason,
             "submodules": {},
         }
+        rm = getattr(self, "risk_manager", None)
+        if rm is not None:
+            try:
+                modes = {
+                    "rm_mode": str(getattr(rm, "rm_mode", "UNKNOWN")),
+                    "trade_mode": str(getattr(rm, "trade_mode", "UNKNOWN")),
+                }
+                if hasattr(rm, "private_plane_state"):
+                    modes["private_plane_state"] = str(rm.private_plane_state)
+                st["modes"] = modes
+            except Exception:
+                pass
+        return st
 
     async def restart(self, reason: str = "inconnu"):
         logger.warning(f"[DynamicExecutionSimulator] 🔁 Redémarrage demandé : {reason}")

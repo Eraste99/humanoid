@@ -32,6 +32,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, Any, Deque, List, Optional, Tuple, Callable, Protocol, runtime_checkable
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
+from contracts.payloads import HealthEvent, MarketEvent, SlipEvent, ValidationError, VolEvent
 
 logger = logging.getLogger("MarketDataRouter")
 
@@ -57,6 +58,7 @@ try:
         ROUTER_QUEUE_HIGH_WATERMARK_TOTAL,
         ROUTER_DROPPED_TOTAL,
         WS_RECONNECTS_TOTAL,
+        note_router_cfg,
     )
 except Exception:  # pragma: no cover
     def mark_router_to_scanner_ts(
@@ -74,6 +76,7 @@ except Exception:  # pragma: no cover
         def inc(self, *a, **k):    return None
         def set(self, *a, **k):    return None
 
+
     ROUTER_QUEUE_DEPTH = _NoopMetric()
     ROUTER_PAIR_QUEUE_DEPTH = _NoopMetric()
     ROUTER_QUEUE_DEPTH_BY_EX = _NoopMetric()
@@ -81,6 +84,9 @@ except Exception:  # pragma: no cover
     ROUTER_DROPPED_TOTAL = _NoopMetric()
     WS_RECONNECTS_TOTAL = _NoopMetric()
 
+
+    def note_router_cfg(*_a, **_k):
+        return None
 
 
 # PATCH 1 — Gauge pair-level: router_queue_depths{exchange, pair}
@@ -151,6 +157,8 @@ class MarketDataRouter:
         self,
         in_queue: asyncio.Queue,
         *,
+        router_cfg=None,
+        bot_cfg=None,
         out_queues: Optional[Dict[str, Dict[str, asyncio.Queue]]] = None,
         combos: Optional[List[Tuple[str, str]]] = None,
         scanner: ScannerProtocol = None,             # ← obligatoire
@@ -190,6 +198,9 @@ class MarketDataRouter:
         if in_queue is None:
             raise ValueError("MarketDataRouter: in_queue requis")
         self.in_queue = in_queue
+        # Config injectée dès la construction (legacy : bot_cfg peut subsister)
+        self.bot_cfg = bot_cfg
+        self.router_cfg = router_cfg or (bot_cfg.router if bot_cfg is not None else None)
         self.shard = str(shard_id).upper()  # ➌ NOUVEAU
 
         # scanner obligatoire (fail-fast)
@@ -207,18 +218,27 @@ class MarketDataRouter:
             for (a, b) in (combos or [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")])
         ]
 
+        if self.router_cfg is not None:
+            stale_source_ms = getattr_int(self.router_cfg, "stale_ms", stale_source_ms)
+            coalesce_window_ms = getattr_int(self.router_cfg, "coalesce_window_ms", coalesce_window_ms)
+            require_l2_first = getattr_bool(self.router_cfg, "require_l2_first", require_l2_first)
+
+
         # --- Queues de sortie vers Scanner / Vol / Slip / Health -------------------
+        queue_max_spec: int | Dict[str, int] | None = None
         if out_queues is not None:
             # Boot peut injecter un mapping explicite pré-construit
             self.out_queues = out_queues
+            if self.router_cfg is not None:
+                queue_max_spec = getattr(self.router_cfg, "out_queues_maxlen_by_kind", None) or getattr(
+                    self.router_cfg, "out_queues_maxlen", None
+                )
         else:
             # P0 Marché Public — tailles de queues pilotées par BotConfig.router
             # 1) base globale (ROUTER_OUT_QUEUES_MAXLEN)
             base_max = 2000  # fallback legacy
-            router_cfg = None
+            router_cfg = self.router_cfg
             try:
-                cfg = getattr(self, "bot_cfg", None)
-                router_cfg = getattr(cfg, "router", None) if cfg is not None else None
                 v = getattr(router_cfg, "out_queues_maxlen", None) if router_cfg is not None else None
                 if v is not None:
                     base_max = int(v)
@@ -271,6 +291,7 @@ class MarketDataRouter:
                 combos=self.combos,
                 maxsize=maxsize_spec,
             )
+            queue_max_spec = maxsize_spec
 
 
         # vues latest (full & light) + lock
@@ -320,6 +341,16 @@ class MarketDataRouter:
         self._coalesce_buckets: Dict[str, Dict[str, Deque[Dict[str, Any]]]] = defaultdict(dict)
         # Tâches de flush programmées par paire
         self._coalesce_tasks: Dict[str, asyncio.Task] = {}
+
+        try:
+            note_router_cfg(
+                self.stale_source_ms,
+                self.coalesce_window_ms,
+                self.require_l2_first,
+                queue_max_spec,
+            )
+        except Exception:
+            pass
 
         # state per (EX,PAIR)
         self._vol_ema: Dict[Tuple[str, str], float] = {}
@@ -611,12 +642,10 @@ class MarketDataRouter:
         exu = ex.upper()
         per_ex: Mapping[str, int] = {}
 
-        cfg = getattr(self, "bot_cfg", None)
+        cfg = self.router_cfg or getattr(self, "bot_cfg", None)
         if cfg is not None:
             try:
-                router_cfg = getattr(cfg, "router", None)
-                if router_cfg is not None:
-                    per_ex = getattr(router_cfg, "deque_maxlen_per_ex", {}) or {}
+                per_ex = getattr(cfg, "deque_maxlen_per_ex", {}) or {}
             except Exception:
                 per_ex = {}
             if not per_ex:
@@ -703,14 +732,12 @@ class MarketDataRouter:
         last_flush_ms = last_hb_ms = int(time.time() * 1000)
 
         # P0 Marché Public — backpressure piloté par BotConfig.router.backpressure
-        bp_cfg = getattr(self, "bot_cfg", None)
+        bp_cfg = self.router_cfg or getattr(self, "bot_cfg", None)
         bp: Dict[str, Any] = {}
         if bp_cfg is not None:
             # Priorité à RouterCfg.backpressure, fallback sur l'ancien champ plat ROUTER_BACKPRESSURE
             try:
-                router_cfg = getattr(bp_cfg, "router", None)
-                if router_cfg is not None:
-                    bp = getattr(router_cfg, "backpressure", {}) or {}
+                bp = getattr(bp_cfg, "backpressure", {}) or {}
             except Exception:
                 bp = {}
             if not bp:
@@ -943,48 +970,49 @@ class MarketDataRouter:
 
                 # VOL
                 try:
-                    payload_vol = {
-                        "exchange": ex_up,
-                        "pair_key": pair_key,
-                        "best_bid": ev.get("best_bid"),
-                        "best_ask": ev.get("best_ask"),
-                        "mid": (
+                    payload_vol = VolEvent(
+                        exchange=ex_up,
+                        pair_key=pair_key,
+                        symbol=ev.get("symbol"),
+                        best_bid=ev.get("best_bid"),
+                        best_ask=ev.get("best_ask"),
+                        mid=(
                             (ev.get("best_bid") + ev.get("best_ask")) / 2.0
                             if ev.get("best_bid") and ev.get("best_ask") else None
                         ),
-                        "exchange_ts_ms": ev.get("exchange_ts_ms"),
-                        "recv_ts_ms": ev.get("recv_ts_ms"),
-                        "active": ev.get("active", True),
-                    }
+                        exchange_ts_ms=ev.get("exchange_ts_ms"),
+                        recv_ts_ms=ev.get("recv_ts_ms"),
+                        active=ev.get("active", True),
+                    ).model_dump(exclude_none=True, by_alias=True)
                     self._try_put(qmap.get("vol"), f"{per_cex_key}.vol", payload_vol)
                 except Exception:
                     logger.exception("[Router] flush vol")
 
                 # SLIP
                 try:
-                    payload_slip = {
-                        "exchange": ex_up,
-                        "pair_key": pair_key,
-                        "orderbook": ev.get("orderbook"),
-                        "top_bid_vol": ev.get("top_bid_vol"),
-                        "top_ask_vol": ev.get("top_ask_vol"),
-                        "exchange_ts_ms": ev.get("exchange_ts_ms"),
-                        "recv_ts_ms": ev.get("recv_ts_ms"),
-                        "active": ev.get("active", True),
-                    }
+                    payload_slip = SlipEvent(
+                        exchange=ex_up,
+                        pair_key=pair_key,
+                        symbol=ev.get("symbol"),
+                        orderbook=ev.get("orderbook"),
+                        top_bid_vol=ev.get("top_bid_vol"),
+                        top_ask_vol=ev.get("top_ask_vol"),
+                        exchange_ts_ms=ev.get("exchange_ts_ms"),
+                        recv_ts_ms=ev.get("recv_ts_ms"),
+                        active=ev.get("active", True),
+                    ).model_dump(exclude_none=True, by_alias=True)
                     self._try_put(qmap.get("slip"), f"{per_cex_key}.slip", payload_slip)
                 except Exception:
                     logger.exception("[Router] flush slip")
 
                 # HEALTH
                 try:
-                    payload_health = {
-                        "exchange": ex_up,
-                        "pair_key": pair_key,
-                        "seq": ev.get("seq"),
-                        "recv_ts_ms": ev.get("recv_ts_ms"),
-                        "exchange_ts_ms": ev.get("exchange_ts_ms"),
-                    }
+                    payload_health = HealthEvent(
+                        exchange=ex_up,
+                        last_ex_ts_ms=int(ev.get("exchange_ts_ms") or 0),
+                        last_recv_ts_ms=int(ev.get("recv_ts_ms") or 0),
+                        seq=ev.get("seq"),
+                    ).model_dump(exclude_none=True)
                     self._try_put(qmap.get("health"), f"{per_cex_key}.health", payload_health)
                 except Exception:
                     logger.exception("[Router] flush health")
@@ -1112,23 +1140,25 @@ class MarketDataRouter:
             if isinstance(data, dict) and data.get(self._STOP_SENTINEL_KEY):
                 return {self._STOP_SENTINEL_KEY: True}
 
-            ex = str(data["exchange"]).upper()
-            pair = (data.get("pair_key") or data.get("symbol") or data.get("pair") or "").replace("-", "").upper()
+            ev_model = data if isinstance(data, MarketEvent) else MarketEvent(**(data or {}))
+            ev = ev_model.model_dump(exclude_none=True)
+            ex = ev_model.exchange.upper()
+            pair = (ev_model.pair_key or "").replace("-", "").upper()
             if not pair or not ex:
                 try:
                     ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="schema_mismatch").inc()
                 except Exception:
                     pass
                 return None
-            if not data.get("active", False):
+            if not ev_model.active:
                 try:
                     ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="inactive").inc()
                 except Exception:
                     pass
                 return None
 
-            bid = float(data.get("best_bid"))
-            ask = float(data.get("best_ask"))
+            bid = float(ev_model.best_bid)
+            ask = float(ev_model.best_ask)
             if bid <= 0 or ask <= 0 or ask < bid:
                 try:
                     ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="l1_invalid").inc()
@@ -1136,10 +1166,10 @@ class MarketDataRouter:
                     pass
                 return None
 
-            ob = data.get("orderbook") or {}
+            ob = ev.get("orderbook") or {}
             bids, asks = _sanitize_orderbook(ob, max_levels=50) if ob else ([], [])
-            ex_dt = _to_dt(data.get("exchange_ts_ms") or data.get("recv_ts_ms"))
-            recv_dt = _to_dt(data.get("recv_ts_ms") or data.get("exchange_ts_ms"))
+            ex_dt = _to_dt(ev.get("exchange_ts_ms") or ev.get("recv_ts_ms"))
+            recv_dt = _to_dt(ev.get("recv_ts_ms") or ev.get("exchange_ts_ms"))
 
             mid = 0.5 * (bid + ask)
             spread_bps = 10000.0 * (ask - bid) / mid if mid > 0 else 0.0
@@ -1148,11 +1178,12 @@ class MarketDataRouter:
             out = {
                 "exchange": ex,
                 "pair_key": pair,
+                "symbol": ev.get("symbol") or ev_model.symbol,
                 "active": True,
                 "best_bid": bid,
                 "best_ask": ask,
-                "bid_volume": float(data.get("bid_volume") or 0.0),
-                "ask_volume": float(data.get("ask_volume") or 0.0),
+                "bid_volume": float(ev.get("bid_volume") or 0.0),
+                "ask_volume": float(ev.get("ask_volume") or 0.0),
                 "orderbook": {"bids": bids, "asks": asks} if has_l2 else {},
                 "has_l2": has_l2,
                 "exchange_ts_ms": int((ex_dt.timestamp()) * 1000),
@@ -1162,7 +1193,7 @@ class MarketDataRouter:
             }
             return out
 
-        except Exception as e:
+        except ValidationError as e:
             self._events_schema_errors += 1
             if self.verbose:
                 logger.exception("[Router] event schema invalid")
@@ -1173,6 +1204,11 @@ class MarketDataRouter:
                 pass
 
             return None
+
+        except Exception as e:
+            self._events_schema_errors += 1
+            if self.verbose:
+                logger.exception("[Router] event schema invalid")
 
     # -------------------------- Fan-out helpers --------------------------
     def _try_put(self, q: asyncio.Queue | None, route_name: str, payload: dict) -> None:
@@ -1260,21 +1296,21 @@ class MarketDataRouter:
             changed = False  # heartbeat
 
         if do_publish:
-            payload = {
-                "exchange": ex,
-                "pair_key": pair,
-                "ema_vol_bps": round(ema_curr, 4),
-                "l1_spread_bps": round(val, 4),
-                # Compat handlers : L1 & mid
-                "best_bid": float(ev.get("best_bid", 0.0)),
-                "best_ask": float(ev.get("best_ask", 0.0)),
-                "mid": float(ev.get("mid", 0.0)),
-                "changed": changed,
-                "ts_ex_ms": int(ev["exchange_ts_ms"]),
-                "recv_ts_ms": int(ev["recv_ts_ms"]),
-                "age_ms": max(0.0, (_now_dt() - _to_dt(ev["exchange_ts_ms"])).total_seconds() * 1000.0),
-                "seq_no": int((now * 1000) % 2_147_483_647),
-            }
+            payload = VolEvent(
+                exchange=ex,
+                pair_key=pair,
+                symbol=ev.get("symbol"),
+                ema_vol_bps=round(ema_curr, 4),
+                l1_spread_bps=round(val, 4),
+                best_bid=float(ev.get("best_bid", 0.0)),
+                best_ask=float(ev.get("best_ask", 0.0)),
+                mid=float(ev.get("mid", 0.0)),
+                changed=changed,
+                exchange_ts_ms=int(ev["exchange_ts_ms"]),
+                recv_ts_ms=int(ev["recv_ts_ms"]),
+                age_ms=max(0.0, (_now_dt() - _to_dt(ev["exchange_ts_ms"])).total_seconds() * 1000.0),
+                seq_no=int((now * 1000) % 2_147_483_647),
+            ).model_dump(exclude_none=True, by_alias=True)
             self._publish_cex(ex, "vol", payload)
             self._vol_last_pub_ts[key] = now
             self._vol_last_pub_val[key] = ema_curr
@@ -1302,21 +1338,23 @@ class MarketDataRouter:
 
         if do_publish:
             bids, asks = (ev.get("orderbook") or {}).get("bids") or [], (ev.get("orderbook") or {}).get("asks") or []
-            payload = {
-                "exchange": ex,
-                "pair_key": pair,
-                "slip_metric_bps": round(metric, 4),
-                "changed": changed,
-                "notional_hint": None,  # aval peut enrichir
-                "orderbook": {"bids": bids, "asks": asks} if (bids or asks) else {},
-                "top_bid_vol": float(ev.get("bid_volume") or 0.0),
-                "top_ask_vol": float(ev.get("ask_volume") or 0.0),
-                "ts_ex_ms": int(ev["exchange_ts_ms"]),
-                "recv_ts_ms": int(ev["recv_ts_ms"]),
-            }
+            payload = SlipEvent(
+                exchange=ex,
+                pair_key=pair,
+                symbol=ev.get("symbol"),
+                slip_metric_bps=round(metric, 4),
+                changed=changed,
+                notional_hint=None,
+                orderbook={"bids": bids, "asks": asks} if (bids or asks) else {},
+                top_bid_vol=float(ev.get("bid_volume") or 0.0),
+                top_ask_vol=float(ev.get("ask_volume") or 0.0),
+                exchange_ts_ms=int(ev["exchange_ts_ms"]),
+                recv_ts_ms=int(ev["recv_ts_ms"]),
+            ).model_dump(exclude_none=True, by_alias=True)
             self._publish_cex(ex, "slip", payload)
             self._slip_last_pub_ts[key] = now
             self._slip_last_metric[key] = metric
+
 
     def _per_cex_health(self, ev: Dict[str, Any]) -> None:
         ex = ev["exchange"]
@@ -1324,14 +1362,14 @@ class MarketDataRouter:
         last = self._health_last_pub_ts.get(ex, 0.0)
         if (now - last) < self.health_heartbeat_s:
             return
-        payload = {
-            "exchange": ex,
-            "last_ex_ts_ms": int(ev["exchange_ts_ms"]),
-            "last_recv_ts_ms": int(ev["recv_ts_ms"]),
-            "age_ms": max(0.0, (_now_dt() - _to_dt(ev["exchange_ts_ms"])).total_seconds() * 1000.0),
-            "pairs_seen": list((self._latest_light.get(ex, {}) or {}).keys()),
-            "changed": False,
-        }
+        payload = HealthEvent(
+            exchange=ex,
+            last_ex_ts_ms=int(ev["exchange_ts_ms"]),
+            last_recv_ts_ms=int(ev["recv_ts_ms"]),
+            age_ms=max(0.0, (_now_dt() - _to_dt(ev["exchange_ts_ms"])).total_seconds() * 1000.0),
+            pairs_seen=list((self._latest_light.get(ex, {}) or {}).keys()),
+            changed=False,
+        ).model_dump(exclude_none=True)
         self._publish_cex(ex, "health", payload)
         self._health_last_pub_ts[ex] = now
 
@@ -1340,14 +1378,15 @@ class MarketDataRouter:
         now = time.time()
         for ex, pairs in (self._latest_light or {}).items():
             if (now - self._health_last_pub_ts.get(ex, 0.0)) >= self.health_heartbeat_s:
-                payload = {
-                    "exchange": ex,
-                    "last_ex_ts_ms": max([v.get("exchange_ts_ms", 0) for v in pairs.values()] or [0]),
-                    "last_recv_ts_ms": max([v.get("recv_ts_ms", 0) for v in pairs.values()] or [0]),
-                    "age_ms": 0.0,
-                    "pairs_seen": list(pairs.keys()),
-                    "changed": False,
-                }
+                payload = HealthEvent(
+                    exchange=ex,
+                    last_ex_ts_ms=max([v.get("exchange_ts_ms", 0) for v in pairs.values()] or [0]),
+                    last_recv_ts_ms=max([v.get("recv_ts_ms", 0) for v in pairs.values()] or [0]),
+                    age_ms=0.0,
+                    pairs_seen=list(pairs.keys()),
+                    changed=False,
+                ).model_dump(exclude_none=True)
+
                 self._publish_cex(ex, "health", payload)
             # MAJ gauges même sans publication (ex: calme plat)
             self._update_queue_depth_metrics_for(ex)
@@ -1514,7 +1553,8 @@ class MarketDataRouter:
         """
         # 1) Sentinelle de fin (si file connue)
         try:
-            q = getattr(self, "in_q", None) or getattr(self, "_in_q", None)
+            q = getattr(self, "in_queue", None) or getattr(self, "in_q", None) or getattr(self, "_in_q", None)
+
             stop_key = getattr(self, "_STOP_SENTINEL_KEY", "__STOP__")
             if q:
                 try:
@@ -1571,8 +1611,11 @@ class MarketDataRouter:
                 gaps.append((max(ts_list) - min(ts_list)).total_seconds())
         return float(sum(gaps) / len(gaps)) if gaps else 0.0
 
+    def set_risk_manager(self, rm: Any) -> None:
+        self.risk_manager = rm
+
     def get_status(self) -> Dict[str, Any]:
-        return {
+        st: Dict[str, Any] = {
             "module": "MarketDataRouter",
             "healthy": self._is_healthy(),
             "details": f"syncs={self.successful_syncs}, desync_pairs={self.desync_count}",
@@ -1589,7 +1632,19 @@ class MarketDataRouter:
             "submodules": {},
             "ws_source_backpressure": self._ws_backpressure_state,
         }
-
+        rm = getattr(self, "risk_manager", None)
+        if rm is not None:
+            try:
+                modes = {
+                    "rm_mode": str(getattr(rm, "rm_mode", "UNKNOWN")),
+                    "trade_mode": str(getattr(rm, "trade_mode", "UNKNOWN")),
+                }
+                if hasattr(rm, "private_plane_state"):
+                    modes["private_plane_state"] = str(rm.private_plane_state)
+                st["modes"] = modes
+            except Exception:
+                pass
+        return st
 
 # PATCH 6 — Mux WS sharding (fan-in 2–3 sockets/venue → in_queue du Router)
 # À coller n’importe où dans le module (niveau top), usage optionnel:

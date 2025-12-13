@@ -41,8 +41,11 @@ try:
         SLIP_P95_BPS,
         SLIP_P99_BPS,
         set_slip_age_seconds,
+        note_slip_ttl_seconds,
     )
 except Exception:  # pragma: no cover
+
+
     class _Noop:
         def labels(self, *_, **__):
             return self
@@ -56,12 +59,18 @@ except Exception:  # pragma: no cover
         def observe(self, *_, **__):
             return None
 
+
     SLIP_SAMPLE_TOTAL = _Noop()
     SLIP_DECISION_TOTAL = _Noop()
     SLIP_P95_BPS = _Noop()
     SLIP_P99_BPS = _Noop()
 
+
     def set_slip_age_seconds(*_, **__):
+        return None
+
+
+    def note_slip_ttl_seconds(*_, **__):
         return None
 
 
@@ -152,6 +161,11 @@ class SlippageHandler:
         self._heartbeat_s = getattr_int(s, "heartbeat_s", 1)
         # max slippage “dur” autorisé par quote (bps)
         self._max_bps_by_quote = dict(getattr(s, "max_bps_by_quote", {"USDC": 12.0, "EUR": 14.0}))
+
+        try:
+            note_slip_ttl_seconds(self._ttl_s)
+        except Exception:
+            pass
 
         # --------- Paramètres runtime (arguments, avec fallback cfg si utile) ---------
         self.depth_limit = int(depth_limit)
@@ -642,6 +656,10 @@ class SlippageHandler:
             f"history_days_max={self._history_max_age}, push_use_qty_mode={self.push_use_qty_mode}"
         )
 
+    def set_risk_manager(self, rm: Any) -> None:
+        self.risk_manager = rm
+
+
     def get_status(self) -> Dict[str, Any]:
         slips = [
             v
@@ -663,7 +681,7 @@ class SlippageHandler:
         now = time.time()
         age_s = (now - self.last_update) if self.last_update else None
 
-        return {
+        st: Dict[str, Any] = {
             "module": "SlippageHandler",
             "healthy": self.healthy,
             "last_update_epoch_s": self.last_update,
@@ -678,6 +696,20 @@ class SlippageHandler:
             },
             "submodules": {},
         }
+        rm = getattr(self, "risk_manager", None)
+        if rm is not None:
+            try:
+                modes = {
+                    "rm_mode": str(getattr(rm, "rm_mode", "UNKNOWN")),
+                    "trade_mode": str(getattr(rm, "trade_mode", "UNKNOWN")),
+                }
+                if hasattr(rm, "private_plane_state"):
+                    modes["private_plane_state"] = str(rm.private_plane_state)
+                st["modes"] = modes
+            except Exception:
+                pass
+        return st
+
 
     # -------------------------- BUS (per‑CEX slip) --------------------------
     # slippage_handler.py

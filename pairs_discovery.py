@@ -19,26 +19,53 @@ Compatibilité :
 from __future__ import annotations
 import asyncio
 import math
-from typing import Dict, List, Tuple, Optional, Set, Any
-from typing import Dict, List, Set, Tuple
+import random
+import time
+from typing import Any, Dict, List, Optional, Set, Tuple
+
 import aiohttp
-from typing import Dict, List, Tuple, Optional, Set
-import aiohttp, asyncio, random, math
 from asyncio_throttle import Throttler
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
+from modules.rm_compat import getattr_bool, getattr_dict, getattr_float, getattr_int, getattr_list, getattr_str
+from contracts.payloads import DiscoveryResult
 
 try:
     from asyncio_throttle import Throttler  # pip install asyncio-throttle
 except Exception:
     from modules.utils.rate_limiter import AsyncRateLimiter as _RL
+
+
     class Throttler:  # shim compatible "async with Throttler(...)"
         def __init__(self, rate_limit: float) -> None:
             self._rl = _RL(rate=float(rate_limit), capacity=max(1, int(rate_limit)))
+
         async def __aenter__(self):
             await self._rl.acquire(kind="discovery", exchange="global")
+
         async def __aexit__(self, exc_type, exc, tb):
             return False
 
+try:
+    from modules.obs_metrics import (
+        discovery_note_api_error,
+        discovery_note_filtered,
+        discovery_note_stage,
+        discovery_observe_run_ms,
+    )
+except Exception:  # pragma: no cover
+    def discovery_note_stage(*_, **__):
+        return None
+
+
+    def discovery_note_filtered(*_, **__):
+        return None
+
+
+    def discovery_note_api_error(*_, **__):
+        return None
+
+
+    def discovery_observe_run_ms(*_, **__):
+        return None
 
 # --------------------- Endpoints publics ---------------------
 # Binance
@@ -291,7 +318,8 @@ async def discover_pairs_3cex(
     min_quote_volume_eur: Optional[float]  = None,
     # comparabilité EUR->USDC pour le tri global
     eur_usdc_fx: Optional[float] = None,
-) -> Tuple[Dict[str, Dict[str, object]], List[str]]:
+    include_result: bool = False,
+) -> Tuple[Dict[str, Dict[str, object]], List[str]] | Tuple[Dict[str, Dict[str, object]], List[str], DiscoveryResult]:
     """
     Découverte des paires pilotée par cfg.discovery.* + scoring combos.
     - http_timeout_s, max_inflight_requests, retry_policy (base_ms,max_ms,max_attempts,jitter)
@@ -308,10 +336,39 @@ async def discover_pairs_3cex(
           }, ...
         }
         top_pairs: liste des pk triés par meilleur score combo (EUR upscalé par fx)
+        include_result=True retourne aussi une DiscoveryResult (audit)
     """
 
     from collections import defaultdict
+    start = time.perf_counter()
+    stage_counts: Dict[str, int] = {}
+    filtered_counts: Dict[str, int] = {}
+    api_errors: Dict[str, int] = {}
 
+    def _add_stage(stage: str, count: int) -> None:
+        c = max(0, int(count))
+        stage_counts[stage] = stage_counts.get(stage, 0) + c
+        try:
+            discovery_note_stage(stage, c)
+        except Exception:
+            pass
+
+    def _add_filtered(reason: str, count: int) -> None:
+        c = max(0, int(count))
+        if c <= 0:
+            return
+        filtered_counts[reason] = filtered_counts.get(reason, 0) + c
+        try:
+            discovery_note_filtered(reason, c)
+        except Exception:
+            pass
+
+    def _mark_api_error(exchange: str) -> None:
+        api_errors[exchange] = api_errors.get(exchange, 0) + 1
+        try:
+            discovery_note_api_error(exchange)
+        except Exception:
+            pass
     # --------------------------
     # Helpers locaux autonomes
     # --------------------------
@@ -516,46 +573,72 @@ async def discover_pairs_3cex(
         res = await asyncio.gather(*tasks, return_exceptions=True)
         i = 0
         if "BINANCE" in enabled:
-            if isinstance(res[i], Exception): (b_meta, b_volq) = ({}, {})
-            else: (b_meta, b_volq) = res[i]
+            if isinstance(res[i], Exception):
+                (b_meta, b_volq) = ({}, {})
+                _mark_api_error("BINANCE")
+            else:
+                (b_meta, b_volq) = res[i]
             i += 1
         if "COINBASE" in enabled:
-            if isinstance(res[i], Exception): (c_meta, c_volq) = ({}, {})
-            else: (c_meta, c_volq) = res[i]
+            if isinstance(res[i], Exception):
+                (c_meta, c_volq) = ({}, {})
+                _mark_api_error("COINBASE")
+            else:
+                (c_meta, c_volq) = res[i]
             i += 1
         if "BYBIT" in enabled:
-            if isinstance(res[i], Exception): (y_meta, y_volq) = ({}, {})
-            else: (y_meta, y_volq) = res[i]
+            if isinstance(res[i], Exception):
+                (y_meta, y_volq) = ({}, {})
+                _mark_api_error("BYBIT")
+            else:
+                (y_meta, y_volq) = res[i]
 
     # --------------------------
     # 5) Normalisation & filtres
     # --------------------------
-    allow: Optional[Set[str]] = {a.upper() for a in (allowlist or [])} or (set(x.upper() for x in whitelist) if whitelist else None)
+    allow: Optional[Set[str]] = {a.upper() for a in (allowlist or [])} or (
+        set(x.upper() for x in whitelist) if whitelist else None)
     deny: Set[str] = set(x.upper() for x in blacklist)
 
     def _fill_maps(meta: Dict[str, dict], volq: Dict[str, float], ex: str):
         sym_map: Dict[str, str] = {}
         vol_map: Dict[str, float] = {}
+        filtered_local: Dict[str, int] = {}
+        raw = 0
         for sym, m in (meta or {}).items():
-            base = (m or {}).get("base"); quote = (m or {}).get("quote")
+            raw += 1
+            base = (m or {}).get("base");
+            quote = (m or {}).get("quote")
             if not base or not quote:
+                filtered_local["missing_base_quote"] = filtered_local.get("missing_base_quote", 0) + 1
                 continue
             if quote and quote.upper() not in quotes_allowed:
+                filtered_local["quote_not_allowed"] = filtered_local.get("quote_not_allowed", 0) + 1
                 continue
-            if allow is not None and base.upper() not in allow:
+            base_u = base.upper()
+            if allow is not None and base_u not in allow:
+                filtered_local["not_in_allowlist"] = filtered_local.get("not_in_allowlist", 0) + 1
                 continue
-            if base.upper() in deny:
+            if base_u in deny:
+                filtered_local["denylist"] = filtered_local.get("denylist", 0) + 1
                 continue
             pk = _pk(base, quote)
             v = fnum(volq.get(sym, 0.0), 0.0)
             # Coinbase garde product_id hyphéné pour mapping externe
             sym_map[pk] = sym
             vol_map[pk] = v
-        return sym_map, vol_map
+        stats = {"raw": raw, "kept": len(sym_map), "filtered": filtered_local}
+        return sym_map, vol_map, stats
 
-    b_syms, b_vols = _fill_maps(b_meta, b_volq, "BINANCE")
-    c_syms, c_vols = _fill_maps(c_meta, c_volq, "COINBASE")
-    y_syms, y_vols = _fill_maps(y_meta, y_volq, "BYBIT")
+    b_syms, b_vols, b_stats = _fill_maps(b_meta, b_volq, "BINANCE")
+    c_syms, c_vols, c_stats = _fill_maps(c_meta, c_volq, "COINBASE")
+    y_syms, y_vols, y_stats = _fill_maps(y_meta, y_volq, "BYBIT")
+
+    for ex, stats in ("binance", b_stats), ("coinbase", c_stats), ("bybit", y_stats):
+        _add_stage(f"{ex}_raw", stats.get("raw", 0))
+        _add_stage(f"{ex}_eligible", stats.get("kept", 0))
+        for reason, cnt in (stats.get("filtered") or {}).items():
+            _add_filtered(reason, cnt)
 
     # --------------------------
     # 6) pair_mapping enrichi
@@ -583,6 +666,8 @@ async def discover_pairs_3cex(
         _ensure(pk, _quote_from_pk(pk))
         pair_mapping[pk]["bybit"] = sym
         pair_mapping[pk]["volumes"]["BYBIT"] = fnum(y_vols.get(pk, 0.0), 0.0)
+
+    _add_stage("pair_mapping", len(pair_mapping))
 
     # --------------------------
     # 7) Scoring des combos
@@ -612,6 +697,11 @@ async def discover_pairs_3cex(
             if s > 0:
                 best_scores[pk] = max(best_scores.get(pk, 0.0), s)
 
+        _add_stage("combos_eligible", len(best_scores))
+        drop_combo = max(0, len(pair_mapping) - len(best_scores))
+        if drop_combo:
+            _add_filtered("combo_not_eligible", drop_combo)
+
     # --------------------------
     # 8) Tri global (EUR → USDC via FX)
     # --------------------------
@@ -624,7 +714,29 @@ async def discover_pairs_3cex(
     ranked = sorted(best_scores.keys(), key=_global_score, reverse=True)
     top_pairs = ranked[: max(0, int(top_n))]
 
+    _add_stage("top_pairs", len(top_pairs))
+    drop_rank = max(0, len(best_scores) - len(top_pairs))
+    if drop_rank:
+        _add_filtered("rank_cutoff", drop_rank)
+
+    run_ms = (time.perf_counter() - start) * 1000.0
+    try:
+        discovery_observe_run_ms(run_ms)
+    except Exception:
+        pass
+
+    result = DiscoveryResult(
+        stage_counts=stage_counts,
+        filtered_counts=filtered_counts,
+        api_errors=api_errors,
+        run_ms=run_ms,
+        top_pairs=top_pairs,
+    )
+
+    if include_result:
+        return pair_mapping, top_pairs, result
     return pair_mapping, top_pairs
+
 
 # ---------- Alias de compat pour l'ancien nom ----------
 async def discover_usdc_pairs(

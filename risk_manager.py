@@ -2780,15 +2780,71 @@ class RiskManager:
         except Exception:
             return False
 
+    def _norm_route_for_sfc(self, route: dict | None, *, pair_key: str | None = None) -> dict:
+        """
+        Normalise un dict route pour l'API SFC Forme A.
+        Garantit: buy_ex/sell_ex, pair_key, base, quote (+ conserve les autres champs).
+        Ne casse rien: copie défensive, jamais d'exception.
+        """
+        r = dict(route or {})
+
+        try:
+            buy_ex = (r.get("buy_ex") or r.get("buy_exchange") or r.get("buy") or "").upper()
+            sell_ex = (r.get("sell_ex") or r.get("sell_exchange") or r.get("sell") or "").upper()
+
+            # pair
+            pk = (r.get("pair_key") or r.get("pair") or pair_key or "")
+            pk = self._norm_pair(pk) if pk else ""
+
+            # base/quote (SFC Forme A construit pair = base+quote)
+            base = (r.get("base") or "").upper()
+            quote = (r.get("quote") or "").upper()
+
+            if not pk and base and quote:
+                pk = (base + quote).replace("-", "").upper()
+            if pk and (not base or not quote):
+                try:
+                    quote = _pair_quote(pk)
+                except Exception:
+                    quote = "USDC"
+                try:
+                    base = _strip_quote(pk)
+                except Exception:
+                    base = pk
+
+            if buy_ex:
+                r["buy_ex"] = buy_ex
+            if sell_ex:
+                r["sell_ex"] = sell_ex
+            if pk:
+                r["pair_key"] = pk
+                r["pair"] = pk
+            if base:
+                r["base"] = base
+            if quote:
+                r["quote"] = quote
+
+        except Exception:
+            # fallback ultra-safe: on renvoie la copie originale
+            pass
+
+        return r
+
     def _reb_cost_fn(self, route: dict) -> float:
         """
         Coût net en bps pour REB (pur, sans I/O).
         Utilise SFC.get_total_cost_pct(..., side="TM") car le bridge se fait en maker côté destination.
         """
         try:
+            route_sfc = self._norm_route_for_sfc(route, pair_key=(route.get("pair") or route.get("pair_key")))
+            slip_kind = getattr_str(self.cfg, "sfc_slippage_source", "ewma")
+
             pct = float(self.slip_collector.get_total_cost_pct(
-                route, side="TM", size_quote=float(getattr(self.cfg, "rebal_size_quote", 2000.0)),
-                slippage_kind="ewma", prudence_key="NORMAL"
+                route_sfc,
+                side="TM",
+                size_quote=float(getattr(self.cfg, "rebal_size_quote", 2000.0)),
+                slippage_kind=("p95" if str(slip_kind).lower() == "p95" else "ewma"),
+                prudence_key="NORMAL",
             ))
             bps = pct * 1e4
             try:
@@ -8243,6 +8299,99 @@ class RiskManager:
 
         return target_mode, target_reason
 
+    def _net_bps_with_split_penalty(self, net_bps_raw: float, buy_ex: str, sell_ex: str) -> tuple[float, float]:
+        """
+        Convention RM:
+        - net_bps_raw = net_bps calculé "marché - fees/slip" (sans SPLIT penalty)
+        - net_bps_eff = net_bps_raw - split_penalty_bps
+        Retourne (net_bps_eff, split_penalty_bps).
+        """
+        try:
+            pen = float(self._split_penalty_bps(str(buy_ex).upper(), str(sell_ex).upper()) or 0.0)
+            if pen < 0 or math.isnan(pen):
+                pen = 0.0
+        except Exception:
+            pen = 0.0
+        try:
+            nb = float(net_bps_raw)
+            if math.isnan(nb):
+                nb = 0.0
+        except Exception:
+            nb = 0.0
+        return (nb - pen, pen)
+
+    def _resolve_exchange_region(self, ex: str) -> str | None:
+        """
+        Résout la région (EU/US/JP/...) d’un exchange via cfg/botconfig.
+        - Si aucun mapping n’est dispo -> None (fallback comportement historique).
+        """
+        exu = (ex or "").upper()
+        if not exu:
+            return None
+
+        cfg = getattr(self, "cfg", None) or getattr(self, "config", None) or self
+        g = getattr(cfg, "g", None)
+
+        # 1) méthode dédiée si dispo (préférée)
+        for obj in (cfg, g):
+            if obj is None:
+                continue
+            for fn_name in ("exchange_region", "get_exchange_region", "cex_region", "get_cex_region"):
+                fn = getattr(obj, fn_name, None)
+                if callable(fn):
+                    try:
+                        r = fn(exu)
+                        r = (str(r).upper() if r is not None else None)
+                        return r or None
+                    except Exception:
+                        pass
+
+        # 2) mapping dict si dispo
+        for obj in (cfg, g):
+            if obj is None:
+                continue
+            for attr in ("exchange_region_map", "cex_region_map", "engine_region_map", "engine_pod_map"):
+                mp = getattr(obj, attr, None)
+                if isinstance(mp, dict):
+                    try:
+                        # tolère clés non upper dans la config
+                        if exu in mp:
+                            return str(mp[exu]).upper()
+                        for k, v in mp.items():
+                            if str(k).upper() == exu:
+                                return str(v).upper()
+                    except Exception:
+                        pass
+
+        return None
+
+    def _split_edge_key(self, r1: str, r2: str) -> str:
+        a = str(r1).upper()
+        b = str(r2).upper()
+        return f"{a}-{b}" if a <= b else f"{b}-{a}"
+
+    def _split_metrics_for_edge(self, edge_key: str) -> tuple[float, float, float]:
+        """
+        Retourne (base_delta_ms, skew_ms, stale_ms) pour une paire de régions.
+        - Si le pacer/boot injecte self.split_edge_metrics[edge_key], on l’utilise.
+        - Sinon fallback sur les métriques globales self.split_base_delta_ms / split_skew_ms / split_stale_ms.
+        """
+        try:
+            em = getattr(self, "split_edge_metrics", None)
+            if isinstance(em, dict):
+                d = em.get(edge_key)
+                if isinstance(d, dict):
+                    base = float(d.get("base_delta_ms", d.get("base", 0.0)) or 0.0)
+                    skew = float(d.get("skew_ms", d.get("skew", 0.0)) or 0.0)
+                    stale = float(d.get("stale_ms", d.get("stale", 0.0)) or 0.0)
+                    return base, skew, stale
+        except Exception:
+            pass
+
+        base = float(getattr(self, "split_base_delta_ms", 0.0) or 0.0)
+        skew = float(getattr(self, "split_skew_ms", 0.0) or 0.0)
+        stale = float(getattr(self, "split_stale_ms", 0.0) or 0.0)
+        return base, skew, stale
 
     def _split_penalty_bps(self, buy_ex: str, sell_ex: str) -> float:
         """
@@ -8272,22 +8421,20 @@ class RiskManager:
     def _total_cost_bps(self, buy_ex: str, sell_ex: str, pair_key: str) -> float:
         """
         bps = 1e4 * total_cost_pct + split_penalty_bps
-        (desk « coût total » centralisé)
+        Source de vérité: get_total_cost_pct() (déjà routé vers SFC), puis pénalité SPLIT.
         """
         try:
-            breakdown = self._compute_cost_breakdown_for_route(buy_ex, sell_ex, pair_key)
-            return float(breakdown.get("total_cost_bps", 0.0))
+            pct = float(self.get_total_cost_pct(buy_ex, sell_ex, pair_key) or 0.0)
         except Exception:
-            # fallback sûr : ne jamais planter le RM sur une vue coût
-            try:
-                pct = float(self.get_total_cost_pct(buy_ex, sell_ex, pair_key))
-            except Exception:
-                pct = 0.0
-            try:
-                split_pen = float(self._split_penalty_bps(buy_ex, sell_ex))
-            except Exception:
-                split_pen = 0.0
-            return float(1e4 * pct + split_pen)
+            pct = 0.0
+
+        try:
+            split_pen = float(self._split_penalty_bps(str(buy_ex).upper(), str(sell_ex).upper()))
+        except Exception:
+            split_pen = 0.0
+
+        return float(1e4 * max(0.0, pct) + split_pen)
+
 
     def _update_trade_mode(self) -> None:
         """
@@ -8616,6 +8763,9 @@ class RiskManager:
             sell_take = vwap_sell * (1.0 - fee_sell - slip_sell)
             net_bps_est = 1e4 * (sell_take - buy_cost) / max(buy_cost, 1e-12)
 
+            net_bps_est_raw = float(net_bps_est)
+            net_bps_est, split_penalty_bps = self._net_bps_with_split_penalty(net_bps_est_raw, buy_ex, sell_ex)
+
             # Seuils unifiés via politique RM (TT/TM dynamiques)
             strat = str(strategy or "TT").upper()
             thr_bps = float(self._min_required_bps_for(pk, strat))
@@ -8631,7 +8781,10 @@ class RiskManager:
                 "fee_sell": float(fee_sell),
                 "slip_buy": float(slip_buy),
                 "slip_sell": float(slip_sell),
-                "net_bps_est": float(net_bps_est),
+                "net_bps_est_raw": float(net_bps_est_raw),
+                "split_penalty_bps": float(split_penalty_bps),
+                 "net_bps_est": float(net_bps_est),  # net effectif (après pénalité SPLIT)
+
                 "min_required_bps": float(thr_bps),
                 "margin_bps": float(margin_bps),
             }
@@ -10902,7 +11055,8 @@ class RiskManager:
                 spread_norm = (sell_bid - buy_ask) / max(mid, 1e-12)
                 net_frac = spread_norm - total_cost_frac
 
-            net_bps = 1e4 * float(net_frac)
+            net_bps_raw = 1e4 * float(net_frac)
+            net_bps, split_penalty_bps = self._net_bps_with_split_penalty(net_bps_raw, buy_ex, sell_ex)
 
             # ===== 4) final checks: allow_final_loss, expected_net drift, threshold compare =====
             # final loss guard (absolute)
@@ -11002,21 +11156,39 @@ class RiskManager:
     # --- Remplacer l'implémentation actuelle de _mm_cost_bps par :
     def _mm_cost_bps(self, route: dict, *, size_quote: float, prudence_key: str = "NORMAL") -> float:
         """
-        Coût MM (maker/maker) en bps, en utilisant l'API get_total_cost_pct(buy_ex, sell_ex, pair_key).
-        route peut être un dict {'buy_ex':..,'sell_ex':..,'pair':..} ou similaire.
+        Coût MM (maker/maker) en bps.
+        Patch: utilise SFC Forme A (route) avec side="MM" + size_quote + prudence_key.
+        Fallback conservateur: TT taker/taker (via get_total_cost_pct) si SFC indisponible.
         """
         try:
-            if isinstance(route, dict):
-                buy_ex = (route.get("buy_ex") or route.get("buy_exchange") or "").upper()
-                sell_ex = (route.get("sell_ex") or route.get("sell_exchange") or "").upper()
-                pair = (route.get("pair") or route.get("pair_key") or "")
-            else:
-                # fallback safe
+            if not isinstance(route, dict):
                 return 0.0
+
+            # Route normalisée (helper ajouté au patch précédent)
+            route_sfc = self._norm_route_for_sfc(route, pair_key=(route.get("pair") or route.get("pair_key")))
+
+            sfc = getattr(self, "slip_collector", None)
+            if sfc is not None and hasattr(sfc, "get_total_cost_pct"):
+                kind = getattr_str(self.cfg, "sfc_slippage_source", "ewma").lower()
+                pct = float(sfc.get_total_cost_pct(
+                    route_sfc,
+                    side="MM",
+                    size_quote=float(size_quote or 0.0),
+                    slippage_kind=("p95" if kind == "p95" else "ewma"),
+                    prudence_key=str(prudence_key or "NORMAL"),
+                ) or 0.0)
+                return float(max(0.0, pct) * 1e4)
+
+            # Fallback conservateur (évite sous-estimation si SFC absent)
+            buy_ex = (route_sfc.get("buy_ex") or "").upper()
+            sell_ex = (route_sfc.get("sell_ex") or "").upper()
+            pair = (route_sfc.get("pair_key") or route_sfc.get("pair") or "")
             pct = float(self.get_total_cost_pct(buy_ex, sell_ex, pair) or 0.0)
-            return pct * 1e4
+            return float(max(0.0, pct) * 1e4)
+
         except Exception:
             return 0.0
+
 
     def get_fee_pct(self, exchange: str, pair_key: str, mode: str = "taker") -> float:
         if self.slip_collector is None or not hasattr(self.slip_collector, "get_fee_pct"):
@@ -11025,61 +11197,135 @@ class RiskManager:
 
     def get_slippage(self, exchange: str, pair_key: str, side: str = "buy") -> float:
         """
-        Strict: usa il solo 'recent' consolidato dal Collector.
-        (Interfaccia mínima già usata nel file corrente)
+        API publique slippage (fraction).
+        Alignée sur cfg.sfc_slippage_source via _get_slippage() (ewma/p95) + side.
+        Fallbacks conservés: recent_slippage puis slippage_handler puis 0.0.
         """
-        if self.slip_collector is None or not hasattr(self.slip_collector, "get_recent_slippage"):
-            raise RuntimeError("SlippageAndFeesCollector non pronto (recent_slippage)")
-        return float(self.slip_collector.get_recent_slippage(self._norm_pair(pair_key)))
+        ex = (exchange or "").upper()
+        pk = self._norm_pair(pair_key)
+        sd = (side or "buy").lower()
+
+        # 1) Chemin canonique (respect cfg.sfc_slippage_source)
+        try:
+            return float(self._get_slippage(ex, pk, sd))
+        except Exception:
+            pass
+
+        # 2) Compat: ancien "recent" consolidé
+        try:
+            if self.slip_collector is not None and hasattr(self.slip_collector, "get_recent_slippage"):
+                return float(self.slip_collector.get_recent_slippage(pk))
+        except Exception:
+            pass
+
+        # 3) Compat: handler legacy si présent
+        try:
+            if self.slippage_handler is not None and hasattr(self.slippage_handler, "get_slippage"):
+                return float(self.slippage_handler.get_slippage(ex, pk, sd))
+        except Exception:
+            pass
+
+        return 0.0
 
     def _compute_cost_breakdown_for_route(self, buy_ex: str, sell_ex: str, pair_key: str) -> Dict[str, float]:
         """
-        Desk « coût total » : fees, slippage, pénalité SPLIT en bps/pct pour une route.
-        Utilise la vue stricte SlippageAndFeesCollector (fees + slippage récents).
+        Desk « coût total » : fees, slippage, pénalité SPLIT.
+        Patch: total_cost_pct provient de SFC.get_total_cost_pct() (Forme B legs),
+        pour éviter toute divergence entre branches.
         """
         pk = self._norm_pair(pair_key)
+        be = str(buy_ex or "").upper()
+        se = str(sell_ex or "").upper()
 
-        # Fees acheteur / vendeur (fractions)
+        # Fees acheteur / vendeur (fractions) — toujours utile pour debug
         try:
-            fb = float(max(0.0, self.get_fee_pct(buy_ex, pk, "taker")))
-            fs = float(max(0.0, self.get_fee_pct(sell_ex, pk, "taker")))
+            fb = float(max(0.0, self.get_fee_pct(be, pk, "taker")))
+            fs = float(max(0.0, self.get_fee_pct(se, pk, "taker")))
         except Exception:
             fb = fs = 0.0
 
-        # Slippage acheteur / vendeur (fractions)
+        # Slippage acheteur / vendeur (fractions) — aligné (get_slippage -> _get_slippage)
         try:
-            sb = float(max(0.0, self.get_slippage(buy_ex, pk, "buy")))
-            ss = float(max(0.0, self.get_slippage(sell_ex, pk, "sell")))
+            sb = float(max(0.0, self.get_slippage(be, pk, "buy")))
+            ss = float(max(0.0, self.get_slippage(se, pk, "sell")))
         except Exception:
             sb = ss = 0.0
 
         fees_pct = fb + fs
         slippage_pct = sb + ss
-        total_cost_pct = max(0.0, fees_pct + slippage_pct)
+        dbg_total_cost_pct = max(0.0, fees_pct + slippage_pct)
+
+        # ---- Source unique (SFC) pour total_cost_pct ----
+        total_cost_pct = dbg_total_cost_pct
+        try:
+            sfc = getattr(self, "slip_collector", None)
+            if sfc is not None and hasattr(sfc, "get_total_cost_pct"):
+                kind = getattr_str(self.cfg, "sfc_slippage_source", "ewma").lower()
+                buy_leg = {"ex": be, "alias": "TT", "role": "taker"}
+                sell_leg = {"ex": se, "alias": "TT", "role": "taker"}
+                total_cost_pct = float(sfc.get_total_cost_pct(
+                    pk,
+                    buy_leg=buy_leg,
+                    sell_leg=sell_leg,
+                    size_quote=0.0,  # volontairement neutre (comportement proche de l'ancien)
+                    slippage_kind=("p95" if kind == "p95" else "ewma"),
+                    prudence_key="NORMAL",
+                ) or 0.0)
+                total_cost_pct = max(0.0, total_cost_pct)
+        except Exception:
+            total_cost_pct = dbg_total_cost_pct
 
         # Pénalité SPLIT (en bps)
         try:
-            split_penalty_bps = float(self._split_penalty_bps(buy_ex, sell_ex))
+            split_penalty_bps = float(self._split_penalty_bps(be, se))
         except Exception:
             split_penalty_bps = 0.0
 
         return {
-            "fees_pct": total_cost_pct if (fees_pct or slippage_pct) and math.isnan(fees_pct) else fees_pct,
+            "fees_pct": fees_pct,
             "slippage_pct": slippage_pct,
-            "total_cost_pct": total_cost_pct,
+            "total_cost_pct": total_cost_pct,  # ✅ canonique SFC
             "fees_bps": fees_pct * 1e4,
             "slippage_bps": slippage_pct * 1e4,
             "split_penalty_bps": split_penalty_bps,
             "total_cost_bps": total_cost_pct * 1e4 + split_penalty_bps,
+
+            # debug non-cassant (additif)
+            "dbg_total_cost_pct_components": dbg_total_cost_pct,
+            "dbg_total_cost_bps_components": dbg_total_cost_pct * 1e4 + split_penalty_bps,
         }
+
 
     def get_total_cost_pct(self, buy_ex: str, sell_ex: str, pair_key: str) -> float:
         """
         Strict: coût % = fee_buy + fee_sell + slip_buy + slip_sell.
-        Source unique pour le « total_cost_pct » (hors pénalité SPLIT).
+
+        Patch: route prioritairement vers SlippageAndFeesCollector.get_total_cost_pct()
+        en **Forme B (legacy)** afin d'avoir une source unique et ordonnée (RM → SFC)
+        pour fees+slippage.
+
+        Fallback: ancien chemin (_compute_cost_breakdown_for_route) si SFC indisponible
+        ou erreur inattendue, sans casser les signatures ni les appels existants.
         """
+        pk = self._norm_pair(pair_key)
+        be = str(buy_ex or "").upper()
+        se = str(sell_ex or "").upper()
+
+        # --- Fast path: SFC Forme B ---
         try:
-            breakdown = self._compute_cost_breakdown_for_route(buy_ex, sell_ex, pair_key)
+            sfc = getattr(self, "slip_collector", None)
+            if sfc is not None and hasattr(sfc, "get_total_cost_pct"):
+                buy_leg = {"ex": be, "alias": "TT", "role": "taker"}
+                sell_leg = {"ex": se, "alias": "TT", "role": "taker"}
+                v = float(sfc.get_total_cost_pct(pk, buy_leg=buy_leg, sell_leg=sell_leg))
+                # v peut légitimement être 0.0 si pas de snapshot / pas de mesures; on l’accepte.
+                return v
+        except Exception:
+            pass
+
+        # --- Fallback legacy (inchangé) ---
+        try:
+            breakdown = self._compute_cost_breakdown_for_route(be, se, pk)
             return float(breakdown.get("total_cost_pct", 0.0))
         except Exception:
             return 0.0
@@ -11221,30 +11467,154 @@ class RiskManager:
             min_ratio if min_ratio is not None else getattr(self.cfg, "tm_nn_min_depth_ratio", 1.4)))
         return (avail / need) >= ratio_needed
 
-    def should_tm_non_neutral(self, *, pair_key: str, maker_ex: str, taker_ex: str, usdc_amt: float) -> Tuple[bool, str, float]:
-        cfg = self.cfg
-        e_sell = self._tm_edge_bps(maker_side="SELL", maker_ex=maker_ex, taker_ex=taker_ex, pair_key=pair_key)
-        e_buy = self._tm_edge_bps(maker_side="BUY", maker_ex=maker_ex, taker_ex=taker_ex, pair_key=pair_key)
-        best_side, best_edge = (("SELL", e_sell) if e_sell >= e_buy else ("BUY", e_buy))
+    def should_tm_non_neutral(
+            self,
+            *,
+            pair_key: str,
+            maker_ex: str,
+            taker_ex: str,
+            usdc_amt: float,
+            edge_sell_bps: Optional[float] = None,
+            edge_buy_bps: Optional[float] = None,
+            profile: Optional[str] = None,
+    ) -> Tuple[bool, str, float]:
+        """
+        Décide si TM peut basculer en NON_NEUTRAL.
+
+        Patch (P1) : fail-closed.
+        - Si vol/slip indisponibles, non finies, ou stale TTL ⇒ NN = OFF.
+        - Signature compatible avec l'appel existant (edge_* + profile).
+        """
+        import math
+
+        # 0) Edges : utiliser celles déjà calculées si fournies, sinon recalculer.
+        try:
+            if edge_sell_bps is None or not math.isfinite(float(edge_sell_bps)):
+                e_sell = float(self._tm_edge_bps(pair_key, maker_ex=maker_ex, taker_ex=taker_ex,
+                                                 usdc_amt=usdc_amt, side="SELL"))
+            else:
+                e_sell = float(edge_sell_bps)
+
+            if edge_buy_bps is None or not math.isfinite(float(edge_buy_bps)):
+                e_buy = float(self._tm_edge_bps(pair_key, maker_ex=maker_ex, taker_ex=taker_ex,
+                                                usdc_amt=usdc_amt, side="BUY"))
+            else:
+                e_buy = float(edge_buy_bps)
+        except Exception:
+            logger.exception("[RiskManager] should_tm_non_neutral: edge calc failed → NN=OFF")
+            # best-effort return
+            return False, "SELL", 0.0
+
+        best_side = "SELL" if e_sell >= e_buy else "BUY"
+        best_edge = float(max(e_sell, e_buy))
+
+        # Seuils NN (config)
+        nn_min_edge_bps = getattr_float(self.cfg, "tm_nn_min_edge_bps", 9.0)
+        nn_max_vol_bps = getattr_float(self.cfg, "tm_nn_max_vol_bps", 18.0)
+        nn_max_slip_bps = getattr_float(self.cfg, "tm_nn_max_slip_bps", 7.0)
+
+        # TTLs (contrat BotConfig si dispo, sinon fallback cfg)
+        try:
+            vol_ttl_s = float(getattr(getattr(self.bot_cfg, "vol", None), "ttl_s",
+                                      getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0)))
+        except Exception:
+            vol_ttl_s = float(getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0))
 
         try:
-            vol_bps = float(self.vol_manager.get_p95_bps(pair_key))
+            slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s",
+                                       getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0)))
+        except Exception:
+            slip_ttl_s = float(getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0))
+
+        # 1) Volatilité : doit être dispo + finite + fraîche (TTL) + avec samples.
+        vm = getattr(self, "vol_manager", None)
+        if not vm or not hasattr(vm, "get_current_metrics"):
+            logger.debug("[RiskManager] TM_NN fail-closed: vol_manager absent → NN=OFF")
+            return False, best_side, best_edge
+
+        met = None
+        try:
+            met = vm.get_current_metrics(pair_key)
+        except Exception:
+            met = None
+
+        if not met:
+            logger.debug("[RiskManager] TM_NN fail-closed: vol metrics absentes (%s) → NN=OFF", pair_key)
+            return False, best_side, best_edge
+
+        try:
+            vol_age_s = float(met.get("last_age_s", met.get("age_s", float("inf"))))
+        except Exception:
+            vol_age_s = float("inf")
+
+        try:
+            vol_samples = int(met.get("samples", met.get("n_samples", 0)) or 0)
+        except Exception:
+            vol_samples = 0
+
+        # p95_bps: on prend d'abord le snapshot (plus fiable), sinon fallback get_p95_bps()
+        try:
+            vol_bps = float(met.get("p95_bps", met.get("p95_vol_bps", 0.0)))
         except Exception:
             vol_bps = 0.0
+
+        if (not math.isfinite(vol_age_s)) or vol_age_s >= float("inf") or vol_samples <= 0:
+            logger.debug("[RiskManager] TM_NN fail-closed: vol age/samples invalides (age=%s, n=%s) → NN=OFF",
+                         vol_age_s, vol_samples)
+            return False, best_side, best_edge
+
+        if vol_age_s > float(vol_ttl_s):
+            logger.debug("[RiskManager] TM_NN fail-closed: vol stale (age=%.3fs > ttl=%.3fs) → NN=OFF",
+                         vol_age_s, float(vol_ttl_s))
+            return False, best_side, best_edge
+
+        # 2) Slippage : doit être calculable + (si possible) fraîche TTL.
+        sfc = getattr(self, "slip_collector", None) or getattr(self, "slippage_collector", None) or getattr(self, "sfc",
+                                                                                                            None)
+        if not sfc or not hasattr(sfc, "get_recent_slippage"):
+            logger.debug("[RiskManager] TM_NN fail-closed: SFC/collector absent → NN=OFF")
+            return False, best_side, best_edge
+
         try:
-            slip_bps = float(self.slip_collector.get_recent_slippage(pair_key) * 1e4)
+            slip_frac = float(sfc.get_recent_slippage(pair_key))
+            slip_bps = slip_frac * 10_000.0
         except Exception:
-            slip_bps = 0.0
+            logger.exception("[RiskManager] TM_NN fail-closed: slippage compute failed (%s) → NN=OFF", pair_key)
+            return False, best_side, best_edge
 
-        depth_ok = self._depth_ratio_ok(maker_ex, pair_key, usdc_amt, getattr(cfg, "tm_nn_min_depth_ratio", 1.4))
+        if not math.isfinite(slip_bps) or slip_bps < 0:
+            logger.debug("[RiskManager] TM_NN fail-closed: slip invalide (slip_bps=%s) → NN=OFF", slip_bps)
+            return False, best_side, best_edge
 
+        if hasattr(sfc, "last_age_seconds"):
+            try:
+                # NB: certains collectors ignorent l'arg → ok, c'est volontairement conservateur.
+                slip_age_s = float(sfc.last_age_seconds(pair_key) or float("inf"))
+            except Exception:
+                slip_age_s = float("inf")
+
+            if (not math.isfinite(slip_age_s)) or slip_age_s >= float("inf") or slip_age_s > float(slip_ttl_s):
+                logger.debug("[RiskManager] TM_NN fail-closed: slip stale/unknown (age=%s ttl=%s) → NN=OFF",
+                             slip_age_s, float(slip_ttl_s))
+                return False, best_side, best_edge
+
+        # 3) Profondeur (existant)
+        try:
+            depth_ok, _depth_ratio = self._depth_ratio_ok(pair_key, maker_ex=maker_ex, taker_ex=taker_ex)
+        except Exception:
+            logger.exception("[RiskManager] TM_NN fail-closed: depth check failed → NN=OFF")
+            return False, best_side, best_edge
+
+        # 4) Règles NN (inchangées sur le fond, mais plus de fail-open)
         ok = (
-            best_edge >= getattr_float(cfg, "tm_nn_min_edge_bps", 3.0) and
-            vol_bps <= getattr_float(cfg, "tm_nn_max_vol_bps", 60.0) and
-            slip_bps <= getattr_float(cfg, "tm_nn_max_slip_bps", 25.0) and
-            depth_ok
+                (best_edge >= nn_min_edge_bps) and
+                (vol_bps <= nn_max_vol_bps) and
+                (slip_bps <= nn_max_slip_bps) and
+                bool(depth_ok)
         )
-        return (ok, best_side, best_edge)
+
+        return bool(ok), best_side, best_edge
+
 
     def decide_tm_mode(
             self,
@@ -11737,6 +12107,18 @@ class RiskManager:
         slip_src = "none"
         vol_src = "none"
 
+        # Tier hint (optionnel) : si absent, on considère PRIMARY => strict
+        opp_tier = str(
+            opp.get("tier")
+            or opp.get("lhm_tier")
+            or opp.get("cohort")
+            or opp.get("bucket")
+            or "PRIMARY"
+        ).upper()
+
+        # TTL strict sur les tiers critiques (CORE/PRIMARY). Sur les autres tiers, on peut tolérer "unknown"
+        ttl_strict = opp_tier in ("CORE", "PRIMARY")
+
         # --- TTL de base (fallback legacy) : BotConfig.slip/vol.ttl_s ------------
         try:
             slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s", 2.0))
@@ -11805,7 +12187,10 @@ class RiskManager:
                     slip_age_s = None
 
         if slip_age_s is not None:
-            slip_age_ok = slip_age_s <= slip_ttl_s
+            slip_age_ok = float(slip_age_s) <= float(slip_ttl_s)
+        else:
+            # Unknown => stale sur CORE/PRIMARY (fail-closed). Sur tiers non-critiques, on tolère.
+            slip_age_ok = (not ttl_strict)
 
         # Volatilité TTL (contrat public)
         vol_getter = getattr(self, "vol_monitor", None)
@@ -11826,7 +12211,10 @@ class RiskManager:
                     vol_age_s = None
 
         if vol_age_s is not None:
-            vol_age_ok = vol_age_s <= vol_ttl_s
+            vol_age_ok = float(vol_age_s) <= float(vol_ttl_s)
+        else:
+            # TTL strict : si on ne sait pas dater la vol, on considère stale.
+            vol_age_ok = False
 
         if not (slip_age_ok and vol_age_ok):
             if getattr(self, "log", None):
@@ -13382,6 +13770,52 @@ class RiskManager:
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
             raise RMError(RM_STALE_VOL)
 
+        # --- TTL strict volatilité : si last_age_s > vol_ttl_s => reject prebundle ---
+        # Défaut: BotConfig.vol.ttl_s (fallback 5s)
+        try:
+            vol_ttl_s = float(getattr(getattr(self.bot_cfg, "vol", None), "ttl_s", 5.0))
+        except Exception:
+            vol_ttl_s = 5.0
+
+        # Override via SLO (si dispo) : on prend le MIN des TTL publics sur buy/sell exchanges
+        try:
+            slo_map = getattr(self.bot_cfg, "slo", None)
+            if slo_map:
+                g_cfg = _cfg_g(self)
+                mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                per_ex = slo_map.get(mode_key) or {}
+
+                buy_ex_u = str(route.get("buy_ex") or route.get("buy_exchange") or "").upper()
+                sell_ex_u = str(route.get("sell_ex") or route.get("sell_exchange") or "").upper()
+
+                public_slos = []
+                for ex in (buy_ex_u, sell_ex_u):
+                    if not ex:
+                        continue
+                    path_slo = per_ex.get(ex)
+                    if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                        public_slos.append(path_slo.public)
+
+                if public_slos:
+                    vol_ttl_s = min(
+                        float(getattr(ps, "vol_ttl_s", vol_ttl_s))
+                        for ps in public_slos
+                    )
+        except Exception:
+            # Best-effort : si le contrat SLO n'est pas dispo/bug, on garde BotConfig.vol.ttl_s
+            pass
+
+        if float(last_age_s) > float(vol_ttl_s):
+            route_str = f"{(route.get('buy_ex') or route.get('buy_exchange') or '?')}->" \
+                        f"{(route.get('sell_ex') or route.get('sell_exchange') or '?')}"
+            logger.info(
+                "[RiskManager] reject prebundle (RM_STALE_VOL): vol_age_s=%.3f > vol_ttl_s=%.3f pair=%s route=%s",
+                float(last_age_s), float(vol_ttl_s), pair, route_str
+            )
+            inc_rm_reject(reason=RM_STALE_VOL, pair=pair, route=route_str)
+            raise RMError(RM_STALE_VOL)
+
+
         # 2) Prudence (clé) et source de slippage
         prudence = self._current_prudence(pair)
         slip_kind = getattr(self, "slippage_source", "ewma")
@@ -13395,14 +13829,17 @@ class RiskManager:
                           route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
             raise RMError(RM_SFC_UNAVAILABLE)
 
+        route_sfc = self._norm_route_for_sfc(route, pair_key=pair)
+        slip_kind = getattr_str(self.cfg, "sfc_slippage_source", getattr(self, "slippage_source", "ewma"))
+
         cost_frac = float(sfc.get_total_cost_pct(
-            route=route,
+            route=route_sfc,
             side=side,
             size_quote=float(notional_quote or 0.0),
-            slippage_kind=slip_kind,
+            slippage_kind=("p95" if str(slip_kind).lower() == "p95" else "ewma"),
             prudence_key=prudence,
             ts_ns=None,
-            explain={"stage": "prebundle"}
+            explain={"stage": "prebundle"},
         ))
         # cost_frac doit être numérique et >= 0
 

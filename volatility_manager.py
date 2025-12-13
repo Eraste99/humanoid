@@ -578,16 +578,79 @@ class VolatilityManager:
 
     def last_age_seconds(self, _opp: Optional[Any] = None) -> float:
         """
-        Age (en secondes) de la dernière observation de volatilité/spread.
+        Age (secondes) de la dernière observation de volatilité/spread.
 
-        L'argument est volontairement ignoré pour l'instant : on renvoie une vue
-        globale via get_current_metrics(pair=None), ce qui suffit à la garde TTL
-        du RiskManager (pipeline vol frais / pas frais).
+        Version ultime (P1 pair-aware + anti-trou):
+        - si _opp is None => vue globale (pipeline vol frais/pas frais)
+        - sinon => on essaie d'extraire la pair (str/dict/attrs + base/quote)
+                  et on renvoie l'âge de CETTE pair.
+        - si pair introuvable => +inf (fail-closed) pour éviter qu'une vue globale fraîche
+          masque une paire stale.
 
         Retourne +inf s'il n'y a aucune donnée.
         """
+
+        def _norm_pair_safe(s: str) -> str:
+            try:
+                # si ton module a déjà _norm_pair(), on l'utilise
+                fn = globals().get("_norm_pair")
+                if callable(fn):
+                    return fn(s)
+            except Exception:
+                pass
+            # fallback minimal
+            return str(s or "").replace("-", "").replace("/", "").upper().strip()
+
+        def _extract_pair(obj: Any) -> str:
+            try:
+                if obj is None:
+                    return ""
+
+                # cas simple : pair directement en str
+                if isinstance(obj, str):
+                    return _norm_pair_safe(obj)
+
+                # dict opp
+                if isinstance(obj, dict):
+                    for k in ("pair", "pair_key", "symbol", "market", "instrument"):
+                        v = obj.get(k)
+                        if v:
+                            return _norm_pair_safe(str(v))
+                    # fallback base/quote
+                    b = obj.get("base")
+                    q = obj.get("quote")
+                    if b and q:
+                        return _norm_pair_safe(str(b) + str(q))
+                    return ""
+
+                # objet opp (attributs)
+                for attr in ("pair_key", "pair", "symbol", "market", "instrument"):
+                    v = getattr(obj, attr, None)
+                    if v:
+                        return _norm_pair_safe(str(v))
+
+                return ""
+            except Exception:
+                return ""
+
+        # --- Vue globale si aucun contexte ---
+        if _opp is None:
+            try:
+                metrics = self.get_current_metrics(pair=None)
+            except Exception:
+                return float("inf")
+            try:
+                return float(metrics.get("last_age_s", metrics.get("age_s", float("inf"))))
+            except Exception:
+                return float("inf")
+
+        # --- Vue par paire (fail-closed si pair inconnue) ---
+        pk = _extract_pair(_opp)
+        if not pk:
+            return float("inf")
+
         try:
-            metrics = self.get_current_metrics(pair=None)
+            metrics = self.get_current_metrics(pair=pk)
         except Exception:
             return float("inf")
 
@@ -595,6 +658,7 @@ class VolatilityManager:
             return float(metrics.get("last_age_s", metrics.get("age_s", float("inf"))))
         except Exception:
             return float("inf")
+
 
 
     def get_p95_bps(self, pair: str) -> float:

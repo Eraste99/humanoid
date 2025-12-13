@@ -12,6 +12,13 @@ class ErrKind:
     RATELIMIT  = "RATELIMIT"    # 429 / quota / window
     FATAL      = "FATAL"        # 4xx non-retryable, auth, input invalide
 
+
+class StressTag:
+    PRIVATE_PLANE = "PRIVATE_PLANE"
+    INFRA = "INFRA"
+    UNKNOWN = "UNKNOWN"
+
+
 @dataclass
 class RetryOutcome:
     ok: bool
@@ -20,6 +27,7 @@ class RetryOutcome:
     elapsed_s: float
     kind: Optional[str] = None
     last_exception: Optional[BaseException] = None
+    stress_tag: Optional[str] = None
 
 # ===================== Classification ======================
 
@@ -53,6 +61,22 @@ def map_error(venue: str, exc: BaseException) -> str:
 
     # défaut: prudence
     return ErrKind.RETRYABLE
+
+def classify_stress_tag(exc: BaseException) -> str:
+    """
+    Best-effort : tague une erreur comme potentiellement liée au plan privé.
+    Ne doit jamais lever.
+    """
+    try:
+        msg = str(exc).upper()
+    except Exception:
+        return StressTag.UNKNOWN
+
+    if "INSUFFICIENT_BALANCE" in msg or "MARGIN" in msg:
+        return StressTag.PRIVATE_PLANE
+    if "ACCOUNT_LOCKED" in msg or "MAINTENANCE" in msg:
+        return StressTag.PRIVATE_PLANE
+    return StressTag.UNKNOWN
 
 # ====================== Politique v3 =======================
 
@@ -188,17 +212,18 @@ def with_retry(
             return RetryOutcome(True, res, attempt + 1, _elapsed_s(start))
         except BaseException as exc:
             kind = map_error(venue, exc)
+            stress_tag = classify_stress_tag(exc)
 
             # idempotence stricte: on évite de retenter sur certains genres
             if not p.is_idempotent and kind in (ErrKind.FATAL, ErrKind.RATELIMIT):
                 if p.on_giveup: p.on_giveup(kind, attempt + 1, _elapsed_s(start))
-                return RetryOutcome(False, exc, attempt + 1, _elapsed_s(start), kind=kind, last_exception=exc)
+                return RetryOutcome(False, exc, attempt + 1, _elapsed_s(start), kind=kind, last_exception=exc,stress_tag=stress_tag)
 
             attempt += 1
             # budgets
             if attempt >= p.budget_tries or _elapsed_s(start) >= p.cap_total_s:
                 if p.on_giveup: p.on_giveup(kind, attempt, _elapsed_s(start))
-                return RetryOutcome(False, exc, attempt, _elapsed_s(start), kind=kind, last_exception=exc)
+                return RetryOutcome(False, exc, attempt, _elapsed_s(start), kind=kind, last_exception=exc, stress_tag=stress_tag)
 
             # backoff
             sleep_s = p.sleep_for_attempt(attempt)
@@ -228,15 +253,16 @@ async def awith_retry(
             return RetryOutcome(True, res, attempt + 1, _elapsed_s(start))
         except BaseException as exc:
             kind = map_error(venue, exc)
+            stress_tag = classify_stress_tag(exc)
 
             if not p.is_idempotent and kind in (ErrKind.FATAL, ErrKind.RATELIMIT):
                 if p.on_giveup: p.on_giveup(kind, attempt + 1, _elapsed_s(start))
-                return RetryOutcome(False, exc, attempt + 1, _elapsed_s(start), kind=kind, last_exception=exc)
+                return RetryOutcome(False, exc, attempt + 1, _elapsed_s(start), kind=kind, last_exception=exc, stress_tag=stress_tag)
 
             attempt += 1
             if attempt >= p.budget_tries or _elapsed_s(start) >= p.cap_total_s:
                 if p.on_giveup: p.on_giveup(kind, attempt, _elapsed_s(start))
-                return RetryOutcome(False, exc, attempt, _elapsed_s(start), kind=kind, last_exception=exc)
+                return RetryOutcome(False, exc, attempt, _elapsed_s(start), kind=kind, last_exception=exc, stress_tag=stress_tag)
 
             sleep_s = p.sleep_for_attempt(attempt)
             if p.on_retry: p.on_retry(kind, attempt, sleep_s, _elapsed_s(start))

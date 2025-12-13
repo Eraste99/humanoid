@@ -356,10 +356,29 @@ class RPCServer:
                     st = boot.get_status() or {}
                 except Exception:
                     st = {"state": "UNKNOWN"}
+            rm_block = {}
+            if boot is not None:
+                try:
+                    rm = getattr(boot, "risk_manager", None)
+                    if rm is not None:
+                        rm_block = {
+                            "rm_mode": str(getattr(rm, "rm_mode", "UNKNOWN")),
+                            "pacer_mode": str(getattr(rm, "pacer_mode", "UNKNOWN")),
+                            "trade_mode": str(getattr(rm, "trade_mode", "UNKNOWN")),
+                        }
+                        if hasattr(rm, "private_plane_state"):
+                            rm_block["private_plane_state"] = str(rm.private_plane_state)
+                except Exception:
+                    rm_block = {"rm_mode": "UNKNOWN"}
+            if rm_block:
+                try:
+                    st.setdefault("rm", rm_block)
+                except Exception:
+                    pass
             # Optionnel: si tu stockes un buffer d'événements en mémoire,
             # expose-le ici; sinon on renvoie juste le statut.
             return web.json_response({"boot": st})
-
+        
         # éviter double-registration
         try:
             app.router.add_get("/status", _handle_status)

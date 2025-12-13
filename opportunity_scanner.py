@@ -66,6 +66,7 @@ try:
         inc_scanner_rejection,
         inc_scanner_emitted,
         observe_scanner_latency,
+        note_scanner_cfg,
     )
 except Exception:  # pragma: no cover
 
@@ -79,6 +80,10 @@ except Exception:  # pragma: no cover
         return
 
     def observe_scanner_latency(*args, **kwargs):  # type: ignore
+        return
+
+
+    def note_scanner_cfg(*_a, **_k):  # type: ignore
         return
 
 logger = logging.getLogger("OpportunityScanner")
@@ -160,6 +165,13 @@ class _TokenBucket:
         self._refill()
         return 1.0 - min(1.0, self._tokens / max(self.capacity, 1e-9))
 
+    def update_rate(self, rate_per_s: float) -> None:
+        """Met à jour le débit et réaligne la capacité/tokens sans casser les quotas."""
+        self._refill()
+        self.rate = max(0.1, float(rate_per_s))
+        # conserve au moins une capacité proportionnelle au nouveau débit
+        self.capacity = float(max(self.capacity, self.rate * 2.0))
+        self._tokens = min(self.capacity, self._tokens)
 
 # --- Métriques rate-limit (no-op si obs_metrics absent) ----------------------
 try:
@@ -311,6 +323,8 @@ class OpportunityScanner:
         # LHM optionnel: peut être injecté après coup
         # On initialise à None pour éviter les AttributeError au boot.
         self.logger_historique_manager = None
+        # Callback opportunité optionnel (set via set_on_opportunity)
+        self.on_opportunity = None
         # Sink optionnel pour l'historique d'opps (set_history_logger)
         self._hist_logger = None
         self.logger = logging.getLogger("OpportunityScanner")
@@ -371,6 +385,11 @@ class OpportunityScanner:
         self.dedup_cooldown_s = float(max(0.05, getattr(s, "dedup_cooldown_s", 0.35)))
         self.backpressure_log_every = int(max(1, getattr(s, "backpressure_log_every", 100)))
         self.max_opportunities = int(max(100, getattr(s, "max_opportunities", 5000)))
+
+        try:
+            note_scanner_cfg(self.scan_interval, self.min_required_bps, self.max_pairs_per_tick)
+        except Exception:
+            pass
 
         # audition / autopause
         self.audition_ttl_s = float(max(0.0, getattr(s, "audition_ttl_s", 300.0)))
@@ -514,7 +533,8 @@ class OpportunityScanner:
         # ------------------------------------
         # 8) Feeds auxiliaires & caches
         # ------------------------------------
-        # self._slip_cache = {}     # {(EX,PAIR): {"bps": float|None, "ts": float}}
+        self._slip_cache = {}  # {(EX,PAIR): {"bps": float|None, "ts": float}}
+        self._slip_ts = {}  # pair -> ts (dernier snapshot slip)
         self._slip_threshold_bps = {}  # par pair
         self._fees_cache = {}     # {(EX,PAIR): {"taker": float|None, "maker": float|None, "ts": float}}
 
@@ -522,7 +542,7 @@ class OpportunityScanner:
         # 9) Volatility (patch scoring local)
         # ------------------------------------
         self._vol_bps = {}        # pair -> vol instant bps
-        self._vol_ema = {}        # pair -> ema bps
+        self._vol_ema = {}        # (ex, pair) -> ema bps
         self.vol_alpha_penalty = getattr_float(s, "vol_alpha_penalty", 0.15)
         self.vol_soft_cap_bps  = getattr_float(s, "vol_soft_cap_bps", 40.0)
         self.vol_beta_min_req  = getattr_float(s, "vol_beta_min_req", 0.20)
@@ -750,8 +770,13 @@ class OpportunityScanner:
         # agrège sur les CEX connus (max) ; autre stratégie possible (p95, avg)
         vals = []
         now = time.time()
-        # TTL vol : priorité à l'argument, sinon cache interne, sinon cfg.vol.ttl_s
-        ttl = float(ttl_s or getattr(self, "_vol_ttl_s", float(self.cfg.vol.ttl_s)))
+        # TTL vol : priorité à l'argument, sinon SLO public, sinon cfg.vol.ttl_s
+        if ttl_s is not None:
+            ttl = float(ttl_s)
+        else:
+            ex = next(iter(self.exchanges or []), "")
+            ttl = self._public_ttl(ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s",
+                                                            float(getattr(self, "_vol_ttl_s", self.cfg.vol.ttl_s))))
 
         for (ex, p), v in list(self._vol_ema.items()):
             if p != pk:
@@ -1034,7 +1059,9 @@ class OpportunityScanner:
         if buy is not None:  d["buy"] = float(max(0.0, buy))
         if sell is not None: d["sell"] = float(max(0.0, sell))
         if recent is not None: d["recent"] = float(max(0.0, recent))
-        d["ts"] = time.time()
+        ts_now = time.time()
+        d["ts"] = ts_now
+        self._slip_ts[_norm_pair(pair_key)] = ts_now
         if threshold_bps is not None:
             self._slip_threshold_bps[pk] = float(max(0.0, threshold_bps))
 
@@ -1826,7 +1853,7 @@ class OpportunityScanner:
         """
         # global
         if hasattr(self, "_tb_global") and not self._tb_global.allow():
-            self._record_rejection("rate_limit_global", route="*", pair=pair)
+            self._record_rejection(reason="rate_limit_global", route="*", pair=pair)
             return False, "global"
 
         # pair bucket (4 tiers)
@@ -1836,7 +1863,7 @@ class OpportunityScanner:
             tb = self._ensure_buckets_for_pair(pair)
 
         if not tb.allow():
-            self._record_rejection("rate_limit_pair", route="*", pair=pair, ctx={"cohort": cohort})
+            self._record_rejection(reason="rate_limit_pair", route="*", pair=pair, ctx={"cohort": cohort})
             return False, "pair_bucket"
 
         return True, ""
@@ -1844,23 +1871,67 @@ class OpportunityScanner:
     # opportunity_scanner.py (dans la classe)
     def _slip_age_seconds(self, pair: str) -> float:
         p = self._norm_pair(pair)
-        ts = (getattr(self, "_slip_ts", {}) or {}).get(p) or 0.0
-        return max(0.0, time.time() - float(ts))
+        now = time.time()
+        ages = []
+        for (ex, pk), meta in getattr(self, "_slip_cache", {}).items():
+            if pk != p:
+                continue
+            ts_val = meta.get("ts")
+            if ts_val:
+                ages.append(max(0.0, now - float(ts_val)))
+
+        if not ages:
+            ts = (getattr(self, "_slip_ts", {}) or {}).get(p)
+            if ts:
+                ages.append(max(0.0, now - float(ts)))
+
+        return min(ages) if ages else float("inf")
 
     def _vol_age_seconds(self, pair: str) -> float:
         p = self._norm_pair(pair)
-        ts = (getattr(self, "_vol_ts", {}) or {}).get(p) or 0.0
-        return max(0.0, time.time() - float(ts))
+        now = time.time()
+        ages = []
+        for (ex, pk), ts in getattr(self, "_vol_ts", {}).items():
+            if pk != p:
+                continue
+            if ts:
+                ages.append(max(0.0, now - float(ts)))
+
+        return min(ages) if ages else float("inf")
+
+    def _public_ttl(self, exchange: str, attr: str, cfg_default: float) -> float:
+        ttl = None
+        try:
+            cfg = getattr(self, "cfg", None)
+            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+            if slo_map:
+                g_cfg = getattr(cfg, "g", None)
+                mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                per_ex = slo_map.get(mode_key) or {}
+                path_slo = per_ex.get(_norm_ex(exchange))
+                if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                    ttl_val = float(getattr(path_slo.public, attr, 0.0) or 0.0)
+                    if ttl_val > 0.0:
+                        ttl = ttl_val
+        except Exception:
+            ttl = None
+
+        if ttl is None:
+            ttl = float(cfg_default)
+        return float(ttl)
 
     def _risk_feeds_fresh(self, pair: str) -> bool:
         """
         Vérifie la fraicheur des flux auxiliaires (slippage/volatility)
-        en se basant EXCLUSIVEMENT sur cfg.slip.ttl_s et cfg.vol.ttl_s.
+        en se basant EXCLUSIVEMENT sur les SLO publics (fallback cfg.slip/vol.ttl_s).
         """
+        ex = next(iter(self.exchanges or []), "")
+        slip_ttl = self._public_ttl(ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0))
+        vol_ttl = self._public_ttl(ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s", 5.0))
+
         slip_age = self._slip_age_seconds(pair)  # suppose des compteurs internes existants
         vol_age = self._vol_age_seconds(pair)
-        return (slip_age is not None and slip_age <= float(self.cfg.slip.ttl_s)) and \
-            (vol_age is not None and vol_age <= float(self.cfg.vol.ttl_s))
+        return (slip_age is not None and slip_age <= slip_ttl) and (vol_age is not None and vol_age <= vol_ttl)
 
     def _dynamic_thresholds_for(self, pair: str) -> tuple[float, float]:
         """
@@ -2886,7 +2957,7 @@ class OpportunityScanner:
                     continue
 
                 if not self._risk_feeds_fresh(pair):
-                    self._record_rejection("stale_risk_feeds", route="*", pair=pair)
+                    self._record_rejection(reason="stale_risk_feeds", route="*", pair=pair)
                     continue
 
                 self._evaluate_routes_for_pair(pair, ev, enable_mm=self._enable_mm_hints)

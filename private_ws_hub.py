@@ -2482,7 +2482,13 @@ class PrivateWSHub:
         Statut agrégé:
           - status: "WS_OK" | "WS_DEGRADED" | "WS_DOWN" | "WS_UNKNOWN"
           - healthy: bool global (au moins un client 'healthy')
+            * WS_DEGRADED : trafic vu récemment mais gap/error/reconnects élevés
+              ou pas encore de trafic (boot). Le flux reste partiellement
+              exploitable.
+            * WS_DOWN : aucun client healthy ou gap très élevé → alias considéré
+              indisponible tant que la situation persiste.
         """
+
         exu = str(exchange).upper()
         alu = _upper(alias)
         clients = self._collect_ws_client_status_for_alias(exu, alu)
