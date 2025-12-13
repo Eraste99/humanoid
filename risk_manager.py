@@ -13442,6 +13442,12 @@ class RiskManager:
         ev = dict(evt or {})
         status = str(ev.get("status") or ev.get("type") or "").upper()
         etype = str(ev.get("type") or "").lower()
+        rec = getattr(self, "reconciler", None)
+        if rec and hasattr(rec, "mark_ws_activity"):
+            try:
+                rec.mark_ws_activity()
+            except Exception:
+                pass
 
         # Branche dédiée pour les transferts internes (PrivateWSHub).
         if etype in ("transfer", "pws_transfer"):
@@ -13481,6 +13487,11 @@ class RiskManager:
 
         # Validation contrat FILL/PARTIAL pour les events type="fill"
         if etype == "fill":
+            from contracts.payloads import normalize_private_fill_event, validate_private_fill_event_lite  # type: ignore
+
+            ev = normalize_private_fill_event(ev)
+            ev["exchange"] = exchange
+            ev["alias"] = alias
             required = ("symbol", "side", "fill_px", "base_qty", "quote", "quote_qty")
             missing = [name for name in required if ev.get(name) in (None, "")]
             has_id = bool(ev.get("client_id") or ev.get("exchange_order_id"))
@@ -13524,6 +13535,27 @@ class RiskManager:
                 except Exception:
                     pass
                 return
+            ok, fill_model = validate_private_fill_event_lite(ev)
+            if not ok or fill_model is None:
+                try:
+                    logger.warning(
+                        "[RiskManager] on_private_event: drop invalid fill after validation head=%s",
+                        {
+                            "exchange": exchange,
+                            "alias": alias,
+                            "symbol": ev.get("symbol"),
+                            "side": ev.get("side"),
+                            "status": ev.get("status"),
+                            "type": ev.get("type"),
+                            "client_id": ev.get("client_id"),
+                            "exchange_order_id": ev.get("exchange_order_id"),
+                        },
+                    )
+                except Exception:
+                    pass
+                return
+
+            ev = fill_model.model_dump()
 
         # reality-check fees (passif, à partir d'un event déjà validé)
         bf = getattr(self, "balance_fetcher", None)
@@ -13533,9 +13565,8 @@ class RiskManager:
             except Exception as exc:
                 _handle_error("bf_reality_check_failed", exc)
 
-        # Reconciler: observe + resync async
-        rec = getattr(self, "reconciler", None)
-        if rec:
+                # Reconciler: observe + resync async pour les fills valides
+        if etype == "fill" and rec:
             try:
                 rec.observe_fill_event(ev)
             except Exception as exc:

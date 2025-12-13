@@ -768,6 +768,10 @@ class PrivateWSHubCfg:
     PWS_PACER_EU: str = "NORMAL"
     PWS_PACER_US: str = "NORMAL"
     PWS_ALERT_PERIOD_S: int = 5
+    PWS_STATUS_SOFT_GAP_S: float = 60.0
+    PWS_STATUS_HARD_GAP_S: float = 180.0
+    PWS_STATUS_ERROR_THRESHOLD: int = 10
+    PWS_STATUS_RECONNECT_THRESHOLD: int = 20
 
 @dataclass
 class RebalancingCfg:
@@ -789,6 +793,13 @@ class RebalancingCfg:
 class ReconcilerCfg:
     RECO_ALERT_PERIOD_S: int = 30
     RECO_MISS_BURST_THRESHOLD: int = 5
+    RECO_MISS_RECENT_THRESHOLD: float = 30.0
+    RECO_ALIAS_RESYNC_MAX_AGE_S: float = 6 * 3600.0
+    cooldown_s: float = 60.0
+    stale_ms: int = 1500
+    poll_every_s: float = 2.0
+    dedup_max: int = 20000
+    cold_every_h: float = 6.0
 
 # --- Balance Fetcher ---
 @dataclass
@@ -809,6 +820,8 @@ class BalanceFetcherCfg:
     default_private_wallet: str = "SPOT"
     wallet_missing_log_interval_s: float = 60.0
     wallet_types: List[str] = field(default_factory=lambda: ["SPOT","FUNDING"])
+    WS_BAL_TTL_SECONDS: float = 10.0
+    ENABLE_WS_BALANCE_MERGE: bool = False
 
 
 # --- Slippage Handler ---

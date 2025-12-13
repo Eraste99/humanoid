@@ -37,6 +37,8 @@ from modules.private_ws_hub import PrivateWSHub
 from modules.private_ws_reconciler import PrivateWSReconciler
 from modules.execution_engine import ExecutionEngine
 from modules.rpc_gateway import RPCServer
+from modules.balance_fetcher import MultiBalanceFetcher
+
 
 # Config type (indicatif)
 try:
@@ -161,15 +163,18 @@ class Boot:
         await self._discover_pairs_and_compute_active()
         # 3) Public WS + Router
         await self._start_public_pipeline()
-        # 4) RM (kwargs signature)
+
+        # 4) Balances plane (MBF) avant RM
+        await self._start_balances_plane()
+        # 5) RM (kwargs signature)
         await self._start_rm()
-        # 5) Scanner (bind Router push)
+        # 6) Scanner (bind Router push)
         await self._start_scanner()
-        # 6) Private plane (Hub, Reco, Balances)
+        # 7) Private plane (Hub, Reco, Balances)
         await self._start_private_plane()
-        # 7) Engine + RPC
+        # 8) Engine + RPC
         await self._start_engine_and_rpc()
-        # 8) READY
+        # 9) READY
         await self._evaluate_ready()
 
         self.log.info(
@@ -666,6 +671,55 @@ class Boot:
         if queues and hasattr(slip, "attach_bus_slip_queues"):
             slip.attach_bus_slip_queues(queues)
 
+    async def _start_balances_plane(self) -> None:
+        """
+        Instancie et démarre le MultiBalanceFetcher si activé.
+
+        Démarre également sa boucle de synchronisation via une tâche dédiée.
+        Idempotent et feature-flag aware.
+        """
+        g = getattr(self.cfg, "g", None)
+        fs = getattr(g, "feature_switches", {}) if g else {}
+        enable_balances = bool(fs.get("balance_fetcher", False))
+
+        if not enable_balances:
+            self._send_status("balances", "skipped", {"reason": "feature_flag_off"})
+            return
+
+        if not getattr(self.ctx, "balances", None):
+            cfg = getattr(self, "cfg", None)
+            dry_run = bool(getattr(getattr(cfg, "g", object()), "dry_run", False))
+            verbose = bool(getattr(getattr(cfg, "g", object()), "verbose", True))
+            mbf_kwargs = {
+                "binance_accounts": getattr(cfg, "binance_accounts", None),
+                "coinbase_at_accounts": getattr(cfg, "coinbase_at_accounts", None),
+                "bybit_accounts": getattr(cfg, "bybit_accounts", None),
+                "config": cfg,
+                "dry_run": dry_run,
+                "verbose": verbose,
+            }
+            self.ctx.balances = MultiBalanceFetcher(**mbf_kwargs)
+
+        mbf = getattr(self.ctx, "balances", None)
+        if hasattr(mbf, "start"):
+            await mbf.start()
+
+        if hasattr(mbf, "start_sync_loop") and not self._balances_task:
+            try:
+                self._balances_task = asyncio.create_task(
+                    mbf.start_sync_loop(), name="mbf-sync-loop"
+                )
+            except Exception:
+                self.log.exception("[Boot] unable to start MBF sync loop")
+
+        self.ready_balances.set()
+        self._send_status("balances", "ready")
+
+        try:
+            self._wire_mbf_ws_status_providers()
+        except Exception:
+            self.log.exception("[Boot] wiring MBF ws_status_providers depuis _start_balances_plane a échoué")
+
     # --- boot.py (dans class Boot) ---
     async def _start_rm(self) -> None:
         """
@@ -832,13 +886,31 @@ class Boot:
         if hasattr(self.ctx.pws_hub, "start"):
             await self.ctx.pws_hub.start()
 
-        # Hub up = ready_private, mais wiring validé plus tard via RM/Engine
-        self.ready_private.set()
-        self._send_status("private", "ready")
 
         # 2) Reconciler (unique)
         if not getattr(self.ctx, "reconciler", None):
-            self.ctx.reconciler = PrivateWSReconciler(venue_name="TRI-CEX")
+            reco_cfg = getattr(self.cfg, "reconciler", None)
+            reco_kwargs = {
+                "venue_name": "TRI-CEX",
+                "cooldown_s": getattr(reco_cfg, "cooldown_s", 60.0),
+                "stale_ms": getattr(reco_cfg, "stale_ms", 1500),
+                "poll_every_s": getattr(reco_cfg, "poll_every_s", 2.0),
+                "dedup_max": getattr(reco_cfg, "dedup_max", 20000),
+                "cold_every_h": getattr(
+                    reco_cfg, "cold_every_h", getattr(reco_cfg, "cold_resync_interval_h", 6.0)
+                ),
+            }
+            self.ctx.reconciler = PrivateWSReconciler(**reco_kwargs)
+
+        try:
+            self.ctx.reconciler.cfg = getattr(self.cfg, "reconciler", None)
+        except Exception:
+            pass
+
+        try:
+            self.ctx.reconciler.start()
+        except Exception:
+            self.log.exception("[Boot] unable to start PrivateWSReconciler")
 
         # Attacher au Hub s'il expose un hook
         try:
@@ -878,7 +950,15 @@ class Boot:
         except Exception:
             self.log.exception("[Boot] wiring MBF event_sink depuis _start_private_plane a échoué")
 
-
+        reco_task = getattr(self.ctx.reconciler, "_task", None)
+        hub_started = bool(getattr(self.ctx.pws_hub, "__class__", None))
+        if reco_task:
+            self.ready_private.set()
+        self.state["private"] = {
+            "hub_present": hub_started,
+            "reconciler_started": bool(reco_task),
+        }
+        self._send_status("private", "ready", dict(self.state.get("private", {})))
 
     async def _sync_scanner_cohorts_loop(self) -> None:
         """
@@ -1029,6 +1109,11 @@ class Boot:
         with contextlib.suppress(Exception):
             if self.ctx.balances:
                 await self.ctx.balances.stop()
+        if self._balances_task:
+            self._balances_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._balances_task
+            self._balances_task = None
         self._publish_private_hub_status(reason="stopped")
 
 

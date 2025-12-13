@@ -43,6 +43,13 @@ import json
 import random
 from typing import Dict, Any, Optional, Tuple, List,Set, Iterable
 
+from contracts.payloads import (
+    validate_balance_snapshot_rm_lite,
+    validate_reco_alias_status_snapshot_lite,
+    validate_ws_alias_status_snapshot_lite,
+)
+
+
 logger = logging.getLogger("MultiBalanceFetcher")
 logger.setLevel(logging.INFO)
 
@@ -263,7 +270,8 @@ class MultiBalanceFetcher:
         self._ws_balances: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._ws_lock = asyncio.Lock()
         # TTL pour considérer la source WS
-        self._ws_ttl_s = getattr_float(self, "WS_BAL_TTL_SECONDS", 10.0)
+        self._ws_ttl_s = float(getattr(self.cfg, "WS_BAL_TTL_SECONDS", 10.0)) if self.cfg else 10.0
+        self._enable_ws_balance_merge = bool(getattr(self.cfg, "ENABLE_WS_BALANCE_MERGE", False)) if self.cfg else False
 
         # Statut WS / Reconciler (optionnel) pour marquer le capital « à risque »
         # Ces providers sont injectés par le Boot / orchestrateur:
@@ -288,6 +296,8 @@ class MultiBalanceFetcher:
         import time
         key = (exchange.upper(), alias.upper())
         async with self._ws_lock:
+            if not self._enable_ws_balance_merge:
+                return None
             self._ws_balances[key] = {"ts": time.time(), "data": {k.upper(): float(v) for k,v in (balances or {}).items()}}
 
     async def _get_ws_balances_if_fresh(self, exchange: str, alias: str) -> Dict[str, float] | None:
@@ -1324,11 +1334,30 @@ class MultiBalanceFetcher:
         except Exception:
             reco_snap = None
 
-        hub_status = (hub_snap or {}).get("status", "WS_UNKNOWN")
-        reco_status = (reco_snap or {}).get("status", "UNKNOWN")
+        hub_model = None
+        reco_model = None
 
-        miss_rate_per_min = float((reco_snap or {}).get("miss_rate_per_min", 0.0) or 0.0)
-        age_since_resync = float((reco_snap or {}).get("age_since_last_alias_resync_s", 0.0) or 0.0)
+        try:
+            if hub_snap:
+                hub_model = validate_ws_alias_status_snapshot_lite(hub_snap)
+        except Exception:
+            hub_model = None
+
+        try:
+            if reco_snap:
+                reco_model = validate_reco_alias_status_snapshot_lite(reco_snap)
+        except Exception:
+            reco_model = None
+
+        hub_dict = hub_model.model_dump() if hub_model is not None else (hub_snap or {})
+        reco_dict = reco_model.model_dump() if reco_model is not None else (reco_snap or {})
+
+        hub_status = (hub_dict or {}).get("status", "WS_UNKNOWN")
+        reco_status = (reco_dict or {}).get("status", "UNKNOWN")
+
+        miss_rate_per_min = float((reco_dict or {}).get("miss_rate_per_min", 0.0) or 0.0)
+        age_since_resync = float((reco_dict or {}).get("age_since_last_alias_resync_s", 0.0) or 0.0)
+
 
         capital_at_risk = self._derive_capital_at_risk(
             ws_status=hub_status,
@@ -1346,25 +1375,25 @@ class MultiBalanceFetcher:
             "reco_status": reco_status,
             "miss_rate_per_min": miss_rate_per_min,
             "age_since_last_alias_resync_s": age_since_resync if age_since_resync > 0.0 else None,
-            "raw_hub": hub_snap or {},
-            "raw_reconciler": reco_snap or {},
+            "raw_hub": hub_dict or {},
+            "raw_reconciler": reco_dict or {},
         }
 
-        if hub_snap:
+        if hub_dict:
             out.update({
-                "hub_healthy": hub_snap.get("healthy"),
-                "hub_heartbeat_gap_s": hub_snap.get("heartbeat_gap_s"),
-                "hub_last_event_ts": hub_snap.get("last_event_ts"),
-                "hub_errors_total": hub_snap.get("errors_total"),
-                "hub_reconnects_total": hub_snap.get("reconnects_total"),
+                "hub_healthy": hub_dict.get("healthy"),
+                "hub_heartbeat_gap_s": hub_dict.get("heartbeat_gap_s"),
+                "hub_last_event_ts": hub_dict.get("last_event_ts"),
+                "hub_errors_total": hub_dict.get("errors_total"),
+                "hub_reconnects_total": hub_dict.get("reconnects_total"),
             })
 
-        if reco_snap:
+        if reco_dict:
             out.update({
-                "reco_miss_rate_per_min": reco_snap.get("miss_rate_per_min"),
-                "reco_misses_recent": reco_snap.get("misses_recent"),
-                "reco_last_alias_resync_ts": reco_snap.get("last_alias_resync_ts"),
-                "reco_age_since_last_alias_resync_s": reco_snap.get("age_since_last_alias_resync_s"),
+                "reco_miss_rate_per_min": reco_dict.get("miss_rate_per_min"),
+                "reco_misses_recent": reco_dict.get("misses_recent"),
+                "reco_last_alias_resync_ts": reco_dict.get("last_alias_resync_ts"),
+                "reco_age_since_last_alias_resync_s": reco_dict.get("age_since_last_alias_resync_s"),
             })
 
         return out
@@ -1565,11 +1594,15 @@ class MultiBalanceFetcher:
             "as_of_ts": time.monotonic(),
         }
 
-        return {
+        snapshot_payload = {
             "mode": view,
             "balances": balances,
             "meta": meta,
         }
+        try:
+            return validate_balance_snapshot_rm_lite(snapshot_payload).model_dump()
+        except Exception:
+            return snapshot_payload
 
 
     # =========================== Public helpers ===============================

@@ -2535,11 +2535,18 @@ class PrivateWSHub:
         last_ts = max(last_ts_vals) if last_ts_vals else None
         heartbeat_gap_s = (now - last_ts) if last_ts is not None else None
 
-        # Heuristiques simples (ajustables plus tard via la config si besoin)
-        DEFAULT_SOFT_GAP_S = 60.0   # au-delà, on considère l'alias dégradé
-        DEFAULT_HARD_GAP_S = 180.0  # au-delà, on considère l'alias DOWN
-        ERROR_THRESHOLD = 10
-        RECONNECT_THRESHOLD = 20
+        # Heuristiques simples (config-driven, fallback sur les valeurs historiques)
+        pws_cfg = getattr(self, "_pws_cfg", getattr(self, "config", None))
+        soft_default = 60.0  # au-delà, on considère l'alias dégradé
+        hard_default = 180.0  # au-delà, on considère l'alias DOWN
+        error_default = 10
+        reconnect_default = 20
+
+        soft_gap_s = float(getattr(pws_cfg, "PWS_STATUS_SOFT_GAP_S", soft_default) or soft_default)
+        hard_gap_s = float(getattr(pws_cfg, "PWS_STATUS_HARD_GAP_S", hard_default) or hard_default)
+        err_thr = int(getattr(pws_cfg, "PWS_STATUS_ERROR_THRESHOLD", error_default) or error_default)
+        reconnect_thr = int(getattr(pws_cfg, "PWS_STATUS_RECONNECT_THRESHOLD", reconnect_default) or reconnect_default)
+
 
         gap = heartbeat_gap_s if heartbeat_gap_s is not None else None
 
@@ -2552,10 +2559,10 @@ class PrivateWSHub:
                 status = "WS_DEGRADED"
                 healthy = False
         else:
-            if (not any_healthy) or (gap >= DEFAULT_HARD_GAP_S):
+            if (not any_healthy) or (gap >= hard_gap_s):
                 status = "WS_DOWN"
                 healthy = False
-            elif (gap >= DEFAULT_SOFT_GAP_S) or (errors_total >= ERROR_THRESHOLD) or (reconnects_total >= RECONNECT_THRESHOLD):
+            elif (gap >= soft_gap_s) or (errors_total >= err_thr) or (reconnects_total >= reconnect_thr):
                 status = "WS_DEGRADED"
                 healthy = True
             else:

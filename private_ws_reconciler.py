@@ -129,7 +129,7 @@ class PrivateWSReconciler:
         is_inflight_client_id: Optional[Callable[[str], bool]] = None,
         request_full_resync: Optional[Callable[[str], Awaitable[None]]] = None,
         dedup_max: int = 20000,
-
+        cold_every_h: Optional[float] = None,
     ) -> None:
 
         # --- Détection du mode "riche" legacy si signature positionnelle fournie ---
@@ -194,7 +194,11 @@ class PrivateWSReconciler:
         )
 
         # Cold-resync scheduler (désactivé si request_full_resync absent)
-        self._cold_every_h = float(getattr(self, "cold_resync_interval_h", 6.0))
+        self._cold_every_h = float(
+            cold_every_h
+            if cold_every_h is not None
+            else getattr(self, "cold_resync_interval_h", 6.0)
+        )
         self._cold_task = None
         self._event_sink = None  # optionnel: injecte ton LHM/Watchdog
         self._missing_hook_warned: Set[Tuple[str, str, str]] = set()
@@ -393,12 +397,12 @@ class PrivateWSReconciler:
                     if callable(fn):
                         await fn(venue)
                         ok = True
-                        COLD_RESYNC_TOTAL.labels(venue, "OK").inc()
+                        COLD_RESYNC_TOTAL.labels(exchange=venue, result="OK").inc()
                     else:
-                        COLD_RESYNC_TOTAL.labels(venue, "NOOP").inc()
+                        COLD_RESYNC_TOTAL.labels(exchange=venue, result="NOOP").inc()
                 except Exception:
                     venue = getattr(self, "venue", "UNKNOWN")
-                    COLD_RESYNC_TOTAL.labels(venue, "ERROR").inc()
+                    COLD_RESYNC_TOTAL.labels(exchange=venue, result="ERROR").inc()
                 finally:
                     try:
                         ms = (time.perf_counter() - t0) * 1000.0
