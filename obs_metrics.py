@@ -108,6 +108,29 @@ ENGINE_BEST_PRICE_MISSING_TOTAL = Counter(
         "Prix de référence manquant côté Engine",
         ["exchange", "pair", "side"]
     )
+# LHM – EOD orchestration (EOD-01)
+LHM_EOD_RUNS_TOTAL = Counter(
+    "lhm_eod_runs_total",
+    "Total des exécutions EOD (logger historique)",
+    labelnames=["status"],
+)
+
+LHM_EOD_ERRORS_TOTAL = Counter(
+    "lhm_eod_errors_total",
+    "Erreurs rencontrées pendant l'EOD (par étape)",
+    labelnames=["stage"],
+)
+
+LHM_EOD_DURATION_MS = Histogram(
+    "lhm_eod_duration_ms",
+    "Durée des runs EOD en millisecondes",
+)
+
+LHM_EOD_LAST_SUCCESS_TS_MS = Gauge(
+    "lhm_eod_last_success_ts_ms",
+    "Horodatage (ms epoch) du dernier EOD réussi",
+)
+
 # --- END OM-2 ---
 # --- BEGIN OM-3: wrappers safe pour inc/set/observe ---
 def _safe_labels(metric, name: str, where: str, **labels):

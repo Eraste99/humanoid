@@ -72,7 +72,7 @@ RM_ALIAS_COLLAT_LOW = "RM_ALIAS_COLLAT_LOW"
 #    selon RM_REASON_PRIORITY (index le plus petit).
 # 3) "metric dédiée ⇄ reason dédié": toute cause structurante doit avoir son reason.
 
-RM_MM_BUDGET_EXHAUSTED = "RM_MM_BUDGET_EXHAUSTED"
+
 
 # Liste fermée (à maintenir) + ordre de priorité global.
 # (On met des strings pour éviter toute dépendance à l’ordre de définition des constantes.)
@@ -123,7 +123,7 @@ RM_REASON_PRIORITY = (
     "RM_CAPS_ZERO",
     "CAPS_PREEMPT",
 
-    RM_MM_BUDGET_EXHAUSTED,      # reason canonique RM (Partie 2: mapping strict)
+    "RM_MM_BUDGET_EXHAUSTED",      # reason canonique RM (Partie 2: mapping strict)
     "MM_BUDGET_EXHAUSTED",       # legacy (Partie 2: à mapper vers RM_MM_BUDGET_EXHAUSTED)
     "RM_BUDGET_EXHAUSTED",
 
@@ -186,6 +186,7 @@ def _rm_pick_reason(*candidates: str) -> str:
     return best or (str(candidates[0]) if candidates else "")
 
 RM_MM_DELTA_HARD_LIMIT = "RM_MM_DELTA_HARD_LIMIT"
+RM_MM_BUDGET_EXHAUSTED = "RM_MM_BUDGET_EXHAUSTED"
 RM_TTTM_DELTA_HARD_LIMIT = "RM_TTTM_DELTA_HARD_LIMIT"
 
 ENGINE_BACKPRESSURE_QUEUE_FULL = "ENGINE_BACKPRESSURE_QUEUE_FULL"
@@ -3576,14 +3577,18 @@ class RiskManager:
                     bundle_notional,
                     headroom_pair,
                 )
-                # TODO (optionnel) : instrumenter RM_MM_BUDGET_EXHAUSTED_TOTAL ici.
-                # Exemple à adapter à la signature réelle de la métrique :
-                # try:
-                #     RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(
-                #         profile_u, exchange, quote, "PAIR_CAP"
-                #     ).inc()
-                # except Exception:
-                #     pass
+                try:
+                    if RM_MM_BUDGET_EXHAUSTED_TOTAL is not None:
+                        RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile_u, exchange, quote).inc()
+                except Exception:
+                    pass
+                try:
+                    if not isinstance(bundle.get("meta"), dict):
+                        bundle["meta"] = meta
+                    meta["rm_drop_reason"] = RM_MM_BUDGET_EXHAUSTED
+                except Exception:
+                    pass
+                inc_rm_reject(reason=RM_MM_BUDGET_EXHAUSTED)
                 return False, caps_local, trade_mode
 
             # 1.b) Réservation dans le wallet global MM
@@ -3627,6 +3632,7 @@ class RiskManager:
                     meta["rm_drop_reason"] = RM_MM_BUDGET_EXHAUSTED
                 except Exception:
                     pass
+                inc_rm_reject(reason=RM_MM_BUDGET_EXHAUSTED)
 
                 return False, caps_local, trade_mode
             # 1.c) Mise à jour du registre mm_pair_spent_usdc (notional inflight par paire)
@@ -3991,7 +3997,7 @@ class RiskManager:
         return True, ""
 
 
-    def engine_enqueue_bundle(self, bundle: Dict[str, Any]) -> bool:
+    def engine_enqueue_bundle(self, bundle: Dict[str, Any], decision_ctx: Optional[Dict[str, Any]] = None) -> bool:
         """
                 Point central pour envoyer un bundle vers l'Engine en appliquant:
                 - éligibilité RM (branch/profile/pacer/drawdowns),
@@ -4004,8 +4010,18 @@ class RiskManager:
                 Retourne True si le bundle a été accepté par l'Engine.
                 """
 
+        def _record_decision(ok: bool, reason: str = "") -> None:
+            if decision_ctx is None:
+                return
+            decision_ctx["attempted"] = decision_ctx.get("attempted") or True
+            if reason:
+                decision_ctx.setdefault("reasons", []).append(str(reason))
+            if ok:
+                decision_ctx["submitted"] = True
+
         if not self.engine:
             logging.warning("RM : engine indisponible, drop bundle")
+            _record_decision(False, RM_ENGINE_NOT_READY)
             return False
 
         # Rafraîchit le mode consolidé et ses overlays avant d'exposer au moteur
@@ -4067,6 +4083,8 @@ class RiskManager:
                     self._shadow.on_bundle_drop(bundle, "FLOW_FILTERED_BY_MODE")
                 except Exception:
                     pass
+            _record_decision(False, "FLOW_FILTERED_BY_MODE")
+
             return False
 
 
@@ -4107,6 +4125,7 @@ class RiskManager:
         if not eligible:
             if self._shadow:
                 self._shadow.on_bundle_drop(bundle, reason or "INELIGIBLE")
+            _record_decision(False, reason or "INELIGIBLE")
             return False
 
         # 1.b) Gate TTL balances (MBF → RM) avant d'autoriser du capital
@@ -4173,6 +4192,7 @@ class RiskManager:
                 )
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason_ttl)
+                _record_decision(False, reason_ttl)
                 return False
 
             if status == "DEGRADED":
@@ -4192,28 +4212,28 @@ class RiskManager:
                         age_s,
                         capital_at_risk,
                     )
-                    if self._shadow:
-                        self._shadow.on_bundle_drop(bundle, reason_ttl)
-                    return False
+                if self._shadow:
+                    self._shadow.on_bundle_drop(bundle, reason_ttl)
+                return False
 
-                # Pour les branches critiques, on laisse passer mais on taggue l'overlay.
-                overlays = meta.setdefault("overlays", {})
-                overlays_ttl = {
-                    # Statut TTL effectif pour ce bundle (après surcouche WS/capital_move).
-                    "status": status,
-                    "effective_status": status,
-                    "exchange": ex_ttl,
-                    "alias": alias_ttl,
-                    "age_s": age_s,
-                    "capital_at_risk": capital_at_risk,
-                    "alias_cap_factor": alias_cap_factor,
-                    # Copie du capital_mode consolidé exposé au moteur.
-                    "capital_mode": str(meta.get("capital_mode") or "UNKNOWN").upper(),
-                }
-                if ws_info:
-                    overlays_ttl["ws_accounts"] = dict(ws_info)
-                overlays["balances_ttl"] = overlays_ttl
-                bundle["meta"] = meta
+            # Pour les branches critiques, on laisse passer mais on taggue l'overlay.
+        overlays = meta.setdefault("overlays", {})
+        overlays_ttl = {
+            # Statut TTL effectif pour ce bundle (après surcouche WS/capital_move).
+            "status": status,
+            "effective_status": status,
+            "exchange": ex_ttl,
+            "alias": alias_ttl,
+            "age_s": age_s,
+            "capital_at_risk": capital_at_risk,
+            "alias_cap_factor": alias_cap_factor,
+            # Copie du capital_mode consolidé exposé au moteur.
+            "capital_mode": str(meta.get("capital_mode") or "UNKNOWN").upper(),
+        }
+        if ws_info:
+            overlays_ttl["ws_accounts"] = dict(ws_info)
+        overlays["balances_ttl"] = overlays_ttl
+        bundle["meta"] = meta
 
         # 1.c) Si aucune info TTL exploitable n'est disponible,
         # on considère le capital_mode comme "OK" (aucune contrainte TTL détectée).
@@ -4283,17 +4303,20 @@ class RiskManager:
 
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason)
+                _record_decision(False, reason)
                 return False
 
         # 2) Légalité & REB lock
         if not self._is_bundle_legal(bundle):
             if self._shadow:
                 self._shadow.on_bundle_drop(bundle, "ILLEGAL")
+            _record_decision(False, "ILLEGAL")
             return False
 
         if self._is_rebal_lock_active(bundle):
             if self._shadow:
                 self._shadow.on_bundle_drop(bundle, "REB_LOCK")
+            _record_decision(False, "REB_LOCK")
             return False
 
         # 3) Caps notionnels par CEX / profil / branche (+ préemption MM)
@@ -4314,7 +4337,7 @@ class RiskManager:
                 except Exception:
                     pass
                 self._shadow.on_bundle_drop(bundle, drop_reason)
-
+            _record_decision(False, "REB_LOCK")
             return False
 
 
@@ -4371,6 +4394,7 @@ class RiskManager:
 
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason_combo)
+                _record_decision(False, reason_combo)
                 return False
 
             if combo_key and notional_usd > 0.0:
@@ -4394,6 +4418,7 @@ class RiskManager:
                     pass
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason_sc)
+                _record_decision(False, reason_sc)
                 return False
 
 
@@ -4449,9 +4474,11 @@ class RiskManager:
 
             if self._shadow:
                 self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
+            _record_decision(False, reason or "ENGINE_REJECT")
             return False
         if not accepted and self._shadow:
             self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
+        _record_decision(bool(accepted), "ENGINE_REJECT" if not accepted else "")
         return accepted
 
 
@@ -7119,15 +7146,25 @@ class RiskManager:
 
         # audit "admitted" minimal (le détail final peut être émis plus loin si tu veux)
         self._emit_decision_record("admitted", "", opp, ctx)
+        decision_ctx: Dict[str, Any] = {"submitted": False, "attempted": False, "reasons": []}
 
         # Délégation au pipeline existant (inchangé)
         try:
             # si on_scanner_opportunity est synchrone dans ton code actuel, enlève "await" (garde une seule variante)
-            res = self.on_scanner_opportunity(opp)
+            res = self.on_scanner_opportunity(opp, decision_ctx=decision_ctx)
             if inspect.iscoroutine(res):
-                await res
+                res = await res
         except Exception:
             logging.exception("Unhandled exception during on_scanner_opportunity")
+            res = decision_ctx
+
+        summary = res if isinstance(res, dict) else decision_ctx
+        reasons = summary.get("reasons") or []
+        primary_reason = _rm_pick_reason(*reasons) if reasons else ""
+        status_final = "submitted" if summary.get("submitted") else "skipped"
+        primary_reason = _rm_pick_reason(primary_reason or "", "RM_INTERNAL_SKIP") if not summary.get(
+            "submitted") else primary_reason
+        self._emit_decision_record(status_final, primary_reason, opp, ctx)
 
     # =============================================================================
 
@@ -12252,7 +12289,7 @@ class RiskManager:
     # REMPLACEMENT 1/3
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------
-    def on_scanner_opportunity(self, opp: Dict[str, Any]) -> None:
+    def on_scanner_opportunity(self, opp: Dict[str, Any], decision_ctx: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
         P2: scheduler multi-branches TT/TM/MM simultanés + caps notionnels et préemption MM,
             REB lock par combo, shadow non-bloquant.
@@ -12261,6 +12298,15 @@ class RiskManager:
         - REB: lock combo et exécute TM neutral
         """
         now = time.time()
+        decision_ctx = decision_ctx if isinstance(decision_ctx, dict) else {"submitted": False, "attempted": False,
+                                                                    "reasons": []}
+
+        def _record_reason(reason: str) -> None:
+            if not reason:
+                return
+            decision_ctx.setdefault("reasons", []).append(str(reason))
+
+
 
         # --- 0) Freshness guards (TTL strict) ------------------------------------
         # On aligne le TTL sur les briques réellement utilisées :
@@ -12590,7 +12636,8 @@ class RiskManager:
         if not engine:
             if getattr(self, "log", None):
                 self.log.error("RM.on_scanner_opportunity sans engine attaché")
-            return
+            _record_reason(RM_ENGINE_NOT_READY)
+            return decision_ctx
 
         # 5.a) TT/TM: utilisation directe des caps TT/TM par profil (priorité TT > TM)
         for strat in ("TT", "TM"):
@@ -12602,9 +12649,11 @@ class RiskManager:
             if desired < min_trade_usdc:
                 continue
             try:
-                bundle = self._build_bundle(opp, strategy=strat)
+                bundle = self._build_bundle(opp, strategy=strat, decision_ctx=decision_ctx)
                 if bundle:
-                    self._multicast_shadow(bundle)
+                    res_engine = self._multicast_shadow(bundle, decision_ctx=decision_ctx)
+                    decision_ctx["attempted"] = True
+                    decision_ctx["submitted"] = decision_ctx.get("submitted") or bool(res_engine)
                     sent_any = True
             except Exception:
                 if getattr(self, "log", None):
@@ -12619,9 +12668,11 @@ class RiskManager:
                 opp = dict(opp)
                 opp.setdefault("notional_usdc", slot_notional)
                 opp.setdefault("notional_quote", {"ccy": "USDC", "amount": slot_notional})
-                bundle = self._build_bundle(opp, strategy="MM")
+                bundle = self._build_bundle(opp, strategy="MM", decision_ctx=decision_ctx)
                 if bundle:
-                    self._multicast_shadow(bundle)
+                    res_engine = self._multicast_shadow(bundle, decision_ctx=decision_ctx)
+                    decision_ctx["attempted"] = True
+                    decision_ctx["submitted"] = decision_ctx.get("submitted") or bool(res_engine)
                     mm_dual_enqueued = True
                     sent_any = True
             except Exception:
@@ -12641,6 +12692,9 @@ class RiskManager:
         except Exception:
             if getattr(self, "log", None):
                 self.log.exception("RM.on_scanner_opportunity: mm_inventory_single failed")
+
+        return decision_ctx
+
 
     # ---------------------------------------------------------------------
     # REMPLACEMENT 2/3
@@ -12912,14 +12966,23 @@ class RiskManager:
         self._multicast_shadow(bundle)
         return True
 
-
-    def _build_bundle(self, opp: Dict[str, Any], strategy: str) -> Optional[Dict[str, Any]]:
+    def _build_bundle(
+            self,
+            opp: Dict[str, Any],
+            strategy: str,
+            decision_ctx: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         P0: construit un bundle exécutable standard (dict) en s'appuyant sur payloads.make_submit_bundle
         et payloads.submit_leg_from_intent. La fragmentation est suggérée par le Simulateur (suggest_slices)
         et embarquée en meta (cohortes G1/G2/G3).
         """
 
+        def _record_decision_reason(reason: str) -> None:
+            if decision_ctx is None:
+                return
+            if reason:
+                decision_ctx.setdefault("reasons", []).append(str(reason))
 
         pair = opp.get("pair") or opp.get("symbol")
         buy_ex = opp.get("buy_ex") or opp.get("route", {}).get("buy_ex")
@@ -12955,12 +13018,12 @@ class RiskManager:
                 except Exception:
                     pass
 
-        if strategy_u == "MM":
-            base_asset = self._pair_base(pk)
-            delta_state = self.mm_delta_state.get(base_asset, {}).get("state", "OK")
-            if delta_state == "HARD":
-                inc_rm_reject(reason=RM_MM_DELTA_HARD_LIMIT)
-                return None
+            if strategy_u == "MM":
+                base_asset = self._pair_base(pk)
+                delta_state = self.mm_delta_state.get(base_asset, {}).get("state", "OK")
+                if delta_state == "HARD":
+                    inc_rm_reject(reason=RM_MM_DELTA_HARD_LIMIT)
+                    return None
             if delta_state == "SOFT":
                 try:
                     RM_MM_DELTA_SOFT_HIT.labels(asset=base_asset).inc()
@@ -12978,7 +13041,13 @@ class RiskManager:
             except Exception:
                 mm_notional = float(opp.get("notional_usdc") or 0.0)
             if mm_notional <= 0.0:
-                inc_rm_reject(reason="MM_BUDGET_EXHAUSTED")
+                try:
+                    if RM_MM_BUDGET_EXHAUSTED_TOTAL is not None:
+                        RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc()
+                except Exception:
+                    pass
+                _record_decision_reason(RM_MM_BUDGET_EXHAUSTED)
+                inc_rm_reject(reason=RM_MM_BUDGET_EXHAUSTED)
                 return None
 
 
@@ -13417,10 +13486,10 @@ class RiskManager:
     # ---------------------------------------------------------------------
     # REMPLACEMENT 3/3
     # ---------------------------------------------------------------------
-    def _multicast_shadow(self, bundle: Dict[str, Any]) -> None:
+    def _multicast_shadow(self, bundle: Dict[str, Any], decision_ctx: Optional[Dict[str, Any]] = None) -> bool:
         # 1) Envoi Engine (non-bloquant, avec fallbacks gérés)
         self._record_budget_spend(bundle.get("branch"), bundle)
-        self.engine_enqueue_bundle(bundle)
+        engine_ok = self.engine_enqueue_bundle(bundle, decision_ctx=decision_ctx)
         # 2) Shadow Simu (non-bloquant, sampling interne)
         self.shadow_simulate(bundle, l2_cache=getattr(self, "l2_cache", None))
         # 3) Comptage des budgets (branch × profil × combo)
@@ -13436,6 +13505,7 @@ class RiskManager:
                 "[RiskManager] _multicast_shadow: échec _record_exposure_for_bundle",
                 exc_info=False,
             )
+        return bool(engine_ok)
 
 
     # ------------------------------------------------------------------

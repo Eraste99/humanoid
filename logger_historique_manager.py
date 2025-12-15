@@ -66,7 +66,7 @@ import json
 import logging
 import sqlite3
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 from modules.logger_historique.log_writer import LogWriter
 from modules.logger_historique.base_trade_logger import BaseTradeLogger
 from modules.logger_historique.pair_history_tracker import PairHistoryTracker, TrackerConfig
@@ -202,6 +202,14 @@ try:
         PNL_RECO_ABS_DIFF_QUOTE,
         PNL_RECO_MISMATCH_TOTAL,
         PNL_RECO_ERRORS_TOTAL,
+        # --- EOD orchestration ---
+        LHM_EOD_RUNS_TOTAL,
+        LHM_EOD_ERRORS_TOTAL,
+        LHM_EOD_DURATION_MS,
+        LHM_EOD_LAST_SUCCESS_TS_MS,
+        safe_inc,
+        safe_set,
+        safe_observe,
     )
 except Exception:
     class _NoopM:
@@ -218,6 +226,21 @@ except Exception:
     PNL_RECO_ABS_DIFF_QUOTE = _NoopM()
     PNL_RECO_MISMATCH_TOTAL = _NoopM()
     PNL_RECO_ERRORS_TOTAL = _NoopM()
+    LHM_EOD_RUNS_TOTAL = _NoopM()
+    LHM_EOD_ERRORS_TOTAL = _NoopM()
+    LHM_EOD_DURATION_MS = _NoopM()
+    LHM_EOD_LAST_SUCCESS_TS_MS = _NoopM()
+
+
+    def safe_inc(*_a, **_k):
+        return None
+
+    def safe_set(*_a, **_k):
+        return None
+
+    def safe_observe(*_a, **_k):
+        return None
+
 
 # Chemin optionnel sur lequel sonder le stockage (peut être un dossier JSONL)
 LHM_STORAGE_PATH = os.getenv("LHM_STORAGE_PATH")  # ex: /var/lib/arbitrage-bot/data
@@ -336,6 +359,7 @@ except Exception:
     LOGGERH_LAST_ROTATION_TS_SECONDS = LOGGERH_LAST_FLUSH_TS_SECONDS = _Noop()
     LOGGERH_JSONL_ROTATIONS_TOTAL = _Noop()
     LHM_JSONL_INGESTED_TOTAL = LHM_JSONL_DROPPED_TOTAL = LHM_JSONL_QUEUE_SIZE = _Noop()
+
 
 
 class LoggerHistoriqueManager:
@@ -742,35 +766,45 @@ class LoggerHistoriqueManager:
         self._db_lane_q = None
 
     def _db_lane_try_metric_depth(self) -> None:
+        q = getattr(self, "_db_lane_q", None)
+        if q is None:
+            return
+        try:
+            from modules.obs_metrics import LHM_DB_LANE_QUEUE_DEPTH
+
+            LHM_DB_LANE_QUEUE_DEPTH.set(int(q.qsize()))
+            return
+        except Exception:
+            pass
         try:
             from modules.obs_metrics import LOGGERH_DB_LANE_QUEUE_DEPTH
-            q = getattr(self, "_db_lane_q", None)
-            if q is not None:
-                LOGGERH_DB_LANE_QUEUE_DEPTH.set(int(q.qsize()))
+            LOGGERH_DB_LANE_QUEUE_DEPTH.set(int(q.qsize()))
         except Exception:
             pass
 
-    def _db_lane_try_metric_drop(self, op: str) -> None:
+    def _db_lane_try_metric_drop(self, reason: str) -> None:
+        try:
+            from modules.obs_metrics import LHM_DB_LANE_DROPS_TOTAL
+
+            LHM_DB_LANE_DROPS_TOTAL.labels(reason=str(reason)).inc()
+            return
+        except Exception:
+            pass
+
         try:
             from modules.obs_metrics import LOGGERH_DB_LANE_DROPS_TOTAL
-            LOGGERH_DB_LANE_DROPS_TOTAL.labels(op=str(op)).inc()
+            LOGGERH_DB_LANE_DROPS_TOTAL.labels(op=str(reason)).inc()
         except Exception:
             pass
 
     async def _db_lane_submit_bulk(self, op: str, batch: List[Dict[str, Any]]) -> None:
-        if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
-            # fallback direct (ancien mode)
-            if op == "trades":
-                await asyncio.to_thread(self._writer.insert_trades_bulk, batch)
-            elif op == "opportunities":
-                await asyncio.to_thread(self._writer.insert_opportunities_bulk, batch)
-            elif op == "alerts":
-                await asyncio.to_thread(self._writer.insert_alerts_bulk, batch)
-            elif op.startswith("generic:"):
-                log_type = op.split(":", 1)[1]
-                await asyncio.to_thread(self._writer.insert_generic, log_type, batch)
-            elif op == "pair_history":
-                await asyncio.to_thread(self._writer.write_pair_history, batch)
+        enabled = getattr(self, "_db_lane_enabled", False) and getattr(self, "_db_lane_q", None) is not None
+        if not enabled:
+            try:
+                self._db_lane_disabled_seen = True
+            except Exception:
+                pass
+            self._db_lane_try_metric_drop("db_disabled")
             return
 
         q: asyncio.Queue = self._db_lane_q  # type: ignore
@@ -779,11 +813,12 @@ class LoggerHistoriqueManager:
         try:
             q.put_nowait(item)
         except asyncio.QueueFull:
-            if getattr(self, "_db_lane_drop_when_full", True):
-                self._db_lane_try_metric_drop(op)
-                return
-            await q.put(item)
-
+            self._db_lane_try_metric_drop("queue_full")
+            try:
+                self._db_lane_disabled_seen = True
+            except Exception:
+                pass
+            return
         self._db_lane_try_metric_depth()
 
     async def _db_lane_submit_one(self, op: str, payload: Any) -> None:
@@ -976,6 +1011,42 @@ class LoggerHistoriqueManager:
 
         self._streams_task = asyncio.create_task(_runner(), name="LHM-StreamsWorker")
 
+    async def _jsonl_barrier(self, timeout_s: float = 2.0, prio: list[str] | None = None) -> None:
+        """
+        Barrière best-effort pour drainer les queues JSONL avant rotation/stop.
+        Boucle jusqu’à ce que toutes les queues soient vides ou qu’un timeout soit atteint.
+        Si aucun worker n’est actif, draine directement via `_drain_stream_once`.
+        """
+        streams = getattr(self, "_jsonl_streams", {}) or {}
+        if not streams:
+            return
+
+        order = prio or ["events", "errors"]
+        deadline = time.perf_counter() + float(timeout_s)
+        worker = getattr(self, "_streams_task", None)
+
+        while time.perf_counter() < deadline:
+            pending = 0
+            for q_rot in streams.values():
+                try:
+                    q, _rot = q_rot
+                    pending += int(q.qsize())
+                except Exception:
+                    pass
+
+            if pending <= 0:
+                return
+
+            try:
+                await self._drain_stream_once(order)
+            except Exception:
+                logger.exception("jsonl_barrier: drain failed")
+
+            if not worker or worker.done():
+                continue
+
+            await asyncio.sleep(0.01)
+
     async def _drain_stream_once(self, order: list[str]) -> bool:
         """
         Draine chaque stream JSONL au plus N items par tick (backpressure).
@@ -998,8 +1069,28 @@ class LoggerHistoriqueManager:
                 except Exception:
                     break
                 try:
-                    line = (json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
-
+                    try:
+                        line = (json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str) + "\n").encode(
+                            "utf-8")
+                    except Exception:
+                        try:
+                            fallback = {"raw_json": json.dumps(item, ensure_ascii=False, default=str)}
+                        except Exception:
+                            fallback = {"raw_json": str(item)}
+                        try:
+                            line = (json.dumps(fallback, ensure_ascii=False, separators=(",", ":"),
+                                               default=str) + "\n").encode("utf-8")
+                        except Exception:
+                            try:
+                                from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
+                                LHM_JSONL_DROPPED_TOTAL.labels(stream=name, reason="serialize_error").inc()
+                            except Exception:
+                                pass
+                            try:
+                                self._critical_drop_seen = True
+                            except Exception:
+                                pass
+                            continue
                     # Écriture via l’API du rotateur (thread-safe)
                     await asyncio.to_thread(rot.write_line, line)
 
@@ -1023,10 +1114,14 @@ class LoggerHistoriqueManager:
 
                         from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
 
-                        LHM_JSONL_DROPPED_TOTAL.labels(stream=name).inc()
+                        LHM_JSONL_DROPPED_TOTAL.labels(stream=name, reason="write_error").inc()
 
                     except Exception:
 
+                        pass
+                    try:
+                        self._critical_drop_seen = True
+                    except Exception:
                         pass
 
                     # Erreur de stockage → pipeline PnL potentiellement non audit-grade
@@ -1423,6 +1518,7 @@ class LoggerHistoriqueManager:
                 e["_schema_missing_fields"] = missing
 
                 # métriques par champ manquant (pour suivre la dérive)
+                self._trade_contract_metric("missing_field")
                 for field in missing:
                     self._on_schema_violation(field)
             else:
@@ -1431,6 +1527,21 @@ class LoggerHistoriqueManager:
 
         except Exception:
             # Jamais bloquant : on ne casse JAMAIS la pipeline si la validation se plante
+            pass
+
+    def _trade_contract_metric(self, reason: str) -> None:
+        try:
+            from modules.obs_metrics import LHM_TRADE_CONTRACT_INVALID_TOTAL
+
+            LHM_TRADE_CONTRACT_INVALID_TOTAL.labels(reason=str(reason)).inc()
+            return
+        except Exception:
+            pass
+        try:
+            from modules.obs_metrics import schema_violation_total
+
+            schema_violation_total.labels(reason=str(reason)).inc()
+        except Exception:
             pass
 
     def _normalize_event_contract(self, log_type: str, e: dict) -> dict:
@@ -1467,6 +1578,69 @@ class LoggerHistoriqueManager:
             # --- stream / log_type pivots (pour forensic / requêtes génériques) ---
             obj.setdefault("log_type", str(log_type))
             obj.setdefault("stream", str(log_type))
+            if log_type == "trades":
+                obj.setdefault("schema_version", "lhm.1")
+
+                try:
+                    ts_ms = self._ensure_ts_ms(obj)
+                    obj["ts_ms"] = ts_ms
+                    obj.setdefault("timestamp_ms", ts_ms)
+                except Exception:
+                    self._trade_contract_metric("missing_field")
+
+                side_raw = obj.get("side") or obj.get("direction")
+                if isinstance(side_raw, str):
+                    s = side_raw.strip().lower()
+                    if s in {"b", "buy", "long"}:
+                        obj["side"] = "buy"
+                    elif s in {"s", "sell", "short"}:
+                        obj["side"] = "sell"
+                    else:
+                        self._trade_contract_metric("type_error")
+                elif side_raw is not None:
+                    self._trade_contract_metric("type_error")
+
+                tm_raw = obj.get("trade_mode")
+                if isinstance(tm_raw, str) and tm_raw:
+                    obj["trade_mode"] = tm_raw.upper()
+                elif tm_raw not in (None, ""):
+                    self._trade_contract_metric("type_error")
+
+                pair_raw = obj.get("pair_key") or obj.get("asset") or obj.get("symbol")
+                if isinstance(pair_raw, str) and pair_raw:
+                    pk = pair_raw.replace("-", "").replace("_", "").upper()
+                    obj["pair_key"] = pk
+                    obj.setdefault("asset", pk)
+                elif pair_raw not in (None, ""):
+                    self._trade_contract_metric("type_error")
+
+                for key, alias in (("buy_ex", "buy_exchange"), ("sell_ex", "sell_exchange")):
+                    raw = obj.get(key) or obj.get(alias)
+                    if raw is None:
+                        continue
+                    if isinstance(raw, str):
+                        obj[key] = raw.replace("-", "").replace("_", "").upper()
+                    else:
+                        self._trade_contract_metric("type_error")
+
+                if not obj.get("route"):
+                    bx = obj.get("buy_ex") or ""
+                    sx = obj.get("sell_ex") or ""
+                    if bx and sx:
+                        obj["route"] = f"BUY:{bx}→SELL:{sx}"
+
+                for ident in ("route_id", "trace_id"):
+                    if ident in obj and obj.get(ident) is not None:
+                        obj[ident] = str(obj.get(ident))
+
+                payload_obj = obj.get("payload")
+                if payload_obj is not None:
+                    try:
+                        json.dumps(payload_obj)
+                    except Exception:
+                        obj["raw_json"] = payload_obj
+                        obj.pop("payload", None)
+
 
             return obj
         except Exception:
@@ -1556,6 +1730,11 @@ class LoggerHistoriqueManager:
 
         try:
             q.put_nowait(payload)
+            try:
+                from modules.obs_metrics import LHM_JSONL_QUEUE_SIZE
+                LHM_JSONL_DROPPED_TOTAL.labels(stream=stream, reason="queue_full").inc()
+            except Exception:
+                pass
         except Exception:
             # File pleine → on signale le drop, et si c’était critique on marque le flag.
             try:
@@ -1701,43 +1880,233 @@ class LoggerHistoriqueManager:
 
     # logger_historique_manager.py — dans class LoggerHistoriqueManager
 
-    async def run_eod_reconciliation(self, *, sign_priv_pem_path: str | None = None) -> dict:
-        """
-        Fin de journée: flush + finalize DB (checkpoint+vacuum+hash+signature optionnelle),
-        et trace un marqueur JSONL 'eod' (best effort).
-        """
-        # Flush fort
+    def _emit_eod_metrics(self, meta: dict[str, Any]) -> None:        # Flush fort
         try:
-            await self.flush_now(rotate=True)
+            status = str(meta.get("status") or "unknown")
+            safe_inc(LHM_EOD_RUNS_TOTAL, "lhm_eod_runs_total", "logger_historique", status=status)
+
+            duration = meta.get("duration_ms")
+            if isinstance(duration, (int, float)):
+                safe_observe(LHM_EOD_DURATION_MS, "lhm_eod_duration_ms", "logger_historique", float(duration))
+
+            if status == "OK":
+                end_ts = meta.get("ended_ts_ms")
+                if isinstance(end_ts, (int, float)):
+                    safe_set(LHM_EOD_LAST_SUCCESS_TS_MS, "lhm_eod_last_success_ts_ms", "logger_historique",
+                             float(end_ts))
+
+            for err in meta.get("errors", []) or []:
+                stage = str(err.get("stage") or "unknown")
+                safe_inc(LHM_EOD_ERRORS_TOTAL, "lhm_eod_errors_total", "logger_historique", stage=stage)
         except Exception:
-            logger.exception("EOD: flush_now failed")
+            logger.exception("EOD metrics emit failed")
 
-        # Finalize DB (writer)
+    async def run_eod(
+            self,
+            *,
+            local_day: str | None = None,
+            pod_region: str | None = None,
+            sign_priv_pem_path: str | None = None,
+            timeout_flush_s: float = 5.0,
+            timeout_finalize_s: float = 30.0,
+            timeout_pnl_reco_s: float = 30.0,
+            fetch_pnl_cex_fn: Callable[[str, str, str, str], Any] | None = None,
+            skip_cex: bool = False,
+            dry_run: bool = False,
+            skip_finalize: bool = False,
+    ) -> dict:
+        """
+        Exécute un EOD complet (flush + finalize + marqueur JSONL) de manière idempotente.
+
+        Retourne un meta dict stable:
+        {
+          status: OK|ERROR|PARTIAL|SKIPPED,
+          local_day, pod_region,
+          started_ts_ms, ended_ts_ms, duration_ms,
+          finalize: {...},
+          errors: [ {stage, err}, ... ],
+        }
+        """
+
+        started_ts_ms = int(time.time() * 1000)
+        day = str(local_day or datetime.utcnow().strftime("%Y-%m-%d"))
+        region = str(pod_region or getattr(self, "_pod_region", "")) or "NA"
+        region = region.upper()
+
+        meta: dict[str, Any] = {
+            "schema_version": "lhm.eod.1",
+            "status": "OK",
+            "local_day": day,
+            "pod_region": region,
+            "started_ts_ms": started_ts_ms,
+            "ended_ts_ms": None,
+            "duration_ms": None,
+            "finalize": {},
+            "errors": [],
+            "pnl_reconciliation": None,
+        }
+
+        marker_path = Path(self._out_dir) / "eod" / f"eod-{day}.done.json"
+
+        if marker_path.exists():
+            try:
+                with marker_path.open("r", encoding="utf-8") as fh:
+                    previous = json.load(fh)
+                if isinstance(previous, dict):
+                    meta = {**previous, "local_day": day, "pod_region": region}
+                else:
+                    meta.update({
+                        "status": "SKIPPED",
+                        "errors": [{"stage": "idempotence", "err": "corrupted_marker"}],
+                    })
+            except Exception as exc:
+                meta.update({
+                    "status": "SKIPPED",
+                    "errors": [{"stage": "idempotence", "err": f"read_failed:{exc}"}],
+                })
+            meta["idempotent_skip"] = True
+            if not meta.get("pnl_reconciliation"):
+                meta["pnl_reconciliation"] = {
+                    "component": "pnl_reconciliation",
+                    "status": "SKIPPED",
+                    "reason": "idempotent_skip",
+                    "local_day": day,
+                    "region": region,
+                }
+            self._emit_eod_metrics(meta)
+            return meta
+
+        # Flush fort (timebox)
         try:
-            meta = await self._db_lane_call("finalize_day", {"sign_priv_pem_path": sign_priv_pem_path})
-        except Exception:
-            logger.exception("EOD: finalize_day failed")
-            meta = {"error": "finalize_failed"}
+            await asyncio.wait_for(self.flush_now(rotate=True), timeout=timeout_flush_s)
+        except asyncio.TimeoutError:
+            meta["status"] = "PARTIAL"
+            meta.setdefault("errors", []).append({"stage": "flush", "err": "timeout"})
+        except Exception as exc:
+            meta["status"] = "PARTIAL"
+            meta.setdefault("errors", []).append({"stage": "flush", "err": str(exc)})
 
+        # PnL reconciliation (best-effort)
+        pnl_meta: dict[str, Any] | None = None
+        if skip_cex:
+            pnl_meta = {
+                "component": "pnl_reconciliation",
+                "status": "SKIPPED",
+                "reason": "skip_cex_flag",
+                "local_day": day,
+                "region": region,
+            }
+        elif fetch_pnl_cex_fn is None:
+            pnl_meta = {
+                "component": "pnl_reconciliation",
+                "status": "SKIPPED",
+                "reason": "missing_fetch_fn",
+                "local_day": day,
+                "region": region,
+            }
+        else:
+            try:
+                pnl_meta = await asyncio.wait_for(
+                    self.run_pnl_reconciliation_for_day(
+                        local_day=day,
+                        pod_region=region,
+                        fetch_pnl_cex_fn=fetch_pnl_cex_fn,
+                        dry_run=dry_run,
+                    ),
+                    timeout=timeout_pnl_reco_s,
+                )
+                if isinstance(pnl_meta, dict):
+                    state = pnl_meta.get("global_state")
+                    if state is None:
+                        pnl_meta["status"] = "SKIPPED"
+                    elif int(state) >= 2:
+                        pnl_meta["status"] = "ERROR"
+                    elif int(state) >= 1:
+                        pnl_meta["status"] = "WARN"
+                    else:
+                        pnl_meta["status"] = "OK"
+            except asyncio.TimeoutError:
+                meta["status"] = "PARTIAL"
+                meta.setdefault("errors", []).append({"stage": "pnl_reconciliation", "err": "timeout"})
+                pnl_meta = {
+                    "component": "pnl_reconciliation",
+                    "status": "PARTIAL",
+                    "reason": "timeout",
+                    "local_day": day,
+                    "region": region,
+                }
+            except Exception as exc:
+                meta["status"] = "PARTIAL"
+                meta.setdefault("errors", []).append({"stage": "pnl_reconciliation", "err": str(exc)})
+                pnl_meta = {
+                    "component": "pnl_reconciliation",
+                    "status": "ERROR",
+                    "reason": "exception",
+                    "err": str(exc),
+                    "local_day": day,
+                    "region": region,
+                }
 
-        # Marqueur JSONL
-        try:
-            self._enqueue_jsonl("events", {
-                "stream": "events",
-                "type": "eod",
+        if isinstance(pnl_meta, dict):
+            meta["pnl_reconciliation"] = pnl_meta
+
+            # Finalize DB (writer)
+            finalize_meta: dict[str, Any] | None = None
+            if skip_finalize:
+                meta["finalize"] = {"status": "SKIPPED"}
+            else:
+                try:
+                    finalize_meta = await asyncio.wait_for(
+                        self._db_lane_call("finalize_day", {"sign_priv_pem_path": sign_priv_pem_path}),
+                        timeout=timeout_finalize_s,
+                    )
+                    if isinstance(finalize_meta, dict):
+                        meta["finalize"] = finalize_meta
+                except asyncio.TimeoutError:
+                    meta["status"] = "PARTIAL"
+                    meta.setdefault("errors", []).append({"stage": "finalize", "err": "timeout"})
+                except Exception as exc:
+                    meta["status"] = "ERROR"
+                    meta.setdefault("errors", []).append({"stage": "finalize", "err": str(exc)})
+
+            meta["ended_ts_ms"] = int(time.time() * 1000)
+            meta["duration_ms"] = int(meta["ended_ts_ms"]) - int(meta["started_ts_ms"])
+
+            if meta.get("status") == "OK" and meta.get("errors"):
+                meta["status"] = "PARTIAL"
+
+            # Marqueur JSONL canon (best effort)
+            marker_event = {
+                "schema_version": "lhm.eod.1",
+                "event_type": "eod",
+                "log_type": "eod",
+                "ts_ms": int(time.time() * 1000),
+                "local_day": day,
+                "pod_region": region,
+                "status": meta.get("status"),
                 "meta": meta,
-                "ts": int(time.time() * 1000),
-            })
-        except Exception:
-            pass
-        # Trace un marqueur JSONL EOD (best effort, non bloquant) — additionnel
-        meta2 = {"pod_region": self._pod_region, "ts": int(time.time() * 1000)}
+            }
         try:
-            self._enqueue_jsonl("events", {"kind": "eod", "meta": meta2})
+            self._enqueue_jsonl("events", marker_event)
         except Exception:
             logger.exception("EOD: enqueue jsonl failed")
 
+            # Marker fichier pour idempotence
+        try:
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            with marker_path.open("w", encoding="utf-8") as fh:
+                json.dump(meta, fh, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        except Exception:
+            logger.exception("EOD: failed to write idempotence marker")
+
+        self._emit_eod_metrics(meta)
         return meta
+
+    async def run_eod_reconciliation(self, *, sign_priv_pem_path: str | None = None, **kwargs) -> dict:
+        """
+        Alias historique: redirige vers run_eod.
+        """
+        return await self.run_eod(sign_priv_pem_path=sign_priv_pem_path, **kwargs)
 
     async def replay_from_logs(self, *, day: str | None = None, kind: str = "trades", limit: int = 1000) -> list[dict]:
         """
@@ -2750,6 +3119,7 @@ class LoggerHistoriqueManager:
         return {
             "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
             "storage_error_seen": bool(getattr(self, "_storage_error_seen", False)),
+            "db_lane_disabled": bool(getattr(self, "_db_lane_disabled_seen", False)),
         }
 
 
@@ -2995,28 +3365,7 @@ class LoggerHistoriqueManager:
         try:
             streams = getattr(self, "_jsonl_streams", {}) or {}
             if streams:
-                deadline = time.perf_counter() + 2.0
-                prio = ["events", "errors"]
-                drained_once = False
-
-                while time.perf_counter() < deadline:
-                    pending = 0
-                    for q_rot in streams.values():
-                        try:
-                            q, _rot = q_rot
-                            pending += int(q.qsize())
-                        except Exception:
-                            pass
-
-                    if pending <= 0:
-                        break
-
-                    drained = await self._drain_stream_once(prio)
-                    drained_once = drained_once or drained
-                    await asyncio.sleep(0.01)
-
-                if not drained_once:
-                    logger.debug("flush_now: JSONL drain completed (no pending data).")
+                await self._jsonl_barrier(timeout_s=2.0, prio=["events", "errors"])
         except Exception:
             logger.exception("flush_now: JSONL drain failed")
 

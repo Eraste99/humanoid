@@ -2,43 +2,16 @@
 from __future__ import annotations
 
 """
-EOD PnL Runner — Reconciliation CEX ↔ DB (M5-D-3 + M5-E-1)
+EOD Runner — orchestration canonique via LoggerHistoriqueManager
 
 Rôle:
 - Charger BotConfig.from_env()
-- Instancier un LoggerHistoriqueManager en lecture seule (DB SQLite)
-- Appeler LoggerHistoriqueManager.run_pnl_reconciliation_for_day(...)
-- Pousser les métriques Prometheus pnl_reco_* (via LHM)
-- Produire un rapport JSON (stdout ou fichier)
+- Instancier un LoggerHistoriqueManager
+- Appeler la nouvelle API canonique LoggerHistoriqueManager.run_eod(...)
+- Produire un meta dict stable (stdout ou fichier) identique à celui retourné par l'API
 
-Le runner N'EFFECTUE AUCUN TRADE.
-Il ne fait que lire la DB + CEX et calculer des écarts PnL.
-
-Usage typique (CLI):
-
-    python -m modules.LOGGERHISTORIQUE.eod_pnl_runner \\
-        --out-dir /data/loggerh \\
-        --local-day 2025-12-02 \\
-        --region EU \\
-        --output /data/reports/pnl_reco-20251202.json
-
-Pour la partie CEX, tu peux:
-- soit fournir un adaptateur "réel" (modules.reconciler_cex_adapter.fetch_pnl_cex_for_day),
-- soit utiliser --skip-cex pour ne travailler que côté DB.
-
-L'adaptateur attendu (signature):
-
-    def fetch_pnl_cex_for_day(exchange: str,
-                              account_alias: str,
-                              local_day: str,
-                              region: str) -> Mapping:
-        return {
-            "net_profit_quote": float,
-            "fees_quote": float,
-            "turnover_quote": float,
-            "trades": int,
-        }
-
+Le runner n'effectue aucun trade. Il déclenche seulement le flush/finalize EOD
+du logger historique et émet un marqueur JSONL canon côté LHM.
 """
 
 import asyncio
@@ -46,8 +19,9 @@ import argparse
 import json
 import logging
 import sys
+from typing import Callable, Any
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Optional
 
 # Ces imports supposent la structure modules/...
 try:
@@ -62,92 +36,39 @@ logger = logging.getLogger("EODPnLRunner")
 
 
 # ---------------------------------------------------------------------------
-# Helpers CEX adapter
-# ---------------------------------------------------------------------------
-
-FetchPnlCexFn = Callable[[str, str, str, str], Mapping[str, Any]]
-
-
-def _make_fetch_pnl_cex_fn_or_stub(cfg: BotConfig) -> FetchPnlCexFn | None:
-    """
-    Construit un adaptateur PnL CEX ↔ DB basé sur BalanceFetcher.
-
-    On s'attend à trouver dans modules.balance_fetcher une classe
-    PnlRecoCexAdapter(cfg, balance_fetcher=None) exposant:
-
-        async def fetch_pnl_for_day(
-            self,
-            exchange: str,
-            account_alias: str,
-            local_day: str,
-            region: str,
-        ) -> Mapping[str, Any]:
-
-    Cette méthode pourra utiliser les mêmes clients que BalanceFetcher
-    pour reconstruire un PnL jour par (exchange,account_alias).
-
-    Si l'import échoue, on retourne None et le runner pourra soit
-    utiliser --skip-cex, soit accepter un "skipped" côté LHM.
-    """
-    try:
-        from modules.balance_fetcher import PnlRecoCexAdapter  # type: ignore
-    except Exception:
-        logger.warning(
-            "PnlRecoCexAdapter introuvable dans modules.balance_fetcher. "
-            "Utilise --skip-cex ou implémente PnlRecoCexAdapter.fetch_pnl_for_day()."
-        )
-        return None
-
-    try:
-        adapter = PnlRecoCexAdapter(cfg)
-    except Exception:
-        logger.exception("Impossible d'instancier PnlRecoCexAdapter(cfg)")
-        return None
-
-    # On renvoie directement la méthode de l'adaptateur; le runner gère
-    # le fait qu'elle soit sync ou async (via asyncio.iscoroutine).
-    return adapter.fetch_pnl_for_day
-
-
-# ---------------------------------------------------------------------------
 # Core runner
 # ---------------------------------------------------------------------------
 
-async def run_eod_pnl_reconciliation(
+async def run_eod(
     *,
     out_dir: str,
     local_day: Optional[str] = None,
     region: Optional[str] = None,
     output_path: Optional[str] = None,
+    sign_priv_pem_path: Optional[str] = None,
     skip_cex: bool = False,
     dry_run: bool = False,
+    skip_finalize: bool = False,
 ) -> dict:
     """
-    EOD runner PnL (jour local) pour une région donnée.
+    EOD runner canonique (flush + finalize + marker JSONL).
 
     Paramètres
     ----------
     out_dir:
         Répertoire racine utilisé par LoggerHistoriqueManager (DB SQLite).
-        Doit pointer vers le même répertoire que celui utilisé en prod par le bot.
     local_day:
-        Jour local 'YYYY-MM-DD'. Si None, le runner laisse le LHM dériver
-        'aujourd'hui' dans la timezone régionale.
+        Jour local 'YYYY-MM-DD'. Si None, le LHM dérive le jour courant.
     region:
         Région logique ("EU", "US", ...). Si None, utilise cfg.g.pod_region.
     output_path:
-        Si fourni, chemin d'un fichier JSON où écrire le rapport.
-        Sinon, le rapport est écrit sur stdout (JSON pretty).
-    skip_cex:
-        Si True, n'appelle pas les CEX (fetch_pnl_cex_fn=None).
-        Le LHM renverra un "skipped: no_fetch_pnl_cex_fn".
-    dry_run:
-        Si True, ne pousse pas les métriques Prometheus côté LHM.
-        Utile en test local / développement.
+        Si fourni, chemin d'un fichier JSON où écrire le rapport (sinon stdout).
+    sign_priv_pem_path:
+        Clé privée optionnelle pour signature du backup DB via LogWriter.
 
     Retour
     ------
-    dict : structure obtenue depuis LoggerHistoriqueManager.run_pnl_reconciliation_for_day()
+    dict : meta dict retourné par LoggerHistoriqueManager.run_eod()
     """
     cfg = BotConfig.from_env()
 
@@ -158,35 +79,37 @@ async def run_eod_pnl_reconciliation(
         region_effective = str(region).strip().upper()
 
     logger.info(
-        "EOD PnL Reconciliation — out_dir=%s, local_day=%s, region=%s, skip_cex=%s, dry_run=%s",
+        "EOD run — out_dir=%s, local_day=%s, region=%s",
         out_dir,
         local_day,
         region_effective,
-        skip_cex,
-        dry_run,
     )
 
     lhm = LoggerHistoriqueManager(cfg, out_dir)
 
-    if skip_cex:
-        fetch_fn = None
-    else:
-        fetch_fn = _make_fetch_pnl_cex_fn_or_stub(cfg)
-        if fetch_fn is None:
-            # On logge fort, mais on laisse la méthode retourner un "skipped"
-            logger.warning(
-                "Aucun fetch_pnl_cex_fn disponible via BalanceFetcher/PnlRecoCexAdapter ; "
-                "la reco PnL CEX↔DB sera probablement SKIPPED. "
-                "Utilise --skip-cex pour un run DB-only propre."
-            )
-            fetch_fn = None
+    fetch_pnl_cex_fn: Callable[[str, str, str, str], Any] | None = None
+    if not skip_cex:
+        try:
+            from modules.balance_fetcher import PnlRecoCexAdapter  # type: ignore
 
-    result = await lhm.run_pnl_reconciliation_for_day(
-        local_day=local_day,
-        pod_region=region_effective,
-        fetch_pnl_cex_fn=fetch_fn,
-        dry_run=dry_run,
-    )
+            adapter = PnlRecoCexAdapter(cfg)
+            fetch_pnl_cex_fn = adapter.fetch_pnl_for_day
+        except Exception:
+            logger.warning("PnlRecoCexAdapter unavailable; skipping CEX reconciliation")
+            skip_cex = True
+    await lhm.start()
+    try:
+        result = await lhm.run_eod(
+            local_day=local_day,
+            pod_region=region_effective,
+            sign_priv_pem_path=sign_priv_pem_path,
+            fetch_pnl_cex_fn=fetch_pnl_cex_fn,
+            skip_cex=skip_cex,
+            dry_run=dry_run,
+            skip_finalize=skip_finalize,
+        )
+    finally:
+        await lhm.stop()
 
     # Écriture du rapport
     if output_path:
@@ -195,9 +118,9 @@ async def run_eod_pnl_reconciliation(
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-            logger.info("EOD PnL reco report written to %s", path)
+            logger.info("EOD report written to %s", path)
         except Exception:
-            logger.exception("Failed to write EOD PnL reco report to %s", output_path)
+            logger.exception("Failed to write EOD report to %s", output_path)
     else:
         # stdout pour les usages en CLI simple / dev
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True, default=str)
@@ -207,13 +130,19 @@ async def run_eod_pnl_reconciliation(
     return result
 
 
+# Backward compatibility alias
+async def run_eod_pnl_reconciliation(**kwargs):
+    return await run_eod(**kwargs)
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="EOD PnL Reconciliation Runner (CEX ↔ DB)",
+        description="EOD Runner (LoggerHistoriqueManager)",
     )
     parser.add_argument(
         "--out-dir",
@@ -236,14 +165,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Chemin d'un fichier JSON où écrire le rapport (sinon: stdout).",
     )
     parser.add_argument(
+        "--sign-priv-pem",
+        default=None,
+        help="Chemin d'une clé privée PEM pour signer le backup DB (optionnel).",
+    )
+    parser.add_argument(
         "--skip-cex",
         action="store_true",
-        help="Ne pas appeler les CEX (reco PnL basée uniquement sur la DB).",
+        help="Ne pas tenter la réconciliation PnL CEX ↔ DB (reco marquée SKIPPED).",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="N'émet PAS les métriques pnl_reco_* (lecture seule).",
+        help="Mode dry-run pour la réconciliation PnL (pas de métriques).",
+    )
+    parser.add_argument(
+        "--skip-eod-finalize",
+        action="store_true",
+        help="Ne pas appeler finalize_day côté LogWriter (utile pour reco seule).",
     )
     parser.add_argument(
         "--log-level",
@@ -267,20 +206,22 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         asyncio.run(
-            run_eod_pnl_reconciliation(
+            run_eod(
                 out_dir=args.out_dir,
                 local_day=args.local_day,
                 region=args.region,
                 output_path=args.output,
+                sign_priv_pem_path=args.sign_priv_pem,
                 skip_cex=args.skip_cex,
                 dry_run=args.dry_run,
+                skip_finalize=args.skip_eod_finalize,
             )
         )
     except KeyboardInterrupt:
         logger.warning("Interrupted by user (Ctrl+C).")
         return 130
     except Exception:
-        logger.exception("EOD PnL Reconciliation failed")
+        logger.exception("EOD run failed")
         return 1
 
     return 0
