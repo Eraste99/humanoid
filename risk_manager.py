@@ -63,6 +63,52 @@ RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
 
 RM_ALIAS_COLLAT_CRITICAL = "RM_ALIAS_COLLAT_CRITICAL"
 RM_ALIAS_COLLAT_LOW = "RM_ALIAS_COLLAT_LOW"
+# =========================
+# RM Reason taxonomy (closed set)
+# =========================
+# Règles:
+# 1) 1 invariant -> 1 reason unique (pas d’alias).
+# 2) Si plusieurs invariants tombent: choisir le reason le plus prioritaire
+#    selon RM_REASON_PRIORITY (index le plus petit).
+# 3) "metric dédiée ⇄ reason dédié": toute cause structurante doit avoir son reason.
+
+RM_MM_BUDGET_EXHAUSTED = "RM_MM_BUDGET_EXHAUSTED"
+
+# Liste fermée (à maintenir) + ordre de priorité global.
+# (On met des strings pour éviter toute dépendance à l’ordre de définition des constantes.)
+RM_REASON_PRIORITY = (
+    "RM_ENGINE_NOT_READY",
+    "RM_CAP_PROFILE_DISABLED",
+    "RM_CAP_BRANCH_DISABLED",
+    "RM_CAPS_INVALID",
+    "RM_COST_COMPUTE_ERROR",
+    "RM_BALANCE_TTL_BLOCK",
+    "RM_ALIAS_COLLAT_CRITICAL",
+    "RM_ALIAS_COLLAT_LOW",
+    "RM_TTTM_DELTA_HARD_LIMIT",
+    "RM_MM_DELTA_HARD_LIMIT",
+    RM_MM_BUDGET_EXHAUSTED,
+    "RM_CAP_COMBO_EXCEEDED",
+    "RM_CAPS_ZERO",
+    "RM_BELOW_MIN_NOTIONAL",
+    "RM_BELOW_MIN_BPS",
+    "RM_BUDGET_EXHAUSTED",  # fallback générique (à garder en dernier)
+)
+RM_REASON_RANK = {r: i for i, r in enumerate(RM_REASON_PRIORITY)}
+
+def _rm_pick_reason(*candidates: str) -> str:
+    """Choisit un reason unique selon RM_REASON_PRIORITY."""
+    best = ""
+    best_rank = 10**9
+    for c in candidates:
+        if not c:
+            continue
+        r = str(c)
+        rank = RM_REASON_RANK.get(r, 10**8)
+        if rank < best_rank:
+            best, best_rank = r, rank
+    return best or (str(candidates[0]) if candidates else "")
+
 RM_MM_DELTA_HARD_LIMIT = "RM_MM_DELTA_HARD_LIMIT"
 RM_TTTM_DELTA_HARD_LIMIT = "RM_TTTM_DELTA_HARD_LIMIT"
 
@@ -3491,16 +3537,22 @@ class RiskManager:
                     bundle_notional,
                     float(self._mm_wallet_remaining(exchange, quote)),
                 )
-                # TODO (optionnel) : instrumenter RM_MM_BUDGET_EXHAUSTED_TOTAL ici.
-                # Exemple à adapter :
-                # try:
-                #     RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(
-                #         profile_u, exchange, quote, "GLOBAL_WALLET"
-                #     ).inc()
-                # except Exception:
-                #     pass
-                return False, caps_local, trade_mode
+                # Budget virtuel MM épuisé (virtual wallet)
+                try:
+                    if RM_MM_BUDGET_EXHAUSTED_TOTAL is not None:
+                        RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile_u, exchange, quote).inc()
+                except Exception:
+                    pass
 
+                # Expose la cause au reste du pipeline (shadow/logs) sans changer le contrat public
+                try:
+                    if not isinstance(bundle.get("meta"), dict):
+                        bundle["meta"] = meta
+                    meta["rm_drop_reason"] = RM_MM_BUDGET_EXHAUSTED
+                except Exception:
+                    pass
+
+                return False, caps_local, trade_mode
             # 1.c) Mise à jour du registre mm_pair_spent_usdc (notional inflight par paire)
             key = (profile_u, exchange, pair_norm)
             prev_spent = float(self.mm_pair_spent_usdc.get(key, 0.0))
@@ -4180,7 +4232,13 @@ class RiskManager:
         )
         if not ok:
             if self._shadow:
-                self._shadow.on_bundle_drop(bundle, "CAPS_PREEMPT")
+                drop_reason = "CAPS_PREEMPT"
+                try:
+                    drop_reason = str((bundle.get("meta") or {}).get("rm_drop_reason") or drop_reason)
+                except Exception:
+                    pass
+                self._shadow.on_bundle_drop(bundle, drop_reason)
+
             return False
 
 

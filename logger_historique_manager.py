@@ -74,6 +74,7 @@ from modules.obs_metrics import update_storage_metrics, PAIR_ROTATION_AGE_SECOND
 import os, time
 import hashlib, json, time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 try:
     from modules.obs_metrics import obs_is_ready
@@ -452,6 +453,19 @@ class LoggerHistoriqueManager:
         )
         self._trade_logger.set_event_sink(self._on_event_sink)
 
+        # -------- DB lane (single-writer) -------------------------
+        # Objectif: sérialiser TOUTES les écritures SQLite dans 1 seul thread,
+        # éviter 'database is locked' et réduire drastiquement l'overhead.
+        self._db_lane_enabled = bool(getattr(L, "LHM_DB_LANE_ENABLED", True))
+        self._db_lane_q_max = int(getattr(L, "LHM_DB_LANE_Q_MAX", 5000))
+        self._db_lane_batch_max = int(getattr(L, "LHM_DB_LANE_BATCH_MAX", 2000))
+        self._db_lane_drain_ms = float(getattr(L, "LHM_DB_LANE_DRAIN_MS", 5.0))
+        self._db_lane_drop_when_full = bool(getattr(L, "LHM_DB_LANE_DROP_WHEN_FULL", True))
+        self._db_lane_q: asyncio.Queue | None = None
+        self._db_lane_task: asyncio.Task | None = None
+        self._db_lane_executor: ThreadPoolExecutor | None = None
+
+
         # -------- Pipelines JSONL.gz ------------------------------
         # -------- Pipelines JSONL.gz ------------------------------
         self._jsonl_dir = str(Path(db_dir) / "streams")
@@ -578,6 +592,8 @@ class LoggerHistoriqueManager:
             return
         self._running = True
         self._flush_lock = getattr(self, "_flush_lock", asyncio.Lock())
+        await self._start_db_lane()
+
         # 1) BaseTradeLogger -> event_sink (nous)
         btl = getattr(self, "_trade_logger", None)
         if btl:
@@ -587,6 +603,18 @@ class LoggerHistoriqueManager:
         self._init_jsonl_streams()
 
         await self._spawn_streams_worker()
+        # 4) Rotation loop PairHistoryTracker -> write_pair_history (best-effort)
+        try:
+            if getattr(self, "_rotate_interval", 0.0) and float(self._rotate_interval) > 0.0:
+                t = getattr(self, "_rotation_task", None)
+                if not t or t.done():
+                    self._rotation_task = asyncio.create_task(
+                        self._rotation_loop(),
+                        name="LHM-RotationLoop",
+                    )
+        except Exception:
+            logger.exception("start: rotation loop spawn failed")
+
         # 3) Statut / métriques (optionnelles)
         try:
             from modules.obs_metrics import LOGGERH_LAST_FLUSH_TS_SECONDS
@@ -607,6 +635,14 @@ class LoggerHistoriqueManager:
             await self.flush_now(rotate=True)
         except Exception:
             logger.exception("flush_now at stop failed")
+        # 1.5) Arrêt rotation loop
+        t = getattr(self, "_rotation_task", None)
+        if t and not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        self._rotation_task = None
+
         # 2) Arrêt du BTL
         btl = getattr(self, "_trade_logger", None)
         if btl:
@@ -623,6 +659,220 @@ class LoggerHistoriqueManager:
             except Exception:
                 pass
         self._streams_task = None
+        # 4) Drain + stop DB lane (single-writer)
+        try:
+            await self._db_lane_barrier(timeout_s=5.0)
+        except Exception:
+            logger.exception("stop: db_lane barrier failed")
+        try:
+            await self._stop_db_lane()
+        except Exception:
+            logger.exception("stop: db_lane stop failed")
+
+
+    # ---------------- DB lane (single-writer) ----------------
+    async def _start_db_lane(self) -> None:
+        if not getattr(self, "_db_lane_enabled", False):
+            return
+        t = getattr(self, "_db_lane_task", None)
+        if t and not t.done():
+            return
+        self._db_lane_q = asyncio.Queue(maxsize=int(getattr(self, "_db_lane_q_max", 5000)))
+        self._db_lane_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="LHM-DB")
+        self._db_lane_task = asyncio.create_task(self._db_lane_loop(), name="LHM-DBLane")
+
+    async def _stop_db_lane(self) -> None:
+        q = getattr(self, "_db_lane_q", None)
+        t = getattr(self, "_db_lane_task", None)
+        if q is not None:
+            try:
+                q.put_nowait(("__stop__", None, None, None))
+            except Exception:
+                try:
+                    await q.put(("__stop__", None, None, None))
+                except Exception:
+                    pass
+        if t and not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        self._db_lane_task = None
+        ex = getattr(self, "_db_lane_executor", None)
+        if ex:
+            try:
+                ex.shutdown(wait=True, cancel_futures=True)
+            except Exception:
+                pass
+        self._db_lane_executor = None
+        self._db_lane_q = None
+
+    def _db_lane_try_metric_depth(self) -> None:
+        try:
+            from modules.obs_metrics import LOGGERH_DB_LANE_QUEUE_DEPTH
+            q = getattr(self, "_db_lane_q", None)
+            if q is not None:
+                LOGGERH_DB_LANE_QUEUE_DEPTH.set(int(q.qsize()))
+        except Exception:
+            pass
+
+    def _db_lane_try_metric_drop(self, op: str) -> None:
+        try:
+            from modules.obs_metrics import LOGGERH_DB_LANE_DROPS_TOTAL
+            LOGGERH_DB_LANE_DROPS_TOTAL.labels(op=str(op)).inc()
+        except Exception:
+            pass
+
+    async def _db_lane_submit_bulk(self, op: str, batch: List[Dict[str, Any]]) -> None:
+        if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
+            # fallback direct (ancien mode)
+            if op == "trades":
+                await asyncio.to_thread(self._writer.insert_trades_bulk, batch)
+            elif op == "opportunities":
+                await asyncio.to_thread(self._writer.insert_opportunities_bulk, batch)
+            elif op == "alerts":
+                await asyncio.to_thread(self._writer.insert_alerts_bulk, batch)
+            elif op.startswith("generic:"):
+                log_type = op.split(":", 1)[1]
+                await asyncio.to_thread(self._writer.insert_generic, log_type, batch)
+            elif op == "pair_history":
+                await asyncio.to_thread(self._writer.write_pair_history, batch)
+            return
+
+        q: asyncio.Queue = self._db_lane_q  # type: ignore
+        item = ("bulk", str(op), list(batch), None)
+
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            if getattr(self, "_db_lane_drop_when_full", True):
+                self._db_lane_try_metric_drop(op)
+                return
+            await q.put(item)
+
+        self._db_lane_try_metric_depth()
+
+    async def _db_lane_submit_one(self, op: str, payload: Any) -> None:
+        if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
+            # fallback direct
+            if op == "latency_one":
+                await asyncio.to_thread(self._writer.insert_latency, payload)
+            elif op == "alert_one":
+                await asyncio.to_thread(self._writer.insert_alert, *payload)
+            elif op == "opportunity_one":
+                await asyncio.to_thread(self._writer.insert_opportunity, **payload)
+            return
+
+        q: asyncio.Queue = self._db_lane_q  # type: ignore
+        item = ("one", str(op), payload, None)
+
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            if getattr(self, "_db_lane_drop_when_full", True):
+                self._db_lane_try_metric_drop(op)
+                return
+            await q.put(item)
+
+        self._db_lane_try_metric_depth()
+
+    async def _db_lane_call(self, op: str, payload: Any, *, timeout_s: float = 30.0) -> Any:
+        if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
+            # fallback direct
+            if op == "finalize_day":
+                return await asyncio.to_thread(self._writer.finalize_day, **(payload or {}))
+            if op == "pair_history":
+                return await asyncio.to_thread(self._writer.write_pair_history, payload)
+            return None
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        q: asyncio.Queue = self._db_lane_q  # type: ignore
+        await q.put(("call", str(op), payload, fut))
+        self._db_lane_try_metric_depth()
+        return await asyncio.wait_for(fut, timeout=timeout_s)
+
+    async def _db_lane_barrier(self, *, timeout_s: float = 10.0) -> None:
+        if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
+            return
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        q: asyncio.Queue = self._db_lane_q  # type: ignore
+        await q.put(("barrier", "", None, fut))
+        await asyncio.wait_for(fut, timeout=timeout_s)
+
+    async def _db_lane_loop(self) -> None:
+        q: asyncio.Queue = self._db_lane_q  # type: ignore
+        loop = asyncio.get_running_loop()
+        max_batch = int(getattr(self, "_db_lane_batch_max", 2000))
+        drain_s = float(getattr(self, "_db_lane_drain_ms", 5.0)) / 1000.0
+
+        while True:
+            kind, op, payload, fut = await q.get()
+            if kind == "__stop__":
+                break
+
+            if kind == "barrier":
+                if fut is not None and not fut.done():
+                    fut.set_result(True)
+                self._db_lane_try_metric_depth()
+                continue
+
+            # coalescing bulk: merge des batches successifs même op (fenêtre courte)
+            if kind == "bulk" and isinstance(payload, list):
+                merged = payload
+                t_end = time.perf_counter() + drain_s
+                while len(merged) < max_batch and time.perf_counter() < t_end:
+                    try:
+                        k2, op2, payload2, fut2 = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if k2 != "bulk" or op2 != op or not isinstance(payload2, list) or fut2 is not None:
+                        q.put_nowait((k2, op2, payload2, fut2))
+                        break
+                    merged.extend(payload2)
+                payload = merged
+
+            def _fn():
+                if kind == "bulk":
+                    if op == "trades":
+                        return self._writer.insert_trades_bulk(payload)
+                    if op == "opportunities":
+                        return self._writer.insert_opportunities_bulk(payload)
+                    if op == "alerts":
+                        return self._writer.insert_alerts_bulk(payload)
+                    if isinstance(op, str) and op.startswith("generic:"):
+                        lt = op.split(":", 1)[1]
+                        return self._writer.insert_generic(lt, payload)
+                    if op == "pair_history":
+                        return self._writer.write_pair_history(payload)
+                if op == "latency_one":
+                    return self._writer.insert_latency(payload)
+                if op == "alert_one":
+                    return self._writer.insert_alert(*payload)
+                if op == "opportunity_one":
+                    return self._writer.insert_opportunity(**payload)
+                if op == "finalize_day":
+                    return self._writer.finalize_day(**(payload or {}))
+                return None
+
+            t0 = time.perf_counter()
+            try:
+                res = await loop.run_in_executor(self._db_lane_executor, _fn)
+                dt_ms = (time.perf_counter() - t0) * 1000.0
+                try:
+                    from modules.obs_metrics import LOGGERH_WRITE_MS
+                    LOGGERH_WRITE_MS.observe(dt_ms)
+                except Exception:
+                    pass
+                if fut is not None and not fut.done():
+                    fut.set_result(res)
+            except Exception as e:
+                logger.exception("DB lane op failed: %s", op)
+                if fut is not None and not fut.done():
+                    fut.set_exception(e)
+            finally:
+                self._db_lane_try_metric_depth()
+
 
     def _init_jsonl_streams(self, *, base_dir: str | None = None, max_bytes: int = 50 * (1 << 20),
                             max_age_s: int = 3600) -> None:
@@ -790,6 +1040,88 @@ class LoggerHistoriqueManager:
         except Exception:
             pass
 
+    def _ensure_ts_ms(self, obj: dict, *, default_now: bool = True) -> int:
+        """
+        [PIVOT-ts_ms] Canonise ts_ms (millisecondes epoch) dans un event.
+
+        - Accepte ts_ms/timestamp_ms/t_*_ms/ingested_ms, ou ts/timestamp (secondes/ms/us/ns).
+        - Accepte timestamp ISO8601 (ex: 2025-12-13T10:00:00+00:00 / ...Z).
+        - Écrit obj["ts_ms"] et pose obj["timestamp_ms"] si absent.
+        - Best-effort: si parsing impossible et default_now=True, fallback sur now_ms.
+        """
+        if not isinstance(obj, dict):
+            # Best-effort: on ne casse jamais la pipeline
+            ts_ms = int(time.time() * 1000) if default_now else 0
+            return ts_ms
+
+        # 1) Cherche une source de temps existante (ordre de préférence)
+        candidates = (
+            "ts_ms",
+            "timestamp_ms",
+            "t_done_ms",
+            "t_filled_ms",
+            "t_ack_ms",
+            "t_sent_ms",
+            "ingested_ms",
+            "ts",
+            "timestamp",
+        )
+        raw = None
+        for k in candidates:
+            v = obj.get(k)
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            raw = v
+            break
+
+        def _from_iso(s: str) -> int:
+            from datetime import timezone
+            ss = s.strip()
+            dt = datetime.fromisoformat(ss.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return int(dt.timestamp() * 1000)
+
+        def _from_number(x: float) -> int:
+            ax = abs(x)
+            # Heuristique robuste: seconds (~1e9), ms (~1e12), us (~1e15), ns (~1e18)
+            if ax < 1e11:
+                return int(x * 1000.0)  # seconds -> ms
+            if ax < 1e14:
+                return int(x)  # ms
+            if ax < 1e17:
+                return int(x / 1000.0)  # us -> ms
+            return int(x / 1_000_000.0)  # ns -> ms
+
+        ts_ms = None
+        try:
+            if isinstance(raw, (int, float)):
+                ts_ms = _from_number(float(raw))
+            elif isinstance(raw, str):
+                s = raw.strip()
+                # Numeric string?
+                try:
+                    ts_ms = _from_number(float(s))
+                except Exception:
+                    ts_ms = _from_iso(s)
+        except Exception:
+            ts_ms = None
+
+        if ts_ms is None or ts_ms <= 0:
+            if default_now:
+                ts_ms = int(time.time() * 1000)
+            else:
+                raise ValueError("cannot derive ts_ms from event")
+
+        obj["ts_ms"] = int(ts_ms)
+        obj.setdefault("timestamp_ms", obj["ts_ms"])
+        return obj["ts_ms"]
+
+
     def _derive_time_fields(self, ts_ms_or_iso, pod_region: str) -> dict[str, int | str]:
         """
         Dérive hour_local/hour_utc/weekday_* et local_day (helper interne),
@@ -916,6 +1248,87 @@ class LoggerHistoriqueManager:
             e["symbol"] = e["symbol"].replace("_", "-").upper()
         return e
 
+    def _to_tracker_trade(self, e: dict) -> dict:
+        """
+        Adapter un event trade LHM -> format attendu par PairHistoryTracker.
+        Important: PairHistoryTracker veut trade["timestamp"] = secondes epoch (float).
+        On ne modifie jamais l'event original (DB/JSONL).
+        """
+        obj = dict(e or {})
+
+        # Canon ts_ms (ms epoch) côté LHM
+        try:
+            ts_ms = self._ensure_ts_ms(obj)
+        except Exception:
+            ts_ms = int(time.time() * 1000)
+            obj["ts_ms"] = ts_ms
+            obj.setdefault("timestamp_ms", ts_ms)
+
+        # Tracker: timestamp en secondes (float)
+        obj["timestamp"] = float(ts_ms) / 1000.0
+
+        # Status canonique pour le tracker (success/fail)
+        raw = (obj.get("status") or obj.get("result") or obj.get("trade_status") or obj.get("source") or "unknown")
+        s = str(raw).strip().lower()
+        if any(k in s for k in ("non_rentable",)):
+            obj["status"] = "non_rentable"
+        elif any(k in s for k in ("fail", "failed", "reject", "rejected", "cancel", "canceled", "error")):
+            obj["status"] = "failed"
+        elif any(k in s for k in ("simul", "simulated", "dryrun", "paper")):
+            obj["status"] = "simulated"
+        elif any(k in s for k in ("exec", "executed", "fill", "filled", "success", "rentable", "rebalancing_accept")):
+            obj["status"] = "executed"
+        else:
+            obj["status"] = "unknown"
+
+        # trade_mode (tracker attend TT/TM/REB/MM...)
+        tm = obj.get("trade_mode")
+        if isinstance(tm, str) and tm:
+            obj["trade_mode"] = tm.upper()
+
+        # Alias exchanges attendus par le tracker
+        if "buy_ex" not in obj and obj.get("buy_exchange"):
+            obj["buy_ex"] = obj.get("buy_exchange")
+        if "sell_ex" not in obj and obj.get("sell_exchange"):
+            obj["sell_ex"] = obj.get("sell_exchange")
+
+        return obj
+
+    def _to_tracker_opp(self, e: dict) -> dict:
+        """
+        Adapter un event opportunity LHM -> format attendu par PairHistoryTracker.
+        timestamp en secondes epoch (float) pour éviter float(ISO) côté tracker.
+        """
+        obj = dict(e or {})
+
+        try:
+            ts_ms = self._ensure_ts_ms(obj)
+        except Exception:
+            ts_ms = int(time.time() * 1000)
+            obj["ts_ms"] = ts_ms
+            obj.setdefault("timestamp_ms", ts_ms)
+
+        obj["timestamp"] = float(ts_ms) / 1000.0
+
+        if "buy_ex" not in obj and obj.get("buy_exchange"):
+            obj["buy_ex"] = obj.get("buy_exchange")
+        if "sell_ex" not in obj and obj.get("sell_exchange"):
+            obj["sell_ex"] = obj.get("sell_exchange")
+
+        tm = obj.get("trade_mode")
+        if isinstance(tm, str) and tm:
+            obj["trade_mode"] = tm.upper()
+
+        # route best-effort (utile pour métriques route)
+        if not obj.get("route"):
+            bx = obj.get("buy_ex") or ""
+            sx = obj.get("sell_ex") or ""
+            if bx and sx:
+                obj["route"] = f"BUY:{bx}→SELL:{sx}"
+
+        return obj
+
+
     def _validate_trade_schema(self, e: dict) -> None:
         """
         [M5-A3-1] Validation NON BLOQUANTE du contrat minimal pour les trades.
@@ -1000,18 +1413,10 @@ class LoggerHistoriqueManager:
         try:
             obj = dict(e or {})
 
-            # --- ts_ms pivot ---
-            ts = (
-                obj.get("ts_ms")
-                or obj.get("ts")
-                or obj.get("timestamp")
-            )
-            if isinstance(ts, (int, float)):
-                obj.setdefault("ts_ms", int(ts))
-            elif ts is None:
-                now_ms = int(time.time() * 1000)
-                obj.setdefault("ts_ms", now_ms)
-                ts = now_ms
+
+            # --- ts_ms pivot (canon) ---
+            self._ensure_ts_ms(obj)
+
             # si ts est une string ISO, on laisse _derive_time_fields la gérer
 
             # --- event_type canonique ---
@@ -1150,15 +1555,15 @@ class LoggerHistoriqueManager:
             e = self._normalize_event_contract(log_type, e)
 
             pod = (e.get("pod_region") or "EU")
-            ts = (
-                    e.get("ts_ms")
-                    or e.get("ts")
-                    or e.get("timestamp")  # iso-8601 éventuel (BaseTradeLogger ou Engine)
-                    or int(time.time() * 1000)
-            )
-
+            ts_ms = self._ensure_ts_ms(e)
             # Horaires (UTC/local) + local_day (en s'appuyant sur pod_region)
-            e.update(self._derive_time_fields(ts, pod))
+            e.update(self._derive_time_fields(ts_ms, pod))
+
+            # [P0-opps] LogWriter.insert_opportunities_bulk attend timestamp=float(secondes).
+            # On écrase toute valeur ISO éventuelle pour éviter float("2025-...") => ValueError.
+            if log_type == "opportunities":
+                e["timestamp"] = float(ts_ms) / 1000.0
+                e.setdefault("ts", e["timestamp"])
 
             # Canonicalisation légère (exchanges, pair, symbol, etc.)
             e = self._canonicalize(e)
@@ -1200,28 +1605,18 @@ class LoggerHistoriqueManager:
             )
 
         # Écriture DB (thread → pas de blocage loop)
+        # Écriture DB via DB lane (single-writer, non bloquant)
         try:
-            t0 = time.time()
-            record_latency = True
             if log_type == "trades":
-                await self._write_trades_async(enriched)
-                record_latency = False  # déjà observé dans _write_trades_async
+                await self._db_lane_submit_bulk("trades", enriched)
             elif log_type == "opportunities":
-                await asyncio.to_thread(self._writer.insert_opportunities_bulk, enriched)
+                await self._db_lane_submit_bulk("opportunities", enriched)
             elif log_type == "alerts":
-                await asyncio.to_thread(self._writer.insert_alerts_bulk, enriched)
+                await self._db_lane_submit_bulk("alerts", enriched)
             else:
-                # best-effort: on tente une table générique si elle existe
-                await asyncio.to_thread(self._writer.insert_generic, log_type, enriched)
-            if record_latency:
-                try:
-                    from modules.obs_metrics import LOGGERH_WRITE_MS
-                    LOGGERH_WRITE_MS.observe((time.time() - t0) * 1000.0)
-                except Exception:
-                    pass
-
+                await self._db_lane_submit_bulk(f"generic:{log_type}", enriched)
         except Exception:
-            logger.exception("DB write failed for log_type=%s", log_type)
+            logger.exception("DB enqueue failed for log_type=%s", log_type)
             # Erreur DB = I/O critique côté PnL (on ne sait pas si la ligne a été persistée)
             try:
                 self._storage_error_seen = True
@@ -1239,9 +1634,9 @@ class LoggerHistoriqueManager:
         # Ingestion tracker (best-effort, non bloquant)
         try:
             if log_type == "trades":
-                self._tracker.ingest_trades(enriched)
+                self._tracker.ingest_trades([self._to_tracker_trade(x) for x in enriched])
             elif log_type == "opportunities":
-                self._tracker.ingest_opportunities(enriched)
+                self._tracker.ingest_opportunities([self._to_tracker_opp(x) for x in enriched])
         except Exception:
             logger.exception("PairHistoryTracker ingestion failed for %s", log_type)
 
@@ -1284,7 +1679,7 @@ class LoggerHistoriqueManager:
 
         # Finalize DB (writer)
         try:
-            meta = await asyncio.to_thread(self._writer.finalize_day, sign_priv_pem_path=sign_priv_pem_path)
+            meta = await self._db_lane_call("finalize_day", {"sign_priv_pem_path": sign_priv_pem_path})
         except Exception:
             logger.exception("EOD: finalize_day failed")
             meta = {"error": "finalize_failed"}
@@ -2565,22 +2960,24 @@ class LoggerHistoriqueManager:
             except Exception:
                 logger.exception("rotate_pairs failed")
 
-        # export des métriques paires
         try:
             rows = self._tracker.collect_pair_metrics() or []
             if rows:
                 import time
                 t0 = time.perf_counter()
-                await asyncio.to_thread(self._writer.write_pair_history, rows)
+                mapped = self._map_pair_history_rows(rows)
+                await self._db_lane_call("pair_history", mapped)
+
                 dt_ms = (time.perf_counter() - t0) * 1000.0
                 try:
                     from modules.obs_metrics import PAIR_HISTORY_ROWS_TOTAL, PAIR_HISTORY_COMPUTE_MS
-                    PAIR_HISTORY_ROWS_TOTAL.inc(len(rows))
+                    PAIR_HISTORY_ROWS_TOTAL.inc(len(mapped))
                     PAIR_HISTORY_COMPUTE_MS.observe(dt_ms)
                 except Exception:
                     pass
         except Exception:
             logger.exception("flush_now: write_pair_history failed")
+
         try:
             path = self._writer.get_db_path()
             db_label = f"{self._db_name}:{path.split('/')[-1]}"
@@ -2601,11 +2998,9 @@ class LoggerHistoriqueManager:
     async def _write_trades_async(self, entries: List[Dict[str, Any]]) -> None:
         start = time.perf_counter()
         try:
-            def _write():
-                for e in entries:
-                    self._writer.insert_trade_log("trade", **e)
+            # [P2] Bulk insert trades (évite PRAGMA table_info + INSERT par ligne)
+            await asyncio.to_thread(self._writer.insert_trades_bulk, entries)
 
-            await asyncio.to_thread(_write)
             dur_ms = (time.perf_counter() - start) * 1000.0
             LOGGERH_WRITE_MS.observe(dur_ms)
             # MAJ “dernier flush”
@@ -2623,6 +3018,133 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("_write_trades_async failed")
 
+    def _map_pair_history_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Adaptateur PairHistoryTracker -> LogWriter.write_pair_history.
+        - latency_ms_avg: scalaire (ms) dérivé de route_latency_ema_ms / ema_latency_ms (dict {e2e, ack, fill,...})
+        - trade_result: compat depuis last_trade_result
+        - volatility: doit être scalaire (REAL) => on tente d’extraire un float depuis dict, sinon None
+        - slippage_est: compat depuis slippage si présent
+        """
+        def _pick_float_from_dict(d: Any, preferred_keys: List[str]) -> Optional[float]:
+            if not isinstance(d, dict) or not d:
+                return None
+            for k in preferred_keys:
+                if k in d and d[k] is not None:
+                    try:
+                        return float(d[k])
+                    except Exception:
+                        pass
+            # fallback: première valeur numérique >0
+            for v in d.values():
+                if isinstance(v, (int, float)) and v > 0:
+                    return float(v)
+            return None
+
+        mapped: List[Dict[str, Any]] = []
+        for r in (rows or []):
+            if not isinstance(r, dict):
+                continue
+            rr = dict(r)
+
+            # trade_result (schema DB)
+            if rr.get("trade_result") is None and rr.get("last_trade_result") is not None:
+                rr["trade_result"] = rr.get("last_trade_result")
+
+            # latency_ms_avg (schema DB)
+            if rr.get("latency_ms_avg") is None:
+                lat = (
+                    _pick_float_from_dict(rr.get("route_latency_ema_ms"), ["e2e", "ack", "fill"])
+                    or _pick_float_from_dict(rr.get("ema_latency_ms"), ["e2e", "ack", "fill"])
+                )
+                if lat is not None:
+                    rr["latency_ms_avg"] = lat
+
+            # slippage_est (schema DB) - best effort
+            if rr.get("slippage_est") is None and isinstance(rr.get("slippage"), (int, float)):
+                rr["slippage_est"] = float(rr.get("slippage"))
+
+            # volatility (schema DB REAL) => jamais un dict
+            vol = rr.get("volatility")
+            if isinstance(vol, dict):
+                rr["volatility"] = _pick_float_from_dict(
+                    vol,
+                    [
+                        "ema_vol_bps", "vol_bps", "volatility_bps",
+                        "sigma_bps", "sigma",
+                        "price_p95", "price_p99", "spread_p95", "spread_p99",
+                        "p95", "p99",
+                    ],
+                )
+            elif not (vol is None or isinstance(vol, (int, float))):
+                rr["volatility"] = None
+
+            mapped.append(rr)
+
+        return mapped
+
+    def _map_pair_history_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Adapter PairHistoryTracker.collect_pair_metrics() -> schéma attendu par LogWriter.write_pair_history().
+        Objectif: éviter les dicts (volatility/ema_latency_ms) qui cassent sqlite bindings.
+        """
+        def _pick_numeric(d: Any) -> Optional[float]:
+            if isinstance(d, (int, float)):
+                return float(d)
+            if not isinstance(d, dict) or not d:
+                return None
+            # priorités connues (EMA latencies du tracker)
+            for k in ("e2e", "ack", "fill"):
+                v = d.get(k)
+                if isinstance(v, (int, float)) and v > 0:
+                    return float(v)
+            # fallback: première valeur numérique
+            for v in d.values():
+                if isinstance(v, (int, float)):
+                    return float(v)
+            return None
+
+        out: List[Dict[str, Any]] = []
+        now_iso = datetime.utcnow().isoformat()
+
+        for r in (rows or []):
+            if not isinstance(r, dict):
+                continue
+            pair = r.get("pair") or r.get("pair_key") or r.get("symbol") or r.get("asset")
+            if not pair:
+                continue
+
+            # latency_ms_avg : scalaire dérivé route_latency_ema_ms puis ema_latency_ms
+            lat = None
+            lat_src = r.get("route_latency_ema_ms") or r.get("ema_latency_ms") or r.get("rt_latency_ema_ms")
+            lat = _pick_numeric(lat_src)
+
+            # volatility : scalaire (sinon None)
+            vol = _pick_numeric(r.get("volatility"))
+
+            # slippage_est : scalaire depuis tracker "slippage"
+            slip = r.get("slippage")
+            slippage_est = float(slip) if isinstance(slip, (int, float)) else None
+
+            out.append({
+                "timestamp": r.get("timestamp") or now_iso,
+                "pair": pair,
+                "spread": r.get("spread"),
+                "volume": r.get("volume"),
+                "slippage_est": slippage_est,
+                "slippage_real": r.get("slippage_real"),
+                "volatility": vol,
+                "trade_result": r.get("trade_result") or r.get("last_trade_result"),
+                "net_profitability": r.get("net_profitability"),
+                "opportunity_freq": r.get("opportunity_freq"),
+                "score": r.get("score"),
+                "latency_ms_avg": lat,
+                "tier": r.get("tier"),
+            })
+
+        return out
+
+
     async def _rotation_loop(self) -> None:
         try:
             while True:
@@ -2630,12 +3152,7 @@ class LoggerHistoriqueManager:
                 self._tracker.rotate_pairs()
                 rows = self._tracker.collect_pair_metrics() or []
                 if rows:
-                    # mapping de compat: rt_latency_ema_ms -> latency_ms_avg
-                    mapped = []
-                    for r in rows:
-                        if "latency_ms_avg" not in r and "rt_latency_ema_ms" in r:
-                            r = {**r, "latency_ms_avg": r.get("rt_latency_ema_ms")}
-                        mapped.append(r)
+                    mapped = self._map_pair_history_rows(rows)
                     await asyncio.to_thread(self._writer.write_pair_history, mapped)
                     try:
                         path = self._writer.get_db_path()
@@ -2675,18 +3192,47 @@ class LoggerHistoriqueManager:
 
     async def record_opportunity(self, payload: Dict[str, Any]) -> None:
         try:
-            # tracker en amont
-            try:
-                self._tracker.ingest_opportunity(payload)
-            except Exception:
-                logging.exception("Unhandled exception")
-            # tagging + normalisation guard_reason
+            # tagging + compat guard_reason (façade LHM)
             obj = self._with_context_tags(dict(payload or {}))
             if "guard_reason" not in obj:
                 gr = obj.get("reject_reason") or obj.get("blocked_reason") or obj.get("reason")
                 if gr is not None:
                     obj["guard_reason"] = str(gr)
-            await asyncio.to_thread(self._writer.insert_opportunity, obj)
+
+            # Aliases exchanges (certains payloads utilisent buy_exchange/sell_exchange)
+            if "buy_ex" not in obj and obj.get("buy_exchange"):
+                obj["buy_ex"] = obj.get("buy_exchange")
+            if "sell_ex" not in obj and obj.get("sell_exchange"):
+                obj["sell_ex"] = obj.get("sell_exchange")
+
+            # Canon minimal (best-effort, ne casse jamais)
+            try:
+                obj = self._canonicalize(obj)
+            except Exception:
+                pass
+            try:
+                obj = self._normalize_event_contract("opportunities", obj)
+            except Exception:
+                pass
+
+            # Assurer ts/timestamp (secondes) pour la DB (ts_ms reste pivot canon)
+            try:
+                ts_ms = obj.get("ts_ms") or self._ensure_ts_ms(obj)
+                ts_sec = float(ts_ms) / 1000.0
+                obj["timestamp"] = ts_sec  # évite toute valeur ISO résiduelle
+                obj.setdefault("ts", ts_sec)
+            except Exception:
+                pass
+
+            # IMPORTANT: tracker ne reçoit jamais le payload brut
+            try:
+                self._tracker.ingest_opportunity(self._to_tracker_opp(obj))
+            except Exception:
+                logging.exception("record_opportunity: tracker ingest failed")
+
+            # LogWriter.insert_opportunity attend des kwargs (**opp), pas un dict positionnel
+            await self._db_lane_submit_bulk("opportunities", [obj])
+
         except Exception:
             logger.exception("record_opportunity failed")
 
@@ -2700,7 +3246,8 @@ class LoggerHistoriqueManager:
     ) -> None:
         try:
             ctx = json.dumps(context or {}, separators=(",", ":"))
-            await asyncio.to_thread(self._writer.insert_alert, module, level, pair_key or None, message, ctx)
+            await self._db_lane_submit_one("alert_one", (module, level, pair_key or None, message, ctx))
+
         except Exception:
             logger.exception("record_alert failed")
 

@@ -418,6 +418,51 @@ class LogWriter:
         return con
 
     # ------------------------------------------------------------------
+    # DB retry + metrics (low-card op labels)
+    # ------------------------------------------------------------------
+    def _obs_db_write_ms(self, op: str, dt_ms: float) -> None:
+        try:
+            from modules.obs_metrics import LOGGERH_DB_WRITE_MS
+            LOGGERH_DB_WRITE_MS.labels(op=str(op)).observe(max(0.0, float(dt_ms)))
+        except Exception:
+            pass
+
+    def _obs_db_locked_retry(self, op: str) -> None:
+        try:
+            from modules.obs_metrics import LOGGERH_DB_LOCKED_RETRIES_TOTAL
+            LOGGERH_DB_LOCKED_RETRIES_TOTAL.labels(op=str(op)).inc()
+        except Exception:
+            pass
+
+    def _run_db(self, op: str, fn, *, max_attempts: int = 6, base_sleep_s: float = 0.05):
+        """
+        Exécute fn() avec retries si sqlite 'database is locked/busy'.
+        - métrique: retries_total{op}
+        - métrique: write_ms{op} (temps total, retries inclus)
+        """
+        t0 = time.perf_counter()
+        last_exc = None
+        for attempt in range(1, int(max_attempts) + 1):
+            try:
+                res = fn()
+                self._obs_db_write_ms(op, (time.perf_counter() - t0) * 1000.0)
+                return res
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if ("locked" in msg or "busy" in msg) and attempt < int(max_attempts):
+                    self._obs_db_locked_retry(op)
+                    time.sleep(float(base_sleep_s) * (2 ** (attempt - 1)))
+                    last_exc = e
+                    continue
+                self._obs_db_write_ms(op, (time.perf_counter() - t0) * 1000.0)
+                raise
+        # fallback (théoriquement unreachable)
+        self._obs_db_write_ms(op, (time.perf_counter() - t0) * 1000.0)
+        if last_exc:
+            raise last_exc
+
+
+    # ------------------------------------------------------------------
     # Bootstrap schéma
     # ------------------------------------------------------------------
     def _bootstrap(self, conn: sqlite3.Connection) -> None:
@@ -724,24 +769,62 @@ class LogWriter:
         rows = list(rows or [])
         if not rows:
             return 0
-        with self._lock:
-            self._rotate_if_needed()
-            with self._conn() as conn:
-                cur = conn.cursor()
-                cur.execute("PRAGMA table_info(trades);")
-                cols = {row[1] for row in cur.fetchall()}
-                count = 0
-                for payload in rows:
-                    p = {k: v for k, v in {**payload}.items() if k in cols}
-                    if "timestamp" not in p:
-                        p["timestamp"] = datetime.utcnow().isoformat()
-                    keys = ", ".join(p.keys())
-                    qmarks = ", ".join(["?"] * len(p))
-                    cur.execute(f"INSERT INTO trades ({keys}) VALUES ({qmarks})", list(p.values()))
-                    count += 1
-                conn.commit()
-                self.log_count += count
-                return count
+
+        def _safe(v: Any) -> Any:
+            if isinstance(v, (dict, list, tuple)):
+                try:
+                    return json.dumps(v, default=str)
+                except Exception:
+                    return str(v)
+            return v
+
+        def _do() -> int:
+            with self._lock:
+                self._rotate_if_needed()
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("PRAGMA table_info(trades);")
+                    cols = {row[1] for row in cur.fetchall()}
+
+                    payloads: List[Dict[str, Any]] = []
+                    for payload in rows:
+                        p0 = dict(payload or {})
+                        p = {k: _safe(v) for k, v in p0.items() if k in cols}
+
+                        # timestamp ISO UTC si absent
+                        if not p.get("timestamp"):
+                            p["timestamp"] = datetime.utcnow().isoformat()
+
+                        # dérivés horaires best-effort si ts_ms présent et champs manquants
+                        if p.get("ts_ms") and (("hour_utc" not in p) or ("local_day" not in p)):
+                            try:
+                                pod = p.get("pod_region") or p.get("region") or "EU"
+                                tf = _derive_time_fields(p.get("ts_ms"), str(pod))
+                                for k, v in tf.items():
+                                    p.setdefault(k, v)
+                            except Exception:
+                                pass
+
+                        if p:
+                            payloads.append(p)
+
+                    if not payloads:
+                        return 0
+
+                    # Union de colonnes (ordre stable)
+                    col_union = sorted({k for p in payloads for k in p.keys()})
+                    qmarks = ", ".join(["?"] * len(col_union))
+                    sql = f"INSERT INTO trades ({', '.join(col_union)}) VALUES ({qmarks})"
+
+                    params = [tuple(p.get(c) for c in col_union) for p in payloads]
+                    cur.executemany(sql, params)
+                    conn.commit()
+
+                    self.log_count += len(params)
+                    return len(params)
+
+        return int(self._run_db("trades", _do))
+
 
     def write_pair_history(self, pair_data_list: Iterable[Dict[str, Any]]) -> None:
         """Insère plusieurs entrées dans pair_history (batch)."""
@@ -1610,7 +1693,6 @@ class LogWriter:
 
         return out
 
-
     def insert_opportunity(self, **opp):
         """
         Insert robuste:
@@ -1623,68 +1705,76 @@ class LogWriter:
         tf = _derive_time_fields(ts_ms, opp.get("pod_region") or "EU")
         opp.update(tf)
 
-        with sqlite3.connect(self.db_path, timeout=10) as conn:
-            cur = conn.cursor()
-            cur.execute("PRAGMA table_info(opportunities);")
-            cols = {row[1] for row in cur.fetchall()}
+        with self._lock:
+            self._rotate_if_needed()
+            with self._conn() as conn:
+                cur = conn.cursor()
+                cur.execute("PRAGMA table_info(opportunities);")
+                cols = {row[1] for row in cur.fetchall()}
 
-            data = {k: v for k, v in opp.items() if k in cols}
-            if not data:
-                return 0
+                data = {k: v for k, v in opp.items() if k in cols}
+                if not data:
+                    return 0
 
-            keys = ",".join(data.keys())
-            q = ",".join(["?"] * len(data))
-            sql = f"INSERT OR REPLACE INTO opportunities ({keys}) VALUES ({q})"
-            cur.execute(sql, tuple(data.values()))
-            conn.commit()
-            return 1
+                keys = ",".join(data.keys())
+                q = ",".join(["?"] * len(data))
+                sql = f"INSERT OR REPLACE INTO opportunities ({keys}) VALUES ({q})"
+                cur.execute(sql, tuple(data.values()))
+                conn.commit()
+                return 1
 
     def insert_opportunities_bulk(self, opps: Iterable[Dict[str, Any]]) -> int:
         opps = list(opps or [])
         if not opps:
             return 0
-        self._rotate_if_needed()
-        with self._conn() as conn:
-            cur = conn.cursor()
-            rows = []
-            for o in opps:
-                rows.append(
-                    (
-                        o.get("id"),
-                        float(o.get("timestamp", 0.0) or 0.0),
-                        (o.get("pair") or o.get("pair_key")),
-                        self._norm_ex(o.get("buy_exchange") or o.get("buy_ex")),
-                        self._norm_ex(o.get("sell_exchange") or o.get("sell_ex")),
-                        o.get("buy_price"),
-                        o.get("sell_price"),
-                        o.get("spread_brut"),
-                        o.get("spread_net"),
-                        o.get("volume_possible_usdc"),
-                        o.get("score"),
-                        o.get("type"),
-                        o.get("trade_mode"),
-                        o.get("route_id"),
-                        o.get("deployment_mode"),
-                        o.get("pod_region"),
-                        o.get("capital_profile"),
-                        o.get("pacer_mode"),
-                        str(o),
+
+        # Prépare hors lock (évite de bloquer la DB)
+        rows = []
+        for o in opps:
+            rows.append(
+                (
+                    o.get("id"),
+                    float(o.get("timestamp", 0.0) or 0.0),
+                    (o.get("pair") or o.get("pair_key")),
+                    self._norm_ex(o.get("buy_exchange") or o.get("buy_ex")),
+                    self._norm_ex(o.get("sell_exchange") or o.get("sell_ex")),
+                    o.get("buy_price"),
+                    o.get("sell_price"),
+                    o.get("spread_brut"),
+                    o.get("spread_net"),
+                    o.get("volume_possible_usdc"),
+                    o.get("score"),
+                    o.get("type"),
+                    o.get("trade_mode"),
+                    o.get("route_id"),
+                    o.get("deployment_mode"),
+                    o.get("pod_region"),
+                    o.get("capital_profile"),
+                    o.get("pacer_mode"),
+                    str(o),
+                )
+            )
+
+        def _do() -> int:
+            with self._lock:
+                self._rotate_if_needed()
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    cur.executemany(
+                        """
+                        INSERT OR REPLACE INTO opportunities(
+                            id, ts, pair_key, buy_ex, sell_ex, buy_price, sell_price, spread_brut,
+                            spread_net, volume_possible_usdc, score, typ, trade_mode, route_id,
+                            deployment_mode, pod_region, capital_profile, pacer_mode, raw_json
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        rows,
                     )
-                )
+                    conn.commit()
+                    return len(rows)
 
-                cur.executemany(
-                    """
-                    INSERT OR REPLACE INTO opportunities(
-                        id, ts, pair_key, buy_ex, sell_ex, buy_price, sell_price, spread_brut,
-                        spread_net, volume_possible_usdc, score, typ, trade_mode, route_id,
-                        deployment_mode, pod_region, capital_profile, pacer_mode, raw_json
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    rows,
-                )
+        return int(self._run_db("opportunities", _do))
 
-            conn.commit()
-            return len(rows)
 
     def insert_alert(self, module: str, level: str, pair_key: str | None, message: str, ctx: str | None = None) -> None:
         with self._lock:
@@ -1953,6 +2043,74 @@ class LogWriter:
                 conn.execute("PRAGMA optimize;")
         except Exception:
             logger.exception("PRAGMA optimize failed")
+
+    def finalize_day(self, *, sign_priv_pem_path: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Finalisation EOD best-effort:
+        - checkpoint WAL (FULL) pour consolider
+        - PRAGMA optimize
+        - backup atomique via sqlite backup API
+        - retourne un meta dict (pas de hard fail)
+        """
+        meta: Dict[str, Any] = {
+            "utc_ts": datetime.utcnow().isoformat(),
+            "db_path": self.db_path,
+            "backup_path": None,
+            "sha256_db": None,
+            "sha256_backup": None,
+            "signing": None,
+        }
+
+        def _sha256_file(path: str) -> Optional[str]:
+            try:
+                import hashlib
+                h = hashlib.sha256()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(chunk)
+                return h.hexdigest()
+            except Exception:
+                logger.exception("sha256 failed for %s", path)
+                return None
+
+        with self._lock:
+            try:
+                self.wal_checkpoint("FULL")
+                meta["wal_checkpoint"] = "FULL"
+            except Exception:
+                logger.exception("finalize_day: wal_checkpoint failed")
+
+            try:
+                self.optimize()
+                meta["optimize"] = True
+            except Exception:
+                logger.exception("finalize_day: optimize failed")
+
+            try:
+                bp = self.backup_database()
+                meta["backup_path"] = bp
+            except Exception:
+                logger.exception("finalize_day: backup_database failed")
+
+        # checksums hors lock
+        try:
+            meta["sha256_db"] = _sha256_file(self.db_path)
+        except Exception:
+            pass
+        try:
+            if meta.get("backup_path"):
+                meta["sha256_backup"] = _sha256_file(str(meta["backup_path"]))
+        except Exception:
+            pass
+
+        # Signing: best-effort, optionnel (pas bloquant)
+        if sign_priv_pem_path:
+            meta["signing"] = {"requested": True, "done": False, "error": "not_implemented"}
+        else:
+            meta["signing"] = {"requested": False}
+
+        return meta
+
 
     # ------------------------------------------------------------------
     # Utilitaires lecture simples / statut

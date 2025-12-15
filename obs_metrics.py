@@ -1347,6 +1347,20 @@ def pws_set_pool_size(exchange: str, size: int) -> None:
     except Exception:
         pass
 LOGGERH_WRITE_MS = _metric(Histogram, 'loggerh_write_ms', 'Write latency per JSONL batch (ms)', buckets=BUCKETS_MS if 'BUCKETS_MS' in globals() else (1, 2, 5, 8, 12, 18, 25, 35, 50, 75, 100, 150, 200, 300, 500, 800, 1600))
+LOGGERH_DB_WRITE_MS = _metric(
+    Histogram,
+    'loggerh_db_write_ms',
+    'DB write latency (ms) by operation',
+    ['op'],
+    buckets=BUCKETS_MS if 'BUCKETS_MS' in globals() else (1, 2, 5, 8, 12, 18, 25, 35, 50, 75, 100, 150, 200, 300, 500, 800, 1600),
+)
+LOGGERH_DB_LOCKED_RETRIES_TOTAL = _metric(
+    Counter,
+    'loggerh_db_locked_retries_total',
+    'SQLite locked/busy retries',
+    ['op'],
+)
+
 LHM_JSONL_INGESTED_TOTAL = _metric(Counter, 'lhm_jsonl_ingested_total', 'JSONL records ingested', ['stream'])
 LHM_JSONL_DROPPED_TOTAL = _metric(Counter, 'lhm_jsonl_dropped_total', 'JSONL records dropped (non-critical/backpressure)', ['stream', 'reason'])
 LHM_JSONL_QUEUE_SIZE = _metric(Gauge, 'lhm_jsonl_queue_size', 'Current queue size per JSONL stream', ['stream'])
@@ -1366,6 +1380,9 @@ STORAGE_ALERTS_TOTAL = _metric(Counter, 'storage_alerts_total', 'Storage alerts 
 LOGGERH_JSONL_BYTES = _metric(Gauge, 'loggerh_jsonl_bytes', 'Total size of JSONL files (bytes)')
 LOGGERH_DB_STALLS_TOTAL = _metric(Counter, 'loggerh_db_stalls_total', 'DB stalls detected (write delays/backpressure)')
 LOGGERH_DB_FILE_BYTES = _metric(Gauge, 'loggerh_db_file_bytes', 'LoggerHistorique DB file size (bytes)')
+LOGGERH_DB_LANE_QUEUE_DEPTH = _metric(Gauge, 'loggerh_db_lane_queue_depth', 'DB lane queue depth (pending write batches)')
+LOGGERH_DB_LANE_DROPS_TOTAL = _metric(Counter, 'loggerh_db_lane_drops_total', 'DB lane drops when queue is full', ['op'])
+
 LHM_JSONL_QUEUE_CAP = _metric(Gauge, 'lhm_jsonl_queue_cap', 'Configured JSONL queue capacity (records)')
 
 # --- [LHM SLO] Cibles & lag pipeline LHM (M5-B3) ------------------------------
