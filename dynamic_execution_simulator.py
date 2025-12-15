@@ -924,6 +924,8 @@ class DynamicExecutionSimulator:
         }
         meta = opportunity.setdefault("meta", {})
         meta.update(dict(route.get("meta") or {}))
+        for k, v in (bundle.get("meta") or {}).items():
+            meta.setdefault(k, v)
         meta.setdefault("shadow", True)
         meta.setdefault("shadow_branch", "TT")
 
@@ -966,6 +968,8 @@ class DynamicExecutionSimulator:
             "has_buy_book": bool(buy_levels_raw),
             "has_sell_book": bool(sell_levels_raw),
             "usage_ratio": usage_ratio,
+            "mode_overrides": meta.get("mode_overrides"),
+            "pacer_mode": (meta.get("rm_engine_pacer_ctx") or {}).get("pacer_mode"),
         }
 
         return {
@@ -1060,8 +1064,28 @@ class DynamicExecutionSimulator:
         }
         meta = opportunity.setdefault("meta", {})
         meta.update(dict(route.get("meta") or {}))
+        for k, v in (bundle.get("meta") or {}).items():
+            meta.setdefault(k, v)
         meta.setdefault("shadow", True)
         meta.setdefault("shadow_branch", "TM")
+        if meta.get("mode_overrides", {}).get("ioc_only") is True:
+            guards: Dict[str, Any] = {
+                "branch": "TM",
+                "has_buy_book": bool(buy_levels_raw),
+                "has_sell_book": bool(sell_levels_raw),
+                "usage_ratio": 0.0,
+                "sell_best_ask_px": None,
+                "mode_overrides": meta.get("mode_overrides"),
+                "pacer_mode": (meta.get("rm_engine_pacer_ctx") or {}).get("pacer_mode"),
+            }
+            return {
+                "ok": False,
+                "reason": "TM_BLOCKED_IOC_ONLY",
+                "dev_bps": float("inf"),
+                "fills_ratio": 0.0,
+                "lat_ms": float(getattr(self, "timeout_each_s", 1.2)) * 1000.0,
+                "guards": guards,
+            }
 
         # On fournit un best ask côté SELL pour aider la logique maker du core
         if sell_best_ask_px is not None and sell_best_ask_px > 0.0:
@@ -1107,6 +1131,8 @@ class DynamicExecutionSimulator:
             "has_sell_book": bool(sell_levels_raw),
             "usage_ratio": usage_ratio,
             "sell_best_ask_px": sell_best_ask_px,
+            "mode_overrides": meta.get("mode_overrides"),
+            "pacer_mode": (meta.get("rm_engine_pacer_ctx") or {}).get("pacer_mode"),
         }
 
         return {
@@ -1210,6 +1236,27 @@ class DynamicExecutionSimulator:
 
             ok_tt = bool(tt_r.get("ok", False))
             ok_tm = bool(tm_r.get("ok", False))
+
+            tm_blocked_ioc = tm_r.get("reason") == "TM_BLOCKED_IOC_ONLY"
+
+            if tm_blocked_ioc and not ok_tt:
+                dev_bps = float(tm_r.get("dev_bps", float("inf")))
+                fills_ratio = float(tm_r.get("fills_ratio", 0.0))
+                sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
+                return {
+                    "ok": False,
+                    "reason": tm_r.get("reason"),
+                    "sim_vwap_dev_bps": float(dev_bps if math.isfinite(dev_bps) else 1e6),
+                    "fills_expected_ratio": float(fills_ratio),
+                    "sim_latency_ms": sim_lat_ms,
+                    "guards": {
+                        "tt_ok": ok_tt,
+                        "tm_ok": ok_tm,
+                        "tt_reason": tt_r.get("reason"),
+                        "tm_reason": tm_r.get("reason"),
+                        "split_mode": split_mode,
+                    },
+                }
 
             # Sélection conservatrice : si au moins une branche OK, on prend celle au dev_bps minimal.
             if ok_tt or ok_tm:

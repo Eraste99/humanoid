@@ -38,7 +38,9 @@ from modules.private_ws_reconciler import PrivateWSReconciler
 from modules.execution_engine import ExecutionEngine
 from modules.rpc_gateway import RPCServer
 from modules.balance_fetcher import MultiBalanceFetcher
-
+from modules.utils.rate_limiter import RateLimiter
+from modules import obs_metrics
+from modules.retry_policy import BackoffPolicy
 
 # Config type (indicatif)
 try:
@@ -63,6 +65,8 @@ class BootContext:
     rm: Any | None = None
     scanner: Any | None = None
     engine: Any | None = None
+    rate_limiter: Any | None = None
+    retry_policy: Any | None = None
     # privé
     pws_hub: Any | None = None
     reconciler: Any | None = None
@@ -132,14 +136,64 @@ class Boot:
         self._log = logging.getLogger(getattr(self, "__class__", type("Boot", (object,), {})).__name__)
         self._status_sink = getattr(self.cfg, "status_sink", None)  # callable(payload)|None
         self.boot_complete = asyncio.Event()
-        self.ctx = BootContext(cfg)
         self._started = False
         self._private_health_task: Optional[asyncio.Task] = None
         # Moniteur santé pipeline PnL (LHM/JSONL/DB)
         self._pnl_pipeline_task: Optional[asyncio.Task] = None
         self._pnl_unhealthy_since: Optional[float] = None
+        self._obs_inc_cb: Optional[Any] = None
+        self._obs_counter_cache: Dict[Tuple[str, tuple[str, ...]], Any] = {}
 
+        # --- boot.py ---
+    def _ensure_engine_dependencies(self) -> None:
+        """Instancie RateLimiter + RetryPolicy si absents.
 
+        Le RateLimiter est no-op si la cfg ne fournit pas de caps.
+        La RetryPolicy utilise BackoffPolicy.from_cfg pour compat v2/v3.
+        """
+        try:
+            if getattr(self.ctx, "rate_limiter", None) is None:
+                self.ctx.rate_limiter = RateLimiter(getattr(self.cfg, "rl", None))
+        except Exception:
+            # fallback défensif : no-op RL pour éviter de casser le boot
+            try:
+                self.ctx.rate_limiter = RateLimiter(None)
+            except Exception:
+                self.ctx.rate_limiter = None
+
+        try:
+            if getattr(self.ctx, "retry_policy", None) is None:
+                self.ctx.retry_policy = BackoffPolicy.from_cfg(getattr(self.cfg, "retry", None))
+        except Exception:
+            self.ctx.retry_policy = BackoffPolicy()
+
+    def _get_obs_inc_callback(self) -> Optional[Any]:
+        """Retourne un callback best-effort pour obs_inc (RM/Engine).
+
+        Crée dynamiquement les counters Prometheus en fonction des labels
+        fournis. Jamais bloquant ni exceptionnel.
+        """
+
+        if self._obs_inc_cb is not None:
+            return self._obs_inc_cb
+
+        def _obs_inc(metric: str, **labels: Any) -> None:
+            cache = self._obs_counter_cache
+            label_names = tuple(sorted(labels.keys()))
+            try:
+                counter = cache.get((metric, label_names))
+                if counter is None:
+                    counter = obs_metrics.get_counter(metric, metric, labelnames=label_names)
+                    cache[(metric, label_names)] = counter
+                obs_metrics.safe_inc(counter, metric, "boot.obs_inc", **labels)
+            except Exception:
+                try:
+                    obs_metrics.OBS_NOOP_TOTAL.labels(metric=metric, where="boot.obs_inc").inc()
+                except Exception:
+                    pass
+
+        self._obs_inc_cb = _obs_inc
+        return self._obs_inc_cb
     # ------------------------------- Public API ----------------------------
     async def start(self) -> BootContext:
         # boot.py — dans async def start(self): juste au début
@@ -172,6 +226,8 @@ class Boot:
         await self._start_scanner()
         # 7) Private plane (Hub, Reco, Balances)
         await self._start_private_plane()
+        # 7bis) Dépendances Engine (RL + retry)
+        self._ensure_engine_dependencies()
         # 8) Engine + RPC
         await self._start_engine_and_rpc()
         # 9) READY
@@ -769,6 +825,12 @@ class Boot:
         rm_kwargs = {k: v for k, v in rm_kwargs.items() if k in sig.parameters}
 
         self.ctx.rm = RiskManager(**rm_kwargs)
+        try:
+            cb = self._get_obs_inc_callback()
+            if cb and hasattr(self.ctx.rm, "set_obs_inc_callback"):
+                self.ctx.rm.set_obs_inc_callback(cb)
+        except Exception:
+            pass
         if hasattr(self.ctx.rm, "start"):
             await self.ctx.rm.start()
 
@@ -1022,7 +1084,25 @@ class Boot:
         """
         # 1) Engine
         if not getattr(self.ctx, "engine", None):
-            self.ctx.engine = ExecutionEngine(getattr(self, "cfg", None))
+            # Garantit la présence du hub privé avant l'Engine
+            if getattr(self.ctx, "pws_hub", None) is None:
+                self.ctx.pws_hub = PrivateWSHub(getattr(self, "cfg", None))
+
+            self.ctx.engine = ExecutionEngine(
+                private_ws=self.ctx.pws_hub,
+                rate_limiter=getattr(self.ctx, "rate_limiter", None),
+                retry_policy=getattr(self.ctx, "retry_policy", None),
+                cfg=getattr(self, "cfg", None),
+                risk_manager=getattr(self.ctx, "rm", None),
+                ready_event=self.ready_engine,
+            )
+
+            try:
+                cb = self._get_obs_inc_callback()
+                if cb is not None:
+                    setattr(self.ctx.engine, "obs_inc", cb)
+            except Exception:
+                pass
 
         engine = self.ctx.engine
 

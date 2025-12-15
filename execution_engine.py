@@ -1048,12 +1048,38 @@ class ExecutionEngine:
         init_ms = int(getattr(self.config, "pacer_init_ms", 0))
         jitter = int(getattr(self.config, "pacer_jitter_ms", 1))
 
+        if getattr(self, "_pacer", None):
+            pacer = self._pacer
+            try:
+                if hasattr(pacer, "set_bot_config"):
+                    pacer.set_bot_config(self.cfg)
+            except Exception:
+                pass
+            try:
+                if hasattr(pacer, "set_capital_profile"):
+                    pacer.set_capital_profile(cap_profile)
+            except Exception:
+                pass
+            try:
+                if hasattr(pacer, "set_region_map"):
+                    pacer.set_region_map(region_map)
+            except Exception:
+                pass
+            for rg, overrides in targets_overrides.items():
+                try:
+                    if hasattr(pacer, "set_region_targets"):
+                        pacer.set_region_targets(rg, overrides)
+                except Exception:
+                    continue
+            return
+
         self._pacer = EnginePacer(
             region=region,
             capital_profile=cap_profile,
             min_ms=min_ms, max_ms=max_ms, init_ms=init_ms, jitter_ms=jitter,
             targets_overrides=targets_overrides,
             region_map=region_map,
+            bot_cfg=self.cfg,
         )
 
     # === /PACER: init & targets ===
@@ -1191,6 +1217,23 @@ class ExecutionEngine:
                     try:
                         if hasattr(rm, "set_pacer_mode"):
                             rm.set_pacer_mode(pacer_mode, source="engine_pacer")
+                            # --- Bridge PACER -> RM : policy snapshot (flags hold-time) ---
+                            try:
+                                if hasattr(rm, "set_engine_pacer_policy"):
+                                    pol = {}
+                                    try:
+                                        if hasattr(pacer, "policy"):
+                                            pol = pacer.policy(region) or {}
+                                        else:
+                                            pol = getattr(pacer, "current_policy", {}) or {}
+                                    except Exception:
+                                        pol = getattr(pacer, "current_policy", {}) or {}
+
+                                    if isinstance(pol, dict) and pol:
+                                        rm.set_engine_pacer_policy(pol, source="engine_pacer")
+                            except Exception:
+                                pass  # jamais bloquant
+
                         else:
                             # Fallback compat : ancien comportement (ne jamais casser le flux)
                             setattr(rm, "pacer_mode", pacer_mode)
@@ -1236,15 +1279,17 @@ class ExecutionEngine:
         from typing import Optional, Dict, Any, Tuple, List
 
         # --- Wiring de base ---
+        self.cfg = cfg or config
+        if self.cfg is None:
+            # fallback minimal pour éviter AttributeError trop tôt
+            self.cfg = type("EngineCfg", (object,), {})()
+        self.config = getattr(self.cfg, "engine", self.cfg)
         self.pws = private_ws
         self.private_ws_hub = private_ws
         self.rl = rate_limiter
         self.retry = retry_policy
         self.history = history_logger
 
-
-        # Sous-config "engine" (si fournie) ; sinon cfg.engine ; sinon cfg
-        self.config = config or getattr(self.cfg, "engine", self.cfg)
 
         self.risk_manager = risk_manager
 
@@ -1613,8 +1658,7 @@ class ExecutionEngine:
         )
         self.tm_exposure_ttl_hedge_ratio = float(getattr(self.config, "tm_exposure_ttl_hedge_ratio", 0.50))
         # Hub WS privé (injecté par le Boot) + flags wiring
-        self.private_ws_hub = None
-        self._has_private_ws_hub = False
+        self._has_private_ws_hub = bool(self.private_ws_hub)
         self._wiring_checked = False
         self._ready = False
 
@@ -1706,6 +1750,19 @@ class ExecutionEngine:
           - Le hub doit également disposer d'un callback "risk" (RiskManager).
           - Toute absence de callback requis = wiring incomplet (non READY).
         """
+        current_hub = getattr(self, "private_ws_hub", None)
+        if hub is None and current_hub is not None:
+            # Ne pas écraser un hub déjà injecté ; garder le wiring existant.
+            self._has_private_ws_hub = True
+            self._wiring_checked = False
+            return
+
+        if hub is current_hub and hub is not None:
+            # Idempotent si le même hub est ré-injecté.
+            self._has_private_ws_hub = True
+            self._wiring_checked = False
+            return
+
         self.private_ws_hub = hub
         self._has_private_ws_hub = bool(hub)
         self._wiring_checked = False
@@ -8156,7 +8213,9 @@ class ExecutionEngine:
             #   si le RM n’a PAS explicitement posé un autre choix (clé absente / None).
             if ioc_flag:
                 prev_ioc = mode_overrides.get("ioc_only", None)
-                if prev_ioc is None:
+                # PACER ne peut que SERRER : s'il demande IOC_ONLY, on force True
+                # sauf si c'est déjà True (idempotent).
+                if prev_ioc is not True:
                     mode_overrides["ioc_only"] = True
 
             if mode_overrides:

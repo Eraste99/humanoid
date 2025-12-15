@@ -629,12 +629,16 @@ class LoggerHistoriqueManager:
         """
         if not getattr(self, "_running", False):
             return
-        self._running = False
+
+        # IMPORTANT : on garde _running=True tant que le BTL peut encore émettre (flush/stop),
+        # afin que le worker JSONL continue de drainer.
+
         # 1) Flush fort (DB + JSONL)
         try:
             await self.flush_now(rotate=True)
         except Exception:
             logger.exception("flush_now at stop failed")
+
         # 1.5) Arrêt rotation loop
         t = getattr(self, "_rotation_task", None)
         if t and not t.done():
@@ -643,14 +647,45 @@ class LoggerHistoriqueManager:
                 await t
         self._rotation_task = None
 
-        # 2) Arrêt du BTL
+        # 2) Arrêt du BTL (peut encore émettre ici → JSONL worker doit rester vivant)
         btl = getattr(self, "_trade_logger", None)
         if btl:
             try:
                 await btl.stop()
             except Exception:
                 logger.exception("BaseTradeLogger.stop failed")
-        # 3) Arrêt worker JSONL
+
+        # 3) Barrière JSONL (best-effort, timeboxed) : laisse le worker vider les queues
+        try:
+            deadline = time.perf_counter() + 2.0
+            streams = getattr(self, "_jsonl_streams", {}) or {}
+            streams_task = getattr(self, "_streams_task", None)
+            prio = ["events", "errors"]
+
+            while time.perf_counter() < deadline:
+                pending = 0
+                for q_rot in streams.values():
+                    try:
+                        q, _rot = q_rot
+                        pending += int(q.qsize())
+                    except Exception:
+                        pass
+
+                if pending <= 0:
+                    break
+
+                # Si le worker n'est pas actif, on draine nous-mêmes (sans concurrence)
+                if not streams_task or streams_task.done():
+                    drained = await self._drain_stream_once(prio)
+                    if not drained:
+                        break
+                else:
+                    await asyncio.sleep(0.01)
+        except Exception:
+            logger.exception("stop: jsonl drain barrier failed")
+
+        # 4) Arrêt worker JSONL (maintenant seulement)
+        self._running = False
         t = getattr(self, "_streams_task", None)
         if t and not t.done():
             t.cancel()
@@ -659,7 +694,8 @@ class LoggerHistoriqueManager:
             except Exception:
                 pass
         self._streams_task = None
-        # 4) Drain + stop DB lane (single-writer)
+
+        # 5) Drain + stop DB lane (single-writer)
         try:
             await self._db_lane_barrier(timeout_s=5.0)
         except Exception:
@@ -668,7 +704,6 @@ class LoggerHistoriqueManager:
             await self._stop_db_lane()
         except Exception:
             logger.exception("stop: db_lane stop failed")
-
 
     # ---------------- DB lane (single-writer) ----------------
     async def _start_db_lane(self) -> None:
@@ -2943,54 +2978,60 @@ class LoggerHistoriqueManager:
             logger.debug("set_rotate_every_s: invalid value %s", seconds)
 
     # ---------------- flush immédiat ----------------
-    async def flush_now(self, *, rotate: bool = False) -> None:
-        """Vide les buffers trades et pousse (optionnel) les métriques paires en DB."""
+    async def flush_now(self, rotate: bool = False) -> None:
+        """
+        Force un flush des buffers BaseTradeLogger + JSONL + DB lane.
+        Best-effort : non bloquant, timeboxé.
+        """
+        # 1) Flush du BaseTradeLogger
+        btl = getattr(self, "_trade_logger", None)
+        if btl:
+            try:
+                await btl.flush_now()
+            except Exception:
+                logger.exception("flush_now: BaseTradeLogger.flush_now failed")
+
+        # 2) Flush JSONL — drain complet (timeboxé, best-effort)
         try:
-            # vidage du buffer BaseTradeLogger
-            await self._trade_logger.flush_now()
+            streams = getattr(self, "_jsonl_streams", {}) or {}
+            if streams:
+                deadline = time.perf_counter() + 2.0
+                prio = ["events", "errors"]
+                drained_once = False
+
+                while time.perf_counter() < deadline:
+                    pending = 0
+                    for q_rot in streams.values():
+                        try:
+                            q, _rot = q_rot
+                            pending += int(q.qsize())
+                        except Exception:
+                            pass
+
+                    if pending <= 0:
+                        break
+
+                    drained = await self._drain_stream_once(prio)
+                    drained_once = drained_once or drained
+                    await asyncio.sleep(0.01)
+
+                if not drained_once:
+                    logger.debug("flush_now: JSONL drain completed (no pending data).")
         except Exception:
-            logging.exception("Unhandled exception")
+            logger.exception("flush_now: JSONL drain failed")
 
-        # faire une petite cession pour laisser _run() émettre
-        await asyncio.sleep(0)  # yield au scheduler
-
+        # 3) Rotation éventuelle
         if rotate:
             try:
-                self._tracker.rotate_pairs()
+                await self._rotate_if_needed(force=True)
             except Exception:
-                logger.exception("rotate_pairs failed")
+                logger.exception("flush_now: rotate failed")
 
+        # 4) DB lane barrier (best-effort)
         try:
-            rows = self._tracker.collect_pair_metrics() or []
-            if rows:
-                import time
-                t0 = time.perf_counter()
-                mapped = self._map_pair_history_rows(rows)
-                await self._db_lane_call("pair_history", mapped)
-
-                dt_ms = (time.perf_counter() - t0) * 1000.0
-                try:
-                    from modules.obs_metrics import PAIR_HISTORY_ROWS_TOTAL, PAIR_HISTORY_COMPUTE_MS
-                    PAIR_HISTORY_ROWS_TOTAL.inc(len(mapped))
-                    PAIR_HISTORY_COMPUTE_MS.observe(dt_ms)
-                except Exception:
-                    pass
+            await self._db_lane_barrier(timeout_s=2.0)
         except Exception:
-            logger.exception("flush_now: write_pair_history failed")
-
-        try:
-            path = self._writer.get_db_path()
-            db_label = f"{self._db_name}:{path.split('/')[-1]}"
-            LOGGERH_LAST_FLUSH_TS_SECONDS.set(int(datetime.utcnow().timestamp()))
-        except Exception:
-            pass
-        await self._update_db_size_gauge()
-        # rotation opportuniste des flux JSONL (limiter la dérive horaire)
-        try:
-            for rot in self._jsonl.values():
-                await asyncio.to_thread(rot.rotate_if_needed)
-        except Exception:
-            logger.exception("flush_now: jsonl rotate failed")
+            logger.exception("flush_now: db_lane barrier failed")
 
 
     # ---------------- event sink (trades batch) ----------------

@@ -77,23 +77,99 @@ RM_MM_BUDGET_EXHAUSTED = "RM_MM_BUDGET_EXHAUSTED"
 # Liste fermée (à maintenir) + ordre de priorité global.
 # (On met des strings pour éviter toute dépendance à l’ordre de définition des constantes.)
 RM_REASON_PRIORITY = (
-    "RM_ENGINE_NOT_READY",
-    "RM_CAP_PROFILE_DISABLED",
-    "RM_CAP_BRANCH_DISABLED",
+    # A) Hard-safety / invariants (bloquants)
     "RM_CAPS_INVALID",
     "RM_COST_COMPUTE_ERROR",
+    "RM_SFC_UNAVAILABLE",
+    "RM_BUNDLE_EMPTY_PARAMS",
+    "RM_REB_FACTORY_REJECT",
+
+    # B) Readiness
+    "RM_ENGINE_NOT_READY",
+
+    # C) Freshness / TTL strict
     "RM_BALANCE_TTL_BLOCK",
-    "RM_ALIAS_COLLAT_CRITICAL",
-    "RM_ALIAS_COLLAT_LOW",
+    "RM_STALE_VOL",
+
+    # D) Guards (risque / intégrité trade)
     "RM_TTTM_DELTA_HARD_LIMIT",
     "RM_MM_DELTA_HARD_LIMIT",
-    RM_MM_BUDGET_EXHAUSTED,
+
+    # E) Pacer / RL / Backpressure / NACK Engine (tech)
+    "RM_ENGINE_NACK_429",
+    "RM_ENGINE_NACK_TIMEOUT",
+    "RM_ENGINE_NACK_5XX",
+    "RM_ENGINE_NACK_REJECT",
+
+    "ENGINE_BACKPRESSURE_QUEUE_FULL",
+    "ENGINE_BACKPRESSURE_CAP_BRANCH",
+    "ENGINE_BACKPRESSURE_HIGH_WM",
+
+    "ENGINE_MM_DISABLED_BY_CAPITAL",
+    "ENGINE_NACK_429",
+    "ENGINE_NACK_5XX",
+    "ENGINE_REJECT",
+    "ENGINE_SUBMIT_TIMEOUT",
+    "ENGINE_PRICE_GUARD",
+    "ENGINE_SHALLOW_BOOK",
+
+    # F) Locks
+    "REB_LOCK",
+
+    # G) Caps / Budgets
+    "RM_CAP_PROFILE_DISABLED",
+    "RM_CAP_BRANCH_DISABLED",
     "RM_CAP_COMBO_EXCEEDED",
     "RM_CAPS_ZERO",
+    "CAPS_PREEMPT",
+
+    RM_MM_BUDGET_EXHAUSTED,      # reason canonique RM (Partie 2: mapping strict)
+    "MM_BUDGET_EXHAUSTED",       # legacy (Partie 2: à mapper vers RM_MM_BUDGET_EXHAUSTED)
+    "RM_BUDGET_EXHAUSTED",
+
+    "REB_REJECT_CAP_EXCEEDED",
+
+    # H) Soft-gates / éligibilité (non “hard-safety”)
+    "RM_ALIAS_COLLAT_CRITICAL",
+    "RM_ALIAS_COLLAT_LOW",
     "RM_BELOW_MIN_NOTIONAL",
     "RM_BELOW_MIN_BPS",
-    "RM_BUDGET_EXHAUSTED",  # fallback générique (à garder en dernier)
+
+    "GLOBAL_KILL_SWITCH",
+    "RM_MODE_SEVERE_MM_OFF",
+    "MM_DISABLED",
+
+    "MM_MODE_MONO_REQUIRED",
+    "MM_MODE_CROSS_UNSUPPORTED",
+
+    "MM_HINTS_GUARD_VOL",
+    "MM_HINTS_GUARD_NET_BPS",
+    "MM_HINTS_GUARD_QPOS",
+    "MM_HINTS_GUARD_DEPTH",
+    "MM_HINTS_GUARD_P_BOTH",
+
+    "MM_COLLAT_CRIT",
+    "MM_REB_CRITICAL",
+    "MM_HIGH_WM",
+    "MM_DELTA_HEDGE",
+
+    "MM_DUAL_SPREAD_TOO_SMALL",
+    "MM_DUAL_DEPTH_TOO_SHALLOW",
+    "MM_DUAL_INVENTORY_SKEW_TOO_HIGH",
+
+    "REB_HINT_IGNORED_BAD_CONTEXT",
+    "REB_HINT_IGNORED_SMALL_SIZE",
+    "REB_HINT_IGNORED_UNIMPLEMENTED",
+
+    "REB_SIM_REJECT_GUARD",
+    "REB_SIM_REJECT_LATENCY",
+    "REB_SIM_REJECT_BPS",
+
+    "REB_HINT_EXEC_INTERNAL_TRANSFER",
+    "REB_HINT_EXEC_REB_TM_NEUTRAL",
+    "REB_TM_NEUTRAL_TRADE",
 )
+
 RM_REASON_RANK = {r: i for i, r in enumerate(RM_REASON_PRIORITY)}
 
 def _rm_pick_reason(*candidates: str) -> str:
@@ -7963,6 +8039,23 @@ class RiskManager:
             "trade_mode": str(self.trade_mode or "NORMAL").upper(),
             "stage": "rm_raw",
         }
+        # --- Down-clamp only avec policy PACER (flags hold-time) ---
+        try:
+            pol = dict(getattr(self, "_last_engine_pacer_policy", {}) or {})
+            flags = pol.get("flags") or {}
+            if isinstance(flags, dict):
+                # PACER ne peut que SERRER
+                if bool(flags.get("mm_frozen")):
+                    self.enable_mm = False
+                    self._current_mode_overrides["mm_enabled"] = False
+                    self._current_mode_overrides["pacer_mm_frozen"] = True
+                if bool(flags.get("ioc_only")):
+                    self._ioc_only = True
+                    self._current_mode_overrides["ioc_only"] = True
+                    self._current_mode_overrides["pacer_ioc_only"] = True
+        except Exception:
+            pass
+
         if self.trade_mode == "OPPORTUNISTE" and self.rm_mode in ("OPP_VOLUME", "OPP_VOL"):
             self._current_mode_overrides["submode"] = self.rm_mode
 
@@ -8120,6 +8213,23 @@ class RiskManager:
         except Exception:
             pass
 
+    def set_engine_pacer_policy(self, policy: dict, *, source: str = "engine_pacer") -> None:
+        """
+        Snapshot best-effort de la policy du PACER (incluant flags hold-time).
+        Sert uniquement à down-clamp les mode_overrides (IOC_ONLY / MM freeze).
+        """
+        try:
+            if not isinstance(policy, dict):
+                return
+            self._last_engine_pacer_policy = dict(policy)
+            try:
+                import time
+                self._last_engine_pacer_policy_ts = float(time.time())
+                self._last_engine_pacer_policy_source = str(source or "engine_pacer")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _compute_trade_mode(self) -> str:
         """
@@ -13754,6 +13864,18 @@ class RiskManager:
         pk = self._norm_pair(pair_key)
         total = float(max(0.0, total_usdc))
         source = "SIM"
+
+        # Ajustements conservateurs en fonction du trade_mode consolidé.
+        trade_mode = str(getattr(self, "trade_mode", "NORMAL")).upper()
+        max_frags = int(self.max_fragments)
+        min_frag_usdc = float(self.min_fragment_usdc)
+        if trade_mode == "CONSTRAINED":
+            max_frags = max(1, int(max_frags * 0.5))
+            min_frag_usdc = float(min_frag_usdc * 1.5)
+        elif trade_mode == "SEVERE":
+            max_frags = max(1, min(2, int(max_frags)))
+            min_frag_usdc = float(min_frag_usdc * 2.0)
+
         if total <= 0:
             return {
                 "amounts": [],
@@ -13776,7 +13898,7 @@ class RiskManager:
             validated = fraglib.validate_fragment_plan(
                 {"amounts": [total], "groups": ["G1"], "source": "FALLBACK"},
                 total_quote=total,
-                min_fragment_quote=float(self.min_fragment_usdc),
+                min_fragment_quote=min_frag_usdc,
             )
             validated["auto"] = False
             validated["source"] = "FALLBACK"
@@ -13791,8 +13913,8 @@ class RiskManager:
                 asks=asks,
                 bids=bids,
                 target_participation=float(self.target_ladder_participation),
-                max_frags=int(self.max_fragments),
-                min_frag_usdc=float(self.min_fragment_usdc),
+                max_frags=int(max_frags),
+                min_frag_usdc=min_frag_usdc,
                 safety_pad=float(self.fragment_safety_pad),
             )
             cnt = int(max(1, plan.get("count", 1))) if plan else None
@@ -13806,15 +13928,14 @@ class RiskManager:
             source = "FALLBACK"
 
         weights = fraglib.normalize_frontload_weights(
-            getattr(self, "frontload_weights", None), max_fragments=int(getattr(self, "max_fragments", 0) or 0)
-        )
+            getattr(self, "frontload_weights", None), max_fragments=int(max_frags)        )
         group_size = int(getattr(self, "frontload_group_size", 3) or 3)
         plan = fraglib.build_fragment_plan(
             total_quote=total,
             desired_count=cnt,
             weights=weights,
-            min_fragment_quote=float(self.min_fragment_usdc),
-            max_fragments=int(self.max_fragments),
+            min_fragment_quote=min_frag_usdc,
+            max_fragments=int(max_frags),
             group_size=group_size,
             source=source,
             avg_fragment_quote=avg,
@@ -13822,8 +13943,8 @@ class RiskManager:
         validated = fraglib.validate_fragment_plan(
             plan,
             total_quote=total,
-            min_fragment_quote=float(self.min_fragment_usdc),
-            max_fragments=int(self.max_fragments),
+            min_fragment_quote=min_frag_usdc,
+            max_fragments=int(max_frags),
         )
         if not validated.get("valid", True):
 
@@ -13834,8 +13955,8 @@ class RiskManager:
                     "source": "FALLBACK",
                 },
                 total_quote=total,
-                min_fragment_quote=float(self.min_fragment_usdc),
-                max_fragments=int(self.max_fragments),
+                min_fragment_quote=min_frag_usdc,
+                max_fragments=int(max_frags),
             )
         validated["auto"] = auto
         validated["source"] = validated.get("source", source)
