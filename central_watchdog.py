@@ -43,6 +43,23 @@ import os, time, hmac, hashlib, json, threading, queue, uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+# AlertDispatcher global (M5-B3) — best-effort
+try:
+    from modules.observability_pacer import ALERT_DISPATCHER
+except Exception:  # pragma: no cover
+
+    class _NoopAlertDispatcher:
+        def emit(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def alert_pnl_lhm_lag(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def alert_pnl_lhm_drops_trade(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+    ALERT_DISPATCHER = _NoopAlertDispatcher()
+
 try:
     import requests  # facultatif
 except Exception:  # pragma: no cover
@@ -348,6 +365,9 @@ class CentralWatchdog:
         # statut enfants
         self._children_status: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
+        # Santé pipeline PnL (LHM/JSONL/DB)
+        self._pnl_unhealthy_since: Optional[float] = None
+
 
     # ----- intégrations optionnelles via ENV -----
 
@@ -419,16 +439,37 @@ class CentralWatchdog:
     # ----- émission / réception -----
 
     def on_child_event(self, event: Event) -> None:
-        """Point d'entrée unique pour TOUS les watchdogs enfants."""
+        """Point d'entrée unique pour TOUS les watchdogs enfants.
+
+        Compatible avec :
+        - Events déjà normalisés (type, data, level, …)
+        - Callbacks simples style Boot.status_sink(component, status, payload, ts)
+        """
         # Normalisation minimale
         e = dict(event)
         e.setdefault("ts", now_ts())
+
+        # Compat Boot.status_sink : component/status/payload -> data
+        if "component" in e and "data" not in e:
+            data: Dict[str, Any] = {
+                "component": e.get("component"),
+                "status": e.get("status"),
+            }
+            payload = e.get("payload") or {}
+            if isinstance(payload, dict):
+                data.update(payload)
+            e["data"] = data
+            # Si aucun type explicite, considérer que c'est un status enfant
+            if "type" not in e:
+                e["type"] = "child::status"
+
         e["level"] = _coerce_level(e.get("level", "INFO"))
         e.setdefault("watchdog", e.get("watchdog") or "child")
         # wrap comme event enfant
         if not str(e.get("type", "")).startswith("child::"):
             e["type"] = "child::" + str(e.get("type", "event"))
         self._q.put(e)
+
 
     def emit_event(self, **kwargs: Any) -> None:
         """Émettre un event CW (non enfant)."""
@@ -504,9 +545,84 @@ class CentralWatchdog:
 
         # Mise à jour status enfants (optionnel: si les enfants émettent un status event)
         if str(t).endswith("::status") and e.get("data", {}).get("component"):
-            comp = e["data"]["component"]
-            with self._lock:
-                self._children_status[comp] = dict(e["data"])
+            self._handle_child_status(e)
+
+    def _handle_child_status(self, e: Event) -> None:
+        """
+        Met à jour le cache de status enfants et, pour component="pnl_pipeline",
+        déclenche éventuellement des alertes PnL/LHM (M5-B3).
+
+        Cette méthode est appelée depuis _handle_event dès qu'on reçoit un event
+        child::status avec un champ data.component.
+        """
+        data = e.get("data", {}) or {}
+        comp = data.get("component")
+        if not comp:
+            return
+
+        # 1) Comportement historique : mémoriser le status enfant
+        with self._lock:
+            self._children_status[comp] = dict(data)
+
+        # 2) On ne fait des choses en plus que pour le pipeline PnL
+        if comp != "pnl_pipeline":
+            return
+
+        # Lag pipeline (si fourni par le producteur du status)
+        lag = None
+        for key in ("lag_seconds", "pipeline_lag_s", "unhealthy_for_s"):
+            v = data.get(key)
+            if isinstance(v, (int, float)):
+                lag = float(v)
+                break
+
+        # Drops trades (si un watcher agrège sur une fenêtre récente)
+        dropped = data.get("dropped_trades_recent")
+        try:
+            dropped = int(dropped) if dropped is not None else None
+        except Exception:
+            dropped = None
+
+        # Flags critiques exposés par LHM / Boot
+        critical_drop_seen = bool(data.get("critical_drop_seen"))
+        storage_error_seen = bool(data.get("storage_error_seen"))
+        if dropped is None and (critical_drop_seen or storage_error_seen):
+            # On force un "minimun 1 drop" pour déclencher l'alerte si nécessaire
+            dropped = 1
+
+        # SLO / budgets lus depuis l'env (alignés avec obs_metrics.py)
+        try:
+            slo_lag = float(os.getenv("LHM_SLO_LAG_SECONDS_MAX_TARGET", "5.0"))
+        except Exception:
+            slo_lag = 5.0
+        try:
+            budget = float(os.getenv("LHM_SLO_DROPPED_TRADES_BUDGET", "0.0"))
+        except Exception:
+            budget = 0.0
+
+        # 3) Alerte sur lag pipeline (si on a un lag exploitable)
+        if lag is not None and slo_lag > 0.0:
+            try:
+                ALERT_DISPATCHER.alert_pnl_lhm_lag(
+                    lag_seconds=lag,
+                    slo_seconds=slo_lag,
+                    mode=str(data.get("mode") or "online"),
+                )
+            except Exception:
+                # Observabilité best-effort
+                pass
+
+        # 4) Alerte sur drops trades JSONL (si info dispo)
+        if dropped is not None:
+            try:
+                ALERT_DISPATCHER.alert_pnl_lhm_drops_trade(
+                    dropped=dropped,
+                    budget=budget,
+                    window=str(data.get("window") or "5m"),
+                )
+            except Exception:
+                # Observabilité best-effort
+                pass
 
     def _append_history(self, e: Event) -> None:
         self._history.append(e)
@@ -516,7 +632,9 @@ class CentralWatchdog:
     # ----- chemin critique & persistance -----
 
     def _update_critical_path(self, e: Event) -> None:
-        # Heuristique simple: si CRIT sur composants clés → blocage
+        # Heuristique simple:
+        # - si blocage Router/Engine/Scanner/PrivateWS/BalanceFetcher → block_since
+        # - si CRIT sur composants clés → blocage
         d = e.get("data", {}) or {}
         comp = d.get("component") or ""
         lvl = _coerce_level(e.get("level", "INFO"))
@@ -529,10 +647,72 @@ class CentralWatchdog:
             if not self._last_crit_since:
                 self._last_crit_since = now_ts()
 
+    def _update_pnl_pipeline_health(self, e: Event) -> None:
+        """
+        Suit la santé du pipeline PnL (component="pnl_pipeline") en se basant sur
+        les events child::status émis par Boot.
+
+        Si critical_drop_seen ou storage_error_seen restent vrais plus longtemps
+        que auto.persist_s → émet un event CRIT cw::pnl_pipeline avec intent
+        "pnl_pipeline_unhealthy" (notify-only).
+        """
+        data = e.get("data", {}) or {}
+        status = str(data.get("status") or "").lower()
+
+        flags = {
+            "critical_drop_seen": bool(data.get("critical_drop_seen")),
+            "storage_error_seen": bool(data.get("storage_error_seen")),
+        }
+        unhealthy = (status == "unhealthy") or flags["critical_drop_seen"] or flags["storage_error_seen"]
+
+        now = now_ts()
+        if unhealthy:
+            if self._pnl_unhealthy_since is None:
+                self._pnl_unhealthy_since = now
+        else:
+            # retour à la normale
+            self._pnl_unhealthy_since = None
+            return
+
+        # Durée en état dégradé
+        dur = max(0.0, now - (self._pnl_unhealthy_since or now))
+        threshold = float(getattr(self.cfg.auto, "persist_s", 120) or 120)
+
+        if dur >= threshold:
+            # On "reset" la fenêtre pour ne pas spammer : un event CRIT par tranche ~persist_s
+            self._pnl_unhealthy_since = now
+
+            msg = (
+                f"Pipeline PnL (LHM/JSONL/DB) en état dégradé depuis ~{int(dur)}s "
+                f"(critical_drop_seen={flags['critical_drop_seen']}, "
+                f"storage_error_seen={flags['storage_error_seen']}). "
+                "Recommandation: bloquer la montée de capital et forcer RM en mode SEVERE "
+                "tant que ce signal persiste."
+            )
+
+            # Notify-only: aucune action locale, mais intent explicite pour les couches supérieures
+            self.emit_event(
+                type="cw::pnl_pipeline",
+                level="CRIT",
+                message=msg,
+                data={
+                    "component": "pnl_pipeline",
+                    "status": status or "unhealthy",
+                    "unhealthy_for_s": dur,
+                    "flags": flags,
+                    "intent": "pnl_pipeline_unhealthy",
+                    "recommended_actions": [
+                        "NO_CAPITAL_INCREASE",
+                        "RM_MODE_SEVERE_WHILE_UNHEALTHY",
+                    ],
+                },
+            )
+
     def _crit_persistent(self) -> bool:
         if self._last_crit_since is None:
             return False
         return (now_ts() - self._last_crit_since) >= self.cfg.auto.persist_s
+
 
     def _block_persistent(self) -> bool:
         if self._block_since is None:
