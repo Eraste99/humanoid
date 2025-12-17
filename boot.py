@@ -470,14 +470,26 @@ class Boot:
         et branche les sinks Engine/Scanner si disponibles.
         """
 
-
+        lhm_cfg = getattr(self.cfg, "lhm", None)
         # 1) Résolution robuste de l'out_dir (priorité décroissante)
         out_dir = (
-                getattr(self.cfg, "LHM_OUT_DIR", None)
+                getattr(lhm_cfg, "out_dir", None)
+                or getattr(self.cfg, "LHM_OUT_DIR", None)
                 or getattr(self.cfg, "LOG_DIR", None)
                 or getattr(self.cfg, "HISTORY_DIR", None)
                 or "/srv/app/logs"
         )
+        try:
+            obs_metrics.set_strict_obs(
+                getattr(lhm_cfg, "strict_obs", getattr(getattr(self.cfg, "g", object()), "strict_obs", None)))
+            obs_metrics.init_lhm_slo_targets(
+                write_ms=getattr(lhm_cfg, "LHM_SLO_WRITE_MS_P95_TARGET", None),
+                queue_max=getattr(lhm_cfg, "LHM_SLO_QUEUE_DEPTH_MAX_TARGET", None),
+                lag_max=getattr(lhm_cfg, "LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET", None),
+                dropped_budget=getattr(lhm_cfg, "LHM_SLO_DROPPED_TRADES_BUDGET", None),
+            )
+        except Exception:
+            self.log.exception("[Boot][LHM] Unable to init LHM obs metrics from cfg")
 
         # 2) Création idempotente du dossier
         try:
@@ -867,16 +879,10 @@ class Boot:
             lhm = getattr(self.ctx, "lhm", None)
             coh = None
 
-            # (1) Si un jour LHM expose get_cohorts(), on le préfère
+            # (1) LHM expose get_cohorts(): API publique (Pivot Boot)
             get_coh = getattr(lhm, "get_cohorts", None)
             if callable(get_coh):
                 coh = get_coh()
-
-            # (2) Sinon on interroge directement le tracker interne (actuel)
-            if coh is None:
-                tr = getattr(lhm, "_tracker", None)
-                if tr and hasattr(tr, "get_cohorts"):
-                    coh = tr.get_cohorts()
 
             # (3) Applique au Scanner (fallback binaire si 4-tiers non fournis)
             dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY"))
@@ -988,13 +994,20 @@ class Boot:
             if hasattr(rm, "bind_reconciler"):
                 try:
                     rm.bind_reconciler(self.ctx.reconciler)
+                    wiring_flag = getattr(rm, "reconciler_wiring_ok", None)
+                    if wiring_flag is not None:
+                        self.log.info("[Boot] rm.bind_reconciler wiring_ok=%s", wiring_flag)
                 except Exception:
                     self.log.exception("[Boot] rm.bind_reconciler failed")
 
             # Confier au RM le binding du Hub (callbacks + health + flags wiring)
+
             if hasattr(rm, "bind_private_ws_hub"):
                 try:
                     rm.bind_private_ws_hub(self.ctx.pws_hub)
+                    wiring_flag = getattr(rm, "private_ws_wiring_ok", None)
+                    if wiring_flag is not None:
+                        self.log.info("[Boot] rm.bind_private_ws_hub wiring_ok=%s", wiring_flag)
                 except Exception:
                     self.log.exception("[Boot] rm.bind_private_ws_hub failed")
 
@@ -1039,26 +1052,22 @@ class Boot:
                     await asyncio.sleep(interval)
                     continue
 
-                # Appel best-effort: d’abord rotate_pairs, puis rotate_cohorts si dispo
+                # Appel best-effort: demander au LHM de faire sa rotation interne avant la sync (Pivot Boot)
                 try:
-                    tr = getattr(lhm, "_tracker", None)
-                    if tr:
-                        # laisse le LHM/Tracker décider des mouvements avant la sync
-                        if hasattr(tr, "rotate_pairs"):
-                            tr.rotate_pairs(now=None)
-                        if hasattr(tr, "rotate_cohorts"):
-                            tr.rotate_cohorts(now=None)
+                    rot_pairs = getattr(lhm, "rotate_pairs", None)
+                    if callable(rot_pairs):
+                        rot_pairs(now=None)
+                    rot_coh = getattr(lhm, "rotate_cohorts", None)
+                    if callable(rot_coh):
+                        rot_coh(now=None)
                 except Exception:
-                    # on ne bloque pas la sync pour ça
-                    self.log.exception("[Boot] tracker rotate_* during cohort-sync failed")
+                    self.log.exception("[Boot] lhm.rotate_* during cohort-sync failed")
 
-                # Récupère les cohortes
+                # Récupère les cohortes via API publique uniquement (Pivot Boot)
                 coh = None
                 get_coh = getattr(lhm, "get_cohorts", None)
                 if callable(get_coh):
                     coh = get_coh()
-                if coh is None and tr and hasattr(tr, "get_cohorts"):
-                    coh = tr.get_cohorts()
 
                 if coh:
                     dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY"))

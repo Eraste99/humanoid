@@ -220,6 +220,55 @@ def _pos(v: Any, name: str) -> float:
         raise ValueError(f"{name} must be > 0")
     return f
 
+def normalize_leg_dict(leg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalise un dictionnaire de leg pour le contrat SubmitLeg.
+
+    - Mappe price ↔ px_limit pour compat.
+    - Mappe alias ↔ account_alias pour compat.
+    - Normalise exchange/symbol/side/qty (best-effort).
+    """
+    if not isinstance(leg, dict):
+        return leg  # pragma: no cover - tolérance legacy
+
+    normalized: Dict[str, Any] = dict(leg)
+
+    # price / px_limit compat
+    price = normalized.get("price", normalized.get("px"))
+    px_limit = normalized.get("px_limit")
+    if price is not None and px_limit is None:
+        px_limit = price
+    if px_limit is not None and price is None:
+        price = px_limit
+    normalized["price"] = float(price) if price is not None else None
+    normalized["px_limit"] = float(px_limit) if px_limit is not None else None
+
+    # alias compat
+    alias = normalized.get("alias")
+    account_alias = normalized.get("account_alias")
+    if alias and not account_alias:
+        account_alias = alias
+    if account_alias and not alias:
+        alias = account_alias
+    normalized["alias"] = alias
+    normalized["account_alias"] = account_alias
+
+    # Normalisation échange / symbole / sens / qty
+    if "exchange" in normalized:
+        normalized["exchange"] = _norm_exchange(normalized.get("exchange"))
+    symbol = normalized.get("symbol") or normalized.get("pair")
+    if symbol is not None:
+        normalized["symbol"] = _norm_symbol(symbol, keep_dash=True)
+    try:
+        normalized["qty"] = float(normalized["qty"]) if normalized.get("qty") is not None else None
+    except Exception:
+        normalized["qty"] = normalized.get("qty")
+    try:
+        normalized_side = _side_ok(normalized.get("side"))
+        normalized["side"] = normalized_side.value
+    except Exception:
+        pass
+
+    return normalized
 
 # -----------------------------------------------------------------------------
 # Contrats marché public (WS → Router → Vol/Slip/Health)
@@ -1235,14 +1284,18 @@ def make_submit_bundle(*,
     - `legs` : liste de legs dict (peuvent contenir "order": {...} ou être plats).
     - Rétro-compat: ajoute toujours "orders" miroir.
     """
-    r = route or {}
-    orders = []
+    legs_normalized: List[Dict[str, Any]] = []
+    orders: List[Dict[str, Any]] = []
     for l in legs:
         if isinstance(l, dict):
-            orders.append(l.get("order", l))
+            base_leg = l.get("order", l)
+            norm_leg = normalize_leg_dict(base_leg)
+            legs_normalized.append(norm_leg)
+            orders.append(norm_leg)
         else:
+            legs_normalized.append(l)
             orders.append(l)
-
+    r = route or {}
     return {
         "bundle_id": str(uuid.uuid4()),
         "client_id": client_id or "default",
@@ -1253,7 +1306,7 @@ def make_submit_bundle(*,
             "sell_ex": r.get("sell_ex"),
             "pair":    r.get("pair"),
         },
-        "legs": legs,
+        "legs": legs_normalized,
         "orders": orders,                # rétro-compat
         "notional_quote": {
             "ccy":    (notional_quote.get("ccy") or "USDC"),
@@ -1310,7 +1363,7 @@ __all__ = [
     "validate_submit_bundle_lite", "validate_cancel_lite",
     "validate_fill_normalized_lite", "validate_order_intent_lite", "make_submit_bundle",
     "validate_ws_alias_status_snapshot_lite", "validate_reco_alias_status_snapshot_lite",
-    "validate_balance_snapshot_rm_lite",
+    "validate_balance_snapshot_rm_lite", "normalize_leg_dict",
     # >>> PATCH #3 — helpers publics
     "norm_symbol", "pair_key","encode_flow_meta",
     # Fragmentation helpers

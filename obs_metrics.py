@@ -50,6 +50,14 @@ OBS_LABEL_MISMATCH_TOTAL = Counter(  # increments quand labels() ne matchent pas
 def prom_ready() -> bool:
     """Expose readiness des métriques Prometheus pour les modules clients (ex: LHM.get_status)."""
     return bool(_PROM_READY)
+
+# Pilotage runtime du mode strict (config-driven)
+def set_strict_obs(strict: bool | int | None) -> None:
+    global STRICT_OBS
+    if strict is None:
+        return
+    STRICT_OBS = 1 if bool(strict) else 0
+
 # --- END OM-1 ---
 # --- BEGIN OM-2: métriques utilisées par Engine/Scanner/LHM ---
 # Scanner – hint top_qty manquant (utilisé dans Patch S4)
@@ -991,27 +999,8 @@ ENGINE_ACK_TIMEOUT_TOTAL = _metric(Counter, 'engine_ack_timeout_total', 'Engine 
 
 
 # === OBS READINESS (Lot B) — strict + stubs + métriques Lot B ===
-import os, logging
 
-# Mode strict (bruit contrôlé en prod)
-STRICT_OBS = int(os.getenv("STRICT_OBS", "0"))
-
-# Prometheus ou no-op
-try:
-    from prometheus_client import Counter, Gauge, Histogram
-    _PROM_READY = True
-except Exception:
-    _PROM_READY = False
-    class _NoopMetric:
-        def labels(self, **kw): return self
-        def inc(self, *a, **k): pass
-        def set(self, *a, **k): pass
-        def observe(self, *a, **k): pass
-    Counter = Gauge = Histogram = _NoopMetric  # type: ignore
-
-def prom_ready() -> bool:
-    return bool(_PROM_READY)
-
+import logging
 # --- Wrappers sûrs pour éviter les try/except:pass dans les modules ---
 if "OBS_NOOP_TOTAL" not in globals():
     OBS_NOOP_TOTAL = Counter("obs_noop_total", "Appels metrics no-op (init manquante, labels, etc.)", ["metric","where"])
@@ -1467,33 +1456,28 @@ def lhm_set_pipeline_lag(seconds: float) -> None:
         pass
 
 
-def _load_lhm_slo_targets_from_env() -> None:
-    """
-    Initialise les cibles SLO LHM depuis l'environnement.
-
-    Ces valeurs sont exposées comme "targets" uniquement :
-    - le calcul p95/violations se fait côté Prometheus ou CentralWatchdog.
+def init_lhm_slo_targets(
+    *,
+    write_ms: float | None = None,
+    queue_max: float | None = None,
+    lag_max: float | None = None,
+    dropped_budget: float | None = None,
+) -> None:
+    """Initialise les cibles SLO LHM depuis la config (aucun accès ENV).
     """
     try:
-        write_ms = float(_os.getenv('LHM_SLO_WRITE_MS_P95_TARGET', '250.0'))
-        queue_max = float(_os.getenv('LHM_SLO_QUEUE_DEPTH_MAX_TARGET', '2000'))
-        lag_max = float(_os.getenv('LHM_SLO_LAG_SECONDS_MAX_TARGET', '5.0'))
-        dropped_budget = float(_os.getenv('LHM_SLO_DROPPED_TRADES_BUDGET', '0.0'))
-    except Exception:
-        # ENV invalide → on n'écrase rien, on ne casse pas l'import
-        return
-    try:
-        LHM_SLO_WRITE_MS_P95_TARGET.set(write_ms)
-        LHM_SLO_QUEUE_DEPTH_MAX_TARGET.set(queue_max)
-        LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET.set(lag_max)
-        LHM_SLO_DROPPED_TRADES_BUDGET.set(dropped_budget)
+        if write_ms is not None:
+            LHM_SLO_WRITE_MS_P95_TARGET.set(float(write_ms))
+        if queue_max is not None:
+            LHM_SLO_QUEUE_DEPTH_MAX_TARGET.set(float(queue_max))
+        if lag_max is not None:
+            LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET.set(float(lag_max))
+        if dropped_budget is not None:
+            LHM_SLO_DROPPED_TRADES_BUDGET.set(float(dropped_budget))
     except Exception:
         # Best-effort
         pass
 
-
-# Initialisation one-shot des SLO (M5-B3)
-_load_lhm_slo_targets_from_env()
 
 
 def loggerh_observe_write_ms(dt_ms: float) -> None:

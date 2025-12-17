@@ -41,7 +41,7 @@ from modules.obs_metrics import inc_blocked
 import logging
 from collections import defaultdict
 from modules.obs_metrics import TIME_SKEW_MS
-from contracts.payloads import make_submit_bundle, submit_leg_from_intent
+from contracts.payloads import make_submit_bundle, submit_leg_from_intent, normalize_leg_dict
 from dataclasses import dataclass, asdict
 import json
 from contracts import payloads as fraglib
@@ -965,6 +965,58 @@ class RiskManager:
     _as_list_upper=staticmethod(_as_list_upper)
     _pair_quote = staticmethod(_pair_quote)  # si tu veux pouvoir l’appeler en self._pair_quote(...)
 
+    def _rm_cfg(self):
+        try:
+            return getattr(self, "_rm_cfg_obj", None) or getattr(self.cfg, "rm", None) or getattr(self, "cfg", None)
+        except Exception:
+            return getattr(self, "cfg", None)
+
+    def _resolve_rm_param(self, names: tuple | str, default=None):
+        if isinstance(names, str):
+            names = (names,)
+
+        rm_cfg = self._rm_cfg()
+        bot_cfg = getattr(self, "bot_cfg", None)
+
+        for name in names:
+            if rm_cfg is not None:
+                val = getattr(rm_cfg, name, None)
+                if val is not None:
+                    return val
+            if bot_cfg is not None:
+                val = getattr(bot_cfg, name, None)
+                if val is not None:
+                    return val
+            val = getattr(self.cfg, name, None)
+            if val is not None:
+                return val
+
+        return default
+
+    def _load_rm_runtime_policy(self) -> None:
+        raw_budgets = self._resolve_rm_param("daily_strategy_budget_quote", {}) or {}
+        self.daily_strategy_budget_quote = {
+            str(k).upper(): float(v)
+            for k, v in (raw_budgets or {}).items()
+        }
+
+        self._spent_today_quote = {"TT": 0.0, "TM": 0.0, "MM": 0.0}
+        for strat in self.daily_strategy_budget_quote.keys():
+            self._spent_today_quote.setdefault(strat, 0.0)
+
+        self._budget_reset_ts = time.time()
+        self._budget_reset_interval_s = float(
+            self._resolve_rm_param("daily_budget_reset_interval_s", 86400.0)
+        )
+        self.global_kill_switch = bool(
+            self._resolve_rm_param("global_kill_switch", False)
+        )
+
+    def _load_inventory_limits(self) -> None:
+        inv_cap = self._resolve_rm_param(("inventory_cap_quote", "inventory_cap_usd"), 1500.0)
+        self.inventory_cap_quote = float(inv_cap)
+        self.inventory_cap_usd = self.inventory_cap_quote
+        self.min_buffer_quote = float(self._resolve_rm_param("min_buffer_quote", 0.0))
 
     def __init__(
             self,
@@ -1001,6 +1053,7 @@ class RiskManager:
         self.bot_cfg = base_cfg
         self.config = base_cfg  # alias explicite conservé
         self.cfg = base_cfg
+        self._rm_cfg_obj = getattr(self.cfg, "rm", None)
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.history_logger = history_logger
         # Hooks optionnels : observabilité (obs_inc) et mute de routes.
@@ -1021,7 +1074,7 @@ class RiskManager:
         # inflight_rebal_by_profile et combo_cap_usd_by_profile).
         self._profile_caps_summary: Dict[str, Dict[str, float | int]] = {}
         try:
-            rm_cfg = getattr(self.cfg, "rm", None)
+            rm_cfg = self._rm_cfg()
             if rm_cfg is not None:
                 inflight = getattr(rm_cfg, "inflight_trading_by_profile", {}) or {}
                 caps = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
@@ -1054,15 +1107,7 @@ class RiskManager:
             # Purement décoratif : ne doit jamais casser l'init du RM
             self._profile_caps_summary = {}
 
-        self.inventory_cap_quote = _cfg_float(
-            self.cfg, "inventory_cap_quote",
-            _cfg_float(self.cfg, "inventory_cap_usd", 1500.0)
-        )
-
-        # conservez les attributs existants pour limiter le diff interne
-        self.inventory_cap_usd = self.inventory_cap_quote  # compat interne
-        self.min_buffer_quote = _cfg_float(self.cfg, "min_buffer_quote", 0.0)
-
+        self._load_inventory_limits()
         # --- MM toggles & budgets ---
         self.mm_mode = str(getattr(self.bot_cfg, "mm_mode", "MONO") or "MONO").upper()
         self.enable_mm = bool(getattr(self.bot_cfg, "enable_maker_maker", False))
@@ -1197,7 +1242,7 @@ class RiskManager:
 
         # Queue-position TM (ahead en QUOTE/USD) + ETA max (ms)
         # Ces valeurs servent de fallback canonique pour tm_controls envoyés à l'Engine.
-        rm_cfg = getattr(self.cfg, "rm", self.cfg)
+        rm_cfg = self._rm_cfg()
         self.tm_queuepos_max_ahead_usd = _cfg_float(rm_cfg, "tm_queuepos_max_ahead_usd", 25000.0)
         self.tm_queuepos_max_eta_ms = _cfg_int(rm_cfg, "tm_queuepos_max_eta_ms", 0)
         # Alias "absolu" (aujourd'hui = ahead) pour compat tm_controls["queuepos_max_usd"].
@@ -1208,20 +1253,10 @@ class RiskManager:
         # ==== [ADD INSIDE __init__ RIGHT AFTER "MM toggles & budgets" BLOCK] =========
         # Kill switch global + budgets (en mémoire, resetés par ton scheduler quotidien)
 
-        self.global_kill_switch = bool(getattr(self.cfg, "global_kill_switch", False))
-        self.daily_strategy_budget_quote = {
-            str(k).upper(): float(v)
-            for k, v in (_cfg_dict(self.bot_cfg, "daily_strategy_budget_quote", {}) or {}).items()
-        }
-        self._spent_today_quote = {"TT": 0.0, "TM": 0.0, "MM": 0.0}
-        for strat in self.daily_strategy_budget_quote.keys():
-            self._spent_today_quote.setdefault(strat, 0.0)
-        self._budget_reset_ts = time.time()
-        self._budget_reset_interval_s = float(getattr(self.cfg, "daily_budget_reset_interval_s", 86400.0))
-
+        self._load_rm_runtime_policy()
         # Optionnel: fichier JSONL de décision (audit)
 
-        self.decision_log_path = _cfg_str(self.cfg, "decision_log_path","")  # vide = pas de fichier
+        self.decision_log_path = _cfg_str(SimpleNamespace(decision_log_path=self._resolve_rm_param("decision_log_path", "")), "decision_log_path","")  # vide = pas de fichier
         # Politique pré-filtre: source slippage et seuils de fraicheur (utilise déjà tes cfg si présents)
         self.slippage_source = _cfg_str(self.cfg, "sfc_slippage_source", "ewma")
         self.max_book_age_s    = _cfg_float(self.cfg, "max_book_age_s", 1.0)
@@ -1522,15 +1557,15 @@ class RiskManager:
         # --- Balances TTL (MBF → RM) ----------------------------------------
         # Paramètres RM côté config (en secondes). Defaults à ajuster dans BotConfig
         # mais on met des valeurs safe par défaut ici.
-        self._balance_ttl_s_normal = float(
-            getattr(self.cfg, "RM_BALANCE_TTL_S_NORMAL", 60.0)
-        )
-        self._balance_ttl_s_degraded = float(
-            getattr(self.cfg, "RM_BALANCE_TTL_S_DEGRADED", 180.0)
-        )
-        self._balance_ttl_s_block = float(
-            getattr(self.cfg, "RM_BALANCE_TTL_S_BLOCK", 600.0)
-        )
+        self._balance_ttl_s_normal = float(self._resolve_rm_param(
+            ("balance_ttl_s_normal", "RM_BALANCE_TTL_S_NORMAL"), 60.0
+        ))
+        self._balance_ttl_s_degraded = float(self._resolve_rm_param(
+            ("balance_ttl_s_degraded", "RM_BALANCE_TTL_S_DEGRADED"), 180.0
+        ))
+        self._balance_ttl_s_block = float(self._resolve_rm_param(
+            ("balance_ttl_s_block", "RM_BALANCE_TTL_S_BLOCK"), 600.0
+        ))
 
         # Cache local par (exchange, alias) pour l’âge et le statut TTL.
         # Clés toujours en UPPER pour être robustes.
@@ -5148,9 +5183,11 @@ class RiskManager:
         délègue à _wire_reconciler_engine_hooks() pour la partie Engine.
         """
         try:
+            previous = getattr(self, "reconciler", None)
             self.reconciler = reconciler
             # Par défaut, wiring KO tant que _wire_reconciler_engine_hooks n'a pas validé
-            self.reconciler_wiring_ok = False
+            if reconciler is not previous:
+                self.reconciler_wiring_ok = False
 
             if self.reconciler is None:
                 return
@@ -5182,18 +5219,24 @@ class RiskManager:
               * private_ws_healthy (via set_private_ws_health),
               * private_ws_wiring_ok (via status["wiring"]).
         """
+        previous = getattr(self, "private_ws_hub", None)
         self.private_ws_hub = hub
         # Par défaut: wiring considéré comme KO tant qu'on n'a pas un status exploitable
-        self.private_ws_wiring_ok = False
+        if hub is not previous:
+            self.private_ws_wiring_ok = False
+            self._pws_callback_registered = False
 
         if hub is None:
+            self.private_ws_wiring_ok = False
             self.set_private_ws_health(None)
             return
 
         # 1) Enregistement du callback RM auprès du Hub
         if hasattr(hub, "register_callback") and hasattr(self, "on_private_event"):
             try:
-                hub.register_callback(self.on_private_event, role="risk")
+                if not getattr(self, "_pws_callback_registered", False) or hub is not previous:
+                    hub.register_callback(self.on_private_event, role="risk")
+                    self._pws_callback_registered = True
             except Exception as exc:
                 logger.exception("[RiskManager] unable to register RM callback on hub")
                 self._emit_private_plane_event("pws_register_failed", error=str(exc))
@@ -7432,6 +7475,30 @@ class RiskManager:
         except Exception:
             logger.debug("[RiskManager] private plane event drop (%s)", event, exc_info=False)
 
+    def _mark_books_observability(self, orderbooks: Dict[str, Dict[str, Any]]) -> None:
+        """Met à jour les métriques de fraîcheur orderbook (best-effort)."""
+        try:
+            for ex, pairs in (orderbooks or {}).items():
+                for pk in (pairs or {}).keys():
+                    mark_books_fresh(self._norm_pair(pk))
+        except Exception:
+            try:
+                mark_books_fresh("ALL")
+            except Exception:
+                pass
+
+    def _mark_balances_observability(self, balances: Dict[str, Dict[str, Any]]) -> None:
+        """Met à jour les métriques de fraîcheur balances (best-effort)."""
+        try:
+            for ex, per_alias in (balances or {}).items():
+                for alias in (per_alias or {}).keys():
+                    mark_balances_fresh(ex, alias)
+        except Exception:
+            try:
+                mark_balances_fresh("ALL", "ALL")
+            except Exception:
+                pass
+
     # ------------------------------------------------------------------
     # Loops
     # ------------------------------------------------------------------
@@ -7473,7 +7540,7 @@ class RiskManager:
                             "ts": ts,
                         }
                 self._orderbooks = ob_cache
-                mark_books_fresh("ALL")
+                self._mark_books_observability(self._last_books)
 
                 # Slippage & fees collector (passif)
                 if self.slip_collector and hasattr(self.slip_collector, "collect_from_orderbooks"):
@@ -7677,7 +7744,7 @@ class RiskManager:
 
                 if self.rebalancing and hasattr(self.rebalancing, "update_balances"):
                     self.rebalancing.update_balances(bals)
-                    mark_balances_fresh()
+                    self._mark_balances_observability(self._last_balances)
 
                 self.last_update = time.time()
                 self._mark_loop_success("balances")
@@ -13389,7 +13456,7 @@ class RiskManager:
 
 
         for i, leg in enumerate(legs):
-            q = float(leg.get("qty") or 0.0)
+            px = float(leg.get("px_limit") or leg.get("price") or 0.0)
             px = float(leg.get("px_limit") or 0.0)
             if q <= 0.0 or px <= 0.0:
                 inc_rm_reject(reason=RM_BUNDLE_EMPTY_PARAMS,

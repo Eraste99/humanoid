@@ -612,6 +612,11 @@ class RiskManagerCfg:
     mm_vol_bps_max: float = 40.0
 
     global_kill_switch: bool = False
+    inventory_cap_quote: float = 1500.0
+    min_buffer_quote: float = 0.0
+    balance_ttl_s_normal: float = 60.0
+    balance_ttl_s_degraded: float = 180.0
+    balance_ttl_s_block: float = 600.0
     daily_strategy_budget_quote: Dict[str, float] = field(default_factory=dict)
     daily_budget_reset_interval_s: float = 86400.0
     decision_log_path: str = ""
@@ -966,6 +971,8 @@ class RPCCfg:
 # --- Logger Historique ---
 @dataclass
 class LoggerCfg:
+    out_dir: str = "/srv/app/logs"
+    strict_obs: bool = False
     LHM_Q_STREAM_MAX: int = 20000
     LHM_STREAM_BATCH: int = 200
     LHM_DROP_WHEN_FULL: bool = True
@@ -987,6 +994,13 @@ class LoggerCfg:
     LHM_WD_STALL_THRESHOLD_S: float = 10.0
     LHM_TRADE_BATCH_SIZE: int = 30
     LHM_TRADE_FLUSH_INTERVAL_S: float = 0.35
+    LHM_SLO_WRITE_MS_P95_TARGET: float = 250.0
+    LHM_SLO_QUEUE_DEPTH_MAX_TARGET: float = 2000.0
+    LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET: float = 5.0
+    LHM_SLO_DROPPED_TRADES_BUDGET: float = 0.0
+    # PIVOT: chemins pilotés par cfg.lhm (pas d'ENV dans LHM)
+    out_dir: Optional[str] = None
+    storage_path: Optional[str] = None
 
 # --- Dashboard / Tests (optionnels) ---
 @dataclass
@@ -1232,7 +1246,10 @@ class BotConfig:
         cfg.ws_public.connect_timeout_s = _Env.get_int("WS_CONNECT_TIMEOUT_S", cfg.ws_public.connect_timeout_s)
         cfg.ws_public.read_timeout_s = _Env.get_int("WS_READ_TIMEOUT_S", cfg.ws_public.read_timeout_s)
         # Budget journalier par stratégie (en quote, ex: {"TT": 1_000_000, "TM": 500_000})
-        cfg.daily_strategy_budget_quote = _Env.get_dict("DAILY_STRATEGY_BUDGET_QUOTE", {}) or {}
+        cfg.rm.daily_strategy_budget_quote = _Env.get_dict(
+            "DAILY_STRATEGY_BUDGET_QUOTE", cfg.rm.daily_strategy_budget_quote
+        ) or {}
+        cfg.daily_strategy_budget_quote = cfg.rm.daily_strategy_budget_quote
 
         cfg.discovery.http_timeout_s = _Env.get_int("DISCOVERY_HTTP_TIMEOUT_S", cfg.discovery.http_timeout_s)
         cfg.discovery.retry_policy = _Env.get_dict("DISCOVERY_RETRY_POLICY", cfg.discovery.retry_policy)
@@ -1275,7 +1292,7 @@ class BotConfig:
         if not getattr(cfg.g, "pairs", None) and getattr(cfg.g, "pair_whitelist", None):
             cfg.g.pairs = list(cfg.g.pair_whitelist)
 
-        # --- RM caps richiesti dal RiskManager (root-level, non dentro cfg.rm) ---
+        # --- RM caps richiesti dal RiskManager (canonique cfg.rm avec compat racine) ---
         def _float_or_none(name: str):
             v = _Env.get(name)
             if v in (None, "", "None"):
@@ -1289,29 +1306,37 @@ class BotConfig:
         if inv is None:
             inv = _float_or_none("INVENTORY_CAP_USD")
         if inv is None:
-            inv = 1500.0
-        setattr(cfg, "inventory_cap_quote", float(inv))
+            inv = getattr(cfg.rm, "inventory_cap_quote", 1500.0)
+        cfg.rm.inventory_cap_quote = float(inv)
+        setattr(cfg, "inventory_cap_quote", cfg.rm.inventory_cap_quote)
 
         buf = _float_or_none("MIN_BUFFER_QUOTE")
         if buf is None:
             buf = _float_or_none("MIN_BUFFER_USD")
         if buf is None:
-            buf = 0.0
-        setattr(cfg, "min_buffer_quote", float(buf))
-
+            buf = getattr(cfg.rm, "min_buffer_quote", 0.0)
+        cfg.rm.min_buffer_quote = float(buf)
+        setattr(cfg, "min_buffer_quote", cfg.rm.min_buffer_quote)
         # TTL balances par alias (OK / DEGRADED / BLOCKED)
-        cfg.RM_BALANCE_TTL_S_NORMAL = _Env.get_float(
+        cfg.rm.balance_ttl_s_normal = _Env.get_float(
             "RM_BALANCE_TTL_S_NORMAL",
-            getattr(cfg, "RM_BALANCE_TTL_S_NORMAL", 60.0),
+            getattr(cfg.rm, "balance_ttl_s_normal", 60.0),
         )
-        cfg.RM_BALANCE_TTL_S_DEGRADED = _Env.get_float(
+        cfg.rm.balance_ttl_s_degraded = _Env.get_float(
             "RM_BALANCE_TTL_S_DEGRADED",
-            getattr(cfg, "RM_BALANCE_TTL_S_DEGRADED", 180.0),
+            getattr(cfg.rm, "balance_ttl_s_degraded", 180.0),
         )
-        cfg.RM_BALANCE_TTL_S_BLOCK = _Env.get_float(
+        cfg.rm.balance_ttl_s_block = _Env.get_float(
             "RM_BALANCE_TTL_S_BLOCK",
-            getattr(cfg, "RM_BALANCE_TTL_S_BLOCK", 600.0),
+            getattr(cfg.rm, "balance_ttl_s_block", 600.0),
         )
+        # Compat racine + aliases legacy
+        cfg.RM_BALANCE_TTL_S_NORMAL = cfg.rm.balance_ttl_s_normal
+        cfg.RM_BALANCE_TTL_S_DEGRADED = cfg.rm.balance_ttl_s_degraded
+        cfg.RM_BALANCE_TTL_S_BLOCK = cfg.rm.balance_ttl_s_block
+        setattr(cfg.rm, "RM_BALANCE_TTL_S_NORMAL", cfg.rm.balance_ttl_s_normal)
+        setattr(cfg.rm, "RM_BALANCE_TTL_S_DEGRADED", cfg.rm.balance_ttl_s_degraded)
+        setattr(cfg.rm, "RM_BALANCE_TTL_S_BLOCK", cfg.rm.balance_ttl_s_block)
 
         # Alias critiques (accélération des modes SEVERE)
         crit_aliases = _Env.get_list(
@@ -1927,6 +1952,8 @@ class BotConfig:
 
 
         # --- Logger / LHM (optionnel) ---
+        cfg.lhm.out_dir = _Env.get("LHM_OUT_DIR", cfg.lhm.out_dir)
+        cfg.lhm.strict_obs = _Env.get_bool("STRICT_OBS", cfg.lhm.strict_obs)
         cfg.lhm.LHM_Q_STREAM_MAX = _Env.get_int("LHM_Q_STREAM_MAX", cfg.lhm.LHM_Q_STREAM_MAX)
         cfg.lhm.LHM_STREAM_BATCH = _Env.get_int("LHM_STREAM_BATCH", cfg.lhm.LHM_STREAM_BATCH)
         cfg.lhm.LHM_DROP_WHEN_FULL = _Env.get_bool("LHM_DROP_WHEN_FULL", cfg.lhm.LHM_DROP_WHEN_FULL)
@@ -1949,6 +1976,17 @@ class BotConfig:
         cfg.lhm.LHM_TRADE_BATCH_SIZE = _Env.get_int("LHM_TRADE_BATCH_SIZE", cfg.lhm.LHM_TRADE_BATCH_SIZE)
         cfg.lhm.LHM_TRADE_FLUSH_INTERVAL_S = _Env.get_float("LHM_TRADE_FLUSH_INTERVAL_S",
                                                             cfg.lhm.LHM_TRADE_FLUSH_INTERVAL_S)
+        cfg.lhm.LHM_SLO_WRITE_MS_P95_TARGET = _Env.get_float("LHM_SLO_WRITE_MS_P95_TARGET",
+                                                             cfg.lhm.LHM_SLO_WRITE_MS_P95_TARGET)
+        cfg.lhm.LHM_SLO_QUEUE_DEPTH_MAX_TARGET = _Env.get_float("LHM_SLO_QUEUE_DEPTH_MAX_TARGET",
+                                                                cfg.lhm.LHM_SLO_QUEUE_DEPTH_MAX_TARGET)
+        cfg.lhm.LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET = _Env.get_float(
+            "LHM_SLO_LAG_SECONDS_MAX_TARGET", cfg.lhm.LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET)
+        cfg.lhm.LHM_SLO_DROPPED_TRADES_BUDGET = _Env.get_float("LHM_SLO_DROPPED_TRADES_BUDGET",
+                                                               cfg.lhm.LHM_SLO_DROPPED_TRADES_BUDGET)
+        # PIVOT: chemins pilotés par cfg.lhm
+        cfg.lhm.out_dir = _Env.get("LHM_OUT_DIR", cfg.lhm.out_dir)
+        cfg.lhm.storage_path = _Env.get("LHM_STORAGE_PATH", cfg.lhm.storage_path)
 
         # --- Dashboard (optionnel) ---
         cfg.dashboard.OBS_BASE_URL    = _Env.get("OBS_BASE_URL",     cfg.dashboard.OBS_BASE_URL)

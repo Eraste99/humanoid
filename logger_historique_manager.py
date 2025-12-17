@@ -194,7 +194,7 @@ try:
         lhm_jsonl_ingested_total, lhm_jsonl_dropped_total, lhm_flush_batch_current,
         schema_violation_total, log_dedup_total, log_replay_total,
         forensic_chain_head, forensic_verify_ok_total,
-        set_lhm_queue, mark_schema_violation, mark_drop, mark_ingested,
+        set_lhm_queue, mark_schema_violation, mark_drop, mark_ingested, loggerh_on_queue_plateau,
         set_flush_batch, set_forensic_head_numeric,
         # --- PnL reconciliation CEX ↔ DB (M5-D-2) ---
         PNL_RECO_LAST_RUN_TS_SECONDS,
@@ -243,7 +243,9 @@ except Exception:
 
 
 # Chemin optionnel sur lequel sonder le stockage (peut être un dossier JSONL)
-LHM_STORAGE_PATH = os.getenv("LHM_STORAGE_PATH")  # ex: /var/lib/arbitrage-bot/data
+# Chemin optionnel sur lequel sonder le stockage (config-driven).
+# Pivot BotConfig: PAS d'ENV ici.
+LHM_STORAGE_PATH: str | None = None
 
 def _update_storage_safe(candidate_path: str | None = None) -> None:
     """
@@ -274,8 +276,6 @@ def _update_storage_safe(candidate_path: str | None = None) -> None:
         # observabilité best-effort seulement: jamais bloquant
         pass
 
-# Chemin du dossier à monitorer (définissable via env)
-LHM_STORAGE_PATH = os.getenv("LHM_STORAGE_PATH")  # ex: /var/lib/arbitrage-bot/data
 
 _storage_task: asyncio.Task | None = None
 
@@ -313,7 +313,7 @@ def start_storage_monitor(path: str | None = None, period_s: float = 60.0) -> No
     if _storage_task and not _storage_task.done():
         return
     loop = asyncio.get_running_loop()
-    _storage_task = loop.create_task(_storage_monitor(period_s, path or LHM_STORAGE_PATH))
+    _storage_task = loop.create_task(_storage_monitor(period_s, path))
 
 async def stop_storage_monitor() -> None:
     """Arrête proprement la tâche asyncio (si active)."""
@@ -382,8 +382,14 @@ class LoggerHistoriqueManager:
 
         self.cfg = cfg
         self.out_dir = out_dir
-        # Cap coda JSONL con fallback robusto
-        raw_cap = getattr(self.cfg, "LHM_JSONL_QUEUE_CAP", 5000)
+        # Cap queue JSONL (Pivot BotConfig)
+        # Source de vérité: cfg.lhm.jsonl_queue_cap (compat: cfg.lhm.LHM_JSONL_QUEUE_CAP puis cfg.LHM_JSONL_QUEUE_CAP)
+        L = getattr(self.cfg, "lhm", self.cfg)
+        raw_cap = getattr(L, "jsonl_queue_cap", None)
+        if raw_cap is None:
+            raw_cap = getattr(L, "LHM_JSONL_QUEUE_CAP", None)
+        if raw_cap is None:
+            raw_cap = getattr(self.cfg, "LHM_JSONL_QUEUE_CAP", 5000)
         self._jsonl_queue_cap = _safe_int(raw_cap, 5000)
 
         # -------- Tags globaux (déploiement/profil/pacer) --------
@@ -585,13 +591,14 @@ class LoggerHistoriqueManager:
 
         # -------- Métriques (init à 0) ----------------------------
         try:
-            # calcolata PRIMA di toccare le metriche (già fatto sopra ma ribadiamo il valore safe)
-            self._jsonl_queue_cap = _safe_int(getattr(self.cfg, "LHM_JSONL_QUEUE_CAP", 5000), 5000)
+            # _jsonl_queue_cap est déjà calculé dans __init__ depuis cfg.lhm.* (Pivot BotConfig).
+            cap = int(getattr(self, "_jsonl_queue_cap", 5000))
 
             # helper compat che aggiorna size+cap della coda JSONL
             from modules.obs_metrics import set_lhm_queue, LOGGERH_DB_FILE_BYTES, LOGGERH_LAST_FLUSH_TS_SECONDS, \
                 LOGGERH_LAST_ROTATION_TS_SECONDS
-            set_lhm_queue(0, self._jsonl_queue_cap)  # size=0 + cap
+            set_lhm_queue(0, cap)  # size=0 + cap
+
             LOGGERH_DB_FILE_BYTES.set(0)  # gauge SENZA label
             LOGGERH_LAST_FLUSH_TS_SECONDS.set(0)  # gauge SENZA label
             LOGGERH_LAST_ROTATION_TS_SECONDS.set(0)  # gauge SENZA label
@@ -728,6 +735,39 @@ class LoggerHistoriqueManager:
             await self._stop_db_lane()
         except Exception:
             logger.exception("stop: db_lane stop failed")
+
+    # ---------------- API publique (Pivot Boot) ----------------
+
+    def get_cohorts(self) -> dict | None:
+        """
+        API publique: Boot/Scanner peut lire les cohortes sans accéder aux sous-modules.
+        Best-effort: retourne None si indisponible.
+        """
+        tr = getattr(self, "_tracker", None)
+        if tr and hasattr(tr, "get_cohorts"):
+            try:
+                return tr.get_cohorts()
+            except Exception:
+                return None
+        return None
+
+    def rotate_pairs(self, now=None) -> None:
+        """API publique: demande au tracker de faire sa rotation paires (best-effort)."""
+        tr = getattr(self, "_tracker", None)
+        if tr and hasattr(tr, "rotate_pairs"):
+            try:
+                tr.rotate_pairs(now=now)
+            except Exception:
+                pass
+
+    def rotate_cohorts(self, now=None) -> None:
+        """API publique: demande au tracker de faire sa rotation cohorts (best-effort)."""
+        tr = getattr(self, "_tracker", None)
+        if tr and hasattr(tr, "rotate_cohorts"):
+            try:
+                tr.rotate_cohorts(now=now)
+            except Exception:
+                pass
 
     # ---------------- DB lane (single-writer) ----------------
     async def _start_db_lane(self) -> None:
@@ -960,6 +1000,15 @@ class LoggerHistoriqueManager:
             q: asyncio.Queue = asyncio.Queue(maxsize=10000)
             rot = _JsonlRotator(os.path.join(base_dir, stream), stream, max_bytes=max_bytes, max_age_s=max_age_s)
             self._jsonl_streams[stream] = (q, rot)
+            try:
+                lhm_set_queue_size(stream, q.qsize())
+            except Exception:
+                pass
+            try:
+                set_lhm_queue(0, self._jsonl_queue_cap)
+            except Exception:
+                pass
+
 
     def forensic_verify(self, limit_lines: int | None = None) -> bool:
         """
@@ -1099,9 +1148,9 @@ class LoggerHistoriqueManager:
 
                     # === OBS (on conserve tes compteurs) ===
                     try:
-                        from modules.obs_metrics import LHM_JSONL_INGESTED_TOTAL, LHM_JSONL_QUEUE_SIZE
-                        LHM_JSONL_INGESTED_TOTAL.labels(stream=name).inc()
-                        LHM_JSONL_QUEUE_SIZE.labels(stream=name).set(q.qsize())
+                        lhm_on_ingested(name)
+                        lhm_set_queue_size(name, q.qsize())
+                        set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
                     except Exception:
                         pass
 
@@ -1112,12 +1161,8 @@ class LoggerHistoriqueManager:
 
                     try:
 
-                        from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
-
-                        LHM_JSONL_DROPPED_TOTAL.labels(stream=name, reason="write_error").inc()
-
+                        lhm_on_dropped(name, "write_error")
                     except Exception:
-
                         pass
                     try:
                         self._critical_drop_seen = True
@@ -1139,8 +1184,7 @@ class LoggerHistoriqueManager:
                 rotated = await asyncio.to_thread(rot.rotate_if_needed)
                 if rotated:
                     try:
-                        from modules.obs_metrics import LOGGERH_JSONL_ROTATIONS_TOTAL
-                        LOGGERH_JSONL_ROTATIONS_TOTAL.labels(stream=name).inc()
+                        lhm_on_rotation(name)
                     except Exception:
                         pass
             except Exception:
@@ -1544,6 +1588,93 @@ class LoggerHistoriqueManager:
         except Exception:
             pass
 
+    def _lite_normalize_payload(self, log_type: str, payload: dict) -> tuple[dict, bool, str | None]:
+        """Best-effort normalisation via payloads pivot (sans exception bloquante).
+
+        Retourne (payload_normalized, schema_invalid, reason).
+        """
+        obj = dict(payload or {})
+        reason: str | None = None
+        invalid = False
+        try:
+            import payloads as contracts
+
+            if log_type == "opportunities":
+                try:
+                    if hasattr(contracts, "Opportunity"):
+                        model = getattr(contracts, "Opportunity")
+                        if hasattr(model, "model_validate"):
+                            normalized = model.model_validate(obj)
+                        else:
+                            normalized = model(**obj)
+                        obj = normalized.model_dump()
+                except Exception as exc:  # pragma: no cover - best effort
+                    invalid = True
+                    reason = f"opportunity:{exc}"[:200]
+                if "symbol" not in obj:
+                    invalid = True
+                    reason = reason or "opportunity:missing_symbol"
+        except Exception:
+            # modules payloads indisponible → pas de validation
+            pass
+
+        if invalid:
+            obj.setdefault("_schema_invalid", True)
+            if reason:
+                obj.setdefault("_schema_reason", reason)
+        return obj, invalid, reason
+
+    def _make_event_id(self, envelope: dict) -> str:
+        try:
+            base = {
+                "stream": envelope.get("stream"),
+                "log_type": envelope.get("log_type"),
+                "event_type": envelope.get("event_type"),
+                "ts_ms": envelope.get("ts_ms"),
+                "payload": envelope.get("payload"),
+            }
+            data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
+            return hashlib.sha1(data.encode("utf-8")).hexdigest()
+        except Exception:
+            return hex(int(time.time() * 1000))[2:]
+
+    def _build_envelope(
+            self,
+            stream: str,
+            payload: dict,
+            *,
+            log_type: str | None = None,
+            event_type: str | None = None,
+            schema_version: str = "lhm.envelope.1",
+    ) -> dict:
+        """Construit une enveloppe JSONL canonique (ts_ms/event/log/stream/id).
+
+        - Ne jette jamais: ajoute _schema_invalid=True si la normalisation échoue.
+        - Applique tags de contexte globaux.
+        """
+        normalized, invalid, reason = self._lite_normalize_payload(str(log_type or stream), payload)
+        inner = self._with_context_tags(normalized)
+        ts_ms = self._ensure_ts_ms(inner)
+        inner.setdefault("ts_ms", ts_ms)
+
+        envelope = {
+            "schema_version": schema_version,
+            "stream": stream,
+            "log_type": str(log_type or inner.get("log_type") or stream),
+            "event_type": str(event_type or inner.get("event_type") or log_type or stream),
+            "ts_ms": ts_ms,
+            "payload": inner,
+            "ingested_ms": int(time.time() * 1000),
+        }
+        if invalid:
+            envelope["_schema_invalid"] = True
+            if reason:
+                envelope.setdefault("_schema_reason", reason)
+
+        envelope = self._with_context_tags(envelope)
+        envelope.setdefault("event_id", self._make_event_id(envelope))
+        return envelope
+
     def _normalize_event_contract(self, log_type: str, e: dict) -> dict:
         """
         [M5-B1-1] Contrat minimal d'événement pour le pipeline LHM (non bloquant).
@@ -1700,13 +1831,7 @@ class LoggerHistoriqueManager:
 
     def _enqueue_jsonl(self, stream: str, payload: dict) -> None:
         """
-        Enqueue best-effort dans une stream JSONL si configurée.
-
-        [M5-B4-1] Politique de drop :
-        - toutes les écritures JSONL restent best-effort,
-        - mais on marque explicitement les drops d'événements PnL-critiques
-          (trades/balances/décisions RM…) pour que le pipeline PnL puisse
-          se mettre en mode "à risque".
+        Enqueue best-effort dans une stream JSONL pré-enveloppée.
         """
         streams = getattr(self, "_jsonl_streams", {}) or {}
         q_rot = streams.get(stream)
@@ -1714,39 +1839,37 @@ class LoggerHistoriqueManager:
             return
         q, _rot = q_rot
 
-        # Détection d'event PnL-critique en fonction du contenu (best-effort)
         try:
             log_type = str(payload.get("log_type") or "").lower()
             inner = payload.get("payload") or {}
             kind = str(inner.get("event_type") or inner.get("kind") or "").lower()
             is_critical = (
-                    log_type in ("trades", "balances", "balance_snapshots")
-                    or kind.startswith("rm.")
-                    or kind.startswith("engine.")
-                    or kind.startswith("balance.")
+                log_type in ("trades", "balances", "balance_snapshots")
+                or kind.startswith("rm.")
+                or kind.startswith("engine.")
+                or kind.startswith("balance.")
             )
         except Exception:
             is_critical = False
 
         try:
             q.put_nowait(payload)
+            # métriques best-effort (success path)
             try:
-                from modules.obs_metrics import LHM_JSONL_QUEUE_SIZE
-                LHM_JSONL_DROPPED_TOTAL.labels(stream=stream, reason="queue_full").inc()
+                lhm_set_queue_size(stream, q.qsize())
+                set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
             except Exception:
                 pass
         except Exception:
-            # File pleine → on signale le drop, et si c’était critique on marque le flag.
+            # File pleine → drop (reason obligatoire, metrics best-effort)
             try:
-                from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
-                LHM_JSONL_DROPPED_TOTAL.labels(stream=stream).inc()
+                lhm_on_dropped(stream, "queue_full")
             except Exception:
                 pass
             if is_critical:
                 try:
                     self._critical_drop_seen = True
                 except Exception:
-                    # on n'expose pas cette erreur, c'est un flag interne
                     pass
 
 
@@ -1807,16 +1930,9 @@ class LoggerHistoriqueManager:
 
             enriched.append(e)
 
-            # JSONL parallèle “events” (inchangé : on loggue ce qui part en DB)
-            self._enqueue_jsonl(
-                "events",
-                {
-                    "stream": "events",
-                    "log_type": log_type,
-                    "payload": e,
-                    "ingested_ms": int(time.time() * 1000),
-                },
-            )
+            # JSONL parallèle “events” via enveloppe canonique
+            envelope = self._build_envelope("events", e, log_type=log_type)
+            self._enqueue_jsonl("events", envelope)
 
         # Écriture DB (thread → pas de blocage loop)
         # Écriture DB via DB lane (single-writer, non bloquant)
@@ -1837,13 +1953,12 @@ class LoggerHistoriqueManager:
             except Exception:
                 pass
             self._enqueue_jsonl(
-                "errors",
-                {
-                    "stream": "errors",
-                    "log_type": log_type,
-                    "payload": enriched,
-                    "err": "db_write_failed",
-                },
+                self._build_envelope(
+                    "errors",
+                    {"payload": enriched, "err": "db_write_failed"},
+                    log_type=log_type,
+                    event_type="db_write_failed",
+                ),
             )
         # Ingestion tracker (best-effort, non bloquant)
         try:
@@ -2087,7 +2202,16 @@ class LoggerHistoriqueManager:
                 "meta": meta,
             }
         try:
-            self._enqueue_jsonl("events", marker_event)
+            self._enqueue_jsonl(
+                "events",
+                self._build_envelope(
+                    "events",
+                    marker_event,
+                    log_type="eod",
+                    event_type="eod",
+                    schema_version="lhm.eod.1",
+                ),
+            )
         except Exception:
             logger.exception("EOD: enqueue jsonl failed")
 
@@ -3251,7 +3375,10 @@ class LoggerHistoriqueManager:
                             0.05 * max(1, max(window))):
                         # plateau détecté
                         self._last_queue_plateau_ts = time.time()
-                        LOGGERH_QUEUE_PLATEAU_TOTAL.labels(streams="btl_trades").inc()
+                        try:
+                            loggerh_on_queue_plateau("btl_trades")
+                        except Exception:
+                            pass
                         try:
                             await self.record_alert(
                                 "LoggerHistorique", "WARN", "queue_plateau_detected",
@@ -3698,9 +3825,13 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("_append_jsonl enqueue failed (%s)", stream)
 
-    # [PATCH-BP] incrément de drops + log throttle
-    def _drop_stream_record(self, stream: str) -> None:
-        LHM_JSONL_DROPPED_TOTAL.labels(stream=stream).inc()
+    def _drop_stream_record(self, stream: str, reason: str = "queue_full") -> None:
+        # métriques best-effort + low-cardinality (stream, reason)
+        try:
+            from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
+            LHM_JSONL_DROPPED_TOTAL.labels(stream=stream, reason=reason).inc()
+        except Exception:
+            pass
         # pas de log spammy; laisse Prometheus raconter l'histoire
 
     async def _loop_streams(self) -> None:
@@ -3971,15 +4102,10 @@ class LoggerHistoriqueManager:
 
             # 1) JSONL best-effort (stream 'events')
             try:
-                self._enqueue_jsonl(
-                    "events",
-                    {
-                        "stream": "events",
-                        "log_type": "rotation_decision",
-                        "payload": obj,
-                        "ingested_ms": ts_ms,
-                    },
+                envelope = self._build_envelope(
+                    "events", obj, log_type="rotation_decision", event_type="rotation_decision"
                 )
+                self._enqueue_jsonl("events", envelope)
             except Exception:
                 # On ne veut surtout pas que l'absence de JSONL casse le hot-path
                 logger.exception("log_rotation_decision: jsonl enqueue failed")
@@ -4083,6 +4209,30 @@ class LoggerHistoriqueManager:
     def rotate_now(self) -> None:
         """Force une rotation immédiate (le tracker applique ses quotas par branche)."""
         self._tracker.rotate_pairs()
+
+    def rotate_cohorts(self) -> None:
+        """Best-effort: rotation des cohortes côté tracker (si supporté)."""
+        fn = getattr(self._tracker, "rotate_cohorts", None)
+        if callable(fn):
+            try:
+                fn(now=None)
+            except Exception:
+                logger.exception("rotate_cohorts failed", exc_info=True)
+
+    def get_cohorts(self) -> Dict[str, list]:
+        """
+        API publique: cohortes actuelles (CORE/PRIMARY/AUDITION/SANDBOX).
+        Boot/Scanner ne doivent jamais lire _tracker directement.
+        """
+        fn = getattr(self._tracker, "get_cohorts", None)
+        if callable(fn):
+            try:
+                coh = fn()
+                return coh or {}
+            except Exception:
+                logger.exception("get_cohorts failed", exc_info=True)
+        return {}
+
 
     def set_max_active_by_mode(self, **kw) -> None:
         """
