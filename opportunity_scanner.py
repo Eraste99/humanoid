@@ -49,7 +49,7 @@ except Exception:
         def defaultdict(factory):  # type: ignore
             return _DefaultDict(factory)
 
-import asyncio
+import math
 import asyncio, random, time
 import uuid
 import logging
@@ -365,6 +365,7 @@ class OpportunityScanner:
         s = self.cfg.scanner
         # workers / windows / habilitations
         self._workers = int(getattr(s, "workers", 1))
+        self._workers_target = self._workers
         self._dedup_window_s = float(getattr(s, "dedup_window_s", 0.5))
         self._ttl_hints_s = float(getattr(s, "ttl_hints_s", 1.0))
         self._audition_ttl_min = int(getattr(s, "audition_ttl_min", 5))
@@ -570,6 +571,16 @@ class OpportunityScanner:
         # token-buckets
         self._tb_global = _TokenBucket(rate_per_s=self.global_eval_hz, capacity=self.global_eval_hz * 2.0)
         self._tb_pair = {}
+
+        # --- Shedding pilotable ---
+        self._shed_load_threshold = float(getattr(s, "shed_load_threshold", 0.95))
+        self._shed_primary_factor = float(getattr(s, "shed_primary_factor", 0.8))
+        self._shed_primary_min = float(getattr(s, "shed_primary_min", 0.5))
+        self._shed_audition_factor = float(getattr(s, "shed_audition_factor", 0.0))
+        self._shed_cooldown_s = float(getattr(s, "shed_cooldown_s", 3.0))
+        self._hard_shed_until = 0.0
+        self._shed_primary = 1.0
+        self._shed_audition = 1.0
 
         # Cohortes (sets) — rétro-compat: PRIMARY/AUDITION existaient déjà
         self._core_pairs = set()
@@ -922,13 +933,27 @@ class OpportunityScanner:
         # Stocker le snapshot puis quotas
         self.orderbooks.setdefault(ex, {})[pair] = data
         allowed, _why = self._should_scan_now(pair)
+        if self._workers_target > 0:
+            if allowed:
+                self._enqueue_for_workers(pair, data)
+            return
         if not allowed:
             return
 
-        # Évalue uniquement la paire concernée
+        # Évalue uniquement la paire concernée (mode pull / sans workers)
         self.check_opportunity(pair)
 
     # ---------------- Pull utils ----------------
+    def _enqueue_for_workers(self, pair: str, event: dict) -> None:
+        try:
+            dq = self._queues[pair]
+            if self._pair_queue_max and len(dq) >= self._pair_queue_max:
+                self._record_rejection(reason="queue_full", route="*", pair=pair)
+            dq.append(event)
+            self._last_enqueued_ts_ms[pair] = int(event.get("exchange_ts_ms") or event.get("recv_ts_ms") or 0)
+        except Exception:
+            logger.exception("[Scanner] enqueue failed for %s", pair)
+
     def get_books(self) -> Dict[str, Dict[str, dict]]:
         """
         Mode pull : retourne un snapshot des orderbooks par exchange/pair.
@@ -1083,17 +1108,29 @@ class OpportunityScanner:
         return float(val) if val is not None else None
 
     # ---------------- Détection (mode push) ----------------
+    def _snapshot_ts_seconds(self, snap: dict, *, pair_key: str, exchange: str) -> Optional[float]:
+        ts_ms = snap.get("exchange_ts_ms") or snap.get("recv_ts_ms")
+        if ts_ms is None:
+            self._record_rejection(reason="missing_ts", route="*", pair=pair_key)
+            return None
+        try:
+            ts_s = float(ts_ms) / 1000.0
+        except Exception:
+            self._record_rejection(reason="invalid_ts", route="*", pair=pair_key)
+            return None
+        if not math.isfinite(ts_s):
+            self._record_rejection(reason="invalid_ts", route="*", pair=pair_key)
+            return None
+        return ts_s
     def _synced_snapshots_for_pair(self, pair_key: str):
-        snaps: List[Tuple[str, dict, Decimal]] = []
+        snaps: List[Tuple[str, dict, float]] = []
         for ex, pairs in self.orderbooks.items():
             snap = pairs.get(pair_key)
             if not snap:
                 continue
-            ts_ms = snap.get("exchange_ts_ms") or snap.get("recv_ts_ms")
-            try:
-                ts_s = D(ts_ms) / D(1000)
-            except Exception:
-                ts_s = D(time.time())
+            ts_s = self._snapshot_ts_seconds(snap, pair_key=pair_key, exchange=ex)
+            if ts_s is None:
+                continue
             snaps.append((ex, snap, ts_s))
 
         n = len(snaps)
@@ -2774,9 +2811,13 @@ class OpportunityScanner:
     async def start(self):
         if getattr(self, "_running", False):
             return
+        workers = int(getattr(self, "_workers_target", 1))
+        if workers <= 0:
+            self.logger.info("[Scanner] start skipped (workers=0, pull-mode)")
+            return
         self._running = True
         self._tasks = []
-        workers = max(1, int(getattr(self, "_workers_target", 1)))
+
         self.logger.info("[Scanner] start (workers=%s)", workers)
         for i in range(workers):
             self._tasks.append(asyncio.create_task(self._scan_loop(), name=f"scanner-worker-{i + 1}"))
@@ -2794,6 +2835,21 @@ class OpportunityScanner:
     async def restart(self):
         await self.stop()
         await self.start()
+
+    def _apply_load_shedding(self, load: float, now: float) -> None:
+        threshold = float(getattr(self, "_shed_load_threshold", 0.95))
+        if load > threshold:
+            if now > getattr(self, "_hard_shed_until", 0.0):
+                self._shed_primary = max(
+                    float(getattr(self, "_shed_primary_min", 0.5)),
+                    float(getattr(self, "_shed_primary", 1.0)) * float(getattr(self, "_shed_primary_factor", 0.8)),
+                )
+                self._shed_audition = float(getattr(self, "_shed_audition_factor", 0.0))
+                self._hard_shed_until = now + float(getattr(self, "_shed_cooldown_s", 3.0))
+        elif getattr(self, "_hard_shed_until", 0.0) and now > getattr(self, "_hard_shed_until", 0.0):
+            self._shed_primary = 1.0
+            self._shed_audition = 1.0
+            self._hard_shed_until = 0.0
 
     def _next_candidate_pair(self) -> Optional[str]:
         """
@@ -2912,23 +2968,13 @@ class OpportunityScanner:
 
     async def _scan_loop(self):
         await asyncio.sleep(random.random() * 0.03)  # jitter
-        hard_until = 0.0
+
         while getattr(self, "_running", False):
             try:
                 gl = self._tb_global.load() if hasattr(self, "_tb_global") else 0.0
                 now = time.time()
 
-                # Hard shedding: si charge >0.95, on gèle AUDITION et on réduit PRIMARY 20% pendant 3s
-                if gl > 0.95:
-                    if now > hard_until:
-                        self._shed_primary = max(0.5, getattr(self, "_shed_primary", 1.0) * 0.8)
-                        self._shed_audition = 0.0
-                        hard_until = now + 3.0
-                elif hard_until and now > hard_until:
-                    # retour progressif
-                    self._shed_primary = 1.0
-                    self._shed_audition = 1.0
-                    hard_until = 0.0
+                self._apply_load_shedding(gl, now)
 
                 pair = self._next_candidate_pair()
                 if not pair:

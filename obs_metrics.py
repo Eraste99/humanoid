@@ -12,6 +12,40 @@ _obs_shim_log = logging.getLogger('observability_shim')
 
 from prometheus_client import Counter, Gauge, Histogram, REGISTRY
 
+class _AlertCounter:
+    def __init__(self):
+        self.count = 0
+        self.kwargs = []
+        self.last_value = None
+
+    def labels(self, **kwargs):
+        self.kwargs.append(kwargs)
+        return self
+
+    def inc(self, *_args, **_kwargs):
+        self.count += 1
+        return None
+
+    def set(self, value):
+        self.last_value = value
+        self.count += 1
+        return None
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram, REGISTRY
+except Exception:
+    class _NoopMetric:
+        def __init__(self, *_, **__):
+            pass
+
+        def labels(self, **kwargs): return self
+        def inc(self, *a, **k): pass
+        def set(self, *a, **k): pass
+        def observe(self, *a, **k): pass
+
+    Counter = Gauge = Histogram = _NoopMetric  # type: ignore
+    REGISTRY = None  # type: ignore
+
 # --- BEGIN OM-0: STRICT + PROM READY + Noop ---
 import os
 STRICT_OBS = int(os.getenv("STRICT_OBS", "0"))  # 0 par défaut en dry-run
@@ -23,6 +57,8 @@ except Exception:
     # fallback: on exporte des classes no-op
     _PROM_READY = False
     class _NoopMetric:
+        def __init__(self, *_, **__):
+            pass
         def labels(self, **kwargs): return self
         def inc(self, *a, **k): pass
         def set(self, *a, **k): pass
@@ -446,6 +482,8 @@ ROUTER_CFG_STALE_MS = _metric(Gauge, 'router_cfg_stale_ms', 'Configured Router s
 ROUTER_CFG_COALESCE_WINDOW_MS = _metric(Gauge, 'router_cfg_coalesce_window_ms', 'Configured Router coalesce window (ms)')
 ROUTER_CFG_REQUIRE_L2_FIRST = _metric(Gauge, 'router_cfg_require_l2_first', 'Router require_l2_first flag (1/0)')
 ROUTER_CFG_OUT_QUEUE_MAXLEN = _metric(Gauge, 'router_cfg_out_queue_maxlen', 'Router out queue maxlen by kind', ['kind'])
+WS_SYMBOL_UNMAPPED_TOTAL = _metric(Counter, 'ws_symbol_unmapped_total', 'WS symbol mapping failures', ['exchange'])
+
 
 def mark_router_to_scanner(route: str, ok: bool, dt_ms: float, reason: str = 'ok') -> None:
     try:
@@ -553,6 +591,11 @@ def note_slip_ttl_seconds(ttl_s: float) -> None:
     except Exception:
         OBS_NOOP_TOTAL.labels(metric='slip_ttl_seconds_config', where='note_slip_ttl_seconds').inc()
 
+def note_slip_drop(reason: str, exchange: str) -> None:
+    try:
+        SLIP_DROP_TOTAL.labels(lbl_exchange(exchange), _norm(reason)).inc()
+    except Exception:
+        OBS_NOOP_TOTAL.labels(metric='slip_drop_total', where='note_slip_drop').inc()
 
 def note_scanner_cfg(scan_interval_s: float, min_required_bps: float, max_pairs_per_tick: float) -> None:
     try:
@@ -618,6 +661,12 @@ SLIP_P99_BPS = _metric(Gauge, 'slip_p99_bps', 'Slippage p99 (bps)')
 SCANNER_REJECTIONS_TOTAL = _metric(Counter, 'scanner_rejections_total', 'Opportunities rejected', ['reason'])
 SC_STRATEGY_SCORE = _metric(Gauge, 'sc_strategy_score', 'Strategy score', ['pair', 'route', 'branch'])
 SC_ELIGIBLE = _metric(Gauge, 'sc_eligible', 'Pair eligibility flag', ['pair'])
+SLIP_DROP_TOTAL = _metric(
+    Counter,
+    'slip_drop_total',
+    'Slippage bus events dropped',
+    ['exchange', 'reason'],
+)
 SC_BANNED = _metric(Gauge, 'sc_banned', 'Pair banned flag', ['pair'])
 SC_PROMOTED_PRIMARY = _metric(Counter, 'sc_promoted_primary_total', 'Promotions to PRIMARY', ['pair'])
 SC_ROTATION_PRIMARY_SIZE = _metric(Gauge, 'sc_rotation_primary_size', 'Rotation PRIMARY size')
@@ -637,6 +686,53 @@ RM_DROPPED_TOTAL = _metric(
     'rm_dropped_total',
     'Opportunities dropped by the RM',
     labelnames=('reason',),
+)
+
+RM_SHUTDOWN_SECONDS = _metric(
+    Histogram,
+    'rm_shutdown_seconds',
+    'RiskManager shutdown duration (seconds)',
+)
+RM_SHUTDOWN_TIMEOUT_TOTAL = _metric(
+    Counter,
+    'rm_shutdown_timeout_total',
+    'RiskManager shutdowns that hit timeout with pending tasks',
+)
+RM_SHUTDOWN_PENDING_TASKS = _metric(
+    Gauge,
+    'rm_shutdown_pending_tasks',
+    'Number of RiskManager tasks still pending after shutdown timeout',
+)
+
+RM_TRADING_READY = _metric(
+    Gauge,
+    'rm_trading_ready',
+    'RiskManager trading readiness (1=ready)',
+)
+RM_DEP_READY = _metric(
+    Gauge,
+    'rm_dep_ready',
+    'RiskManager dependency readiness',
+    labelnames=('dep',),
+)
+RM_CALLBACK_LATENCY_MS = _metric(
+    Histogram,
+    'rm_callback_latency_ms',
+    'Latency of RM callbacks',
+    buckets=(0.5, 1, 2.5, 5, 10, 25, 50, 100, 250, 500, 1000),
+    labelnames=('cb_name',),
+)
+RM_CALLBACK_DROPS_TOTAL = _metric(
+    Counter,
+    'rm_callback_drops_total',
+    'Dropped RM callbacks',
+    labelnames=('cb_name', 'reason'),
+)
+RM_CALLBACK_INFLIGHT = _metric(
+    Gauge,
+    'rm_callback_inflight',
+    'Inflight RM callbacks',
+    labelnames=('cb_name',),
 )
 
 RM_MODE_CURRENT = _metric(
@@ -969,6 +1065,18 @@ ENGINE_PACER_MODE = _metric(
     'Engine pacer mode (0=NORMAL,1=CONSTRAINED,2=SEVERE)',
     ['region', 'profile'],
 )
+ENGINE_PACER_UNAVAILABLE_TOTAL = _metric(
+    Counter,
+    'engine_pacer_unavailable_total',
+    'Engine pacer unavailable events',
+    ['reason'],
+)
+ENGINE_RL_TIMEOUT_TOTAL = _metric(
+    Counter,
+    'engine_rate_limit_timeout_total',
+    'Rate limiter timeouts caught by the engine',
+    ['exchange'],
+)
 PACER_ACK_TARGET_MS = _metric(
     Gauge,
     'engine_pacer_ack_target_ms',
@@ -1154,47 +1262,6 @@ if "WS_PUBLIC_STALENESS_SECONDS" not in globals():
     )
 
 
-# === Hub WS privés (PWS) ===
-if "PWS_DROPPED_TOTAL" not in globals():
-    PWS_DROPPED_TOTAL = Counter(
-        "pws_dropped_total", "Evénements PWS rejetés", ["exchange","alias","reason"]
-    )
-if "PWS_RECONNECTS_TOTAL" not in globals():
-    PWS_RECONNECTS_TOTAL = Counter(
-        "pws_reconnects_total", "Reconnects PWS", ["exchange","alias"]
-    )
-if "PWS_BACKOFF_SECONDS" not in globals():
-    PWS_BACKOFF_SECONDS = Gauge(
-        "pws_backoff_seconds", "Backoff courant (secondes) PWS", ["exchange","alias"]
-    )
-if "PWS_ALERT_TOTAL" not in globals():
-    PWS_ALERT_TOTAL = Counter(
-        "pws_alert_total",
-        "Alertes PWS (heartbeat/ordre/lag…)",
-        ["severity", "reason", "exchange", "alias", "kind"],
-    )
-if "PWS_EVENT_LAG_MS" not in globals():
-    PWS_EVENT_LAG_MS = Histogram(
-        "pws_event_lag_ms", "Lag événement PWS (ms)", ["exchange","alias"]
-    )
-if "PWS_QUEUE_FILL_RATIO" not in globals():
-    PWS_QUEUE_FILL_RATIO = Gauge(
-        "pws_queue_fill_ratio",
-        "Remplissage des queues internes PWS (0..1)",
-        ["exchange", "alias", "kind"],
-    )
-if "PWS_QUEUE_SATURATION_TOTAL" not in globals():
-    PWS_QUEUE_SATURATION_TOTAL = Counter(
-        "pws_queue_saturation_total",
-        "Saturations de queues PWS",
-        ["exchange", "alias", "kind"],
-    )
-if "PWS_HEARTBEAT_GAP_BREACH_TOTAL" not in globals():
-    PWS_HEARTBEAT_GAP_BREACH_TOTAL = Counter(
-        "pws_heartbeat_gap_breach_total",
-        "Nombre de fois où le gap heartbeat hub a dépassé le seuil",
-        ["exchange", "alias"],
-    )
 
 # === Déjà utilisés ailleurs (cohérence Lot A & B) ===
 if "SCANNER_HINT_TOPQTY_MISSING_TOTAL" not in globals():
@@ -1245,10 +1312,10 @@ FEE_TOKEN_LEVEL = _metric(Gauge, 'fee_token_level', 'Fee token level (0..1 of ta
 FEE_TOKEN_TARGET_PERCENT = _metric(Gauge, 'fee_token_target_percent', 'Fee token target (0..1)', ['cex', 'token'])
 PWS_DEDUP_HITS_TOTAL = _metric(Counter, 'pws_dedup_hits_total', 'PrivateWS LRU dedup hits', ['exchange', 'alias'])
 PWS_RECONNECTS_TOTAL = _metric(Counter, 'pws_reconnects_total', 'PrivateWS reconnects', ['exchange'])
-PWS_EVENT_LAG_MS = _metric(Histogram, 'pws_event_lag_ms', 'PrivateWS event lag (ms)', ['exchange'], buckets=BUCKETS_MS)
+PWS_EVENT_LAG_MS = _metric(Histogram, 'pws_event_lag_ms', 'PrivateWS event lag (ms)', ['exchange', 'alias'], buckets=BUCKETS_MS)
 PWS_TRANSFERS_TOTAL = _metric(Counter, 'pws_transfers_total', 'PrivateWS internal transfers', ['exchange'])
-PWS_EVENTS_TOTAL = _metric(Counter, 'pws_events_total', 'PrivateWS events received', ['exchange', 'kind'])
-PWS_BACKOFF_SECONDS = _metric(Gauge, 'pws_backoff_seconds', 'PrivateWS backoff seconds', ['exchange'])
+PWS_EVENTS_TOTAL = _metric(Counter, 'pws_events_total', 'PrivateWS events received', ['exchange', 'alias', 'status', 'source'])
+PWS_BACKOFF_SECONDS = _metric(Gauge, 'pws_backoff_seconds', 'PrivateWS backoff seconds', ['exchange', 'alias'])
 PWS_HEARTBEAT_GAP_SECONDS = _metric(
     Gauge,
     'pws_heartbeat_gap_seconds',
@@ -1267,7 +1334,7 @@ PWS_HEALTH_STATE = _metric(
     'PrivateWS health state (0=HEALTHY,1=WARN,2=CRITICAL)',
     ['exchange', 'alias'],
 )
-PWS_DROPPED_TOTAL = _metric(Counter, 'pws_dropped_total', 'PrivateWS dropped events', ['exchange', 'reason'])
+PWS_DROPPED_TOTAL = _metric(Counter, 'pws_dropped_total', 'PrivateWS dropped events', ['exchange', 'alias', 'reason'])
 PWS_ACK_LATENCY_MS = _metric(Histogram, 'pws_ack_latency_ms', 'Ack latency from private WS (ms)', ['exchange'], buckets=BUCKETS_MS)
 PWS_FILL_LATENCY_MS = _metric(Histogram, 'pws_fill_latency_ms', 'Fill latency from private WS (ms)', ['exchange'], buckets=BUCKETS_MS)
 WS_FAILOVER_TOTAL = _metric(Counter, 'ws_failover_total', 'PrivateWS failovers', ['exchange', 'reason'])
@@ -1281,6 +1348,12 @@ WS_RECO_MISS_PER_MINUTE = _metric(
     'ws_reco_miss_per_minute',
     'Miss détectés par minute (fenêtre glissante ~60s)',
     ['exchange', 'alias'],
+)
+PWS_CALLBACK_ERRORS_TOTAL = _metric(
+    Counter,
+    'pws_callback_errors_total',
+    'Erreurs surfaced par les callbacks PrivateWSHub',
+    ['label'],
 )
 WS_RECO_MISS_BURST_TOTAL = _metric(
     Counter,

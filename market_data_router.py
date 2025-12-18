@@ -368,6 +368,11 @@ class MarketDataRouter:
         self._last_vol_feed = defaultdict(lambda: 0.0)
         self._last_slip_feed = defaultdict(lambda: 0.0)
         self._vol_feed_min_interval_ms = 75
+        # scanner lane décorrélée pour éviter de bloquer l'ingestion
+        scanner_max = getattr_int(self.router_cfg, "scanner_queue_maxlen", 512) if self.router_cfg else 512
+        self._scanner_queue: asyncio.Queue = asyncio.Queue(
+            maxsize=max(1, scanner_max)) if self.push_to_scanner else asyncio.Queue(maxsize=1)
+        self._scanner_task: Optional[asyncio.Task] = None
         self._slip_feed_min_interval_ms = 100
 
         # buffers / métriques
@@ -1017,20 +1022,10 @@ class MarketDataRouter:
                 except Exception:
                     logger.exception("[Router] flush health")
 
-            # 3) Push vers Scanner (optionnel)
-            if self.push_to_scanner and hasattr(self.scanner, "update_orderbook"):
+                    # 3) Push vers Scanner (optionnel, via queue dédiée)
+            if self.push_to_scanner:
                 for ev in latest_by_ex.values():
-                    try:
-                        res = self.scanner.update_orderbook(ev)
-                        if asyncio.iscoroutine(res):
-                            await res
-                    except Exception:
-                        logger.exception("[Router] scanner.update_orderbook failed", extra={"pair": pair_key})
-                        try:
-                            ROUTER_DROPPED_TOTAL.labels(queue="scanner", reason="exception").inc()
-                        except Exception:
-                            pass
-
+                    self._enqueue_scanner(ev)
 
             # 4) reset fenêtre
             self._coalesce_buckets[pair_key] = {
@@ -1253,6 +1248,46 @@ class MarketDataRouter:
         # MAJ métriques pour ce CEX
         self._update_queue_depth_metrics_for(ex)
 
+    def _enqueue_scanner(self, payload: Dict[str, Any]) -> None:
+        if not self.push_to_scanner:
+            return
+        try:
+            self._scanner_queue.put_nowait(payload)
+        except asyncio.QueueFull:
+            try:
+                _ = self._scanner_queue.get_nowait()
+            except Exception:
+                pass
+            try:
+                self._scanner_queue.put_nowait(payload)
+                ROUTER_DROPPED_TOTAL.labels(queue="scanner_lane", reason="coalesced").inc()
+            except asyncio.QueueFull:
+                ROUTER_DROPPED_TOTAL.labels(queue="scanner_lane", reason="overflow").inc()
+
+    async def _scanner_worker(self) -> None:
+        while self._running:
+            try:
+                ev = await self._scanner_queue.get()
+            except Exception:
+                continue
+            ts0 = time.perf_counter_ns()
+            ok = False
+            reason = "ok"
+            try:
+                res = self.scanner.update_orderbook(ev)
+                if inspect.iscoroutine(res):
+                    await res
+                ok = True
+            except Exception as e:
+                reason = "exception"
+                report_nonfatal("MarketDataRouter", "scanner_update_failed", e)
+            finally:
+                try:
+                    mark_router_to_scanner_ts(ts0, route="tri_cex", ok=ok, reason=reason)
+                except Exception:
+                    pass
+                self._scanner_queue.task_done()
+
     # -------------------------- Per-CEX signals --------------------------
     @staticmethod
     def _ema_update(prev: Optional[float], value: float, dt_ms: float, window_ms: float) -> float:
@@ -1434,7 +1469,8 @@ class MarketDataRouter:
         if getattr(self, "_running", False):
             return
         self._running = True
-
+        if self.push_to_scanner and (self._scanner_task is None or self._scanner_task.done()):
+            self._scanner_task = asyncio.create_task(self._scanner_worker(), name="router-scanner")
         # maintenance loop (flush/heartbeats/purge)
         if not getattr(self, "_purge_task", None) or self._purge_task.done():
             self._purge_task = asyncio.create_task(self._purge_loop(), name="router-purge")
@@ -1461,10 +1497,30 @@ class MarketDataRouter:
                             last_error=payload.get("error"),
                         )
                         continue
+                    if isinstance(item, dict) and item.get("__ws_error__"):
+                        payload = item
+                        ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
+                        try:
+                            ROUTER_DROPPED_TOTAL.labels(queue=f"ws_source:{ex}", reason="ws_error").inc()
+                        except Exception:
+                            pass
+                        continue
 
                     ev = self._validate_and_enrich(item)
                     if not ev:
                         continue
+
+                    ex_pair = (ev.get("exchange"), ev.get("pair_key"))
+                    has_l2 = bool(ev.get("has_l2"))
+                    if has_l2:
+                        self._l2_seen[ex_pair] = True
+                    if self.require_l2_first and not has_l2 and not self._l2_seen.get(ex_pair, False):
+                        try:
+                            ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="require_l2_first").inc()
+                        except Exception:
+                            pass
+                        continue
+
 
                     # --- PATCH C2: guard staleness + métriques reason-codées ---
                     # Base legacy : TTL brut (ms) injecté via stale_source_ms / BotConfig.router.stale_ms.
@@ -1530,6 +1586,11 @@ class MarketDataRouter:
                 except asyncio.CancelledError:
                     pass
             self._purge_task = None
+            if self._scanner_task:
+                self._scanner_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await self._scanner_task
+            self._scanner_task = None
 
     # --- market_data_router.py (dans class MarketDataRouter) ---
     def get_orderbooks(self):

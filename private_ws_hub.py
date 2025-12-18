@@ -119,6 +119,7 @@ try:
         PWS_QUEUE_SATURATION_TOTAL,
         PWS_QUEUE_DEPTH,
         PWS_QUEUE_CAP,
+        PWS_CALLBACK_ERRORS_TOTAL,
         PWS_ALERT_TOTAL,
         # AJOUTER dans la liste existante :
         WS_FAILOVER_TOTAL, PWS_POOL_SIZE,
@@ -149,6 +150,7 @@ except Exception:  # pragma: no cover
     PWS_QUEUE_DEPTH = _NoopMetric()
     PWS_QUEUE_CAP = _NoopMetric()
     PWS_ALERT_TOTAL = _NoopMetric()
+    PWS_CALLBACK_ERRORS_TOTAL = _NoopMetric()
 
 log = logging.getLogger("PrivateWSHub")
 log.setLevel(logging.INFO)
@@ -178,6 +180,24 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return float(x)
     except Exception:
         return default
+
+def _log_callback_exception(task: "asyncio.Task", label: str) -> None:
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        return
+    if exc is None:
+        return
+    try:
+        PWS_CALLBACK_ERRORS_TOTAL.labels(label).inc()
+    except Exception:
+        pass
+    try:
+        log.warning("[PrivateWSHub] callback %s raised: %s", label, exc)
+    except Exception:
+        pass
 
 def _quote_ccy_from_symbol(sym: str) -> str:
     s = (sym or "").replace("-", "").upper()
@@ -1212,6 +1232,10 @@ class PrivateWSHub:
                 auth_msg_factory=auth_msg_factory,
                 subscribe_payload=subscribe_payload,
             )
+            if alias in self.cb_ack_ws_by_alias:
+                log.warning(
+                    "[PrivateWSHub] overriding Coinbase ACK client for alias %s", alias
+                )
             c.register_callback(self._dispatch(alias, "COINBASE"))
             self.cb_ack_ws_by_alias[alias] = c
 
@@ -1231,38 +1255,6 @@ class PrivateWSHub:
         except Exception:
             # pas bloquant
             pass
-        # WS ACK Coinbase (facultatif) — dual-path
-        self.cb_ack_ws_by_alias: Dict[str, CoinbaseOrdersWS] = {}
-        # 1) Si des clients sont fournis explicitement (coinbase_ws_ack_clients={"TT": {...}})
-        for al, cfg in (coinbase_ws_ack_clients or {}).items():
-            alias = _upper(al)
-            ws_urls = cfg.get("ws_urls") or getattr(self.config, "coinbase_ws_orders_urls", None) \
-                      or ["wss://advanced-trade-ws.coinbase.com"]
-            auth_msg_factory = cfg.get("auth_msg_factory")  # optionnel
-            subscribe_payload = cfg.get("subscribe_payload") or {"type": "subscribe", "channel": "orders"}
-            c = CoinbaseOrdersWS(self.config, alias=alias, ws_urls=ws_urls,
-                                 auth_msg_factory=auth_msg_factory,
-                                 subscribe_payload=subscribe_payload)
-
-            c.register_callback(self._dispatch(alias, "COINBASE"))
-            self.cb_ack_ws_by_alias[alias] = c
-
-        # 2) Si activé par config (cb_ack_ws_enabled=1), on instancie pour les mêmes alias que le poller
-        try:
-            if int(getattr(self.config, "cb_ack_ws_enabled", 0)):
-                default_ws_urls = getattr(self.config, "coinbase_ws_orders_urls", None) \
-                                  or ["wss://advanced-trade-ws.coinbase.com"]
-                for al in (list(self.cb_poller_by_alias.keys())):
-                    alias = _upper(al)
-                    if alias in self.cb_ack_ws_by_alias:
-                        continue
-                    c = CoinbaseOrdersWS(self.config, alias=alias, ws_urls=default_ws_urls)
-
-                    c.register_callback(self._dispatch(alias, "COINBASE"))
-                    self.cb_ack_ws_by_alias[alias] = c
-        except Exception:
-            pass
-
 
         # Transferts
         self._transfer_clients: Dict[str, Any] = {}
@@ -1404,6 +1396,13 @@ class PrivateWSHub:
         if exu in self._region_map:
             return str(self._region_map[exu]).upper()
         return "EU"
+
+    def emit(self, event: dict, dedup: bool = True) -> None:
+        """Publie un événement privé en appliquant la dédup (par défaut)."""
+        if dedup:
+            self._dispatch(event)
+        else:
+            self.on_event(event)
 
     def on_event(self, event: dict) -> None:
         """
@@ -1596,7 +1595,10 @@ class PrivateWSHub:
             result = cb(ev)
             if inspect.isawaitable(result):
                 try:
-                    asyncio.create_task(result)
+                    task = asyncio.create_task(result)
+                    task.add_done_callback(
+                        lambda t, lbl=label: _log_callback_exception(t, lbl)
+                    )
                 except RuntimeError:
                     log.warning(
                         "[PrivateWSHub] %s callback coroutine sans boucle active", label
@@ -2129,16 +2131,24 @@ class PrivateWSHub:
             tasks.append(asyncio.create_task(c.stop()))
         for c in self.cb_poller_by_alias.values():
             tasks.append(asyncio.create_task(c.stop()))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
 
         for c in getattr(self, "cb_ack_ws_by_alias", {}).values():
             tasks.append(asyncio.create_task(c.stop()))
 
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        if self._hb_task:
-            self._hb_task.cancel()
-            self._hb_task = None
+        for t_attr in ("_hb_task", "_alerts_task"):
+            t = getattr(self, t_attr, None)
+            if t:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                setattr(self, t_attr, None)
 
         self._started = False
         log.info("[PrivateWSHub] stopped")

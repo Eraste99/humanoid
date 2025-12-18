@@ -8,7 +8,7 @@ Alignement P0/Hub :
 - Latences/horodatages gérés côté Hub ; ici on se concentre sur idempotence + resync.
 """
 from __future__ import annotations
-
+import inspect
 import asyncio
 import logging
 import time
@@ -564,8 +564,9 @@ class PrivateWSReconciler:
                 pass
             self._alias_miss_counter[key] = int(self._alias_miss_counter.get(key, 0)) + 1
 
-
-    async def correlate_and_maybe_resync(self, exchange: str, alias: str, client_id: Optional[str]) -> None:
+    async def correlate_and_maybe_resync(
+            self, exchange: str, alias: str, order_identifier: Optional[str], *, id_kind: Optional[str] = None
+    ) -> None:
         """
         Après un miss détecté, tente:
           1) resync ciblé (order) si client_id dispo
@@ -582,14 +583,21 @@ class PrivateWSReconciler:
         attempted = False
         try:
             # 1) resync order
-            if client_id:
+            if order_identifier:
                 if callable(self._resync_order):
                     scope = "order"
                     attempted = True
                     order_ok = False
                     order_exc: Optional[BaseException] = None
                     try:
-                        order_ok = bool(await self._resync_order(exchange, alias, client_id))
+                        params = {
+                            "exchange": exchange,
+                            "alias": alias,
+                            "order_id": order_identifier,
+                        }
+                        if id_kind and "id_kind" in inspect.signature(self._resync_order).parameters:
+                            params["id_kind"] = id_kind
+                        order_ok = bool(await self._resync_order(**params))
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
@@ -874,7 +882,14 @@ class PrivateWSReconciler:
         """
         snap = self.get_alias_status_snapshot(exchange, alias)
         return snap.get("status") in ("AT_RISK", "BROKEN")
-
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "running": bool(self._task and not self._task.done()),
+            "cold_loop_running": bool(getattr(self, "_cold_task", None) and not getattr(self, "_cold_task").done()),
+            "miss_alerts_running": bool(getattr(self, "_miss_alert_task", None) and not getattr(self, "_miss_alert_task").done()),
+            "last_ws_ns": getattr(self, "_last_ws_ns", None),
+            "wiring_ok": bool(getattr(self, "_wiring_checked", False)),
+        }
 
     def start_cold_resync_loop(self, *, period_hours: float = 6.0) -> None:
         """Déclenche un full-resync périodique; ne bloque jamais et supporte Cancel."""

@@ -114,6 +114,7 @@ class Boot:
         self.ready_router = asyncio.Event()
         self.ready_scanner = asyncio.Event()
         self.ready_rm = asyncio.Event()
+        self.ready_rm_loops = asyncio.Event()
         self.ready_engine = asyncio.Event()
         self.ready_private = asyncio.Event()
         self.ready_balances = asyncio.Event()
@@ -138,6 +139,7 @@ class Boot:
         self.boot_complete = asyncio.Event()
         self._started = False
         self._private_health_task: Optional[asyncio.Task] = None
+        self._rm_ready_sync_task: Optional[asyncio.Task] = None
         # Moniteur santé pipeline PnL (LHM/JSONL/DB)
         self._pnl_pipeline_task: Optional[asyncio.Task] = None
         self._pnl_unhealthy_since: Optional[float] = None
@@ -207,31 +209,57 @@ class Boot:
 
         if self._running:
             return self.ctx
+        # reset des events pour un restart propre
+        for ev in (
+                self.ready_ws,
+                self.ready_router,
+                self.ready_scanner,
+                self.ready_rm,
+                self.ready_engine,
+                self.ready_private,
+                self.ready_balances,
+                self.ready_rpc,
+                self.ready_all,
+        ):
+            ev.clear()
         self._running = True
         self._mark_stage("starting")
         self.log.info("[Boot] 🚀 start… mode=%s", str(mode).upper())
 
         # 1) LHM
-        await self._start_lhm()
-        # 2) Discovery (optionnelle) -> active pairs
-        await self._discover_pairs_and_compute_active()
-        # 3) Public WS + Router
-        await self._start_public_pipeline()
+        try:
+            # 1) LHM
+            await self._start_lhm()
+            # 2) Discovery (optionnelle) -> active pairs
+            await self._discover_pairs_and_compute_active()
+            # 3) Public WS + Router
+            await self._start_public_pipeline()
 
-        # 4) Balances plane (MBF) avant RM
-        await self._start_balances_plane()
-        # 5) RM (kwargs signature)
-        await self._start_rm()
-        # 6) Scanner (bind Router push)
-        await self._start_scanner()
-        # 7) Private plane (Hub, Reco, Balances)
-        await self._start_private_plane()
-        # 7bis) Dépendances Engine (RL + retry)
-        self._ensure_engine_dependencies()
-        # 8) Engine + RPC
-        await self._start_engine_and_rpc()
-        # 9) READY
-        await self._evaluate_ready()
+            # 4) Balances plane (MBF) avant RM
+            await self._start_balances_plane()
+            # 5) RM (kwargs signature)
+            await self._start_rm()
+            # 6) Scanner (bind Router push)
+            await self._start_scanner()
+            # 7) Private plane (Hub, Reco, Balances)
+            await self._start_private_plane()
+            # 7bis) Dépendances Engine (RL + retry)
+            self._ensure_engine_dependencies()
+            # 8) Engine + RPC
+            await self._start_engine_and_rpc()
+            # 9) READY
+            await self._evaluate_ready()
+        except Exception:
+            reason = f"boot_start_exception:{self.state.get('stage', 'starting')}"
+            self.state["degraded"] = True
+            self.state.setdefault("reasons", [])
+            if reason not in self.state["reasons"]:
+                self.state["reasons"].append(reason)
+            self.log.exception("[Boot] start failed, rolling back")
+            with contextlib.suppress(Exception):
+                await self.stop()
+            self._running = False
+            return self.ctx
 
         self.log.info(
             "[Boot] ✅ ready=%s degraded=%s reasons=%s",
@@ -258,6 +286,7 @@ class Boot:
         Arrêt global en ordre inverse strict. Idempotent.
         Chaque étape est protégée (best-effort) et loggée.
         """
+        self._running = False
         # Annule la tâche de sync cohortes si active
         with contextlib.suppress(Exception):
             t = getattr(self, "_cohort_sync_task", None)
@@ -282,6 +311,12 @@ class Boot:
                 t.cancel()
                 await asyncio.wait_for(t, timeout=timeout_s)
             self._pnl_pipeline_task = None
+        with contextlib.suppress(Exception):
+            t = getattr(self, "_rm_ready_sync_task", None)
+            if t:
+                t.cancel()
+                await asyncio.wait_for(t, timeout=timeout_s)
+            self._rm_ready_sync_task = None
 
 
 
@@ -311,10 +346,16 @@ class Boot:
                 self._send_status("scanner", "stopped")
 
         # 3) RM
+        rm_timeout = timeout_s
+        with contextlib.suppress(Exception):
+            cfg_rm = getattr(getattr(self, "cfg", None), "rm", getattr(self, "cfg", None))
+            rm_timeout = float(getattr(cfg_rm, "rm_stop_join_timeout_s", rm_timeout))
+            if rm_timeout != timeout_s:
+                self.log.debug("[Boot] using RM-specific stop timeout %.2fs", rm_timeout)
         with contextlib.suppress(Exception):
             rm = getattr(self.ctx, "rm", None)
             if rm and hasattr(rm, "stop"):
-                await asyncio.wait_for(rm.stop(), timeout=timeout_s)
+                await asyncio.wait_for(rm.stop(), timeout=rm_timeout)
                 self._send_status("rm", "stopped")
 
         # 4) Engine
@@ -360,6 +401,24 @@ class Boot:
                 await asyncio.wait_for(lhm.stop(), timeout=timeout_s)
                 self._send_status("lhm", "stopped")
 
+
+        # Nettoyage des flags/events pour autoriser un restart sain
+        for ev in (
+                self.ready_ws,
+                self.ready_router,
+                self.ready_scanner,
+                self.ready_rm,
+                self.ready_engine,
+                self.ready_private,
+                self.ready_balances,
+                self.ready_rpc,
+                self.ready_all,
+                self.boot_complete,
+        ):
+            with contextlib.suppress(Exception):
+                ev.clear()
+        self._mark_stage("stopped")
+
     async def wait_ready(self, timeout_s: Optional[float] = None) -> bool:
         try:
             if timeout_s is None:
@@ -377,6 +436,7 @@ class Boot:
             "ws_ready": self.ready_ws.is_set(),
             "router_ready": self.ready_router.is_set(),
             "scanner_ready": self.ready_scanner.is_set(),
+            "rm_loops_ready": self.ready_rm_loops.is_set(),
             "rm_ready": self.ready_rm.is_set(),
             "engine_ready": self.ready_engine.is_set(),
             "private_ready": self.ready_private.is_set(),
@@ -797,10 +857,14 @@ class Boot:
         if getattr(self.ctx, "rm", None):
             # déjà démarré
             self._send_status("rm", "ready")
+            self.ready_rm_loops.set()
+            if getattr(getattr(self.ctx, "rm", None), "trading_ready_event", None):
+                if self.ctx.rm.trading_ready_event.is_set():
+                    self.ready_rm.set()
+            else:
+                self.ready_rm.set()
+            self._mark_stage("rm_ready")
             return
-
-
-
 
         # Getter orderbooks robuste (latest|alias)
         router = getattr(self.ctx, "router", None)
@@ -846,15 +910,23 @@ class Boot:
         if hasattr(self.ctx.rm, "start"):
             await self.ctx.rm.start()
 
+        if getattr(self.ctx.rm, "ready_event", None):
+            with contextlib.suppress(Exception):
+                self.ready_rm_loops.set()
+
         # recâblages idempotents
         try:
             if hasattr(self.ctx.rm, "set_engine") and getattr(self.ctx, "engine", None):
                 self.ctx.rm.set_engine(self.ctx.engine)
-            if hasattr(self.ctx, "reconciler", None) and getattr(self.ctx, "reconciler", None):
-                if hasattr(self.ctx.rm, "bind_reconciler"):
-                    self.ctx.rm.bind_reconciler(self.ctx.reconciler)
+
+            reco = getattr(self.ctx, "reconciler", None)
+            if reco and hasattr(self.ctx.rm, "bind_reconciler"):
+                self.ctx.rm.bind_reconciler(reco)
         except Exception:
             pass
+        self.ready_rm.set()
+        self._mark_stage("rm_ready")
+        self._send_status("rm", "ready")
 
         self._wire_private_hub_callbacks()
 
@@ -871,6 +943,16 @@ class Boot:
             self.log.exception("[Boot] wiring MBF event_sink depuis _start_rm a échoué")
 
         self._send_status("rm", "ready")
+        if getattr(self.ctx.rm, "trading_ready_event", None):
+            if self.ctx.rm.trading_ready_event.is_set():
+                self.ready_rm.set()
+            try:
+                self._rm_ready_sync_task = asyncio.create_task(self._sync_rm_trading_ready(), name="boot-rm-ready-sync")
+            except Exception:
+                self.log.exception("[Boot] unable to start rm trading ready sync")
+        else:
+            self.ready_rm.set()
+        self._mark_stage("rm_ready")
 
     async def _start_scanner(self) -> None:
 
@@ -901,7 +983,19 @@ class Boot:
                     audition=[],
                 )
         self.ctx.scanner.apply_runtime_config(self.cfg)
+        self._scanner_proxy.bind(self.ctx.scanner)
         await self.ctx.scanner.start()
+
+        self.ready_scanner.set()
+        self._mark_stage("scanner_ready")
+        # P0: bind du proxy pour que le Router n’ait plus 100% de drops
+        with contextlib.suppress(Exception):
+            self._scanner_proxy.bind(self.ctx.scanner)
+
+        # P0: readiness explicite (sinon _evaluate_ready() peut bloquer)
+        self.ready_scanner.set()
+        self._mark_stage("scanner_ready")
+        self._send_status("scanner", "ready")
 
         # (4) Démarre la mini-loop de sync périodique (voir méthode plus bas)
         try:
@@ -1027,11 +1121,20 @@ class Boot:
 
         reco_task = getattr(self.ctx.reconciler, "_task", None)
         hub_started = bool(getattr(self.ctx.pws_hub, "__class__", None))
-        if reco_task:
+        reco_status: Dict[str, Any] = {}
+        try:
+            if hasattr(self.ctx.reconciler, "get_status"):
+                reco_status = self.ctx.reconciler.get_status() or {}
+        except Exception:
+            reco_status = {}
+
+        if reco_task or reco_status.get("running"):
             self.ready_private.set()
+            self._mark_stage("private_ready")
         self.state["private"] = {
             "hub_present": hub_started,
             "reconciler_started": bool(reco_task),
+            "reconciler_status": reco_status,
         }
         self._send_status("private", "ready", dict(self.state.get("private", {})))
 
@@ -1118,6 +1221,7 @@ class Boot:
         if hasattr(engine, "start"):
             await engine.start()
 
+
         # Wiring initial Engine ↔ Hub (callback "engine" + set_private_ws_hub)
         self._wire_private_hub_callbacks()
         self._send_status("engine", "ready")
@@ -1140,6 +1244,8 @@ class Boot:
         if hasattr(self.ctx.rpc, "start"):
             await self.ctx.rpc.start()
         self._send_status("rpc", "ready")
+        self.ready_rpc.set()
+        self._mark_stage("rpc_ready")
 
         # 3) Recâblage tardif RM ↔ Engine/Reconciler (idempotent)
         rm = getattr(self.ctx, "rm", None)
@@ -1150,6 +1256,9 @@ class Boot:
                 reconciler = getattr(self.ctx, "reconciler", None)
                 if reconciler and hasattr(rm, "bind_reconciler"):
                     rm.bind_reconciler(reconciler)
+                    hub = getattr(self.ctx, "pws_hub", None)
+                    if hub and hasattr(rm, "bind_private_ws_hub"):
+                        rm.bind_private_ws_hub(hub)
             except Exception:
                 pass
 
@@ -1365,6 +1474,23 @@ class Boot:
                 return len(v)
         return None
 
+    async def _sync_rm_trading_ready(self) -> None:
+        try:
+            while self._running:
+                rm = getattr(self.ctx, "rm", None)
+                if not rm:
+                    break
+                ev = getattr(rm, "trading_ready_event", None) or getattr(rm, "ready_event", None)
+                if ev and ev.is_set():
+                    self.ready_rm.set()
+                else:
+                    self.ready_rm.clear()
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            self.log.exception("[Boot] rm trading ready sync crashed")
+
     async def _evaluate_ready(self) -> None:
         self._mark_stage("evaluating_ready")
         reasons: List[str] = []
@@ -1380,6 +1506,9 @@ class Boot:
         fs = getattr(g, "feature_switches", {}) if g else {}
         live = (str(getattr(self.cfg, "mode", "DRY_RUN")).upper() == "PROD") or bool(fs.get("engine_real", False))
         private_ws_enabled = bool(fs.get("private_ws", False))
+
+        rm_status: Dict[str, Any] = {}
+        engine_status: Dict[str, Any] = {}
 
         if live:
             req.append(self.ready_engine)
@@ -1411,6 +1540,25 @@ class Boot:
             if not self.ready_balances.is_set():
                 reasons.append("balances_stale")
 
+        # RM readiness (loops vs trading)
+        rm = getattr(self.ctx, "rm", None)
+        if rm and hasattr(rm, "get_status"):
+            try:
+                rm_status = rm.get_status() or {}
+            except Exception:
+                rm_status = {}
+
+        if rm_status:
+            if not rm_status.get("rm_loops_ready", True):
+                reasons.append("rm_loops_not_ready")
+            if not rm_status.get("rm_trading_ready", True):
+                reasons.append("rm_trading_not_ready")
+        else:
+            if not self.ready_rm_loops.is_set():
+                reasons.append("rm_loops_not_ready")
+            if not self.ready_rm.is_set():
+                reasons.append("rm_trading_not_ready")
+
         # RPC obligatoire si activé
         if rpc_enabled and not self.ready_rpc.is_set():
             reasons.append("rpc_unavailable")
@@ -1420,10 +1568,7 @@ class Boot:
             rm = getattr(self.ctx, "rm", None)
             engine = getattr(self.ctx, "engine", None)
 
-            rm_status: Dict[str, Any] = {}
-            engine_status: Dict[str, Any] = {}
-
-            if rm and hasattr(rm, "get_status"):
+            if not rm_status and rm and hasattr(rm, "get_status"):
                 try:
                     rm_status = rm.get_status() or {}
                 except Exception:
@@ -1453,17 +1598,9 @@ class Boot:
                     reasons.append("engine_private_hub_wiring_incomplete")
 
         # Décision READY / DEGRADED
-        if reasons:
-            self.state["degraded"] = True
-            self.state["reasons"] = reasons
-            base_ready = all(
-                ev.is_set() for ev in [self.ready_ws, self.ready_router, self.ready_scanner, self.ready_rm]
-            )
-            if live:
-                base_ready = base_ready and self.ready_engine.is_set()
-            if base_ready:
-                self.ready_all.set()
-        else:
+        self.state["degraded"] = bool(reasons)
+        self.state["reasons"] = reasons
+        if not reasons:
             self.ready_all.set()
 
         self._mark_stage("ready")

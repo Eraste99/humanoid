@@ -210,7 +210,11 @@ def with_retry(
         try:
             res = op()
             return RetryOutcome(True, res, attempt + 1, _elapsed_s(start))
-        except BaseException as exc:
+        except asyncio.CancelledError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
             kind = map_error(venue, exc)
             stress_tag = classify_stress_tag(exc)
 
@@ -251,7 +255,11 @@ async def awith_retry(
         try:
             res = await aop()
             return RetryOutcome(True, res, attempt + 1, _elapsed_s(start))
-        except BaseException as exc:
+        except asyncio.CancelledError:
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
             kind = map_error(venue, exc)
             stress_tag = classify_stress_tag(exc)
 

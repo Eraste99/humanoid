@@ -93,7 +93,7 @@ class DynamicExecutionSimulator:
         self.bot_cfg = config
         self.config = config  # <-- alias back-compat
         self.depth_limit = int(depth_limit)
-        self._allowed_routes: Set[Tuple[str, str]] = set()
+        self._allowed_routes: Optional[Set[Tuple[str, str]]] = set()
         self._fee_map_pct: Dict[str, Dict[str, float]] = {}  # {EX:{maker: frac, taker: frac}}
 
         # Contexte poussé par le RiskManager
@@ -118,12 +118,15 @@ class DynamicExecutionSimulator:
         self._event_sink = sink
 
     # --------- NOUVEAU: injection de routes autorisées ---------
-    def update_allowed_routes(self, routes: List[Tuple[str, str]]) -> None:
+    def update_allowed_routes(self, routes: Optional[List[Tuple[str, str]]]) -> None:
         try:
-            self._allowed_routes = {(a.upper(), b.upper()) for a, b in (routes or [])}
+            if routes is None:
+                self._allowed_routes = None
+            else:
+                self._allowed_routes = {(a.upper(), b.upper()) for a, b in (routes or [])}
         except Exception as e:
             report_nonfatal("DynamicExecutionSimulator", "update_allowed_routes_failed", e, phase="init")
-            self._allowed_routes = set()
+            self._allowed_routes = None
 
     def set_fee_map_pct(self, fee_map: Dict[str, Dict[str, float]]) -> None:
         """
@@ -206,9 +209,12 @@ class DynamicExecutionSimulator:
     # --------- NOUVEAU: check route via state local ou fallback 6 routes ---------
     def _combo_allowed(self, buy_ex: str, sell_ex: str) -> bool:
         a, b = str(buy_ex).upper(), str(sell_ex).upper()
-        if self._allowed_routes:
-            return (a, b) in self._allowed_routes
-        return (a, b) in _DEFAULT_ROUTES
+        if self._allowed_routes is None:
+            return (a, b) in _DEFAULT_ROUTES
+        if len(self._allowed_routes) == 0:
+            return False
+        return (a, b) in self._allowed_routes
+
 
     def _consume_depth_fragment(
         self,
@@ -660,6 +666,11 @@ class DynamicExecutionSimulator:
 
         if not self._combo_allowed(buy_ex, sell_ex):
             logger.debug(f"[Sim] Combo non autorisé: {buy_ex}->{sell_ex}")
+            self.last_result = {
+                "blocked": True,
+                "reason": "route_not_allowed",
+                "route": f"{buy_ex}->{sell_ex}",
+            }
             return None
         if capital_available_usdc <= 0:
             return None

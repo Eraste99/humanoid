@@ -35,14 +35,15 @@ from __future__ import annotations
     """
 import asyncio, time, inspect
 import time, uuid, random
-import threading,meta
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import contextlib
 from typing import Dict, Any, List, Optional, Tuple
 from modules.obs_metrics import inc_blocked
 import logging
 from collections import defaultdict
 from modules.obs_metrics import TIME_SKEW_MS
-from contracts.payloads import make_submit_bundle, submit_leg_from_intent, normalize_leg_dict
-from dataclasses import dataclass, asdict
+from contracts.payloads import make_submit_bundle, submit_leg_from_intent, normalize_leg_dict, normalize_reason_codefrom dataclasses import dataclass, asdict
 import json
 from contracts import payloads as fraglib
 
@@ -239,7 +240,10 @@ except Exception:
 from modules.obs_metrics import (
     mark_books_fresh, mark_balances_fresh, inc_rm_reject,
     set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
-    get_counter, get_gauge, safe_inc,
+    get_counter, get_gauge, safe_inc, safe_set, safe_observe,
+    RM_SHUTDOWN_SECONDS, RM_SHUTDOWN_TIMEOUT_TOTAL, RM_SHUTDOWN_PENDING_TASKS,
+    RM_TRADING_READY, RM_DEP_READY, RM_CALLBACK_LATENCY_MS,
+    RM_CALLBACK_DROPS_TOTAL, RM_CALLBACK_INFLIGHT,
 )
 from modules.bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
@@ -1482,6 +1486,20 @@ class RiskManager:
 
         # Readiness
         self.ready_event: asyncio.Event = ready_event or asyncio.Event()
+        self.trading_ready_event: asyncio.Event = asyncio.Event()
+        self._readiness: Dict[str, Any] = {
+            "engine": False,
+            "books": False,
+            "balances": False,
+            "scanner": True,
+            "reasons": [],
+        }
+        self._last_books_snapshot_ts: float = 0.0
+        self._last_balances_ts: float = 0.0
+
+        # Callback dispatch
+        self._cb_tasks: Set[asyncio.Task] = set()
+        self._cb_executor = None
         self.fee_buyer = FeeTokenBuyer(self.config, logger=getattr(self, "logger", None))
 
         # --- RM Mode Overlay (FSM P0) ---
@@ -5331,6 +5349,7 @@ class RiskManager:
                 self.reconciler_wiring_ok = False
                 return
             self._wire_reconciler_engine_hooks()
+            self._maybe_update_trading_ready()
         except Exception as exc:
             logger.exception("[RiskManager] set_engine failed")
             self._emit_private_plane_event("set_engine_failed", error=str(exc))
@@ -6492,6 +6511,8 @@ class RiskManager:
             except Exception:
                 pass
 
+        self._maybe_update_trading_ready()
+
         # Démarre la colle RM<->MBF a posteriori (pour ne pas bloquer start())
         if hasattr(self, "_mbf_glue"):
             try:
@@ -6499,35 +6520,105 @@ class RiskManager:
             except Exception:
                 logger.exception("[RiskManager] mbf_glue.start() failed")
 
+            # Audit de config (best-effort, option strict)
+            rm_cfg = getattr(getattr(self, "cfg", None), "rm", getattr(self, "cfg", None))
+            if bool(getattr(rm_cfg, "audit_config_on_start", True)):
+                try:
+                    payload = self._audit_effective_config(strict=bool(getattr(rm_cfg, "strict_config", False)))
+                    self._hist_rm_event("rm.config_audit", payload)
+                except Exception:
+                    logger.exception("[RiskManager] config audit failed", exc_info=False)
+
+    async def _cancel_and_join(self, tasks: List[asyncio.Task], *, timeout_s: float, label: str) -> List[
+        asyncio.Task]:
+        remaining: List[asyncio.Task] = [t for t in tasks if t and not t.done()]
+        for t in remaining:
+            with contextlib.suppress(Exception):
+                t.cancel()
+
+        if not remaining:
+            return []
+
+        done: Set[asyncio.Task]
+        pending: Set[asyncio.Task]
+        try:
+            done, pending = await asyncio.wait(remaining, timeout=timeout_s)
+        except asyncio.CancelledError:
+            # stop() must be cancellation-safe
+            return remaining
+
+        if pending:
+            try:
+                names = [getattr(t, "get_name", lambda: "")() or str(t) for t in pending]
+                logger.warning("[RiskManager] shutdown pending tasks (label=%s): %s", label, names)
+            except Exception:
+                logger.warning("[RiskManager] shutdown pending tasks (label=%s)", label)
+        return list(pending)
+
     async def stop(self) -> None:
         """Arrêt idempotent, join propre des boucles et de la glue."""
-        self._running = False
+        if not getattr(self, "_running", False) and not getattr(self, "_tasks", None):
+            with contextlib.suppress(Exception):
+                if hasattr(self, "ready_event"):
+                    self.ready_event.clear()
+            return
 
+        self._running = False
+        shutdown_start = time.perf_counter()
+
+        cfg = getattr(self, "cfg", None)
+        rm_cfg = getattr(cfg, "rm", cfg)
+        join_timeout_s = float(getattr(rm_cfg, "rm_stop_join_timeout_s", 2.0))
+        glue_timeout_s = float(getattr(rm_cfg, "mbf_glue_stop_timeout_s", 1.0))
+        dump_stacks = bool(getattr(rm_cfg, "shutdown_dump_task_stacks", True))
+        stack_limit = int(getattr(rm_cfg, "shutdown_stack_limit", 10))
+        pending: List[asyncio.Task] = []
         # Arrêt glue d'abord (évite push tardifs)
         if hasattr(self, "_mbf_glue"):
             try:
-                await self._mbf_glue.stop()
+                await asyncio.wait_for(self._mbf_glue.stop(), timeout=glue_timeout_s)
+            except asyncio.TimeoutError:
+                logger.warning("[RiskManager] mbf_glue.stop() timeout (%.2fs)", glue_timeout_s)
+            except asyncio.CancelledError:
+                pass
             except Exception:
                 logger.exception("[RiskManager] mbf_glue.stop() failed")
 
         tasks = getattr_list(self, "_tasks")
-        for t in tasks:
-            if t and not t.done():
-                t.cancel()
-        if tasks:
-            try:
-                await asyncio.gather(*tasks, return_exceptions=True)
-            except Exception:
-                pass
+        try:
+            pending = await self._cancel_and_join(tasks, timeout_s=join_timeout_s, label="rm_loops")
+        except Exception:
+            pending = []
         self._tasks = []
 
-        if hasattr(self, "ready_event"):
-            try:
-                self.ready_event.clear()
-            except Exception:
-                pass
+        if pending and dump_stacks:
+            for t in pending:
+                try:
+                    stack = t.get_stack(limit=stack_limit)
+                    if stack:
+                        logger.warning("[RiskManager] pending task stack: %s", stack)
+                except Exception:
+                    pass
 
-        logger.info("[RiskManager] 🛑 Orchestrateur arrêté")
+        if hasattr(self, "ready_event"):
+            with contextlib.suppress(Exception):
+                self.ready_event.clear()
+                with contextlib.suppress(Exception):
+                    self.trading_ready_event.clear()
+                try:
+                    for t in list(self._cb_tasks):
+                        t.cancel()
+                    self._cleanup_cb_tasks()
+                except Exception:
+                    pass
+
+                duration = max(0.0, time.perf_counter() - shutdown_start)
+                safe_observe(RM_SHUTDOWN_SECONDS, "rm_shutdown_seconds", "rm.stop", duration)
+                safe_set(RM_SHUTDOWN_PENDING_TASKS, "rm_shutdown_pending_tasks", "rm.stop", float(len(pending)))
+                if pending:
+                    safe_inc(RM_SHUTDOWN_TIMEOUT_TOTAL, "rm_shutdown_timeout_total", "rm.stop")
+
+        logger.info("[RiskManager] 🛑 Orchestrateur arrêté en %.3fs (pending=%d)", duration, len(pending))
 
     # ------------------------------------------------------------------
     # API externes protégées par readiness (patch demandé)
@@ -7069,6 +7160,60 @@ class RiskManager:
             # Sécurité maximale : jamais d'exception qui remonte
             logger.exception("[RM] _emit_decision_record failed", exc_info=False)
 
+    def _cleanup_cb_tasks(self) -> None:
+        try:
+            done = {t for t in self._cb_tasks if t.done()}
+            self._cb_tasks.difference_update(done)
+        except Exception:
+            self._cb_tasks = {t for t in self._cb_tasks if not t.done()}
+
+    def _dispatch_best_effort(self, cb: Callable[[Any], Any], *, name: str, payload: Any) -> None:
+        if not callable(cb):
+            return
+
+        loop = asyncio.get_running_loop()
+        cfg = getattr(self, "cfg", None)
+        rm_cfg = getattr(cfg, "rm", cfg)
+        timeout_s = float(getattr(rm_cfg, "cb_timeout_s", 0.25) or 0.25)
+        max_inflight = int(getattr(rm_cfg, "cb_max_inflight", 200) or 200)
+        executor_workers = int(getattr(rm_cfg, "cb_executor_workers", 2) or 2)
+
+        self._cleanup_cb_tasks()
+        if len(self._cb_tasks) >= max_inflight:
+            safe_inc(RM_CALLBACK_DROPS_TOTAL, "rm_callback_drops_total", name, cb_name=name, reason="overflow")
+            return
+
+        if self._cb_executor is None and executor_workers > 0:
+            try:
+                self._cb_executor = ThreadPoolExecutor(max_workers=executor_workers)
+            except Exception:
+                self._cb_executor = None
+
+        async def _run() -> None:
+            start = time.perf_counter()
+            try:
+                res = cb(payload)
+                if inspect.isawaitable(res):
+                    await asyncio.wait_for(res, timeout=timeout_s)
+                elif self._cb_executor:
+                    fut = loop.run_in_executor(self._cb_executor, cb, payload)
+                    await asyncio.wait_for(fut, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                safe_inc(RM_CALLBACK_DROPS_TOTAL, "rm_callback_drops_total", name, cb_name=name, reason="timeout")
+            except asyncio.CancelledError:
+                safe_inc(RM_CALLBACK_DROPS_TOTAL, "rm_callback_drops_total", name, cb_name=name, reason="cancelled")
+            except Exception:
+                safe_inc(RM_CALLBACK_DROPS_TOTAL, "rm_callback_drops_total", name, cb_name=name, reason="error")
+            else:
+                duration_ms = (time.perf_counter() - start) * 1000.0
+                safe_observe(RM_CALLBACK_LATENCY_MS, "rm_callback_latency_ms", name, duration_ms, cb_name=name)
+            finally:
+                safe_set(RM_CALLBACK_INFLIGHT, "rm_callback_inflight", name, float(max(0, len(self._cb_tasks) - 1)),
+                         cb_name=name)
+
+        task = asyncio.create_task(_run(), name=f"rm-cb-{name}")
+        self._cb_tasks.add(task)
+        safe_set(RM_CALLBACK_INFLIGHT, "rm_callback_inflight", name, float(len(self._cb_tasks)), cb_name=name)
 
     def _hist_rm_event(self, kind: str, payload: Dict[str, Any]) -> None:
         """
@@ -7103,7 +7248,7 @@ class RiskManager:
             event.setdefault("log_type", "rm")
             event.setdefault("stream", "rm")
 
-            sink(event)
+            self._dispatch_best_effort(sink, name="history_sink", payload=event)
         except Exception:
             # Jamais d'escalade depuis la voie historique
             try:
@@ -9160,7 +9305,7 @@ class RiskManager:
 
                 self._mark_loop_success("fee_sync")
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as exc:
                 if FEESYNC_ERRORS:
                     try:
@@ -9169,8 +9314,10 @@ class RiskManager:
                         pass
                 log.debug("fee_sync_refresh_once failed", exc_info=False)
                 self._mark_loop_error("fee_sync", exc)
-            finally:
+            try:
                 await asyncio.sleep(_read_interval())
+            except asyncio.CancelledError:
+                raise
 
     # ------------------------------------------------------------------
     # Actions
@@ -9229,9 +9376,11 @@ class RiskManager:
         if not self.alert_cb:
             return
         try:
-            r = self.alert_cb(module, message, pair=pair, alert_type=alert_type)
-            if inspect.isawaitable(r):
-                await r
+            self._dispatch_best_effort(
+                self.alert_cb,
+                name="alert_cb",
+                payload={"module": module, "message": message, "pair": pair, "alert_type": alert_type},
+            )
         except Exception:
             logging.exception("Unhandled exception")
 
@@ -9829,6 +9978,12 @@ class RiskManager:
         state = self._loop_health.setdefault(loop_name, {"last_success": 0.0, "consecutive_errors": 0})
         state["last_success"] = time.time()
         state["consecutive_errors"] = 0
+        if loop_name == "orderbooks":
+            self._last_books_snapshot_ts = state["last_success"]
+            self._maybe_update_trading_ready()
+        elif loop_name == "balances":
+            self._last_balances_ts = state["last_success"]
+            self._maybe_update_trading_ready()
 
     def _mark_loop_error(self, loop_name: str, exc: Exception) -> None:
         state = self._loop_health.setdefault(loop_name, {"last_success": 0.0, "consecutive_errors": 0})
@@ -9844,6 +9999,95 @@ class RiskManager:
                 "message": msg,
             })
             state["consecutive_errors"] = 0
+
+    def _maybe_update_trading_ready(self) -> None:
+        cfg = getattr(self, "cfg", None)
+        rm_cfg = getattr(cfg, "rm", cfg)
+        now = time.time()
+
+        engine_ready = False
+        eng = getattr(self, "engine", None)
+        if eng and getattr(eng, "ready_event", None):
+            try:
+                engine_ready = eng.ready_event.is_set()
+            except Exception:
+                engine_ready = False
+
+        book_age = now - self._last_books_snapshot_ts if self._last_books_snapshot_ts else 1e9
+        bal_age = now - self._last_balances_ts if self._last_balances_ts else 1e9
+        max_book_age = float(getattr(self, "max_book_age_s", 1.0) or 1.0)
+        bal_ttl = float(getattr(self, "_balance_ttl_s_normal", 60.0) or 60.0)
+        books_ready = book_age <= max_book_age
+        balances_ready = bal_age <= bal_ttl
+        scanner_required = bool(getattr(rm_cfg, "trading_ready_require_scanner_hook", False))
+        scanner_ready = True
+        if scanner_required:
+            scanner_ready = callable(getattr(self, "_scanner_consumer", None))
+
+        readiness_reasons: List[str] = []
+        if not engine_ready:
+            readiness_reasons.append("engine_not_ready")
+        if not books_ready:
+            readiness_reasons.append("books_stale")
+        if not balances_ready:
+            readiness_reasons.append("balances_stale")
+        if not scanner_ready:
+            readiness_reasons.append("scanner_hook_missing")
+
+        self._readiness.update({
+            "engine": engine_ready,
+            "books": books_ready,
+            "balances": balances_ready,
+            "scanner": scanner_ready,
+            "reasons": readiness_reasons,
+        })
+
+        safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if engine_ready else 0.0, dep="engine")
+        safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if books_ready else 0.0, dep="books")
+        safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if balances_ready else 0.0, dep="balances")
+        safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if scanner_ready else 0.0, dep="scanner")
+
+        ready = not readiness_reasons
+        if ready:
+            self.trading_ready_event.set()
+        else:
+            self.trading_ready_event.clear()
+
+        safe_set(RM_TRADING_READY, "rm_trading_ready", "rm", 1.0 if ready else 0.0)
+
+    def _audit_effective_config(self, *, strict: bool = False) -> Dict[str, Any]:
+        cfg = getattr(self, "cfg", None)
+        rm_cfg = getattr(cfg, "rm", cfg)
+
+        entries: List[Dict[str, Any]] = []
+
+        def _add(key: str, value: Any, default: Any) -> None:
+            present = hasattr(rm_cfg, key)
+            if strict and not present:
+                raise RuntimeError(f"missing config key {key}")
+            entries.append({
+                "key": key,
+                "value": value,
+                "default": default,
+                "used_default": (not present) or value == default,
+                "present": present,
+            })
+
+        _add("max_book_age_s", getattr(self, "max_book_age_s", 1.0), 1.0)
+        _add("balance_ttl_s_normal", getattr(self, "_balance_ttl_s_normal", 60.0), 60.0)
+        _add("cb_timeout_s", float(getattr(rm_cfg, "cb_timeout_s", 0.25) or 0.25), 0.25)
+        _add("cb_max_inflight", int(getattr(rm_cfg, "cb_max_inflight", 200) or 200), 200)
+        _add("cb_executor_workers", int(getattr(rm_cfg, "cb_executor_workers", 2) or 2), 2)
+        _add("trading_ready_require_scanner_hook", bool(getattr(rm_cfg, "trading_ready_require_scanner_hook", False)),
+             False)
+
+        return {
+            "module": "RM",
+            "event": "config_audit",
+            "ts_ms": int(time.time() * 1000),
+            "entries": entries,
+            "strict": bool(strict),
+        }
 
     def _legacy_convert(self, op: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Conversion des anciens formats d'opérations de rebalancing.
@@ -13879,8 +14123,15 @@ class RiskManager:
             else:
                 try:
                     import asyncio
-                    oid = ev.get("order_id") or ev.get("client_id")
-                    task = rec.correlate_and_maybe_resync(exchange, alias, oid)
+                    oid = (
+                            ev.get("exchange_order_id")
+                            or ev.get("client_id")
+                            or ev.get("order_id")
+                    )
+                    id_kind = "exchange_order_id" if ev.get("exchange_order_id") else (
+                        "client_id" if ev.get("client_id") else "order_id"
+                    )
+                    task = rec.correlate_and_maybe_resync(exchange, alias, oid, id_kind=id_kind)
                     if asyncio.iscoroutine(task):
                         asyncio.create_task(task)
                 except Exception as exc:
@@ -14215,6 +14466,9 @@ class RiskManager:
         return {
             "module": "RiskManager",
             "healthy": self._running,
+            "rm_trading_ready": bool(getattr(self, "trading_ready_event", asyncio.Event()).is_set()),
+            "rm_loops_ready": bool(getattr(self, "ready_event", asyncio.Event()).is_set()),
+            "readiness": dict(self._readiness),
             "last_update": self.last_update,
             "private_ws_healthy": bool(getattr(self, "private_ws_healthy", True)),
             "private_ws": private_ws_status,
@@ -14370,6 +14624,7 @@ class _RM_MBFGlue:
         self.mbf = mbf
         self.rebal_mgr = rebal_mgr
         cfg = getattr(rm, "cfg", None)
+        rm_cfg = getattr(cfg, "rm", cfg)
 
         # vue par défaut: prod → real ; dry-run → merged
         default_mode = "merged" if bool(getattr(cfg, "dry_run", False)) else "real"
@@ -14377,6 +14632,7 @@ class _RM_MBFGlue:
 
         # fréquence de push vers rebal manager
         self.poll_s = float(getattr(cfg, "rm_balance_poll_s", 3.0))
+        self.stop_timeout_s = float(getattr(rm_cfg, "mbf_glue_stop_timeout_s", 1.0))
         self.task = None
 
     # --- lectures ---
@@ -14473,9 +14729,13 @@ class _RM_MBFGlue:
         if t:
             t.cancel()
             try:
-                await t
-            except Exception:
+                await asyncio.wait_for(t, timeout=float(self.stop_timeout_s or 1.0))
+            except asyncio.TimeoutError:
+                log_rm_mbf.warning("RM×MBF glue stop timeout (%.2fs)", float(self.stop_timeout_s or 1.0))
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                log_rm_mbf.exception("RM×MBF glue stop failed")
         self.task = None
 
 

@@ -23,6 +23,7 @@ Dépendances:
 from __future__ import annotations
 import asyncio
 import json
+import contextlib
 import ssl
 import time
 import random
@@ -36,7 +37,7 @@ except Exception as e:  # pragma: no cover
 
 from modules.bot_config import BotConfig
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
-
+from contracts.payloads import validate_submit_bundle_lite, validate_cancel_lite
 import modules.obs_metrics as obs  # on accède par getattr avec fallback no-op
 
 
@@ -48,8 +49,24 @@ class _NoopMetric:
     def inc(self, *a, **k): return None
     def set(self, *a, **k): return None
 
+    def time(self):
+        import contextlib
+        return contextlib.nullcontext()
+
+_METRICS_DISABLED_LOGGED = False
+
 def _get_metric(name: str):
-    return getattr(obs, name, _NoopMetric())
+    global _METRICS_DISABLED_LOGGED
+    metric = getattr(obs, name, None)
+    if metric is None:
+        if not _METRICS_DISABLED_LOGGED:
+            _METRICS_DISABLED_LOGGED = True
+            try:
+                print("[rpc_gateway] metrics disabled/no-op")
+            except Exception:
+                pass
+        return _NoopMetric()
+    return metric
 
 def _observe(metric, value: float, **labels):
     try:
@@ -83,7 +100,7 @@ RPC_ERR_TOTAL = _get_metric("RPC_ERR_TOTAL")
 RPC_RETRIES_TOTAL = _get_metric("RPC_RETRIES_TOTAL")
 # Canon P0: RPC_PAYLOAD_REJECTED_TOTAL a le label ["model"]
 RPC_PAYLOAD_REJECTED_TOTAL = _get_metric("RPC_PAYLOAD_REJECTED_TOTAL")
-
+RPC_METRICS_DISABLED_TOTAL = _get_metric("RPC_METRICS_DISABLED_TOTAL")
 
 
 # ---------- Idempotency store (TTL) ----------
@@ -93,10 +110,10 @@ class _TTLIdempotencyStore:
     def __init__(self, maxsize: int = 10000, ttl_s: int = 600):
         self._maxsize = maxsize
         self._ttl_s = ttl_s
-        self._store: Dict[str, float] = {}
+        self._store: Dict[str, tuple[float, Optional[dict]]] = {}
         self._lock = asyncio.Lock()
 
-    async def seen(self, key: str) -> bool:
+    async def peek(self, key: str) -> tuple[bool, Optional[dict]]:
         now = time.time()
         async with self._lock:
             # GC opportuniste
@@ -106,13 +123,17 @@ class _TTLIdempotencyStore:
                 for k in expired[: self._maxsize // 10 or 1]:
                     self._store.pop(k, None)
             # check
-            t = self._store.get(key)
-            if t and t > now:
-                return True
-            # mark
-            self._store[key] = now + self._ttl_s
-            return False
+                entry = self._store.get(key)
+                if entry:
+                    exp, resp = entry
+                    if exp > now:
+                        return True, resp
+                return False, None
 
+    async def mark(self, key: str, response: Optional[dict] = None) -> None:
+        now = time.time()
+        async with self._lock:
+            self._store[key] = (now + self._ttl_s, response)
 
 # ---------- Handlers interface ----------
 
@@ -201,21 +222,34 @@ class RPCServer:
         self._site = None
         self._idem = _TTLIdempotencyStore(maxsize=20000, ttl_s=600)
         self._lhm = lhm  # <= LoggerHistoriqueManager (facultatif)
-        self._admin_token = admin_token  # <= protège /eod/run ; sinon open-readonly
+        self._admin_enabled = getattr_bool(cfg, "rpc_admin_enabled", False)
+        self._admin_token = admin_token or getattr_str(cfg, "rpc_admin_token", None)
+        self._strict_validation = getattr_bool(cfg, "rpc_strict_validation", False)
+        self._status_handler = None
 
     # ---------- API wrappers (conformes à la spec, utiles en tests) ----------
     async def submit_bundle(self, payload: dict) -> dict:
         # Idempotence côté API directe (tests) : on réutilise la même logique que les handlers HTTP
         key = self._derive_idem_key_from_payload(payload)
-        if key and await self._idem.seen(key):
-            return {"replayed": True}
-        return await self.handlers.submit_bundle(payload)
+        if key:
+            seen, resp = await self._idem.peek(key)
+            if seen:
+                return resp or {"replayed": True}
+        res = await self.handlers.submit_bundle(payload)
+        if key:
+            await self._idem.mark(key, res)
+        return res
 
     async def cancel(self, payload: dict) -> dict:
         key = self._derive_idem_key_from_payload(payload)
-        if key and await self._idem.seen(key):
-            return {"replayed": True}
-        return await self.handlers.cancel(payload)
+        if key:
+            seen, resp = await self._idem.peek(key)
+            if seen:
+                return resp or {"replayed": True}
+        res = await self.handlers.cancel(payload)
+        if key:
+            await self._idem.mark(key, res)
+        return res
 
     async def status(self, req: dict) -> dict:
         return await self.handlers.status(req or {})
@@ -236,11 +270,20 @@ class RPCServer:
             web.post("/rpc/cancel", self._wrap_idempotent(self._handle_cancel)),
             web.post("/rpc/status", self._handle_status),
             web.get("/rpc/stream", self._handle_stream_sse),
-            web.get("/pnl/funnel", self._handle_pnl_funnel),
-            web.get("/logs/replay", self._handle_logs_replay),
-            web.post("/eod/run", self._handle_eod_run),
+
 
         ])
+        if self._admin_enabled and self._admin_token:
+            app.add_routes([
+                web.get("/pnl/funnel", self._handle_pnl_funnel),
+                web.get("/logs/replay", self._handle_logs_replay),
+                web.post("/eod/run", self._handle_eod_run),
+            ])
+        if getattr(self, "_status_handler", None):
+            try:
+                app.router.add_get("/status", self._status_handler)
+            except Exception:
+                pass
         self._app = app
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
@@ -267,8 +310,8 @@ class RPCServer:
         try:
             if route and getattr(route, "resource", None):
                 method = str(route.resource.canonical)
-            elif request.path_qs:
-                method = request.path_qs
+            elif request.path:
+                method = request.path
             method = method.replace("/rpc/", "") if "/rpc/" in method else method
         except Exception:
             method = "unknown"
@@ -281,12 +324,19 @@ class RPCServer:
             return resp
         except web.HTTPException as e:
             _inc(RPC_ERR_TOTAL, 1.0, code=str(e.status), method=method, region=self.settings.region)
-            raise
-        except Exception:
-            _inc(RPC_ERR_TOTAL, 1.0, code="500", method=method, region=self.settings.region)
-            raise
+            payload = {
+                "ok": False,
+                "error": {"code": str(e.status), "message": (e.text or e.reason or "http_error")},
+            }
+            return web.json_response(payload, status=e.status)
+        except Exception as e:
+            code = type(e).__name__ or "exception"
+            _inc(RPC_ERR_TOTAL, 1.0, code=code, method=method, region=self.settings.region)
+            payload = {"ok": False, "error": {"code": code, "message": str(e) or code}}
+            return web.json_response(payload, status=500)
 
     async def _handle_pnl_funnel(self, request):
+        self._require_admin(request)
         if not self._lhm:
             raise web.HTTPServiceUnavailable(text="LHM unavailable")
         try:
@@ -299,6 +349,7 @@ class RPCServer:
         return web.json_response(res)
 
     async def _handle_logs_replay(self, request):
+        self._require_admin(request)
         if not self._lhm:
             raise web.HTTPServiceUnavailable(text="LHM unavailable")
         q = request.rel_url.query
@@ -312,12 +363,10 @@ class RPCServer:
         return web.json_response({"kind": kind, "day": day, "limit": limit, "rows": rows})
 
     async def _handle_eod_run(self, request):
+        self._require_admin(request)
         if not self._lhm:
             raise web.HTTPServiceUnavailable(text="LHM unavailable")
-        # petit garde-fou: token d’admin optionnel (header ou query)
-        token = request.headers.get("X-Admin-Token") or request.rel_url.query.get("token")
-        if self._admin_token and token != self._admin_token:
-            raise web.HTTPUnauthorized(text="missing/invalid admin token")
+
         try:
             body = await self._read_json(request, method="eod_run", required=False) or {}
             pem_path = body.get("sign_priv_pem_path")
@@ -336,17 +385,7 @@ class RPCServer:
         self._boot_ref = boot
         # l'attribut self.app doit exister avant runner.setup(); s'il n'existe pas
         # encore dans ton implémentation, crée-le ici de façon conservatrice.
-        try:
-            from aiohttp import web
-        except Exception as e:
-            # Si aiohttp indisponible, on degrade silencieusement.
-            self._status_route_error = f"aiohttp missing: {e!r}"
-            return
 
-        app = getattr(self, "app", None)
-        if app is None:
-            self.app = web.Application()
-            app = self.app
 
         async def _handle_status(req):
             boot = getattr(self, "_boot_ref", None)
@@ -378,20 +417,18 @@ class RPCServer:
             # Optionnel: si tu stockes un buffer d'événements en mémoire,
             # expose-le ici; sinon on renvoie juste le statut.
             return web.json_response({"boot": st})
-        
-        # éviter double-registration
-        try:
-            app.router.add_get("/status", _handle_status)
-        except Exception:
-            # déjà enregistré ou app non routable: on ignore
-            pass
+
+        self._status_handler = _handle_status
 
     def _wrap_idempotent(self, fn: Callable):
         async def inner(request):
             # Ici : check rapide sur headers uniquement (pour ne pas consommer le body prématurément)
             idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-            if idem and await self._idem.seen(idem):
-                return web.json_response({"replayed": True}, headers={"X-Idempotent-Replay": "1"})
+            if idem:
+                seen, cached = await self._idem.peek(idem)
+                if seen:
+                    return web.json_response(cached or {"replayed": True}, headers={"X-Idempotent-Replay": "1"})
+
             return await fn(request)
 
         return inner
@@ -406,13 +443,13 @@ class RPCServer:
         if body is None:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
             raise web.HTTPBadRequest(text="invalid JSON")
-        # Idempotence: headers d’abord (wrapper), puis fallback body
+        body = self._validate_submit_payload(body)
         idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
         if not idem:
             idem = self._derive_idem_key_from_payload(body)
-        if idem and await self._idem.seen(idem):
-            return web.json_response({"replayed": True}, headers={"X-Idempotent-Replay": "1"})
         res = await self.handlers.submit_bundle(body)
+        if idem:
+            await self._idem.mark(idem, res)
         return web.json_response(res)
 
     async def _handle_cancel(self, request: web.Request):
@@ -420,12 +457,13 @@ class RPCServer:
         if body is None:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
             raise web.HTTPBadRequest(text="invalid JSON")
+        body = self._validate_cancel_payload(body)
         idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
         if not idem:
             idem = self._derive_idem_key_from_payload(body)
-        if idem and await self._idem.seen(idem):
-            return web.json_response({"replayed": True}, headers={"X-Idempotent-Replay": "1"})
         res = await self.handlers.cancel(body)
+        if idem:
+            await self._idem.mark(idem, res)
         return web.json_response(res)
 
     async def _handle_status(self, request: web.Request):
@@ -443,10 +481,20 @@ class RPCServer:
             headers={'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'}
         )
         await response.prepare(request)
-        async for item in self.handlers.stream({}):
-            line = f"data: {json.dumps(item, separators=(',',':'))}\n\n"
-            await response.write(line.encode("utf-8"))
-        await response.write_eof()
+        try:
+            async for item in self.handlers.stream({}):
+                line = f"data: {json.dumps(item, separators=(',', ':'))}\n\n"
+                try:
+                    await response.write(line.encode("utf-8"))
+                except (asyncio.CancelledError, ConnectionResetError):
+                    break
+                except Exception:
+                    break
+                await response.drain()
+        finally:
+            with contextlib.suppress(Exception):
+                await response.write_eof()
+
         return response
 
     # ----- utils -----
@@ -460,6 +508,35 @@ class RPCServer:
         except Exception:
             _inc(RPC_ERR_TOTAL, 1.0, code="400", method=method, region=self.settings.region)
             return None
+
+    def _validate_submit_payload(self, body: dict) -> dict:
+        try:
+            model = validate_submit_bundle_lite(body)
+            data = model.model_dump() if hasattr(model, "model_dump") else getattr(model, "dict", lambda **_: {})(
+                exclude_none=False)
+            if self._strict_validation:
+                return data
+            return data
+        except Exception:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="SubmitBundleRequest")
+            raise web.HTTPBadRequest(text="invalid submit_bundle payload")
+
+    def _validate_cancel_payload(self, body: dict) -> dict:
+        try:
+            model = validate_cancel_lite(body)
+            data = model.model_dump() if hasattr(model, "model_dump") else getattr(model, "dict", lambda **_: {})(
+                exclude_none=False)
+            return data
+        except Exception:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="CancelRequest")
+            raise web.HTTPBadRequest(text="invalid cancel payload")
+
+    def _require_admin(self, request: web.Request) -> None:
+        if not self._admin_enabled:
+            raise web.HTTPForbidden(text="admin endpoints disabled")
+        token = request.headers.get("X-Admin-Token") or request.rel_url.query.get("token")
+        if not self._admin_token or token != self._admin_token:
+            raise web.HTTPUnauthorized(text="missing/invalid admin token")
 
     def _derive_idem_key_from_payload(self, body: Optional[dict]) -> Optional[str]:
         """

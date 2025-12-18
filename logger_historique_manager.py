@@ -424,6 +424,8 @@ class LoggerHistoriqueManager:
         self._disk_alert_warn_pct = float(getattr(L, "LHM_DISK_WARN_PCT", 70.0))
         self._disk_alert_crit_pct = float(getattr(L, "LHM_DISK_CRIT_PCT", 85.0))
         self._last_storage_alert_level = None  # None|"WARN"|"ERROR"
+        self._last_storage_alert_ts: float | None = None
+        self._storage_alert_cooldown_s = float(getattr(L, "LHM_STORAGE_ALERT_COOLDOWN_S", 60.0))
 
         # Watchdogs/rotation DB (métriques globales + bornes taille/âge)
         # - LHM_DB_MAX_BYTES: garde-fou sur la taille maximale du fichier .db courant.
@@ -505,6 +507,10 @@ class LoggerHistoriqueManager:
         stream_prefix = f"{self._db_name}-{self._pod_region}".replace(" ", "_")
 
         self._jsonl: dict[str, _JsonlRotator] = {
+            "events": _JsonlRotator(self._jsonl_dir, f"{stream_prefix}-events",
+                                    max_bytes=self._jsonl_max_bytes, max_age_s=self._jsonl_max_age_s),
+            "errors": _JsonlRotator(self._jsonl_dir, f"{stream_prefix}-errors",
+                                    max_bytes=self._jsonl_max_bytes, max_age_s=self._jsonl_max_age_s),
             "rm_decisions": _JsonlRotator(self._jsonl_dir, f"{stream_prefix}-rm_decisions",
                                           max_bytes=self._jsonl_max_bytes, max_age_s=self._jsonl_max_age_s),
             "engine_submits": _JsonlRotator(self._jsonl_dir, f"{stream_prefix}-engine_submits",
@@ -536,6 +542,8 @@ class LoggerHistoriqueManager:
 
         # -------- Backpressure & priorité de streams --------------
         self._stream_priority = [
+            "events",  # Haute priorité (path complet BTL)
+            "errors",  # Haute priorité (alerte)
             "fills_normalized",   # P0 (critique: jamais droppé)
             "engine_acks",        # P1
             "engine_submits",     # P2
@@ -547,9 +555,8 @@ class LoggerHistoriqueManager:
         ]
         self._stream_critical = {"fills_normalized": True}
 
-        # Files bornées par stream + suivi plateau
-        self._q_streams = {name: asyncio.Queue(maxsize=self._q_stream_max) for name in self._jsonl.keys()}
-        self._plateau_since = {name: 0.0 for name in self._jsonl.keys()}
+        # Files bornées par stream + suivi plateau (initialisé au start)
+        self._plateau_since: dict[str, float] = {name: 0.0 for name in self._jsonl.keys()}
         self._streams_task = None
 
         # (Compat) structures simples héritées
@@ -688,30 +695,7 @@ class LoggerHistoriqueManager:
 
         # 3) Barrière JSONL (best-effort, timeboxed) : laisse le worker vider les queues
         try:
-            deadline = time.perf_counter() + 2.0
-            streams = getattr(self, "_jsonl_streams", {}) or {}
-            streams_task = getattr(self, "_streams_task", None)
-            prio = ["events", "errors"]
-
-            while time.perf_counter() < deadline:
-                pending = 0
-                for q_rot in streams.values():
-                    try:
-                        q, _rot = q_rot
-                        pending += int(q.qsize())
-                    except Exception:
-                        pass
-
-                if pending <= 0:
-                    break
-
-                # Si le worker n'est pas actif, on draine nous-mêmes (sans concurrence)
-                if not streams_task or streams_task.done():
-                    drained = await self._drain_stream_once(prio)
-                    if not drained:
-                        break
-                else:
-                    await asyncio.sleep(0.01)
+            await self._jsonl_barrier(timeout_s=2.0)
         except Exception:
             logger.exception("stop: jsonl drain barrier failed")
 
@@ -887,11 +871,15 @@ class LoggerHistoriqueManager:
 
     async def _db_lane_call(self, op: str, payload: Any, *, timeout_s: float = 30.0) -> Any:
         if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
-            # fallback direct
-            if op == "finalize_day":
-                return await asyncio.to_thread(self._writer.finalize_day, **(payload or {}))
-            if op == "pair_history":
-                return await asyncio.to_thread(self._writer.write_pair_history, payload)
+            # fallback direct (best-effort)
+            try:
+                if op == "finalize_day":
+                    return await asyncio.to_thread(self._writer.finalize_day, **(payload or {}))
+                if op == "pair_history":
+                    return await asyncio.to_thread(self._writer.write_pair_history, payload)
+            except Exception as exc:  # noqa: PERF203
+                logger.exception("DB lane direct call failed: %s", op)
+                return {"status": "ERROR", "op": str(op), "err": str(exc)}
             return None
 
         loop = asyncio.get_running_loop()
@@ -899,7 +887,14 @@ class LoggerHistoriqueManager:
         q: asyncio.Queue = self._db_lane_q  # type: ignore
         await q.put(("call", str(op), payload, fut))
         self._db_lane_try_metric_depth()
-        return await asyncio.wait_for(fut, timeout=timeout_s)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            logger.warning("DB lane call timeout: %s", op)
+            return {"status": "ERROR", "op": str(op), "err": "timeout"}
+        except Exception as exc:  # noqa: PERF203
+            logger.exception("DB lane call failed: %s", op)
+            return {"status": "ERROR", "op": str(op), "err": str(exc)}
 
     async def _db_lane_barrier(self, *, timeout_s: float = 10.0) -> None:
         if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
@@ -974,40 +969,40 @@ class LoggerHistoriqueManager:
                     LOGGERH_WRITE_MS.observe(dt_ms)
                 except Exception:
                     pass
-                if fut is not None and not fut.done():
-                    fut.set_result(res)
+
             except Exception as e:
                 logger.exception("DB lane op failed: %s", op)
-                if fut is not None and not fut.done():
-                    fut.set_exception(e)
+                res = {"status": "ERROR", "op": str(op), "err": str(e)}
             finally:
+                if fut is not None and not fut.done():
+                    try:
+                        fut.set_result(res)
+                    except Exception:
+                        # Last resort: ensure caller does not crash
+                        try:
+                            fut.set_result({"status": "ERROR", "op": str(op), "err": "fut_set_failed"})
+                        except Exception:
+                            pass
                 self._db_lane_try_metric_depth()
 
 
     def _init_jsonl_streams(self, *, base_dir: str | None = None, max_bytes: int = 50 * (1 << 20),
                             max_age_s: int = 3600) -> None:
         """
-        Initialise deux streams JSONL: 'events' et 'errors' avec leurs queues.
-        Idempotent.
+        Initialise l'ensemble des streams JSONL (events/errors + streams métier) avec une file bornée.
         """
         if getattr(self, "_jsonl_streams", None):
             return
-        import asyncio, queue
-        base_dir = base_dir or os.path.join(os.getcwd(), "logs", "jsonl")
-        os.makedirs(base_dir, exist_ok=True)
-        self._jsonl_streams = {}
-        for stream in ("events", "errors"):
-            q: asyncio.Queue = asyncio.Queue(maxsize=10000)
-            rot = _JsonlRotator(os.path.join(base_dir, stream), stream, max_bytes=max_bytes, max_age_s=max_age_s)
-            self._jsonl_streams[stream] = (q, rot)
+        streams: dict[str, tuple[asyncio.Queue, _JsonlRotator]] = {}
+        for name, rot in self._jsonl.items():
+            q: asyncio.Queue = asyncio.Queue(maxsize=self._q_stream_max)
+            streams[name] = (q, rot)
             try:
-                lhm_set_queue_size(stream, q.qsize())
+                lhm_set_queue_size(name, q.qsize())
+                set_lhm_queue(sum((qq.qsize() for qq, _ in streams.values())), self._jsonl_queue_cap)
             except Exception:
                 pass
-            try:
-                set_lhm_queue(0, self._jsonl_queue_cap)
-            except Exception:
-                pass
+        self._jsonl_streams = streams
 
 
     def forensic_verify(self, limit_lines: int | None = None) -> bool:
@@ -1045,11 +1040,14 @@ class LoggerHistoriqueManager:
             return
 
         async def _runner():
-            # ordre de priorité : events > errors (modifiable)
-            prio = ["events", "errors"]
+            order = list(self._stream_priority)
+            streams = getattr(self, "_jsonl_streams", {}) or {}
+            for name in streams.keys():
+                if name not in order:
+                    order.append(name)
             while self._running:
                 try:
-                    drained = await self._drain_stream_once(prio)
+                    drained = await self._drain_stream_once(order)
                     if not drained:
                         await asyncio.sleep(0.01)
                 except asyncio.CancelledError:
@@ -1070,18 +1068,15 @@ class LoggerHistoriqueManager:
         if not streams:
             return
 
-        order = prio or ["events", "errors"]
+        order = prio or list(self._stream_priority)
+        for name in streams.keys():
+            if name not in order:
+                order.append(name)
         deadline = time.perf_counter() + float(timeout_s)
         worker = getattr(self, "_streams_task", None)
 
         while time.perf_counter() < deadline:
-            pending = 0
-            for q_rot in streams.values():
-                try:
-                    q, _rot = q_rot
-                    pending += int(q.qsize())
-                except Exception:
-                    pass
+            pending = sum(int(q.qsize()) for q, _ in streams.values())
 
             if pending <= 0:
                 return
@@ -1095,6 +1090,11 @@ class LoggerHistoriqueManager:
                 continue
 
             await asyncio.sleep(0.01)
+            # timeout atteint → comptage des drops best-effort
+        for name, (q, _rot) in streams.items():
+            if q.qsize() > 0:
+                self._drop_stream_record(name, reason="drain_timeout")
+        logger.warning("jsonl_barrier: drain timeout with pending items")
 
     async def _drain_stream_once(self, order: list[str]) -> bool:
         """
@@ -1105,7 +1105,7 @@ class LoggerHistoriqueManager:
         if not streams:
             return False
         wrote_any = False
-        per_tick_budget = 500
+        per_tick_budget = int(getattr(self, "_stream_batch", 500)) or 500
         for name in order:
             q_rot = streams.get(name)
             if not q_rot:
@@ -1153,7 +1153,7 @@ class LoggerHistoriqueManager:
                         set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
                     except Exception:
                         pass
-
+                    self._maybe_plateau(name, q)
 
                 except Exception:
 
@@ -1829,7 +1829,7 @@ class LoggerHistoriqueManager:
         # Publie la nouvelle tête de forensic chain (projection numérique)
         set_forensic_head_numeric(self._forensic_head)
 
-    def _enqueue_jsonl(self, stream: str, payload: dict) -> None:
+    async def _enqueue_jsonl(self, stream: str, payload: dict, *, is_critical: bool | None = None) -> None:
         """
         Enqueue best-effort dans une stream JSONL pré-enveloppée.
         """
@@ -1838,19 +1838,23 @@ class LoggerHistoriqueManager:
         if not q_rot:
             return
         q, _rot = q_rot
+        critical = False
 
         try:
-            log_type = str(payload.get("log_type") or "").lower()
-            inner = payload.get("payload") or {}
-            kind = str(inner.get("event_type") or inner.get("kind") or "").lower()
-            is_critical = (
-                log_type in ("trades", "balances", "balance_snapshots")
-                or kind.startswith("rm.")
-                or kind.startswith("engine.")
-                or kind.startswith("balance.")
-            )
+            if is_critical is None:
+                log_type = str(payload.get("log_type") or "").lower()
+                inner = payload.get("payload") or {}
+                kind = str(inner.get("event_type") or inner.get("kind") or "").lower()
+                critical = (
+                        log_type in ("trades", "balances", "balance_snapshots")
+                        or kind.startswith("rm.")
+                        or kind.startswith("engine.")
+                        or kind.startswith("balance.")
+                )
+            else:
+                critical = bool(is_critical)
         except Exception:
-            is_critical = False
+            critical = bool(is_critical)
 
         try:
             q.put_nowait(payload)
@@ -1860,17 +1864,25 @@ class LoggerHistoriqueManager:
                 set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
             except Exception:
                 pass
-        except Exception:
-            # File pleine → drop (reason obligatoire, metrics best-effort)
-            try:
-                lhm_on_dropped(stream, "queue_full")
-            except Exception:
+                return
+            except asyncio.QueueFull:
                 pass
-            if is_critical:
+
+            if critical and not getattr(self, "_drop_when_full", True):
                 try:
-                    self._critical_drop_seen = True
+
+                    await asyncio.wait_for(q.put(payload), timeout=0.05)
+                    return
                 except Exception:
                     pass
+
+        self._drop_stream_record(stream, reason="queue_full")
+        if critical:
+            try:
+                self._critical_drop_seen = True
+            except Exception:
+                pass
+
 
 
     async def _on_event_sink(self, log_type: str, entries: list[dict]) -> None:
@@ -1932,7 +1944,7 @@ class LoggerHistoriqueManager:
 
             # JSONL parallèle “events” via enveloppe canonique
             envelope = self._build_envelope("events", e, log_type=log_type)
-            self._enqueue_jsonl("events", envelope)
+            await self._enqueue_jsonl("events", envelope)
 
         # Écriture DB (thread → pas de blocage loop)
         # Écriture DB via DB lane (single-writer, non bloquant)
@@ -1952,7 +1964,8 @@ class LoggerHistoriqueManager:
                 self._storage_error_seen = True
             except Exception:
                 pass
-            self._enqueue_jsonl(
+            await self._enqueue_jsonl(
+                "errors",
                 self._build_envelope(
                     "errors",
                     {"payload": enriched, "err": "db_write_failed"},
@@ -2202,7 +2215,7 @@ class LoggerHistoriqueManager:
                 "meta": meta,
             }
         try:
-            self._enqueue_jsonl(
+            await self._enqueue_jsonl(
                 "events",
                 self._build_envelope(
                     "events",
@@ -3327,8 +3340,22 @@ class LoggerHistoriqueManager:
             elif pct >= self._disk_alert_warn_pct:
                 level = "WARN"
 
-            if level and level != self._last_storage_alert_level:
-                STORAGE_ALERTS_TOTAL.labels(level=level).inc()
+            should_alert = False
+            now = time.time()
+            if level:
+                if self._last_storage_alert_ts is None:
+                    should_alert = True
+                elif level != self._last_storage_alert_level:
+                    if (now - self._last_storage_alert_ts) >= float(self._storage_alert_cooldown_s):
+                        should_alert = True
+                elif (now - self._last_storage_alert_ts) >= float(self._storage_alert_cooldown_s):
+                    should_alert = True
+
+            if level and should_alert:
+                try:
+                    STORAGE_ALERTS_TOTAL.labels(kind=level).inc()
+                except Exception:
+                    pass
                 await self.record_alert(
                     "LoggerHistorique", level,
                     "storage_usage_threshold_crossed",
@@ -3341,6 +3368,7 @@ class LoggerHistoriqueManager:
                 else:
                     logger.warning('{"loggerh":"storage_warn","pct":%.2f,"mount":"%s"}', pct, mount)
                 self._last_storage_alert_level = level
+                self._last_storage_alert_ts = now
             if not level:
                 self._last_storage_alert_level = None
         except Exception:
@@ -3492,7 +3520,7 @@ class LoggerHistoriqueManager:
         try:
             streams = getattr(self, "_jsonl_streams", {}) or {}
             if streams:
-                await self._jsonl_barrier(timeout_s=2.0, prio=["events", "errors"])
+                await self._jsonl_barrier(timeout_s=2.0)
         except Exception:
             logger.exception("flush_now: JSONL drain failed")
 
@@ -3801,8 +3829,7 @@ class LoggerHistoriqueManager:
     # ---- helper commun
     async def _append_jsonl(self, stream: str, payload: Dict[str, Any], *, id_key: str) -> None:
         try:
-            if stream not in self._q_streams:
-                return
+
             ts_ns = int(time.time_ns())
             obj = self._with_context_tags(dict(payload or {}))
             ev_id = str(obj.get(id_key) or obj.get("id") or obj.get("client_order_id") or ts_ns)
@@ -3810,18 +3837,7 @@ class LoggerHistoriqueManager:
             obj.setdefault("type", stream)
             obj.setdefault("id", ev_id)
 
-            q = self._q_streams[stream]
-            try:
-                q.put_nowait(obj)
-                # NOTE: on n'incrémente PAS ici *INGESTED* (ça comptera au flush disque)
-            except asyncio.QueueFull:
-                if self._stream_critical.get(stream):
-                    try:
-                        await asyncio.wait_for(q.put(obj), timeout=0.05)
-                    except Exception:
-                        self._drop_stream_record(stream)
-                else:
-                    self._drop_stream_record(stream)
+            await self._enqueue_jsonl(stream, obj, is_critical=self._stream_critical.get(stream, False))
         except Exception:
             logger.exception("_append_jsonl enqueue failed (%s)", stream)
 
@@ -3833,36 +3849,6 @@ class LoggerHistoriqueManager:
         except Exception:
             pass
         # pas de log spammy; laisse Prometheus raconter l'histoire
-
-    async def _loop_streams(self) -> None:
-        """
-        Écrit les streams JSONL en *round-robin* prioritaire, par rafales.
-        Surveille les tailles de files et détecte les plateaux (hi-watermark prolongé).
-        """
-        try:
-            while True:
-                idle = True
-                # ordre de priorité strict
-                for name in self._stream_priority:
-                    q = self._q_streams.get(name)
-                    if not q or q.empty():
-                        continue
-                    idle = False
-                    await self._drain_stream_once(name, q, self._stream_batch)
-                    # export gauge de taille
-                    try:
-                        LHM_JSONL_QUEUE_SIZE.labels(stream=name).set(q.qsize())
-                    except Exception:
-                        pass
-                    # plateau ?
-                    self._maybe_plateau(name, q)
-                if idle:
-                    await asyncio.sleep(0.02)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("_loop_streams crashed; will exit")
-
 
     async def _drain_all_streams_once(self) -> None:
         """
@@ -4105,7 +4091,11 @@ class LoggerHistoriqueManager:
                 envelope = self._build_envelope(
                     "events", obj, log_type="rotation_decision", event_type="rotation_decision"
                 )
-                self._enqueue_jsonl("events", envelope)
+                try:
+                    asyncio.get_running_loop().create_task(self._enqueue_jsonl("events", envelope))
+                except RuntimeError:
+                    # Aucun loop en cours : best-effort sans bloquer
+                    asyncio.get_event_loop().create_task(self._enqueue_jsonl("events", envelope))
             except Exception:
                 # On ne veut surtout pas que l'absence de JSONL casse le hot-path
                 logger.exception("log_rotation_decision: jsonl enqueue failed")

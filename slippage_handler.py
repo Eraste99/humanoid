@@ -42,6 +42,7 @@ try:
         SLIP_P99_BPS,
         set_slip_age_seconds,
         note_slip_ttl_seconds,
+        note_slip_drop,
     )
 except Exception:  # pragma: no cover
 
@@ -73,6 +74,8 @@ except Exception:  # pragma: no cover
     def note_slip_ttl_seconds(*_, **__):
         return None
 
+    def note_slip_drop(*_, **__):
+        return None
 
 # ----------------------------- Frais dynamiques -----------------------------
 class _FeeSchedule:
@@ -236,6 +239,13 @@ class SlippageHandler:
     @staticmethod
     def _norm_pair(pk: str) -> str:
         return (pk or "").replace("-", "").upper()
+
+    @staticmethod
+    def _note_drop(reason: str, exchange: str, pair: str) -> None:
+        try:
+            note_slip_drop(reason, exchange)
+        except Exception:
+            pass
 
     def _infer_quote(self, symbol: str) -> Optional[str]:
         sym = self._norm_pair(symbol)
@@ -606,6 +616,10 @@ class SlippageHandler:
         vals = [v for v in vals if v is not None]
         return (sum(vals) / len(vals)) if vals else None
 
+    def get_slippage_fraction(self, exchange: str, symbol: str, side: Optional[str] = None) -> Optional[float]:
+        """Alias explicite (fraction 0..1) pour différencier de la version bps TTL."""
+        return self.get_slippage(exchange, symbol, side)
+
     def get_all_slippages(self) -> Dict[str, Dict[str, Dict[str, Optional[float]]]]:
         return self.slippage_data
 
@@ -763,6 +777,7 @@ class SlippageHandler:
             ex = self._norm_ex(msg.get("exchange"))
             pair = self._norm_pair(msg.get("pair_key") or msg.get("symbol") or "")
             if not ex or not pair:
+                self._note_drop("missing_fields", ex or "UNKNOWN", pair or "UNKNOWN")
                 return
 
             ob = (msg.get("orderbook") or {})
@@ -772,8 +787,11 @@ class SlippageHandler:
             best_ask = float(msg.get("best_ask") or (asks[0][0] if asks else 0.0))
             top_bid_vol = float(msg.get("top_bid_vol") or 0.0)
             top_ask_vol = float(msg.get("top_ask_vol") or 0.0)
+            has_book = bool(bids and asks)
+            best_prices_valid = best_bid > 0 and best_ask > best_bid
 
             slip_buy_bps: Optional[float] = None
+
             slip_sell_bps: Optional[float] = None
             slip_metric = msg.get("slip_metric_bps")
             if isinstance(slip_metric, dict):
@@ -786,6 +804,9 @@ class SlippageHandler:
                 slip_buy_bps = slip_sell_bps = val
 
             if slip_buy_bps is None or slip_sell_bps is None:
+                if not has_book:
+                    self._note_drop("no_book", ex, pair)
+                    return
                 self.ingest_snapshot(
                     exchange=ex,
                     symbol=pair,
@@ -799,40 +820,54 @@ class SlippageHandler:
                 if slip_sell_bps is None and snap.get("sell") is not None:
                     slip_sell_bps = max(0.0, float(snap.get("sell"))) * 1e4
 
-            if (slip_buy_bps is None or slip_sell_bps is None) and best_bid > 0 and best_ask > best_bid:
+            if (slip_buy_bps is None or slip_sell_bps is None) and not best_prices_valid:
+                self._note_drop("invalid_prices", ex, pair)
+                return
+
+            if (slip_buy_bps is None or slip_sell_bps is None) and best_prices_valid:
                 approx = (best_ask - best_bid) / max(best_bid, 1e-12) * 1e4
                 if slip_buy_bps is None:
                     slip_buy_bps = approx
                 if slip_sell_bps is None:
                     slip_sell_bps = approx
 
-                if slip_buy_bps is None and slip_sell_bps is None:
-                    logger.debug("[Slip] missing data for %s/%s", ex, pair)
-                    return
+            if slip_buy_bps is None and slip_sell_bps is None:
+                self._note_drop("no_slippage", ex, pair)
+                logger.debug("[Slip] missing data for %s/%s", ex, pair)
+                return
 
-                # Mise à jour du cache TTL (source unique pour get_slippage_bps)
-                self._slip_bps = getattr(self, "_slip_bps", {})
-                self._slip_ts = getattr(self, "_slip_ts", {})
-                now_s = time.time()
+            self._slip_bps = getattr(self, "_slip_bps", {})
+            self._slip_ts = getattr(self, "_slip_ts", {})
+            now_s = time.time()
+            if slip_buy_bps is not None:
+                self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
+            if slip_sell_bps is not None:
+                self._slip_bps[(ex, pair, "sell")] = float(slip_sell_bps)
+            self._slip_ts[(ex, pair)] = now_s
+
+            try:
+                event_ts_ms = (
+                        msg.get("recv_ts_ms")
+                        or msg.get("ts_ms")
+                        or msg.get("exchange_ts_ms")
+                        or msg.get("ts_ex_ms")
+                        or 0
+                )
+                event_age_s = max(0.0, now_s - float(event_ts_ms) / 1000.0) if event_ts_ms else 0.0
+
                 if slip_buy_bps is not None:
-                    self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
+                    set_slip_age_seconds(pair, ex, "buy", event_age_s)
                 if slip_sell_bps is not None:
-                    self._slip_bps[(ex, pair, "sell")] = float(slip_sell_bps)
-                self._slip_ts[(ex, pair)] = now_s
-
-                # Observabilité P0 : âge du dernier point de slippage par pair/exchange/side
-                try:
-                    age_s = 0.0  # âge "au moment de l’ingestion" (référence pour les SLO P0)
-                    if slip_buy_bps is not None:
-                        set_slip_age_seconds(pair, ex, "buy", age_s)
-                    if slip_sell_bps is not None:
-                        set_slip_age_seconds(pair, ex, "sell", age_s)
-                except Exception:
-                    # best-effort, ne doit jamais casser le flux marché public
-                    pass
+                   set_slip_age_seconds(pair, ex, "sell", event_age_s)
+            except Exception:
+                pass
 
         except Exception:
             logging.exception("[Slip] on_slip error")
+            try:
+                self._note_drop("parse_error", msg.get("exchange", "UNKNOWN"), msg.get("pair_key", "UNKNOWN"))
+            except Exception:
+                pass
 
     # slippage_handler.py
     def get_slippage_bps(
@@ -916,7 +951,16 @@ class SlippageHandler:
         return float(v) if age <= ttl else None
 
 
-    def detach_bus_consumers(self) -> None:
-        for ex, t in list(self._bus_tasks.items()):
-            t.cancel()
+    async def detach_bus_consumers(self) -> None:
+        tasks = list(self._bus_tasks.values())
+        for t in tasks:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        if tasks:
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except Exception:
+                pass
         self._bus_tasks.clear()

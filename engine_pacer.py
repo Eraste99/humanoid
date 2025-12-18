@@ -64,27 +64,41 @@ try:
         PACER_CLAMP_SECONDS,
     )
 except Exception:  # pragma: no cover
-    class _NoOp:
-        def labels(self, *args, **kwargs): return self
+    try:
+        from modules import obs_metrics as _obs
 
-        def inc(self, *args, **kwargs): return None
+        ENGINE_PACING_BACKPRESSURE_TOTAL = _obs.ENGINE_PACING_BACKPRESSURE_TOTAL
+        ENGINE_DRAIN_LATENCY_MS = _obs.ENGINE_DRAIN_LATENCY_MS
+        ENGINE_PACER_DELAY_MS = _obs.ENGINE_PACER_DELAY_MS
+        ENGINE_PACER_INFLIGHT_MAX = _obs.ENGINE_PACER_INFLIGHT_MAX
+        ENGINE_PACER_MODE = _obs.ENGINE_PACER_MODE
+        PACER_ACK_HI_MS = _obs.PACER_ACK_HI_MS
+        PACER_ACK_SEV_MS = _obs.PACER_ACK_SEV_MS
+        PACER_ACK_TARGET_MS = _obs.PACER_ACK_TARGET_MS
+        PACER_STATE = _obs.PACER_STATE
+        PACER_CLAMP_SECONDS = _obs.PACER_CLAMP_SECONDS
+    except Exception:
+        class _NoOp:
+            def labels(self, *args, **kwargs): return self
 
-        def set(self, *args, **kwargs): return None
+            def inc(self, *args, **kwargs): return None
 
-        def observe(self, *args, **kwargs): return None
+            def set(self, *args, **kwargs): return None
+
+            def observe(self, *args, **kwargs): return None
 
 
-    ENGINE_PACING_BACKPRESSURE_TOTAL = _NoOp()
-    ENGINE_DRAIN_LATENCY_MS = _NoOp()
-    ENGINE_PACER_DELAY_MS = _NoOp()
-    ENGINE_PACER_INFLIGHT_MAX = _NoOp()
-    ENGINE_PACER_MODE = _NoOp()
-    PACER_ACK_HI_MS = _NoOp()
-    PACER_ACK_SEV_MS = _NoOp()
-    PACER_ACK_TARGET_MS = _NoOp()
-    PACER_STATE = _NoOp()
-    PACER_CLAMP_SECONDS = _NoOp()
-
+        ENGINE_PACING_BACKPRESSURE_TOTAL = _NoOp()
+        ENGINE_DRAIN_LATENCY_MS = _NoOp()
+        ENGINE_PACER_DELAY_MS = _NoOp()
+        ENGINE_PACER_INFLIGHT_MAX = _NoOp()
+        ENGINE_PACER_MODE = _NoOp()
+        PACER_ACK_HI_MS = _NoOp()
+        PACER_ACK_SEV_MS = _NoOp()
+        PACER_ACK_TARGET_MS = _NoOp()
+        PACER_STATE = _NoOp()
+        PACER_CLAMP_SECONDS = _NoOp()
+        _METRICS_FALLBACK_LOGGED = True
 
 # --------- Default regional targets ---------
 # Cibles (hautes/sévères) utilisées pour normaliser les gaps → score de sévérité S∈[0,1].
@@ -166,6 +180,14 @@ class EnginePacer:
         region_map: Optional[Dict[str, str]] = None,
         bot_cfg: Optional["BotConfig"] = None,
     ):
+        global _METRICS_FALLBACK_LOGGED
+        if _METRICS_FALLBACK_LOGGED:
+            try:
+                logger.warning("[EnginePacer] metrics fallback to no-op counters")
+            except Exception:
+                pass
+            _METRICS_FALLBACK_LOGGED = False
+
         self._lock = threading.RLock()
         self._bot_cfg = bot_cfg
         self._default_region = self._norm_region(region)

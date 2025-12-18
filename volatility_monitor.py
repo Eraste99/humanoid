@@ -285,28 +285,20 @@ class VolatilityMonitor:
         key = (_norm_ex(exchange), _norm_pair(pair))
         dq = self.price_history.get(key)
         if dq is not None:
-            self.price_history[key] = deque(
-                ((t, p) for t, p in dq if now - t <= self.window_long),
-                maxlen=dq.maxlen,
-            )
+            while dq and now - dq[0][0] > self.window_long:
+                dq.popleft()
         dq = self.spread_history.get(key)
         if dq is not None:
-            self.spread_history[key] = deque(
-                ((t, s) for t, s in dq if now - t <= self.window_long),
-                maxlen=dq.maxlen,
-            )
+            while dq and now - dq[0][0] > self.window_long:
+                dq.popleft()
         dq = self.historical_price_vols.get(key)
         if dq is not None:
-            self.historical_price_vols[key] = deque(
-                ((t, v) for t, v in dq if now - t <= self.historical_window),
-                maxlen=dq.maxlen,
-            )
+            while dq and now - dq[0][0] > self.historical_window:
+                dq.popleft()
         dq = self.historical_spread_vols.get(key)
         if dq is not None:
-            self.historical_spread_vols[key] = deque(
-                ((t, v) for t, v in dq if now - t <= self.historical_window),
-                maxlen=dq.maxlen,
-            )
+            while dq and now - dq[0][0] > self.historical_window:
+                dq.popleft()
 
     # ---- Utils vol ----
     def _clean_values(self, values: List[float]) -> np.ndarray:
@@ -489,8 +481,10 @@ class VolatilityMonitor:
         # Seuils dynamiques (profil par défaut si historique insuffisant)
         price_thr, spread_thr = self._get_dynamic_thresholds(pair)
 
+        do_log = self._should_log(pair)
+        
         # --- Publication périodique p95/p99 (throttle commun au logging) ---
-        if self._should_log(pair):
+        if do_log:
             try:
                 p95p, p99p, p95s, p99s = self._pair_percentiles(pair)
                 if p95p is not None:
@@ -535,7 +529,7 @@ class VolatilityMonitor:
             pass
 
         # Log (inchangé)
-        if self._should_log(pair):
+        if do_log:
             logger.info(
                 f"[{pair}] thr: price_vol={price_thr:.4f}, spread_vol={spread_thr:.4f} | "
                 f"micro={price_vol_micro:.4f}/{spread_vol_micro:.4f}"
@@ -576,6 +570,8 @@ class VolatilityMonitor:
         self.historical_spread_vols.clear()
         self.update_count = 0
         self.last_update = None
+        if hasattr(self, "_last_vol"):
+            self._last_vol.clear()
 
     def set_risk_manager(self, rm: Any) -> None:
         self.risk_manager = rm
@@ -618,9 +614,12 @@ class VolatilityMonitor:
                 pass
         return st
 
-    def stop_monitoring(self) -> None:
+    async def stop(self) -> None:
+        await self.detach_bus_consumers()
         logger.info("🛑 VolatilityMonitor stoppé.")
 
+    async def stop_monitoring(self) -> None:
+        await self.stop()
     # ----------------------- BUS (per‑CEX vol) -----------------------
     # volatility_monitor.py
     def set_bps_mapping(self, *, midprice_to_bps: float = 1e4, floor_bps: float = 0.0, cap_bps: float = 250.0) -> None:
@@ -684,6 +683,12 @@ class VolatilityMonitor:
                 # best-effort, ne casse jamais le flux
                 pass
 
+            try:
+                self.last_update = datetime.utcfromtimestamp(ts_recv_s)
+            except Exception:
+                self.last_update = datetime.utcnow()
+
+
             self._forward_to_scanner(ex, pk, vol_bps)
 
         except Exception:
@@ -720,7 +725,10 @@ class VolatilityMonitor:
             self._bus_tasks[str(ex).upper()] = t
         logger.info("[VolatilityMonitor] vol consumers: %s", list(self._bus_tasks.keys()))
 
-    def detach_bus_consumers(self) -> None:
-        for ex, t in list(self._bus_tasks.items()):
+    async def detach_bus_consumers(self) -> None:
+        tasks = list(self._bus_tasks.values())
+        for t in tasks:
             t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         self._bus_tasks.clear()

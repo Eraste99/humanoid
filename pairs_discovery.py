@@ -19,27 +19,51 @@ Compatibilité :
 from __future__ import annotations
 import asyncio
 import math
-import random
+from types import SimpleNamespace
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
-
-import aiohttp
-from asyncio_throttle import Throttler
-from modules.rm_compat import getattr_bool, getattr_dict, getattr_float, getattr_int, getattr_list, getattr_str
-from contracts.payloads import DiscoveryResult
 
 try:
     from asyncio_throttle import Throttler  # pip install asyncio-throttle
 except Exception:
     from modules.utils.rate_limiter import AsyncRateLimiter as _RL
-
-
-    class Throttler:  # shim compatible "async with Throttler(...)"
-        def __init__(self, rate_limit: float) -> None:
-            self._rl = _RL(rate=float(rate_limit), capacity=max(1, int(rate_limit)))
+    import aiohttp
+except Exception:  # pragma: no cover - fallback pour environnements de test sans aiohttp
+    class _DummySession:
+        def __init__(self, *_, **__):
+            pass
 
         async def __aenter__(self):
-            await self._rl.acquire(kind="discovery", exchange="global")
+            return None
+
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+    try:
+        from modules.rm_compat import getattr_bool, getattr_dict, getattr_float, getattr_int, getattr_list, getattr_str
+    except Exception:  # pragma: no cover - compat chemin local
+        from rm_compat import getattr_bool, getattr_dict, getattr_float, getattr_int, getattr_list, getattr_str
+    from contracts.payloads import DiscoveryResult
+    from bot_config import DiscoveryCfg
+
+
+    class _DummyAiohttp:  # type: ignore
+        ClientSession = _DummySession
+        ClientTimeout = lambda *_, **__: None
+
+
+    aiohttp = _DummyAiohttp()
+
+    try:
+        from asyncio_throttle import Throttler
+    except Exception:  # pragma: no cover - fallback coopérant
+        class Throttler:  # type: ignore
+            def __init__(self, *_, **__):
+                pass
+        async def __aenter__(self):
+            return None
 
         async def __aexit__(self, exc_type, exc, tb):
             return False
@@ -89,6 +113,12 @@ class RateLimitBackoff(Exception):
         super().__init__(f"Rate limited, retry after {retry_after_s}s")
         self.retry_after_s = float(retry_after_s)
 
+class _noop_async_cm:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 def _pk(base: str, quote: str) -> str:
     return f"{base.upper()}{quote.upper()}"
@@ -119,44 +149,78 @@ def fnum(x: Any, default: float = 0.0) -> float:
         return default
 
 
-async def _fetch_json(session: aiohttp.ClientSession, url: str, *, retries: int = 3, timeout: int = 15):
-    """GET JSON avec gestion 429/Retry-After + retry exponentiel pour erreurs transitoires."""
-    last: Optional[Exception] = None
-    for k in range(retries):
-        try:
+def _build_backoff_policy(retry_cfg: Optional[dict]) -> "BackoffPolicy":
+    """Adapte les formats legacy ({retries, backoff_s}) et v2 ({base_ms, max_ms, ...})."""
+    try:
+        from retry_policy import BackoffPolicy  # lazy import pour éviter dépendance forte
+    except Exception:  # pragma: no cover - fallback inert
+        class _P:  # type: ignore
+            def __init__(self, **kwargs):
+                self.__dict__.update(kwargs)
+
+        return _P()
+
+    if not retry_cfg:
+        return BackoffPolicy()
+
+    # Format legacy léger
+    if isinstance(retry_cfg, dict) and {"retries", "backoff_s"} <= set(retry_cfg):
+        retries = max(1, int(retry_cfg.get("retries", 3)))
+        backoff_s = float(retry_cfg.get("backoff_s", 1.0))
+        return BackoffPolicy(
+            min_backoff_s=backoff_s,
+            max_backoff_s=backoff_s,
+            budget_tries=retries,
+            cap_total_s=float(retry_cfg.get("cap_total_s", 120.0)),
+            full_jitter=bool(retry_cfg.get("full_jitter", True)),
+        )
+
+    # Fallback: mapping v2/v3 via helper
+    return BackoffPolicy.from_cfg(retry_cfg)
+
+
+async def _fetch_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    policy,
+    timeout: int,
+    exchange: str,
+    limiter=None,
+):
+    """GET JSON best-effort via retry_policy.awith_retry (gestions 429 cohérentes)."""
+    try:
+        from retry_policy import awith_retry, ErrKind
+    except Exception as e:  # pragma: no cover - infra manquante
+        raise RuntimeError("retry_policy missing") from e
+
+    async def _op():
+        async with (limiter or _noop_async_cm()):
             async with session.get(url, timeout=timeout) as r:
-                # 429: respecter Retry-After si fourni (secondes)
+
                 if r.status == 429:
                     ra = r.headers.get("Retry-After")
                     delay = fnum(ra, default=0.0) if ra is not None else 0.0
                     if delay > 0:
-                        # Propage au surveillant pour ajuster la cadence
+
                         raise RateLimitBackoff(delay)
-                    # Sinon: backoff exponentiel local
-                    await asyncio.sleep(1 * (2 ** k))
-                    continue
 
                 r.raise_for_status()
                 return await r.json()
-        except RateLimitBackoff:
-            # Propage vers l'appelant (watchdog pourra s'aligner sur le délai)
-            raise
-        except aiohttp.ClientResponseError as e:
-            # Réessaie sur 5xx
-            if e.status in {500, 502, 503, 504} and k < retries - 1:
-                await asyncio.sleep(1 * (2 ** k))
-                last = e
-                continue
-            last = e
-            break
-        except Exception as e:
-            last = e
-            if k < retries - 1:
-                await asyncio.sleep(1 * (2 ** k))
-                continue
-            break
-    raise RuntimeError(f"GET {url} failed after {retries} retries: {last}")
 
+
+    outcome = await awith_retry(_op, venue=str(exchange), policy=policy)
+    if outcome.ok:
+        return outcome.result
+
+    # Ratelimit prolongé: propage RateLimitBackoff si dispo pour que le watchdog s'aligne
+    if isinstance(outcome.last_exception, RateLimitBackoff):
+        raise outcome.last_exception
+
+    # Harmonise l'erreur finale
+    raise RuntimeError(
+        f"GET {url} failed after {outcome.attempts} attempts ({outcome.kind or 'UNKNOWN'})"
+    )
 
 # pairs_discovery.py — helpers importables par boot
 
@@ -189,15 +253,18 @@ def compute_diffs(current: Set[str], nxt: Set[str]) -> Tuple[Set[str], Set[str]]
 
 
 # --------------------- Loaders par CEX ---------------------
-async def _load_binance(session: aiohttp.ClientSession) -> Tuple[Dict[str, dict], Dict[str, float]]:
+
+async def _load_binance(session: aiohttp.ClientSession, *, policy, timeout_s: int, limiter=None) -> Tuple[Dict[str, dict], Dict[str, float]]:
     """
     Retourne:
       meta: { "BASEQUOTE": {...} } pour symboles TRADING avec quote in {USDC, EUR}
       volq: { "BASEQUOTE": quoteVolume_24h_float }
     """
     exinfo, tickers = await asyncio.gather(
-        _fetch_json(session, BINANCE_EXCHANGE_INFO),
-        _fetch_json(session, BINANCE_24HR_TICKERS),
+        _fetch_json(session, BINANCE_EXCHANGE_INFO, policy=policy, timeout=timeout_s, exchange="BINANCE",
+                    limiter=limiter),
+        _fetch_json(session, BINANCE_24HR_TICKERS, policy=policy, timeout=timeout_s, exchange="BINANCE",
+                    limiter=limiter),
     )
     symbols = [s for s in exinfo.get("symbols", []) if (s or {}).get("status") == "TRADING"]
     meta: Dict[str, dict] = {}
@@ -217,7 +284,7 @@ async def _load_binance(session: aiohttp.ClientSession) -> Tuple[Dict[str, dict]
     return meta, volq
 
 
-async def _load_coinbase(session: aiohttp.ClientSession) -> Tuple[Dict[str, dict], Dict[str, float]]:
+async def _load_coinbase(session: aiohttp.ClientSession, *, policy, timeout_s: int, limiter=None) -> Tuple[Dict[str, dict], Dict[str, float]]:
     """
     Coinbase Exchange:
       - products: /products -> [{id:"ETH-USDC", base_currency, quote_currency, status}]
@@ -225,8 +292,8 @@ async def _load_coinbase(session: aiohttp.ClientSession) -> Tuple[Dict[str, dict
     On calcule le volume **quote** ≈ volume_base_24h * last_price.
     """
     products, stats = await asyncio.gather(
-        _fetch_json(session, CB_PRODUCTS),
-        _fetch_json(session, CB_STATS),
+        _fetch_json(session, CB_PRODUCTS, policy=policy, timeout=timeout_s, exchange="COINBASE", limiter=limiter),
+        _fetch_json(session, CB_STATS, policy=policy, timeout=timeout_s, exchange="COINBASE", limiter=limiter),
     )
 
     # Filtre produits "online"
@@ -258,7 +325,7 @@ async def _load_coinbase(session: aiohttp.ClientSession) -> Tuple[Dict[str, dict
     return meta, volq
 
 
-async def _load_bybit(session: aiohttp.ClientSession) -> Tuple[Dict[str, dict], Dict[str, float]]:
+async def _load_bybit(session: aiohttp.ClientSession, *, policy, timeout_s: int, limiter=None) -> Tuple[Dict[str, dict], Dict[str, float]]:
     """
     Bybit v5:
       - instruments-info (spot): quoteCoin/baseCoin/symbol/status
@@ -266,8 +333,8 @@ async def _load_bybit(session: aiohttp.ClientSession) -> Tuple[Dict[str, dict], 
     On calcule le volume **quote** ≈ `turnover24h` si dispo/valide, sinon `lastPrice * volume24h`.
     """
     ins, tks = await asyncio.gather(
-        _fetch_json(session, BYBIT_INSTR),
-        _fetch_json(session, BYBIT_TICKERS),
+        _fetch_json(session, BYBIT_INSTR, policy=policy, timeout=timeout_s, exchange="BYBIT", limiter=limiter),
+        _fetch_json(session, BYBIT_TICKERS, policy=policy, timeout=timeout_s, exchange="BYBIT", limiter=limiter),
     )
 
     meta: Dict[str, dict] = {}
@@ -396,7 +463,8 @@ async def discover_pairs_3cex(
     d = cfg.discovery
     http_timeout_s = getattr_int(d, "http_timeout_s", 10)
     max_inflight   = getattr_int(d, "max_inflight_requests", 8)
-    rp_cfg         = dict(getattr(d, "retry_policy", {"base_ms":500,"max_ms":20_000,"max_attempts":5,"jitter":1}))
+    rp_cfg = getattr(d, "retry_policy", {"base_ms": 500, "max_ms": 20_000, "max_attempts": 5, "jitter": 1})
+    backoff_policy = _build_backoff_policy(rp_cfg)
     quotes_allowed = set(q.upper() for q in getattr(d, "quotes_allowed", ["USDC","EUR"]))
     # Seuils: si non fournis, dériver de min_24h_volume_usd (EUR = 0.3x par défaut comme ta version)
 
@@ -415,7 +483,9 @@ async def discover_pairs_3cex(
     blacklist = set(x.upper() for x in (denylist  if denylist  is not None else getattr(d, "blacklist", [])))
 
     # Exchanges activés
-    enabled = [e.upper() for e in (enabled_exchanges or cfg.g.enabled_exchanges)]
+    enabled = enabled_exchanges or getattr(d, "enabled_exchanges", None) or getattr(cfg, "g", {}).get(
+        "enabled_exchanges", [])
+    enabled = [str(e).upper() for e in enabled]
     enabled = [e for e in enabled if e in ("BINANCE", "COINBASE", "BYBIT")]
     if len(enabled) < 2:
         return {}, []
@@ -426,136 +496,6 @@ async def discover_pairs_3cex(
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=http_timeout_s), headers={"User-Agent": "PairsDiscovery/3"}) as session:
         limiter = Throttler(rate_limit=max_inflight, period=1.0)
 
-        async def _fetch_json(url: str):
-            base = float(rp_cfg.get("base_ms", 500)) / 1000.0
-            cap  = float(rp_cfg.get("max_ms", 20_000)) / 1000.0
-            attempts = int(rp_cfg.get("max_attempts", 5))
-            jitter   = bool(rp_cfg.get("jitter", 1))
-            last = None
-            for k in range(attempts):
-                try:
-                    async with limiter:
-                        async with session.get(url) as r:
-                            if r.status == 429:
-                                ra = r.headers.get("Retry-After")
-                                if ra:
-                                    await asyncio.sleep(float(ra))
-                                    continue
-                            r.raise_for_status()
-                            return await r.json()
-                except Exception as e:
-                    last = e
-                    sleep_s = min(cap, base * (2 ** k))
-                    if jitter:
-                        sleep_s *= random.random()
-                    await asyncio.sleep(sleep_s)
-            raise last or RuntimeError(f"discovery fetch failed: {url}")
-
-        # --------------------------
-        # 3) Loaders par exchange
-        # --------------------------
-        async def _load_binance():
-            # symbols + 24h tickers -> quoteVolume
-            try:
-                info = await _fetch_json("https://api.binance.com/api/v3/exchangeInfo")
-                tick = await _fetch_json("https://api.binance.com/api/v3/ticker/24hr")
-            except Exception:
-                return {}, {}
-            meta = {}
-            for s in (info or {}).get("symbols", []):
-                if str(s.get("status","")).upper() != "TRADING":
-                    continue
-                base = s.get("baseAsset"); quote = s.get("quoteAsset")
-                if not base or not quote: continue
-                if quote.upper() not in quotes_allowed:  # garde USDC/EUR seulement
-                    continue
-                meta[s.get("symbol")] = {"base": base, "quote": quote}
-            volq = {}
-            for t in (tick or []):
-                sym = t.get("symbol")
-                if sym in meta:
-                    qv = t.get("quoteVolume")  # déjà en quote-ccy
-                    volq[sym] = fnum(qv, 0.0)
-            return meta, volq
-
-        async def _load_coinbase():
-            # products + stats (24h) -> approx quoteVolume = last * base_volume
-            try:
-                products = await _fetch_json("https://api.exchange.coinbase.com/products")
-            except Exception:
-                return {}, {}
-            # fetch stats par produit avec limite de concurrence
-            stats = {}
-            async def _load_stat(pid: str):
-                try:
-                    s = await _fetch_json(f"https://api.exchange.coinbase.com/products/{pid}/stats")
-                    stats[pid] = s
-                except Exception:
-                    stats[pid] = None
-
-            tasks = []
-            sem = asyncio.Semaphore(max_inflight)
-            async def _task(pid):
-                async with sem:
-                    await _load_stat(pid)
-
-            pids = []
-            for p in (products or []):
-                quote = (p or {}).get("quote_currency","").upper()
-                base  = (p or {}).get("base_currency","").upper()
-                if not base or not quote:
-                    continue
-                if quote not in quotes_allowed:
-                    continue
-                pid = p.get("id") or f"{base}-{quote}"
-                pids.append(pid)
-
-            await asyncio.gather(*( _task(pid) for pid in pids ))
-
-            meta = {}
-            volq = {}
-            for p in (products or []):
-                base = (p or {}).get("base_currency","")
-                quote= (p or {}).get("quote_currency","")
-                pid  = (p or {}).get("id") or f"{base}-{quote}"
-                if not base or not quote or quote.upper() not in quotes_allowed:
-                    continue
-                meta[pid] = {"base": base, "quote": quote, "product_id": pid}
-                st = stats.get(pid) or {}
-                # Coinbase stats fields: last, open, volume (BASE units)
-                last = fnum(st.get("last"), 0.0) or fnum(st.get("last_price"), 0.0)
-                base_vol = fnum(st.get("volume"), 0.0)
-                volq[pid] = base_vol * last  # approx quote-volume
-            return meta, volq
-
-        async def _load_bybit():
-            # spot symbols + 24h ticker
-            try:
-                syms = await _fetch_json("https://api.bybit.com/spot/v3/public/symbols")
-                t24  = await _fetch_json("https://api.bybit.com/spot/quote/v1/ticker/24hr")
-            except Exception:
-                return {}, {}
-            meta = {}
-            for s in (syms or {}).get("result", {}).get("list", []):
-                base = s.get("baseCoin"); quote = s.get("quoteCoin")
-                if not base or not quote:
-                    continue
-                if quote.upper() not in quotes_allowed:
-                    continue
-                exsym = s.get("name") or f"{base}{quote}"
-                meta[exsym] = {"base": base, "quote": quote}
-            volq = {}
-            for t in (t24 or {}).get("result", []):
-                sym = t.get("symbol")
-                if sym in meta:
-                    # Bybit 24h ticker expose "qv" (quote volume) parfois, sinon calc:
-                    qv = t.get("qv")
-                    if qv is None:
-                        last = fnum(t.get("lastPrice"), 0.0)
-                        base_vol = fnum(t.get("volume"), 0.0)
-                        qv = base_vol * last
-                    volq[sym] = fnum(qv, 0.0)
-            return meta, volq
 
         # --------------------------
         # 4) Collecte parallélisée
@@ -565,12 +505,15 @@ async def discover_pairs_3cex(
         (c_meta, c_volq) = ({}, {})
         (y_meta, y_volq) = ({}, {})
 
-        tasks = []
-        if "BINANCE" in enabled:  tasks.append(_load_binance())
-        if "COINBASE" in enabled: tasks.append(_load_coinbase())
-        if "BYBIT" in enabled:    tasks.append(_load_bybit())
-
-        res = await asyncio.gather(*tasks, return_exceptions=True)
+        fetch_tasks = []
+        if "BINANCE" in enabled:
+            fetch_tasks.append(_load_binance(session, policy=backoff_policy, timeout_s=http_timeout_s, limiter=limiter))
+        if "COINBASE" in enabled:
+            fetch_tasks.append(
+                _load_coinbase(session, policy=backoff_policy, timeout_s=http_timeout_s, limiter=limiter))
+        if "BYBIT" in enabled:
+            fetch_tasks.append(_load_bybit(session, policy=backoff_policy, timeout_s=http_timeout_s, limiter=limiter))
+        res = await asyncio.gather(*fetch_tasks, return_exceptions=True)
         i = 0
         if "BINANCE" in enabled:
             if isinstance(res[i], Exception):
@@ -725,12 +668,15 @@ async def discover_pairs_3cex(
     except Exception:
         pass
 
+    ranking_mode = "fx_scaled" if eur_usdc_fx else "quote_isolated"
     result = DiscoveryResult(
         stage_counts=stage_counts,
         filtered_counts=filtered_counts,
         api_errors=api_errors,
         run_ms=run_ms,
         top_pairs=top_pairs,
+        fx_applied=bool(eur_usdc_fx),
+        ranking_mode=ranking_mode,
     )
 
     if include_result:
@@ -740,6 +686,7 @@ async def discover_pairs_3cex(
 
 # ---------- Alias de compat pour l'ancien nom ----------
 async def discover_usdc_pairs(
+        cfg=None,
     top_n: int = 80,
     *,
     min_quote_volume: float = 100_000.0,            # rétro-compat (USDC) — voir ci-dessous
@@ -755,7 +702,24 @@ async def discover_usdc_pairs(
     - `include_usdt_fallback` est ignoré (pas d’USDT).
     - Ajoute `enabled_exchanges` et `min_quote_volume_eur`.
     """
+    effective_cfg = cfg
+    if effective_cfg is None:
+        effective_cfg = SimpleNamespace(
+            discovery=DiscoveryCfg(
+                min_quote_volume_usdc=float(min_quote_volume),
+                min_quote_volume_eur=float(min_quote_volume_eur),
+            ),
+            g={"enabled_exchanges": enabled_exchanges or []},
+        )
+    else:
+        # Propagation rétro-compat si on ne dispose pas d'override explicite
+        if getattr(getattr(effective_cfg, "discovery", None), "min_quote_volume_usdc", None) is None:
+            setattr(effective_cfg.discovery, "min_quote_volume_usdc", float(min_quote_volume))
+        if getattr(getattr(effective_cfg, "discovery", None), "min_quote_volume_eur", None) is None:
+            setattr(effective_cfg.discovery, "min_quote_volume_eur", float(min_quote_volume_eur))
+
     return await discover_pairs_3cex(
+        effective_cfg,
         top_n=top_n,
         min_quote_volume_usdc=float(min_quote_volume),
         min_quote_volume_eur=float(min_quote_volume_eur),

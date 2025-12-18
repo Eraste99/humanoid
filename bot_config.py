@@ -341,6 +341,14 @@ class ScannerCfg:
     workers: int = 1
     backpressure_log_every: int = 1000
     max_opportunities: int = 1000
+
+    # Load shedding pilotable
+    shed_load_threshold: float = 0.95
+    shed_primary_factor: float = 0.8
+    shed_primary_min: float = 0.5
+    shed_audition_factor: float = 0.0
+    shed_cooldown_s: float = 3.0
+
     # Mode principal du Scanner (TT/TM/MIXED)
     scanner_mode: str = "MIXED"
 
@@ -440,6 +448,22 @@ class RiskManagerCfg:
         "MID": 3,
         "LARGE": 4,
     })
+
+    # Shutdown / cancellation (RiskManager + glue)
+    rm_stop_join_timeout_s: float = 2.0
+    mbf_glue_stop_timeout_s: float = 1.0
+    shutdown_dump_task_stacks: bool = True
+    shutdown_stack_limit: int = 10
+
+    # Readiness / callbacks
+    trading_ready_require_scanner_hook: bool = False
+    cb_timeout_s: float = 0.25
+    cb_max_inflight: int = 200
+    cb_executor_workers: int = 2
+
+    # Config audit
+    audit_config_on_start: bool = True
+    strict_config: bool = False
 
     # Policy "Capital Ladder" — source canonique pour les profils NANO→LARGE.
     # Chaque profil porte :
@@ -1481,6 +1505,21 @@ class BotConfig:
 
         # --- Scanner cfg ------------------------------------------------------
         cfg.scanner.workers = _Env.get_int("SCANNER_WORKERS", cfg.scanner.workers)
+        cfg.scanner.shed_load_threshold = _Env.get_float(
+            "SCANNER_SHED_LOAD_THRESHOLD", cfg.scanner.shed_load_threshold
+        )
+        cfg.scanner.shed_primary_factor = _Env.get_float(
+            "SCANNER_SHED_PRIMARY_FACTOR", cfg.scanner.shed_primary_factor
+        )
+        cfg.scanner.shed_primary_min = _Env.get_float(
+            "SCANNER_SHED_PRIMARY_MIN", cfg.scanner.shed_primary_min
+        )
+        cfg.scanner.shed_audition_factor = _Env.get_float(
+            "SCANNER_SHED_AUDITION_FACTOR", cfg.scanner.shed_audition_factor
+        )
+        cfg.scanner.shed_cooldown_s = _Env.get_float(
+            "SCANNER_SHED_COOLDOWN_S", cfg.scanner.shed_cooldown_s
+        )
         cfg.scanner.scanner_mode = (_Env.get("SCANNER_MODE", cfg.scanner.scanner_mode) or cfg.scanner.scanner_mode)
         cfg.scanner.enable_mm_hints = _Env.get_bool("SCANNER_ENABLE_MM_HINTS", cfg.scanner.enable_mm_hints)
         cfg.scanner.binance_depth_level = _Env.get_int(

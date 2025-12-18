@@ -87,9 +87,22 @@ except Exception:  # pragma: no cover
         def observe(self, *_, **__): pass
         def set(self, *_, **__): pass
 
+        def time(self, *_, **__):
+            import contextlib
+            return contextlib.nullcontext()
+
     BF_API_LATENCY_MS = BF_API_ERRORS_TOTAL = BF_CACHE_AGE_SECONDS = BF_LAST_SUCCESS_TS = FEE_TOKEN_BALANCE = _NoopMetric()
     BF_HTTP_LATENCY_SECONDS = BF_HTTP_ERRORS_TOTAL = BF_FEE_TOKEN_LEVEL = BF_FEE_TOKEN_LOW_TOTAL = _NoopMetric()
     BF_BALANCES_TTL_NORMAL_SECONDS = BF_BALANCES_TTL_DEGRADED_SECONDS = BF_BALANCES_TTL_BLOCK_SECONDS = BF_BALANCES_HEALTH_STATE = _NoopMetric()
+else:
+    class _NoopMetric:
+        def labels(self, *_, **__): return self
+        def inc(self, *_, **__): pass
+        def observe(self, *_, **__): pass
+        def set(self, *_, **__): pass
+        def time(self, *_, **__):
+            import contextlib
+            return contextlib.nullcontext()
 try:
     from modules.observability_pacer import PACER
 except Exception:
@@ -104,22 +117,31 @@ class _RateLimiter:
         self.capacity = max(1, int(per_min))
         self.tokens = float(self.capacity)
         self.last = time.time()
+        self._lock = asyncio.Lock()
 
     async def take(self):
-        now = time.time()
-        refill = (now - self.last) * (self.capacity / 60.0)
-        self.tokens = min(self.capacity, self.tokens + refill)
-        self.last = now
-        if self.tokens < 1.0:
-            await asyncio.sleep((1.0 - self.tokens) * (60.0 / self.capacity))
-        # pacer clamp (bf_rate)
-        try:
-            w = float(PACER.clamp("bf_rate"))
-            if w > 0.0:
-                await asyncio.sleep(w)
-        except Exception:
-            pass
-        self.tokens -= 1.0
+        extra_sleep = 0.0
+        while True:
+            sleep_needed = 0.0
+            async with self._lock:
+                now = time.time()
+                refill = (now - self.last) * (self.capacity / 60.0)
+                self.tokens = min(self.capacity, self.tokens + refill)
+                self.last = now
+                if self.tokens < 1.0:
+                    sleep_needed = (1.0 - self.tokens) * (60.0 / self.capacity)
+                else:
+                    self.tokens -= 1.0
+                    try:
+                        extra_sleep = float(PACER.clamp("bf_rate"))
+                    except Exception:
+                        extra_sleep = 0.0
+            if sleep_needed > 0.0:
+                await asyncio.sleep(sleep_needed)
+                continue
+            break
+        if extra_sleep > 0.0:
+            await asyncio.sleep(extra_sleep)
 
 
 def _upper(x: Optional[str]) -> str:
@@ -246,8 +268,7 @@ class MultiBalanceFetcher:
         # HTTP
         self._session: Optional[aiohttp.ClientSession] = None
         self._timeout = aiohttp.ClientTimeout(total=7.0, connect=3.0, sock_read=5.0)
-        self._connector = aiohttp.TCPConnector(limit=80, ssl=True, enable_cleanup_closed=True)
-
+        self._connector: Optional[aiohttp.TCPConnector] = None
         # Binance time offset
         self._binance_time_offset_ms: int = 0
         self._last_binance_time_sync: float = 0.0
@@ -285,6 +306,7 @@ class MultiBalanceFetcher:
             self.cfg = None
 
         self._refresh_balance_ttls_from_slo()
+        self._alerts_tasks: Set[asyncio.Task] = set()
 
     # =========================== Lifecycle ===================================
 
@@ -459,34 +481,50 @@ class MultiBalanceFetcher:
         period = getattr_float(self.cfg, "BF_ALERT_PERIOD_S", 15.0)
         low_map = self._get_fee_token_low_map()
 
-        while True:
-            try:
-                # itère sur nos snapshots merged (ou real)
-                for (ex, al), snap in list(self._merged_snapshots.items()):
-                    balances = (snap or {}).get("balances") or {}
-                    for tok, thr in low_map.items():
-                        level = float(balances.get(tok, 0.0) or 0.0)
-                        try:
-                            BF_FEE_TOKEN_LEVEL.labels(ex, al, tok).set(level)
-                        except Exception:
-                            pass
-                        if level < thr:
+        task = asyncio.current_task()
+        if task:
+            self._alerts_tasks.add(task)
+        try:
+            while self._running:
+                try:
+                    # itère sur nos snapshots merged (ou real)
+                    for (ex, al), snap in list(self._merged_snapshots.items()):
+                        balances = (snap or {}).get("balances") or {}
+                        for tok, thr in low_map.items():
+                            level = float(balances.get(tok, 0.0) or 0.0)
                             try:
-                                BF_FEE_TOKEN_LOW_TOTAL.labels(ex, al, tok).inc()
+                                BF_FEE_TOKEN_LEVEL.labels(ex, al, tok).set(level)
                             except Exception:
                                 pass
-                            try:
-                                log.warning("[BF][%s:%s] Token de frais %s bas: %.4f < %.4f", ex, al, tok, level, thr)
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-            await asyncio.sleep(max(5.0, period))
+
+                           if level < thr:
+                                try:
+                                    BF_FEE_TOKEN_LOW_TOTAL.labels(ex, al, tok).inc()
+                                except Exception:
+                                    pass
+                                try:
+                                    log.warning("[BF][%s:%s] Token de frais %s bas: %.4f < %.4f", ex, al, tok, level, thr)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                if not self._running:
+                    break
+                await asyncio.sleep(max(5.0, period))
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if task:
+                self._alerts_tasks.discard(task)
 
 
     async def start(self) -> None:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(timeout=self._timeout, connector=self._connector)
+        if self._session and not self._session.closed:
+            self._running = True
+            return
+
+        self._connector = aiohttp.TCPConnector(limit=80, ssl=True, enable_cleanup_closed=True)
+        self._session = aiohttp.ClientSession(timeout=self._timeout, connector=self._connector)
         if self.use_server_time and not self.dry_run and self.binance_accounts:
             try:
                 await self._sync_binance_time_offset()
@@ -496,9 +534,20 @@ class MultiBalanceFetcher:
 
     async def stop(self) -> None:
         self._running = False
+        for t in list(getattr(self, "_alerts_tasks", set())):
+            t.cancel()
+        try:
+            if getattr(self, "_alerts_tasks", None):
+                await asyncio.gather(*self._alerts_tasks, return_exceptions=True)
+        except Exception:
+            pass
+        self._alerts_tasks = set()
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._connector and not getattr(self._connector, "closed", False):
+            self._connector.close()
         self._session = None
+        self._connector = None
 
 
 
@@ -765,7 +814,7 @@ class MultiBalanceFetcher:
             self.successful_syncs += 1
             # Merge conservateur avec source WS si fraiche (optionnelle)
             try:
-                ws_bal = await self._get_ws_balances_if_fresh("BINANCE", alias)  # adapte "BINANCE"/"COINBASE"/"BYBIT"
+                ws_bal = await self._get_ws_balances_if_fresh("BINANCE", alias)
                 if ws_bal:
                     balances = self._conservative_merge(balances, ws_bal)
             except Exception:
@@ -839,7 +888,7 @@ class MultiBalanceFetcher:
             self.successful_syncs += 1
             # Merge conservateur avec source WS si fraiche (optionnelle)
             try:
-                ws_bal = await self._get_ws_balances_if_fresh("BINANCE", alias)  # adapte "BINANCE"/"COINBASE"/"BYBIT"
+                ws_bal = await self._get_ws_balances_if_fresh("COINBASE", alias)
                 if ws_bal:
                     balances = self._conservative_merge(balances, ws_bal)
             except Exception:
@@ -906,7 +955,7 @@ class MultiBalanceFetcher:
             self.successful_syncs += 1
             # Merge conservateur avec source WS si fraiche (optionnelle)
             try:
-                ws_bal = await self._get_ws_balances_if_fresh("BINANCE", alias)  # adapte "BINANCE"/"COINBASE"/"BYBIT"
+                ws_bal = await self._get_ws_balances_if_fresh("BYBIT", alias)
                 if ws_bal:
                     balances = self._conservative_merge(balances, ws_bal)
             except Exception:

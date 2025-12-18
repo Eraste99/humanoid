@@ -2,6 +2,7 @@ from __future__ import annotations
 # -*- coding: utf-8 -*-
 from typing import Any, Dict, List, Tuple, Optional
 import asyncio
+import inspect
 import logging, time
 _LOG = logging.getLogger('RMCompat')
 _USD_ALIAS_WARN_EVERY_S = 60.0
@@ -46,21 +47,48 @@ def _as_dict_or_empty(self, x: Any) -> Dict[str, Any]:
 def _as_list_or_empty(self, x: Any) -> List[Any]:
     return _as_list_or_empty(x)
 
+_TRUE_SET = {"true", "1", "yes", "on", "y"}
+_FALSE_SET = {"false", "0", "no", "off", "n"}
+
 def getattr_int(obj: Any, name: str, default: int) -> int:
     v = getattr(obj, name, default)
-    return int(default) if v is None else int(v)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
 
 def getattr_float(obj: Any, name: str, default: float) -> float:
     v = getattr(obj, name, default)
-    return float(default) if v is None else float(v)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
 
 def getattr_str(obj: Any, name: str, default: str) -> str:
     v = getattr(obj, name, default)
-    return str(default) if v is None else str(v)
+    try:
+        return str(v)
+    except Exception:
+        return str(default)
 
 def getattr_bool(obj: Any, name: str, default: bool) -> bool:
     v = getattr(obj, name, default)
-    return bool(default) if v is None else bool(v)
+    if v is None:
+        return bool(default)
+    if isinstance(v, bool):
+        return v
+    try:
+        if isinstance(v, (int, float)):
+            return bool(int(v))
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in _TRUE_SET:
+                return True
+            if s in _FALSE_SET:
+                return False
+    except Exception:
+        return bool(default)
+    return bool(default)
 
 def getattr_dict(obj: Any, name: str) -> Dict[str, Any]:
     # même logique que dict(getattr(..., {})) avec tolérance None
@@ -88,19 +116,26 @@ def _canonicalize_risk_meta(meta: Optional[Dict[str, Any]],
     compat avec les usages Engine.
     """
     base = dict(meta or {})
-    if rm_mode:
+    if rm_mode is not None:
         base.setdefault("rm_mode", str(rm_mode).upper())
-    if trade_mode:
+    if trade_mode is not None:
         base.setdefault("trade_mode", str(trade_mode).upper())
 
     try:
-        from payloads import encode_flow_meta  # type: ignore
+        from contracts.payloads import encode_flow_meta  # type: ignore
 
         flow = encode_flow_meta(base.get("flow_kind"), base.get("risk_effect"))
         base.update(flow)
     except Exception:
-        # Fallback silencieux si payloads n'est pas dispo dans le contexte
-        pass
+        try:
+            if not getattr(_LOG, "_rmcompat_warned_flow", False):
+                setattr(_LOG, "_rmcompat_warned_flow", True)
+                _LOG.warning(
+                    "[RMCompat] encode_flow_meta unavailable; meta may be partial",
+                    exc_info=False,
+                )
+        except Exception:
+            pass
     return base
 
 
@@ -158,25 +193,45 @@ class RMCompat:
                 logging.exception('Unhandled exception')
         return ([], [])
 
+    @staticmethod
+    def _ok(details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {"accepted": True, "reason": "ok", "details": details or {}}
+
+    @staticmethod
+    def _rej(reason: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {"accepted": False, "reason": reason, "details": details or {}}
+
     async def submit(self, payload: Dict[str, Any]):
-        t = str(payload.get('type', '')).lower()
-        if t == 'rebalancing_trade':
-            cross = payload.get('cross') or payload
-            bundle = self._cross_to_bundle(cross)
-            return await self._submit_bundle(bundle)
-        if t == 'arbitrage_bundle':
-            return await self._submit_bundle(payload)
-        if t == 'single':
-            meta = payload.setdefault('meta', {})
-            if meta.get('type') == 'bridge':
-                meta['type'] = 'rebalancing'
-                meta.setdefault('strategy', 'TT')
-                meta.setdefault('tif_override', 'IOC')
-            leg = self._normalize_single(payload)
-            return await self._submit_single_normalized(leg)
-        if hasattr(super(), 'submit'):
-            return await super().submit(payload)
-        raise RuntimeError('Engine.submit: type unsupported')
+        try:
+            t = str(payload.get('type') or '').strip().lower()
+            if t == 'rebalancing_trade':
+                cross = payload.get('cross') or payload
+                bundle = self._cross_to_bundle(cross)
+                res = await self._submit_bundle(bundle)
+                return self._wrap_result(res)
+            if t == 'arbitrage_bundle':
+                res = await self._submit_bundle(payload)
+                return self._wrap_result(res)
+            if t == 'single':
+                meta = payload.setdefault('meta', {})
+                if meta.get('type') == 'bridge':
+                    meta['type'] = 'rebalancing'
+                    meta.setdefault('strategy', 'TT')
+                    meta.setdefault('tif_override', 'IOC')
+                leg = self._normalize_single(payload)
+                res = await self._submit_single_normalized(leg)
+                return self._wrap_result(res)
+            if hasattr(super(), 'submit'):
+                res = await super().submit(payload)
+                return self._wrap_result(res)
+            return self._rej(f"unsupported_type:{t}")
+        except Exception as exc:
+            try:
+                _LOG.exception("RMCompat.submit failed", exc_info=exc)
+            except Exception:
+                pass
+            return self._rej("rm_compat_exception", {"exc": type(exc).__name__})
+
 
     def _cross_to_bundle(self, cross: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -239,6 +294,17 @@ class RMCompat:
         order.setdefault('alias', 'TT')
         return order
 
+    def _wrap_result(self, res: Any) -> Dict[str, Any]:
+        if isinstance(res, dict) and "accepted" in res and "reason" in res:
+            return res
+        if res is True:
+            return self._ok()
+        if res is False:
+            return self._rej("rejected")
+        if isinstance(res, dict):
+            return self._ok(res)
+        return self._ok({"raw": res})
+
     async def _submit_bundle(self, bundle: Dict[str, Any]):
         """
         Normalise chaque jambe (notional->qty) puis délègue aux adapters.
@@ -248,9 +314,15 @@ class RMCompat:
             leg.setdefault('symbol', pair)
             self._normalize_leg_notional(leg)
         if hasattr(self, '_execute_bundle'):
-            return await self._execute_bundle(bundle)
+            res = self._execute_bundle(bundle)
+            if inspect.isawaitable(res):
+                res = await res
+            return res
         if hasattr(self, 'execute_bundle'):
-            return await self.execute_bundle(bundle)
+            res = self.execute_bundle(bundle)
+            if inspect.isawaitable(res):
+                res = await res
+            return res
         res = []
         for leg in bundle.get('legs', []):
             leg.setdefault('meta', {}).setdefault('tif_override', 'IOC')

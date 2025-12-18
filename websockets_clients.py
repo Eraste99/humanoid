@@ -48,6 +48,7 @@ try:
         WS_CONNECTIONS_OPEN,
         WS_PUBLIC_DROPPED_TOTAL,
         note_ws_public_cfg,
+        WS_SYMBOL_UNMAPPED_TOTAL,
     )
 except Exception:  # pragma: no cover
     class _Noop:
@@ -59,6 +60,7 @@ except Exception:  # pragma: no cover
     WS_BACKOFF_SECONDS  = _Noop()
     WS_CONNECTIONS_OPEN = _Noop()
     WS_PUBLIC_DROPPED_TOTAL = _Noop()
+    WS_SYMBOL_UNMAPPED_TOTAL = _Noop()
 
     def note_ws_public_cfg(*_a, **_k):
         return None
@@ -326,6 +328,7 @@ class WebSocketExchangeClient:
         self._out_queue_drops: Dict[str, int] = defaultdict(int)
         self._out_queue_last_drop_reason: Dict[str, str] = {}
         self._out_queue_last_drop_ts: Dict[str, float] = defaultdict(float)
+        self._bp_last_emit_ts: Dict[str, float] = defaultdict(float)
         self._last_publish_ts: float = 0.0
         self._last_publish_by_exchange: Dict[str, float] = defaultdict(float)
         self._bp_last_log_ts: Dict[str, float] = defaultdict(float)
@@ -333,6 +336,7 @@ class WebSocketExchangeClient:
         self._snapshot_runs = 0
         self._snapshot_pairs = 0
         self._snapshot_last_ts = 0.0
+        self._unmapped_seen: Dict[str, int] = defaultdict(int)
 
         # mapping inverse exchange_symbol -> pair_key
         try:
@@ -706,6 +710,11 @@ class WebSocketExchangeClient:
         lat = (now_ms - ex_ts) if ex_ts else None
         pk = self.unify_pair_key(ex_symbol, ex)
         if not pk:
+            try:
+                WS_SYMBOL_UNMAPPED_TOTAL.labels(exchange=ex).inc()
+            except Exception:
+                pass
+            self._unmapped_seen[ex] += 1
             return
         self.last_update[ex][pk] = now_ms
         self.latency[ex][pk] = lat
@@ -820,14 +829,18 @@ class WebSocketExchangeClient:
         except Exception:
             logger.exception("Erreur lors du log de backpressure")
 
-        payload = {
-            "kind": "ws_backpressure",
-            "exchange": ex,
-            "reason": reason,
-            "drops": self._out_queue_drops[ex],
-        }
-        self._queue_control_event(payload)
-
+        now = time.time()
+        if (now - self._bp_last_emit_ts[ex]) >= 1.0:
+            payload = {
+                "__ws_backpressure__": True,
+                "exchange": ex,
+                "reason": reason,
+                "drops": self._out_queue_drops[ex],
+                "queue_depth": getattr(self.out_queue, "qsize", lambda: 0)(),
+                "ts_ms": int(now * 1000),
+            }
+            self._bp_last_emit_ts[ex] = now
+            self._queue_control_event(payload)
 
     def _queue_control_event(self, payload: Dict[str, Any]) -> None:
         self._control_events_pending.append(payload)
@@ -890,12 +903,16 @@ class WebSocketExchangeClient:
                             await self._emit_if_ready("BINANCE", ex_symbol)
                             continue
             except Exception as e:
-                await self._publish_event({
-                    "exchange": "BINANCE", "pair_key": None, "active": False,
-                    "error": str(e), "recv_ts_ms": int(time.time() * 1000),
-                }, exchange="BINANCE", reason="listener_error")
+                self._queue_control_event({
+                    "__ws_error__": True,
+                    "exchange": "BINANCE",
+                    "reason": "listener_error",
+                    "error": str(e),
+                    "ts_ms": int(time.time() * 1000),
+                })
                 # backoff unifié (une seule fois)
                 self.on_close();
+                did_close = True
                 self._metrics_conn_closed("BINANCE")
                 await self._sleep_backoff("BINANCE", reason="listener_error")
 
@@ -981,10 +998,13 @@ class WebSocketExchangeClient:
                             await self._emit_if_ready("COINBASE", pid)
                             continue
             except Exception as e:
-                await self._publish_event({
-                    "exchange": "COINBASE", "pair_key": None, "active": False,
-                    "error": str(e), "recv_ts_ms": int(time.time() * 1000),
-                }, exchange="COINBASE", reason="listener_error")
+                self._queue_control_event({
+                    "__ws_error__": True,
+                    "exchange": "COINBASE",
+                    "reason": "listener_error",
+                    "error": str(e),
+                    "ts_ms": int(time.time() * 1000),
+                })
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("COINBASE")
@@ -1041,10 +1061,13 @@ class WebSocketExchangeClient:
                             await self._emit_if_ready("BYBIT", sym)
                             continue
             except Exception as e:
-                await self._publish_event({
-                    "exchange": "BYBIT", "pair_key": None, "active": False,
-                    "error": str(e), "recv_ts_ms": int(time.time() * 1000),
-                }, exchange="BYBIT", reason="listener_error")
+                self._queue_control_event({
+                    "__ws_error__": True,
+                    "exchange": "BYBIT",
+                    "reason": "listener_error",
+                    "error": str(e),
+                    "ts_ms": int(time.time() * 1000),
+                })
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("BYBIT")

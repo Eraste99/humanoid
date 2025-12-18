@@ -732,7 +732,10 @@ if "ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL" not in globals():
     ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL = _NoopMetric()
 if "ENGINE_BEST_PRICE_MISSING_TOTAL" not in globals():
     ENGINE_BEST_PRICE_MISSING_TOTAL = _NoopMetric()
-
+if "ENGINE_PACER_UNAVAILABLE_TOTAL" not in globals():
+    ENGINE_PACER_UNAVAILABLE_TOTAL = _NoopMetric()
+if "ENGINE_RL_TIMEOUT_TOTAL" not in globals():
+    ENGINE_RL_TIMEOUT_TOTAL = _NoopMetric()
 
 # Helper/stub functions used by the engine
 if "inc_engine_trade" not in globals():
@@ -784,6 +787,8 @@ try:
         set_engine_running,
         ENGINE_RM_OVERRIDES_TOTAL,
         get_counter,
+        ENGINE_PACER_UNAVAILABLE_TOTAL,
+        ENGINE_RL_TIMEOUT_TOTAL,
     )
 except Exception:
     # on garde les stubs déclarés plus haut
@@ -1009,6 +1014,28 @@ class OrderFSM:
 class NotReadyError(RuntimeError):
     pass
 
+class _InMemoryCIDStore:
+    def __init__(self, ttl_s: float):
+        self.ttl_s = float(ttl_s)
+        self._store: Dict[str, float] = {}
+
+    def seen(self, cid: str, now: Optional[float] = None) -> bool:
+        self.prune(now)
+        return cid in self._store
+
+    def mark(self, cid: str, now: Optional[float] = None) -> None:
+        self._store[cid] = float(now or time.time())
+
+    def prune(self, now: Optional[float] = None) -> None:
+        now = float(now or time.time())
+        ttl = self.ttl_s
+        stale = [k for k, ts in list(self._store.items()) if now - float(ts or 0.0) >= ttl]
+        for cid in stale:
+            self._store.pop(cid, None)
+
+    def clear(self) -> None:
+        self._store.clear()
+
 class ExecutionEngine:
 
     # === PACER: init & targets (EU / US / EU-CB) ===
@@ -1019,68 +1046,85 @@ class ExecutionEngine:
         Initialise ou reconfigure le Pacer selon la config (profil capital, régions, cibles).
         Appelée au boot et à chaque rechargement de config.
         """
-        region = str(getattr(self.config, "region", "EU")).upper()
-        cap_profile = str(
-            getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))).upper()
+        try:
+            region = str(getattr(self.config, "region", "EU")).upper()
+            cap_profile = str(
+                getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))).upper()
 
-        # cibles par région depuis la config
-        targets_overrides = {}
-        eucb = getattr(self.config, "pacer_targets_eucb", None)
-        eu = getattr(self.config, "pacer_targets_eu", None)
-        us = getattr(self.config, "pacer_targets_us", None)
-        jp = getattr(self.config, "pacer_targets_jp", None)  # nouveau pour Japan/Tokyo
+            # cibles par région depuis la config
+            targets_overrides = {}
+            eucb = getattr(self.config, "pacer_targets_eucb", None)
+            eu = getattr(self.config, "pacer_targets_eu", None)
+            us = getattr(self.config, "pacer_targets_us", None)
+            jp = getattr(self.config, "pacer_targets_jp", None)  # nouveau pour Japan/Tokyo
 
-        if eu:
-            targets_overrides["EU"] = eu
-        if us:
-            targets_overrides["US"] = us
-        if eucb:
-            targets_overrides["EU-CB"] = eucb
-        if jp:
-            targets_overrides["JP"] = jp
+            if eu:
+                targets_overrides["EU"] = eu
+            if us:
+                targets_overrides["US"] = us
+            if eucb:
+                targets_overrides["EU-CB"] = eucb
+            if jp:
+                targets_overrides["JP"] = jp
 
-        # mapping exchange -> région (utile si SPLIT)
-        region_map = getattr(self.config, "engine_pod_map", {"BINANCE": "EU", "BYBIT": "EU", "COINBASE": "US"})
+            # mapping exchange -> région (utile si SPLIT)
+            region_map = getattr(self.config, "engine_pod_map", {"BINANCE": "EU", "BYBIT": "EU", "COINBASE": "US"})
 
-        # bornes globales de pacing (serrées par le profil ensuite)
-        min_ms = int(getattr(self.config, "pacer_min_ms", 0))
-        max_ms = int(getattr(self.config, "pacer_max_ms", 250))
-        init_ms = int(getattr(self.config, "pacer_init_ms", 0))
-        jitter = int(getattr(self.config, "pacer_jitter_ms", 1))
+            # bornes globales de pacing (serrées par le profil ensuite)
+            min_ms = int(getattr(self.config, "pacer_min_ms", 0))
+            max_ms = int(getattr(self.config, "pacer_max_ms", 250))
+            init_ms = int(getattr(self.config, "pacer_init_ms", 0))
+            jitter = int(getattr(self.config, "pacer_jitter_ms", 1))
 
-        if getattr(self, "_pacer", None):
-            pacer = self._pacer
-            try:
-                if hasattr(pacer, "set_bot_config"):
-                    pacer.set_bot_config(self.cfg)
-            except Exception:
-                pass
-            try:
-                if hasattr(pacer, "set_capital_profile"):
-                    pacer.set_capital_profile(cap_profile)
-            except Exception:
-                pass
-            try:
-                if hasattr(pacer, "set_region_map"):
-                    pacer.set_region_map(region_map)
-            except Exception:
-                pass
-            for rg, overrides in targets_overrides.items():
+            if getattr(self, "_pacer", None):
+                pacer = self._pacer
                 try:
-                    if hasattr(pacer, "set_region_targets"):
-                        pacer.set_region_targets(rg, overrides)
+                    if hasattr(pacer, "set_bot_config"):
+                        pacer.set_bot_config(self.cfg)
                 except Exception:
-                    continue
-            return
+                   pass
+                try:
+                    if hasattr(pacer, "set_capital_profile"):
+                        pacer.set_capital_profile(cap_profile)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(pacer, "set_region_map"):
+                        pacer.set_region_map(region_map)
+                except Exception:
+                    pass
+                for rg, overrides in targets_overrides.items():
+                    try:
+                        if hasattr(pacer, "set_region_targets"):
+                            pacer.set_region_targets(rg, overrides)
+                    except Exception:
+                        continue
+            else:
+                self._pacer = EnginePacer(
+                    region=region,
+                    capital_profile=cap_profile,
+                    min_ms=min_ms, max_ms=max_ms, init_ms=init_ms, jitter_ms=jitter,
+                    targets_overrides=targets_overrides,
+                    region_map=region_map,
+                    bot_cfg=self.cfg,
+                )
+            self._pacer_available = True
+        except Exception as exc:
+            self._flag_pacer_unavailable("ensure", exc)
+            raise
 
-        self._pacer = EnginePacer(
-            region=region,
-            capital_profile=cap_profile,
-            min_ms=min_ms, max_ms=max_ms, init_ms=init_ms, jitter_ms=jitter,
-            targets_overrides=targets_overrides,
-            region_map=region_map,
-            bot_cfg=self.cfg,
-        )
+    def _flag_pacer_unavailable(self, reason: str, exc: Optional[Exception] = None) -> None:
+        self._pacer_available = False
+        try:
+            ENGINE_PACER_UNAVAILABLE_TOTAL.labels(reason=reason).inc()
+        except Exception:
+            pass
+        if not self._pacer_unavailable_logged:
+            try:
+                logger.warning("[ExecutionEngine] pacer unavailable: %s", reason, exc_info=exc)
+            except Exception:
+                pass
+            self._pacer_unavailable_logged = True
 
     # === /PACER: init & targets ===
 
@@ -1132,8 +1176,10 @@ class ExecutionEngine:
             delay_s = float(self._pacing_sleep_s(regime="normal"))
             if delay_s > 0.0:
                 await asyncio.sleep(delay_s)
-        except Exception:
-            # Ne jamais bloquer l'Engine à cause du pacing
+        except asyncio.CancelledError:
+                raise
+        except Exception as exc:
+            self._flag_pacer_unavailable("sleep", exc)
             return
 
 
@@ -1248,9 +1294,9 @@ class ExecutionEngine:
             except Exception:
                 # Le bridge Pacer -> RM ne doit jamais bloquer le PACER
                 pass
-        except Exception:
-            pass  # jamais bloquant
-
+        except Exception as exc:
+            self._flag_pacer_unavailable("update", exc)
+            return
     # === /PACER: update helper ===
 
     # ---------------------------------------------------------------------------
@@ -1309,10 +1355,21 @@ class ExecutionEngine:
         self._ac_coord = None  # brancher le client Redis/RPC ailleurs si utilisé
 
         # --- Venue keys / readiness ---
-        self.venue_keys = venue_keys or {"BINANCE": {}, "BYBIT": {}, "COINBASE": {}}
+        raw_venue_keys = venue_keys or {"BINANCE": {}, "BYBIT": {}, "COINBASE": {}}
+        self.venue_keys: Dict[str, Dict[str, Dict[str, str]]] = {}
+        for ex, mapping in dict(raw_venue_keys or {}).items():
+            canon = self._ex_venue(ex)
+            try:
+                self.venue_keys[canon] = dict(mapping)
+            except Exception:
+                self.venue_keys[canon] = mapping or {}
         self._order_keys_hint: Dict[str, Tuple[str, Optional[str], Optional[str]]] = {}
         self.ready_event = ready_event or asyncio.Event()
         self._auto_ready_on_start: bool = bool(getattr(self.config, "ready_autoset_on_start", False))
+        self._ready = False
+        self._ready_reasons: List[str] = []
+        self._ready_details: Dict[str, Any] = {}
+        self._readiness_task: Optional[asyncio.Task] = None
 
         # --- File d’ordres bornée & workers ---
         # --- Profil capital & capacités Engine (Ticket 10) ---
@@ -1410,9 +1467,18 @@ class ExecutionEngine:
         qmax = max(1, qmax)
         self.order_queue: asyncio.Queue = asyncio.Queue(maxsize=qmax)
         self.running: bool = False
+        self._pacer_available: bool = True
+        self._pacer_unavailable_logged: bool = False
         self._session: Optional[Any] = None  # aiohttp.ClientSession si utilisé
         self._workers: List[Any] = []
         self._max_concurrent = worker_count
+
+        # déduplication des submissions (TTL configurable)
+        ttl = float(getattr(self.config, "engine_submit_dedupe_ttl_s", 300.0))
+        store = getattr(self.config, "engine_dedupe_store", None)
+        if store is None:
+            store = getattr(self.cfg, "engine_dedupe_store", None)
+        self._seen_cid_store = store or _InMemoryCIDStore(ttl)
 
         # --- Rate limiting par CEX (utilise ta classe TokenBucket existante) ---
         # au lieu de self._rl_binance_order = TokenBucket(...):
@@ -1769,6 +1835,7 @@ class ExecutionEngine:
 
         if not hub:
             log.warning("[ExecutionEngine] Aucun PrivateWSHub attaché (mode test/dry-run)")
+            self._update_trade_ready()
             return
 
         status = {}
@@ -1790,12 +1857,14 @@ class ExecutionEngine:
                 has_rm_cb,
                 auto_rm,
             )
-            self._ready = False
+
             self._wiring_checked = True
+            self.mark_not_ready(reasons=["hub_wiring_incomplete"], details={"wiring": wiring})
             return
 
         self._wiring_checked = True
         log.info("[ExecutionEngine] Hub wiring OK (engine + rm branchés)")
+        self._update_trade_ready()
 
     async def submit_maker_or_delay(self, order: dict, meta: dict) -> Optional[str]:
         """
@@ -2379,9 +2448,96 @@ class ExecutionEngine:
         return EX_CANON.get(self._ex_upper(ex), str(ex or "").strip().title())
 
     # --------------------------- readiness ---------------------------
+    def _compute_trade_readiness(self) -> Tuple[bool, List[str], Dict[str, Any]]:
+        reasons: List[str] = []
+        details: Dict[str, Any] = {}
+
+        g = getattr(self.cfg, "g", None)
+        fs = getattr(g, "feature_switches", {}) if g else {}
+        live_mode = str(getattr(getattr(self.cfg, "g", object()), "mode", "DRY_RUN")).upper() == "PROD" or bool(
+            fs.get("engine_real", False)
+        )
+        required_venues = list(getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", []) or [])
+        if not required_venues:
+            required_venues = list(self.venue_keys.keys())
+
+        missing_keys: List[str] = []
+        for ex in required_venues:
+            canon = self._ex_venue(ex)
+            if not self.venue_keys.get(canon):
+                missing_keys.append(canon)
+        if live_mode and missing_keys:
+            reasons.append("missing_keys")
+            details["missing_keys"] = missing_keys
+
+        require_private_ws = bool(fs.get("private_ws", False))
+        require_private_in_dry = bool(getattr(self.config, "require_private_ws_in_dry_run", False))
+        private_required = (live_mode and require_private_ws) or (not live_mode and require_private_in_dry)
+        hub_status: Dict[str, Any] = {}
+        if private_required:
+            if not self.private_ws_hub:
+                reasons.append("hub_missing")
+            else:
+                try:
+                    if hasattr(self.private_ws_hub, "get_status"):
+                        hub_status = self.private_ws_hub.get_status() or {}
+                except Exception:
+                    hub_status = {}
+                wiring = hub_status.get("wiring", {}) if isinstance(hub_status, dict) else {}
+                hub_wiring_ok = bool(
+                    wiring.get("has_engine_callback") and wiring.get("has_rm_callback") and not wiring.get(
+                        "auto_rm_from_engine")
+                )
+                if not hub_wiring_ok:
+                    reasons.append("hub_wiring_incomplete")
+                accounts_ws = hub_status.get("accounts_ws", {}) if isinstance(hub_status, dict) else {}
+                healthy_aliases = [
+                    alias
+                    for alias, st in accounts_ws.items()
+                    if (isinstance(st, dict) and str(st.get("status", "")).upper() == "WS_OK") or (
+                                isinstance(st, str) and st.upper() == "WS_OK")
+                ]
+                if not healthy_aliases:
+                    reasons.append("private_ws_unhealthy")
+                details["private_ws"] = {"hub_status": hub_status, "healthy_aliases": healthy_aliases}
+
+        try:
+            if private_required and getattr(self, "risk_manager", None) and hasattr(self.risk_manager, "get_status"):
+                rm_status = self.risk_manager.get_status() or {}
+                rm_private = rm_status.get("private_ws") or {}
+                if rm_private and not rm_private.get("hub_wiring_ok", True):
+                    reasons.append("rm_private_wiring_incomplete")
+                    details["rm_private"] = rm_private
+        except Exception:
+            details["rm_private"] = details.get("rm_private") or {"error": "status_unavailable"}
+
+        return (len(reasons) == 0, reasons, details)
+
+    def _update_trade_ready(self) -> bool:
+        ok, reasons, details = self._compute_trade_readiness()
+        if ok:
+            self.mark_ready()
+        else:
+            self.mark_not_ready(reasons=reasons, details=details)
+        return ok
+
+    async def _readiness_loop(self) -> None:
+        interval = float(getattr(self.config, "ready_poll_every_s", 2.0))
+        try:
+            while self.running:
+                self._update_trade_ready()
+                await asyncio.sleep(max(0.5, interval))
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("[ExecutionEngine] readiness loop crashed")
+
     def mark_ready(self) -> None:
         """Permet de passer l’engine en état 'prêt' explicitement."""
         try:
+            self._ready = True
+            self._ready_reasons = []
+            self._ready_details = {}
             self.ready_event.set()
         except Exception:
             logging.exception("Unhandled exception")
@@ -2404,9 +2560,12 @@ class ExecutionEngine:
             self._ack_marked.intersection_update(set(self._ack_ring))
         return True
 
-    def mark_not_ready(self) -> None:
+    def mark_not_ready(self, reasons: Optional[List[str]] = None, details: Optional[Dict[str, Any]] = None) -> None:
         """Permet de bloquer toute émission tant que la synchro/WS n'est pas stabilisée."""
         try:
+            self._ready = False
+            self._ready_reasons = list(reasons or [])
+            self._ready_details = dict(details or {})
             self.ready_event.clear()
         except Exception:
             logging.exception("Unhandled exception")
@@ -2468,8 +2627,6 @@ class ExecutionEngine:
             self._norm_ex(sell_leg.get("exchange", "")),
         )
 
-    def _fmt_pair(self, s: str) -> str:
-        return str(s or "").replace("-", "").upper()
 
     def _ob_latest(self, exchange: str, pair_key: str) -> dict:
         ex = self._ex_upper(exchange)
@@ -2655,7 +2812,7 @@ class ExecutionEngine:
             else:
                 raise ValueError(f"Unsupported exchange {ex}")
 
-    async def resync_order(self, exchange: str, alias: str, order_id: str) -> bool:
+    async def resync_order(self, exchange: str, alias: str, order_id: str, *, id_kind: str = "exchange_order_id") -> bool:
         """
         P0: resynchronise un ordre précis via REST et émet un événement privé normalisé.
         Retourne True si au moins un event a été émis.
@@ -2675,8 +2832,8 @@ class ExecutionEngine:
 
             # 3) publier l'event (Hub si dispo, sinon handler interne)
             hub = getattr(self, "private_ws_hub", None)
-            if hub and hasattr(hub, "on_event"):
-                hub.on_event(ev)
+            if hub and hasattr(hub, "emit"):
+                hub.emit(ev)
             else:
                 handler = getattr(self, "on_private_event", None)
                 if handler:
@@ -2688,7 +2845,19 @@ class ExecutionEngine:
         except asyncio.CancelledError:
             raise
         except Exception:
+            if id_kind != "exchange_order_id":
+                try:
+                    log.warning(
+                        "[ExecutionEngine] resync_order failed for %s id=%s (%s)",
+                        id_kind,
+                        order_id,
+                        ex,
+                    )
+                except Exception:
+                    pass
             return False
+
+
 
     async def resync_alias(self, exchange: str, alias: str) -> bool:
         """
@@ -2708,8 +2877,8 @@ class ExecutionEngine:
                 fills = await client.list_recent_fills(alias=al, limit=50)
                 for f in fills or []:
                     ev = self._normalize_fill_to_private_event(ex, al, f, source="resync_alias")
-                    if hub and hasattr(hub, "on_event"):
-                        hub.on_event(ev)
+                    if hub and hasattr(hub, "emit"):
+                        hub.emit(ev)
                     else:
                         if hasattr(self, "on_private_event"):
                             await self.on_private_event(ev) if asyncio.iscoroutinefunction(
@@ -2721,8 +2890,8 @@ class ExecutionEngine:
                 orders = await client.list_open_orders(alias=al, limit=50)
                 for o in orders or []:
                     ev = self._normalize_order_to_private_event(ex, al, o, source="resync_alias")
-                    if hub and hasattr(hub, "on_event"):
-                        hub.on_event(ev)
+                    if hub and hasattr(hub, "emit"):
+                        hub.emit(ev)
                     else:
                         if hasattr(self, "on_private_event"):
                             await self.on_private_event(ev) if asyncio.iscoroutinefunction(
@@ -2871,7 +3040,7 @@ class ExecutionEngine:
             cid = self._bundle_cid_for_dedupe(bundle)
             now = time.time()
             self._prune_seen_cids(now)
-            if cid in self._seen_cids:
+            if self._seen_cid_store.seen(cid, now):
                 # Idempotence: le bundle (logique) est déjà en file; on no-op mais on
                 # considère que l'appel RM est "accepté" pour rester simple côté desk.
                 try:
@@ -3102,7 +3271,7 @@ class ExecutionEngine:
         try:
             if cid is not None:
                 # On mémorise le CID une fois qu'on sait que le bundle est bien en file.
-                self._seen_cids[cid] = time.time()
+                self._seen_cid_store.mark(cid, time.time())
         except Exception:
             pass
 
@@ -3710,7 +3879,7 @@ class ExecutionEngine:
         cid = self._bundle_cid_for_dedupe(bundle)
         now = time.time()
         self._prune_seen_cids(now)
-        if cid in self._seen_cids:
+        if self._seen_cid_store.seen(cid, now):
             # Idempotence: on court-circuite silencieusement (même bundle logique vu récemment)
             # Compat: on ne renvoie pas d'exception pour ne pas surprendre le RM
             try:
@@ -4015,7 +4184,7 @@ class ExecutionEngine:
         self._increment_active_bundle(branch, profile)
         try:
             await self.order_queue.put(job)
-            self._seen_cids[cid] = now
+            self._seen_cid_store.mark(cid, now)
         except Exception:
             self._decrement_active_bundle(branch, profile)
             raise
@@ -4045,8 +4214,6 @@ class ExecutionEngine:
         que les retry du RM restent idempotents, mais on garde le reste du
         payload (route, meta, legs...) pour que le CID reflète bien la logique.
         """
-        if not hasattr(self, "_seen_cids"):
-            self._seen_cids = {}
 
         # On travaille sur une copie "canonique" best-effort
         try:
@@ -4080,19 +4247,11 @@ class ExecutionEngine:
 
 
     def _prune_seen_cids(self, now: Optional[float] = None) -> None:
-        if not hasattr(self, "_seen_cids"):
-            self._seen_cids = {}
-            return
-        ttl = float(getattr(self.config, "engine_submit_dedupe_ttl_s", 300.0))
-        now = now or time.time()
-        stale = [cid for cid, ts in list(self._seen_cids.items()) if now - float(ts or 0.0) >= ttl]
-        for cid in stale:
-            self._seen_cids.pop(cid, None)
+
         try:
-            if hasattr(self, "_update_submit_queue_gauge"):
-                self._update_submit_queue_gauge()
+            self._seen_cid_store.prune(now)
         except Exception:
-            pass
+            return
 
     async def start(self):
         """
@@ -4119,6 +4278,8 @@ class ExecutionEngine:
 
         self.running = True
         created_session = False
+        started_streams = False
+        started_rebal = False
 
         try:
             # Session HTTP en mode live
@@ -4137,6 +4298,7 @@ class ExecutionEngine:
             # Flux WS privés
             try:
                 await self.start_streams()
+                started_streams = True
             except Exception:
                 logger.debug("[ExecutionEngine] start_streams() a échoué (non bloquant).", exc_info=False)
 
@@ -4144,12 +4306,23 @@ class ExecutionEngine:
             try:
                 if self.rebal_autopilot_enabled:
                     self.start_rebalancing_loop()
+                    started_rebal = True
             except Exception:
                 logger.debug("[ExecutionEngine] rebalancing loop start failed (non bloquant).", exc_info=False)
 
             # Readiness automatique
             if bool(getattr(self, "_auto_ready_on_start", False)):
                 self.mark_ready()
+
+                # Readiness trade-safe
+                try:
+                    self._update_trade_ready()
+                    if not self._readiness_task:
+                        self._readiness_task = asyncio.create_task(
+                            self._readiness_loop(), name="engine-readiness"
+                        )
+                except Exception:
+                    logger.debug("[ExecutionEngine] readiness loop spawn failed", exc_info=True)
 
             # Observabilité
             set_engine_running(True)
@@ -4170,6 +4343,14 @@ class ExecutionEngine:
                 w.cancel()
             await asyncio.gather(*self._workers, return_exceptions=True)
             self._workers.clear()
+
+            if started_streams:
+                with contextlib.suppress(Exception):
+                    await self.stop_streams()
+
+            if started_rebal:
+                with contextlib.suppress(Exception):
+                    self.stop_rebalancing_loop()
 
             # Ferme la session HTTP créée ici
             if created_session and getattr(self, "_session", None):
@@ -4192,6 +4373,12 @@ class ExecutionEngine:
             w.cancel()
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+
+        with contextlib.suppress(Exception):
+            if self._readiness_task:
+                self._readiness_task.cancel()
+                await asyncio.wait_for(self._readiness_task, timeout=2.0)
+        self._readiness_task = None
 
         # Puis annuler proprement les tâches de fond
         try:
@@ -4218,7 +4405,7 @@ class ExecutionEngine:
 
         # READINESS: on repasse en not-ready
         try:
-            self.ready_event.clear()
+            self.mark_not_ready()
         except Exception:
             logging.exception("Unhandled exception")
         self._submit_ts_ns.clear()
@@ -4251,16 +4438,24 @@ class ExecutionEngine:
                     except Exception:
                         pass
                     payload = await asyncio.wait_for(self.order_queue.get(), timeout=1.0)
+                    try:
+                        self.stats.queue_length = self.order_queue.qsize()
+                        self._update_submit_queue_gauge()
+                        set_engine_queue(self.stats.queue_length)
+                    except Exception as e:
+                        self._handle_worker_nonfatal(e, phase=f"queue-metrics-W{wid}")
+                    try:
+                        self._pacer_update()
+                    except Exception as e:
+                        self._handle_worker_nonfatal(e, phase=f"pacer-update-W{wid}")
+
                 except asyncio.TimeoutError:
                     continue
-                self.stats.queue_length = self.order_queue.qsize()
-                self._update_submit_queue_gauge()
-                set_engine_queue(self.stats.queue_length)
-                # PACER: push queue depth (drain latency + signal boucle fermée)
-                try:
-                    self._pacer_update()
-                except Exception:
-                    pass
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    self._handle_worker_nonfatal(e, phase=f"pre-payload-W{wid}")
+                    continue
 
                 t0 = time.time()
                 try:
@@ -4304,11 +4499,25 @@ class ExecutionEngine:
                     try:
                         if payload is not None:
                             self._release_active_bundle(payload)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                            self._handle_worker_nonfatal(e, phase=f"release-active-W{wid}")
                     self.order_queue.task_done()
         except asyncio.CancelledError:
             logger.info(f"[ExecutionEngine/W{wid}] annulé.")
+
+    def _handle_worker_nonfatal(self, exc: Exception, *, phase: str) -> None:
+        try:
+            ENGINE_WORKER_ERRORS_TOTAL.labels(phase=phase).inc()
+        except Exception:
+            pass
+        try:
+            report_nonfatal("ExecutionEngine", "worker_nonfatal", exc, phase=phase)
+        except Exception:
+            pass
+        try:
+            logger.debug("[ExecutionEngine] worker nonfatal in %s", phase, exc_info=exc)
+        except Exception:
+            pass
 
     def _reprioritize_queue_for_safety(self) -> None:
         """
@@ -4357,6 +4566,25 @@ class ExecutionEngine:
                 return
         except Exception:
             return
+
+    async def _acquire_rl(self, bucket, exchange: str) -> bool:
+        if bucket is None:
+            return True
+        try:
+            await bucket.acquire()
+            return True
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            try:
+                ENGINE_RL_TIMEOUT_TOTAL.labels(exchange=exchange).inc()
+            except Exception:
+                pass
+            report_nonfatal("ExecutionEngine", "rate_limit_timeout", exc, exchange=exchange)
+            return False
+        except Exception as exc:
+            report_nonfatal("ExecutionEngine", "rate_limit_error", exc, exchange=exchange)
+            return False
 
     # --------------------------- WS order updates ---------------------------
     def handle_order_update(self, event: Dict[str, Any]):
@@ -8331,7 +8559,8 @@ class ExecutionEngine:
                              client_id: str, *,
                              tif: str = "GTC", maker: bool = False, keys: Dict[str, str] = None):
         assert self._session, "ClientSession not started"
-        await self._rl_binance_order.acquire()
+        if not await self._acquire_rl(self._rl_binance_order, "BINANCE"):
+            raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.binance.com/api/v3/order"
         ts = int(time.time() * 1000)
         otype = "LIMIT_MAKER" if maker else "LIMIT"
@@ -8358,7 +8587,8 @@ class ExecutionEngine:
     async def _binance_cancel(self: "ExecutionEngine", symbol: str, client_id: Optional[str] = None,
                               order_id: Optional[str] = None, *, keys: Dict[str, str] | None = None):
         assert self._session, "ClientSession not started"
-        await self._rl_binance_order.acquire()
+        if not await self._acquire_rl(self._rl_binance_order, "BINANCE"):
+            raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.binance.com/api/v3/order"
         ts = int(time.time() * 1000)
         params = {"symbol": symbol, "recvWindow": 5000, "timestamp": ts}
@@ -8382,7 +8612,8 @@ class ExecutionEngine:
                            client_id: str,
                            *, tif: str = "GTC", maker: bool = False, keys: Dict[str, str] = None):
         assert self._session, "ClientSession not started"
-        await self._rl_bybit_order.acquire()
+        if not await self._acquire_rl(self._rl_bybit_order, "BYBIT"):
+            raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.bybit.com/v5/order/create"
         ts = str(int(time.time() * 1000))
         recv_window = "5000"
@@ -8417,7 +8648,8 @@ class ExecutionEngine:
     async def _bybit_cancel(self: "ExecutionEngine", symbol: str, client_id: Optional[str] = None,
                             order_id: Optional[str] = None, *, keys: Dict[str, str] | None = None):
         assert self._session, "ClientSession not started"
-        await self._rl_bybit_order.acquire()
+        if not await self._acquire_rl(self._rl_bybit_order, "BYBIT"):
+            raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.bybit.com/v5/order/cancel"
         ts = str(int(time.time() * 1000))
         recv_window = "5000"
@@ -8472,7 +8704,8 @@ class ExecutionEngine:
             return {"status": "simulated", "exchange": "Coinbase", "clientOrderId": client_id}
 
         assert self._session, "ClientSession not started"
-        await self._rl_coinbase_order.acquire()
+        if not await self._acquire_rl(self._rl_coinbase_order, "COINBASE"):
+            raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
 
         # Normalisation du product_id (BTCUSDC -> BTC-USDC) si besoin
         orig = str(product_id)
@@ -8555,7 +8788,8 @@ class ExecutionEngine:
             return {"status": "simulated", "exchange": "Coinbase", "clientOrderId": client_id, "orderId": order_id}
 
         assert self._session, "ClientSession not started"
-        await self._rl_coinbase_order.acquire()
+        if not await self._acquire_rl(self._rl_coinbase_order, "COINBASE"):
+            raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
 
         url = "https://api.coinbase.com/api/v3/brokerage/orders/cancel"
         ts = str(int(time.time() * 1000))
@@ -9167,7 +9401,8 @@ class ExecutionEngine:
 
         return {
             "module": "ExecutionEngine",
-            "ready": bool(getattr(self, "_ready", False)),
+            "ready_reasons": list(getattr(self, "_ready_reasons", [])),
+            "ready_details": dict(getattr(self, "_ready_details", {})),
             "private_ws": wiring_info,
             "orders_inflight": len(getattr(self, "_orders", {})),
             "tm_active": getattr(self, "enable_tm", False),

@@ -46,6 +46,7 @@ import enum
 import math
 import time
 import uuid
+import logging
 from typing import Any, Dict, List, Optional,Tuple
 
 # -----------------------------------------------------------------------------␊
@@ -69,6 +70,7 @@ except Exception:  # pragma: no cover
 
 _METRIC_CONVERT = CONTRACTS_HELPERS_CALLS_TOTAL
 _METRIC_ERRORS = CONTRACTS_VALIDATION_ERRORS_TOTAL
+_LOG = logging.getLogger("contracts.payloads")
 
 def _inc(counter, *labels):
     try:
@@ -80,12 +82,16 @@ def _inc(counter, *labels):
 # Pydantic compat v2/v1 (avec fallback no-op)
 # -----------------------------------------------------------------------------
 try:
-    from pydantic import BaseModel, Field, ValidationError
+    from pydantic import field_validator as _pd_field_validator, model_validator as _pd_model_validator  # v2
+
+    _PYDANTIC_V2 = True
     try:
         from pydantic import field_validator, model_validator  # v2
     except Exception:  # pragma: no cover
-        from pydantic import validator as field_validator      # type: ignore
-        from pydantic import root_validator as model_validator  # type: ignore
+        from pydantic import validator as _pd_field_validator  # type: ignore
+        from pydantic import root_validator as _pd_model_validator  # type: ignore
+
+        _PYDANTIC_V2 = False
     try:
         from pydantic import ConfigDict  # v2 only
     except Exception:
@@ -116,7 +122,20 @@ except Exception:
     field_validator = model_validator = _noop_validator  # type: ignore
     ConfigDict = None
 
+    _PYDANTIC_V2 = False
 
+if "_pd_field_validator" in globals():
+    def field_validator(*fields, mode="after", **kwargs):  # type: ignore
+        if _PYDANTIC_V2:
+            return _pd_field_validator(*fields, mode=mode, **kwargs)
+        pre = kwargs.pop("pre", mode == "before")
+        return _pd_field_validator(*fields, pre=pre, **kwargs)
+
+    def model_validator(*fields, mode="after", **kwargs):  # type: ignore
+        if _PYDANTIC_V2:
+            return _pd_model_validator(*fields, mode=mode, **kwargs)
+        pre = kwargs.pop("pre", mode == "before")
+        return _pd_model_validator(*fields, pre=pre, **kwargs)
 
 class _Cfg(BaseModel):
     """Base config tolérante (utile en DRY/DEV & smoke)."""
@@ -164,8 +183,21 @@ def _norm_symbol(sym: str, keep_dash: bool = True) -> str:
     - `keep_dash=False` pour une clé compacte (ex: 'BTCUSDC')
     """
     if sym is None:
+        try:
+            if not getattr(_LOG, "_warned_empty_symbol", False):
+                setattr(_LOG, "_warned_empty_symbol", True)
+                _LOG.warning("[payloads] normalize symbol received None/empty; returning ''", exc_info=False)
+        except Exception:
+            pass
         return ""
     s = str(sym).strip().upper().replace("/", "-")
+    if not s:
+        try:
+            if not getattr(_LOG, "_warned_empty_symbol", False):
+                setattr(_LOG, "_warned_empty_symbol", True)
+                _LOG.warning("[payloads] normalize symbol empty after stripping; returning ''", exc_info=False)
+        except Exception:
+            pass
     return s if keep_dash else s.replace("-", "")
 
 def _norm_pair_key(sym: str) -> str:
@@ -198,8 +230,7 @@ def _normalize_symbol_and_pair(symbol: Optional[str], pair_key_value: Optional[s
     pk_norm = _norm_pair_key(pair_key_value) if pair_key_value else ""
     if sym_norm and not pk_norm:
         pk_norm = _norm_pair_key(sym_norm)
-    if pk_norm and not sym_norm:
-        sym_norm = _norm_symbol(pk_norm)
+
     return sym_norm, pk_norm
 
 
@@ -1002,6 +1033,8 @@ class DiscoveryResult(_Cfg, BaseModel):
     api_errors: Dict[str, int] = Field(default_factory=dict)
     run_ms: Optional[float] = Field(default=None, ge=0)
     top_pairs: List[str] = Field(default_factory=list)
+    fx_applied: Optional[bool] = None
+    ranking_mode: Optional[str] = None
 
     def __init__(self, **data: Any):  # type: ignore[override]
         super().__init__(**data)
@@ -1183,6 +1216,15 @@ def _validate_lite(model, payload, model_name: str):
         _inc(_METRIC_ERRORS, model_name)
         raise
 
+def try_validate_lite(model, payload, model_name: str):
+    try:
+        return model(**payload), None
+    except ValidationError as exc:
+        _inc(_METRIC_ERRORS, model_name)
+        return None, exc
+    except Exception as exc:  # pragma: no cover
+        return None, exc
+
 def validate_payload_lite(payload: Dict[str, Any]) -> Opportunity:
     return _validate_lite(Opportunity, payload, "Opportunity")
 
@@ -1343,6 +1385,52 @@ def make_submit_bundle(*,
         },
     }
 
+def make_rm_shutdown_event(*,
+                           ts_ms: Optional[int] = None,
+                           duration_ms: Optional[float] = None,
+                           pending_tasks: int = 0,
+                           timed_out: bool = False) -> Dict[str, Any]:
+    """Envelope minimale pour tracer un arrêt RiskManager (best-effort)."""
+    now_ms = int(ts_ms if ts_ms is not None else time.time() * 1000)
+    return {
+        "event_type": "rm.shutdown",
+        "schema_version": SCHEMA_VERSION,
+        "ts_ms": now_ms,
+        "duration_ms": float(duration_ms) if duration_ms is not None else None,
+        "pending_tasks": int(pending_tasks or 0),
+        "timed_out": bool(timed_out),
+    }
+
+
+KNOWN_REASON_CODES = {
+    "RM_ENGINE_NOT_READY",
+    "RM_BALANCE_TTL_BLOCK",
+    "RM_STALE_VOL",
+    "RM_BELOW_MIN_BPS",
+    "RM_BELOW_MIN_NOTIONAL",
+    "RM_CAPS_INVALID",
+    "ENGINE_SUBMIT_TIMEOUT",
+    "ENGINE_REJECT",
+    "ENGINE_BACKPRESSURE_QUEUE_FULL",
+    "ENGINE_BACKPRESSURE_HIGH_WM",
+}
+
+
+def normalize_reason_code(reason: Optional[str]) -> Optional[str]:
+    """Normalise un code de reason (safe, best-effort)."""
+    if reason is None:
+        return None
+    try:
+        r = str(reason).strip()
+    except Exception:
+        return None
+    if not r:
+        return None
+    canon = r.upper()
+    if canon in KNOWN_REASON_CODES:
+        return canon
+    return canon
+
 # -----------------------------------------------------------------------------
 # Exports publics
 # -----------------------------------------------------------------------------
@@ -1359,9 +1447,11 @@ __all__ = [
     "submit_leg_from_intent", "engine_action_from_intent",
     "validate_payload_lite", "validate_opportunity_lite", "validate_decision_lite",
     "validate_engine_action_lite", "validate_order_lite", "validate_fill_lite",
+    "try_validate_lite",
     "normalize_private_fill_event", "validate_private_fill_event_lite",
     "validate_submit_bundle_lite", "validate_cancel_lite",
     "validate_fill_normalized_lite", "validate_order_intent_lite", "make_submit_bundle",
+    "make_rm_shutdown_event", "normalize_reason_code",
     "validate_ws_alias_status_snapshot_lite", "validate_reco_alias_status_snapshot_lite",
     "validate_balance_snapshot_rm_lite", "normalize_leg_dict",
     # >>> PATCH #3 — helpers publics
