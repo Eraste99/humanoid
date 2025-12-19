@@ -59,6 +59,8 @@ try:
         ROUTER_DROPPED_TOTAL,
         WS_RECONNECTS_TOTAL,
         note_router_cfg,
+        safe_inc,
+        safe_set,
     )
 except Exception:  # pragma: no cover
     def mark_router_to_scanner_ts(
@@ -86,6 +88,12 @@ except Exception:  # pragma: no cover
 
 
     def note_router_cfg(*_a, **_k):
+        return None
+
+    def safe_inc(*_a, **_k):
+        return None
+
+    def safe_set(*_a, **_k):
         return None
 
 
@@ -468,6 +476,21 @@ class MarketDataRouter:
         except Exception:
             return 0
 
+    @staticmethod
+    def _queue_label(route_name: str) -> str:
+        if route_name.startswith("combo:"):
+            return "combo"
+        if route_name.startswith("cex:"):
+            if route_name.endswith(".vol"):
+                return "vol"
+            if route_name.endswith(".slip"):
+                return "slip"
+            if route_name.endswith(".health"):
+                return "health"
+        if "scanner" in route_name:
+            return "scanner"
+        return "combo"
+
     def _update_queue_depth_metrics_for(self, ex: str) -> None:
         key = self._cex_key(ex)
         bucket = self.out_queues.get(key) or {}
@@ -475,14 +498,43 @@ class MarketDataRouter:
         s = self._qsize(bucket.get("slip"))
         h = self._qsize(bucket.get("health"))
         t = v + s + h
-        try:
-            # APRÈS  (➃➄➅➆ 4 lignes)
-            ROUTER_QUEUE_DEPTH_BY_EX.labels(exchange=str(ex).upper(), queue="vol", shard=self.shard).set(v)
-            ROUTER_QUEUE_DEPTH_BY_EX.labels(exchange=str(ex).upper(), queue="slip", shard=self.shard).set(s)
-            ROUTER_QUEUE_DEPTH_BY_EX.labels(exchange=str(ex).upper(), queue="health", shard=self.shard).set(h)
-            ROUTER_QUEUE_DEPTH_BY_EX.labels(exchange=str(ex).upper(), queue="total", shard=self.shard).set(t)
-        except Exception:
-            pass
+
+        safe_set(
+            ROUTER_QUEUE_DEPTH_BY_EX,
+            "router_queue_depth_by_ex",
+            "_update_queue_depth_metrics_for",
+            v,
+            exchange=str(ex).upper(),
+            queue="vol",
+            shard=self.shard,
+        )
+        safe_set(
+            ROUTER_QUEUE_DEPTH_BY_EX,
+            "router_queue_depth_by_ex",
+            "_update_queue_depth_metrics_for",
+            s,
+            exchange=str(ex).upper(),
+            queue="slip",
+            shard=self.shard,
+        )
+        safe_set(
+            ROUTER_QUEUE_DEPTH_BY_EX,
+            "router_queue_depth_by_ex",
+            "_update_queue_depth_metrics_for",
+            h,
+            exchange=str(ex).upper(),
+            queue="health",
+            shard=self.shard,
+        )
+        safe_set(
+            ROUTER_QUEUE_DEPTH_BY_EX,
+            "router_queue_depth_by_ex",
+            "_update_queue_depth_metrics_for",
+            t,
+            exchange=str(ex).upper(),
+            queue="total",
+            shard=self.shard,
+        )
 
     def _update_queue_depth_metrics_all(self) -> None:
         for key in list(self.out_queues.keys()):
@@ -498,10 +550,14 @@ class MarketDataRouter:
         self._event_sink = sink
 
     def _update_pair_queue_depth(self, pair: str, ex: str, depth: int) -> None:
-        try:
-            ROUTER_PAIR_QUEUE_DEPTH.labels(exchange=str(ex).upper(), pair=str(pair).upper()).set(int(depth))
-        except Exception:
-            pass
+        safe_set(
+            ROUTER_PAIR_QUEUE_DEPTH,
+            "router_pair_queue_depth",
+            "_update_pair_queue_depth",
+            int(depth),
+            exchange=str(ex).upper(),
+            pair=str(pair).upper(),
+        )
 
     def _bp_note_drop(self, route: str, *, reason: str) -> None:
         """Accumule des drops pour détection backpressure soft."""
@@ -686,15 +742,13 @@ class MarketDataRouter:
     # Hook optionnel, callable depuis les clients WS
     def note_ws_reconnect(self, exchange: str, *, reason: str = "listener_reconnect") -> None:
         ex = str(exchange).upper()
-        try:
-            WS_RECONNECTS_TOTAL.labels(exchange=ex, reason=str(reason)).inc()
-            return
-        except Exception:
-            pass
-        try:
-            WS_RECONNECTS_TOTAL.labels(exchange=ex).inc()
-        except Exception:
-            pass
+        safe_inc(
+            WS_RECONNECTS_TOTAL,
+            "ws_reconnects_total",
+            "note_ws_reconnect",
+            exchange=ex,
+            reason=str(reason),
+        )
 
     def note_ws_backpressure(self, exchange: str, *, reason: str, drops: int = 1, last_error: Optional[str] = None) -> None:
         ex = str(exchange).upper()
@@ -705,12 +759,17 @@ class MarketDataRouter:
             "last_error": last_error,
         }
         self._ws_backpressure_until = time.time() + self.ws_source_backpressure_cooldown_s
-        try:
-            ROUTER_DROPPED_TOTAL.labels(queue=f"ws_source:{ex}", reason=reason).inc(max(1, int(drops)))
-        except Exception:
-            pass
-        self._bp_note_drop(f"ws_source:{ex}", reason=reason)
-    # ----------------------------- Purge -----------------------------
+        for _ in range(max(1, int(drops))):
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "note_ws_backpressure",
+                queue="health",
+                reason="queue_full",
+            )
+        self._bp_note_drop("health", reason="queue_full")
+
+     # ----------------------------- Purge -----------------------------
     def _purge_old_snapshots(self) -> None:
         now = _now_dt()
         for pair in list(self.buffer.keys()):
@@ -868,15 +927,28 @@ class MarketDataRouter:
             bucket[ex] = dq
 
         # Nom de queue explicite pour la métrique
-        qname = f"coalesce:{ex}/{pair}"
+        qname = "combo"
 
         # backpressure counters
         if len(dq) == dq.maxlen:
-            ROUTER_DROPPED_TOTAL.labels(queue=qname, reason="overflow").inc()
-            self._bp_note_drop(qname, reason="overflow")
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_coalesce_enqueue",
+                queue=qname,
+                reason="queue_full",
+            )
+            self._bp_note_drop(qname, reason="queue_full")
+
         elif len(dq) >= 1:
-            ROUTER_DROPPED_TOTAL.labels(queue=qname, reason="coalesced").inc()
-            self._bp_note_drop(qname, reason="coalesced")
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_coalesce_enqueue",
+                queue=qname,
+                reason="dedup_coalesce",
+            )
+            self._bp_note_drop(qname, reason="dedup_coalesce")
 
         dq.append(ev)
         self._update_pair_queue_depth(pair, ex, len(dq))
@@ -1140,35 +1212,75 @@ class MarketDataRouter:
             ex = ev_model.exchange.upper()
             pair = (ev_model.pair_key or "").replace("-", "").upper()
             if not pair or not ex:
-                try:
-                    ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="schema_mismatch").inc()
-                except Exception:
-                    pass
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_validate_and_enrich",
+                    queue="combo",
+                    reason="pair_unmapped",
+                )
                 return None
             if not ev_model.active:
-                try:
-                    ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="inactive").inc()
-                except Exception:
-                    pass
-                return None
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_validate_and_enrich",
+                    queue="combo",
+                    reason="inactive",
+                )
 
             bid = float(ev_model.best_bid)
             ask = float(ev_model.best_ask)
             if bid <= 0 or ask <= 0 or ask < bid:
-                try:
-                    ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="l1_invalid").inc()
-                except Exception:
-                    pass
-                return None
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_validate_and_enrich",
+                    queue="combo",
+                    reason="schema_mismatch",
+                )
 
             ob = ev.get("orderbook") or {}
             bids, asks = _sanitize_orderbook(ob, max_levels=50) if ob else ([], [])
+            if ev.get("exchange_ts_ms") is None and ev.get("recv_ts_ms") is None:
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_validate_and_enrich",
+                    queue="combo",
+                    reason="schema_missing_field",
+                )
+                return None
+
             ex_dt = _to_dt(ev.get("exchange_ts_ms") or ev.get("recv_ts_ms"))
             recv_dt = _to_dt(ev.get("recv_ts_ms") or ev.get("exchange_ts_ms"))
+            ex_ts_ms = int((ex_dt.timestamp()) * 1000)
+            recv_ts_ms = int((recv_dt.timestamp()) * 1000)
+            if recv_ts_ms < ex_ts_ms:
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_validate_and_enrich",
+                    queue="combo",
+                    reason="bad_ts_negative_age",
+                )
+                recv_ts_ms = ex_ts_ms
+            quote = ev.get("quote") or "UNKNOWN"
+            if quote == "UNKNOWN":
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_validate_and_enrich",
+                    queue="combo",
+                    reason="missing_quote",
+                )
+            tier = ev.get("tier")
+
 
             mid = 0.5 * (bid + ask)
             spread_bps = 10000.0 * (ask - bid) / mid if mid > 0 else 0.0
             has_l2 = bool(bids) and bool(asks)
+            age_ms = max(0.0, float(recv_ts_ms - ex_ts_ms))
 
             out = {
                 "exchange": ex,
@@ -1181,10 +1293,13 @@ class MarketDataRouter:
                 "ask_volume": float(ev.get("ask_volume") or 0.0),
                 "orderbook": {"bids": bids, "asks": asks} if has_l2 else {},
                 "has_l2": has_l2,
-                "exchange_ts_ms": int((ex_dt.timestamp()) * 1000),
-                "recv_ts_ms": int((recv_dt.timestamp()) * 1000),
+                "exchange_ts_ms": ex_ts_ms,
+                "recv_ts_ms": recv_ts_ms,
+                "age_ms": age_ms,
                 "mid": mid,
                 "l1_spread_bps": spread_bps,
+                "quote": quote,
+                "tier": tier,
             }
             return out
 
@@ -1193,27 +1308,63 @@ class MarketDataRouter:
             if self.verbose:
                 logger.exception("[Router] event schema invalid")
             report_nonfatal("MarketDataRouter", "event_validation_error", e)
-            try:
-                ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="schema_exception").inc()
-            except Exception:
-                pass
-
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_validate_and_enrich",
+                queue="combo",
+                reason="exception",
+            )
             return None
 
         except Exception as e:
             self._events_schema_errors += 1
             if self.verbose:
                 logger.exception("[Router] event schema invalid")
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_validate_and_enrich",
+                queue="combo",
+                reason="exception",
+            )
+            report_nonfatal("MarketDataRouter", "event_validation_exception", e)
+            return None
 
     # -------------------------- Fan-out helpers --------------------------
     def _try_put(self, q: asyncio.Queue | None, route_name: str, payload: dict) -> None:
         if not isinstance(q, asyncio.Queue):
             return
+        queue_label = self._queue_label(route_name)
+        wm_ratio = 0.70
+        try:
+            cfg = self.router_cfg or getattr(self, "bot_cfg", None)
+            if cfg is not None:
+                bp = getattr(cfg, "backpressure", {}) or {}
+                if not bp:
+                    bp = getattr(cfg, "ROUTER_BACKPRESSURE", {}) or {}
+                wm_ratio = float(bp.get("HIGH_WM_RATIO", wm_ratio))
+        except Exception:
+            wm_ratio = 0.70
+        if q.maxsize and q.qsize() >= int(q.maxsize * wm_ratio):
+            safe_inc(
+                ROUTER_QUEUE_HIGH_WATERMARK_TOTAL,
+                "router_queue_high_watermark_total",
+                "_try_put",
+                queue=queue_label,
+            )
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_try_put",
+                queue=queue_label,
+                reason="queue_full",
+            )
+            self._bp_note_drop(queue_label, reason="queue_full")
+            return
         try:
             q.put_nowait(payload)
-            if q.qsize() >= int(q.maxsize * 0.60):
-                # label attendu = queue
-                ROUTER_QUEUE_HIGH_WATERMARK_TOTAL.labels(queue=route_name).inc()
+
         except asyncio.QueueFull:
             # drop oldest (coalesced)
             try:
@@ -1223,13 +1374,37 @@ class MarketDataRouter:
             try:
                 q.put_nowait(payload)
                 # labels attendus = queue + reason
-                ROUTER_DROPPED_TOTAL.labels(queue=route_name, reason="coalesced").inc()
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_try_put",
+                    queue=queue_label,
+                    reason="queue_full",
+                )
             except asyncio.QueueFull:
-                ROUTER_DROPPED_TOTAL.labels(queue=route_name, reason="overflow").inc()
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_try_put",
+                    queue=queue_label,
+                    reason="queue_full",
+                )
 
     def _publish_combo(self, a: str, b: str, payload: Dict[str, Any]) -> None:
         if not self.publish_combo_to_bus:
             return
+        required = ("exchange", "pair_key", "best_bid", "best_ask", "exchange_ts_ms", "recv_ts_ms", "age_ms", "active")
+        missing = [k for k in required if payload.get(k) is None]
+        if missing:
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_publish_combo",
+                queue="combo",
+                reason="schema_missing_field",
+            )
+            return
+
         combo_key = self._combo_key(a, b)
         qs = self.out_queues.get(combo_key) or {}
         self._try_put(qs.get("scanner"), f"{combo_key}.scanner", payload)
@@ -1260,9 +1435,21 @@ class MarketDataRouter:
                 pass
             try:
                 self._scanner_queue.put_nowait(payload)
-                ROUTER_DROPPED_TOTAL.labels(queue="scanner_lane", reason="coalesced").inc()
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_enqueue_scanner",
+                    queue="scanner",
+                    reason="queue_full",
+                )
             except asyncio.QueueFull:
-                ROUTER_DROPPED_TOTAL.labels(queue="scanner_lane", reason="overflow").inc()
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_enqueue_scanner",
+                    queue="scanner",
+                    reason="queue_full",
+                )
 
     async def _scanner_worker(self) -> None:
         while self._running:
@@ -1282,10 +1469,7 @@ class MarketDataRouter:
                 reason = "exception"
                 report_nonfatal("MarketDataRouter", "scanner_update_failed", e)
             finally:
-                try:
-                    mark_router_to_scanner_ts(ts0, route="tri_cex", ok=ok, reason=reason)
-                except Exception:
-                    pass
+                mark_router_to_scanner_ts(ts0, route="tri_cex", ok=ok, reason=reason)
                 self._scanner_queue.task_done()
 
     # -------------------------- Per-CEX signals --------------------------
@@ -1301,6 +1485,7 @@ class MarketDataRouter:
         return float(prev + alpha * (value - prev))
 
     def _per_cex_vol(self, ev: Dict[str, Any]) -> None:
+        """Émet VolEvent (bps): l1_spread_bps/ema_vol_bps sont exprimés en bps."""
         ex = ev["exchange"]; pair = ev["pair_key"]
         key = (ex, pair)
         now = time.time()
@@ -1351,13 +1536,22 @@ class MarketDataRouter:
             self._vol_last_pub_val[key] = ema_curr
 
     def _per_cex_slip(self, ev: Dict[str, Any]) -> None:
-        """Proxy slippage très léger (on-change/heartbeat/capHz). Le handler aval fera mieux."""
+        """Proxy slippage très léger (on-change/heartbeat/capHz). Unité: bps (pas fraction)."""
         ex = ev["exchange"]; pair = ev["pair_key"]
         key = (ex, pair)
         now = time.time()
 
         # proxy : on réutilise l1_spread_bps comme métrique simple
         metric = float(ev.get("l1_spread_bps") or 0.0)
+        if metric < 0.0 or metric > 100000.0:
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_per_cex_slip",
+                queue="slip",
+                reason="unit_mismatch",
+            )
+            return
         last_metric = self._slip_last_metric.get(key, metric)
         last_pub_ts = self._slip_last_pub_ts.get(key, 0.0)
         min_interval = 1.0 / self.slip_max_hz
@@ -1447,12 +1641,8 @@ class MarketDataRouter:
             report_nonfatal("MarketDataRouter", "scanner_update_failed", e)
             logger.exception("[Router] update_orderbook error")
         finally:
-            try:
-                # route logique : tri_cex (aligné avec obs)
-                mark_router_to_scanner_ts(ts0, route="tri_cex", ok=ok, reason=reason)
-            except Exception:
-                # Pas critique
-                pass
+            # route logique : tri_cex (aligné avec obs)
+            mark_router_to_scanner_ts(ts0, route="tri_cex", ok=ok, reason=reason)
 
     # ----------------------------- Main loop -----------------------------
     # PATCH D — WSFanInMux.start : sources dynamiques, pas de snapshot de la liste des clés
@@ -1500,11 +1690,13 @@ class MarketDataRouter:
                     if isinstance(item, dict) and item.get("__ws_error__"):
                         payload = item
                         ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
-                        try:
-                            ROUTER_DROPPED_TOTAL.labels(queue=f"ws_source:{ex}", reason="ws_error").inc()
-                        except Exception:
-                            pass
-                        continue
+                        safe_inc(
+                            ROUTER_DROPPED_TOTAL,
+                            "router_dropped_total",
+                            "start",
+                            queue="health",
+                            reason="exception",
+                        )
 
                     ev = self._validate_and_enrich(item)
                     if not ev:
@@ -1515,10 +1707,13 @@ class MarketDataRouter:
                     if has_l2:
                         self._l2_seen[ex_pair] = True
                     if self.require_l2_first and not has_l2 and not self._l2_seen.get(ex_pair, False):
-                        try:
-                            ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="require_l2_first").inc()
-                        except Exception:
-                            pass
+                        safe_inc(
+                            ROUTER_DROPPED_TOTAL,
+                            "router_dropped_total",
+                            "start",
+                            queue="combo",
+                            reason="l2_missing",
+                        )
                         continue
 
 
@@ -1554,10 +1749,13 @@ class MarketDataRouter:
 
                     ts_ex_ms = int(ev.get("exchange_ts_ms") or 0)
                     if ts_ex_ms and (int(time.time() * 1000) - ts_ex_ms) > stale_limit_ms:
-                        try:
-                            ROUTER_DROPPED_TOTAL.labels(queue="combo", reason="stale_source").inc()
-                        except Exception:
-                            pass
+                        safe_inc(
+                            ROUTER_DROPPED_TOTAL,
+                            "router_dropped_total",
+                            "start",
+                            queue="combo",
+                            reason="stale_source",
+                        )
                         self._events_ignored_stale += 1
                         continue
                     # --- /PATCH C2 ---

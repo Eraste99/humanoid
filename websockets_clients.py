@@ -30,6 +30,7 @@ import random
 import socket
 import logging
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from collections import defaultdict, OrderedDict, deque
 from dataclasses import dataclass
@@ -73,6 +74,7 @@ try:
         ws_public_note_reconnect,
         ws_public_note_event_ok,
         ws_public_note_event_dropped,
+        ws_public_staleness,
     )
 except Exception:  # pragma: no cover
     # Fallback no-op : on ne casse jamais le flux WS si obs_metrics n'est pas à jour
@@ -89,6 +91,9 @@ except Exception:  # pragma: no cover
         return None
 
     def ws_public_note_event_dropped(*a, **k):  # type: ignore[no-redef]
+        return None
+
+    def ws_public_staleness(*a, **k):  # type: ignore[no-redef]
         return None
 
 
@@ -332,6 +337,14 @@ class WebSocketExchangeClient:
         self._last_publish_ts: float = 0.0
         self._last_publish_by_exchange: Dict[str, float] = defaultdict(float)
         self._bp_last_log_ts: Dict[str, float] = defaultdict(float)
+        now_ms = int(time.time() * 1000)
+        self._last_recv_ts_ms: Dict[str, int] = {
+            "BINANCE": now_ms,
+            "COINBASE": now_ms,
+            "BYBIT": now_ms,
+        }
+        self._disabled_last_note_ts: Dict[str, float] = defaultdict(float)
+        self._staleness_task: Optional["asyncio.Task"] = None
         self._control_events_pending: Deque[Dict[str, Any]] = deque(maxlen=64)
         self._snapshot_runs = 0
         self._snapshot_pairs = 0
@@ -608,8 +621,107 @@ class WebSocketExchangeClient:
             "bybit":    {v.get("bybit"):    k for k, v in self.pair_mapping.items() if v.get("bybit")},
         }
 
+    def _note_drop(self, exchange: str, *, reason: str, kind: str) -> None:
+        ws_public_note_event_dropped(
+            exchange=exchange,
+            region=getattr(self, "region", "EU"),
+            deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+            reason=reason,
+            kind=kind,
+        )
+
+    def _note_ok(self, exchange: str, *, kind: str) -> None:
+        ws_public_note_event_ok(
+            exchange=exchange,
+            region=getattr(self, "region", "EU"),
+            deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+            kind=kind,
+        )
+
+    @staticmethod
+    def _normalize_ts_ms(raw_ts: Any, recv_ts_ms: int) -> int:
+        if raw_ts is None:
+            return int(recv_ts_ms)
+        if isinstance(raw_ts, str):
+            ts = raw_ts.strip()
+            if not ts:
+                return int(recv_ts_ms)
+            if "T" in ts or "t" in ts:
+                try:
+                    iso = ts.replace("Z", "+00:00")
+                    dt = datetime.fromisoformat(iso)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    return int(dt.timestamp() * 1000)
+                except Exception:
+                    return int(recv_ts_ms)
+            try:
+                raw_ts = float(ts)
+            except Exception:
+                return int(recv_ts_ms)
+        try:
+            ts_val = float(raw_ts)
+        except Exception:
+            return int(recv_ts_ms)
+        if ts_val < 1e12:
+            return int(ts_val * 1000)
+        return int(ts_val)
+
+    def _exchange_region_disabled(self, exchange: str, pair_key: Optional[str] = None) -> bool:
+        if getattr(self.cfg, "g", None) is not None:
+            enable_jp = bool(getattr(self.cfg.g, "enable_jp", False))
+        else:
+            enable_jp = bool(getattr(self.cfg, "enable_jp", False))
+        if enable_jp:
+            return False
+        if pair_key:
+            mapping = self.pair_mapping.get(pair_key) or {}
+            region_hint = (mapping.get("region_hint") or {}).get(exchange.upper())
+            if str(region_hint).upper() == "JP":
+                return True
+        return False
+
     def unify_pair_key(self, exchange_symbol: str, exchange: str) -> Optional[str]:
         return self._inv_map.get(exchange.lower(), {}).get(exchange_symbol)
+
+    def _note_frame_received(self, exchange: str, recv_ts_ms: int) -> None:
+        self._last_recv_ts_ms[exchange.upper()] = int(recv_ts_ms)
+
+    def _exchange_disabled_by_flag(self, exchange: str) -> bool:
+        wscfg = getattr(self.cfg, "ws_public", None)
+        disabled_raw = getattr(wscfg, "disabled_exchanges", []) if wscfg is not None else []
+        disabled = set(str(e).upper() for e in (disabled_raw or []))
+        return exchange.upper() in disabled
+
+    def _maybe_note_disabled(self, exchange: str) -> None:
+        ex = exchange.upper()
+        now = time.time()
+        if (now - self._disabled_last_note_ts[ex]) >= 60.0:
+            self._note_drop(ex, reason="disabled_by_flag", kind="subscribe")
+            self._disabled_last_note_ts[ex] = now
+
+    async def _staleness_loop(self) -> None:
+        wscfg = getattr(self.cfg, "ws_public", None)
+        interval_s = float(getattr(wscfg, "staleness_interval_s", 1.0))
+        slo_s = getattr(wscfg, "staleness_slo_s", None)
+        while self._running:
+            now_ms = int(time.time() * 1000)
+            for ex in ("BINANCE", "COINBASE", "BYBIT"):
+                if ex not in self.enabled_exchanges:
+                    continue
+                if self._exchange_disabled_by_flag(ex):
+                    continue
+                last_ms = self._last_recv_ts_ms.get(ex, now_ms)
+                staleness_s = max(0.0, (now_ms - last_ms) / 1000.0)
+                ws_public_staleness(
+                    ex,
+                    region=getattr(self, "region", "EU"),
+                    deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+                    seconds=staleness_s,
+                )
+                if isinstance(slo_s, (int, float)) and staleness_s > float(slo_s):
+                    self._note_drop(ex, reason="stale", kind="health")
+            await asyncio.sleep(max(0.2, interval_s))
 
     def get_symbol(self, pair_key: str, exchange: str) -> str:
         m = self.pair_mapping.get(pair_key)
@@ -687,6 +799,7 @@ class WebSocketExchangeClient:
 
     def compute_backoff(self) -> float:
         d = float(self._ws_policy.next_delay(self._rng))
+        d = min(max(d, self.min_backoff), self.max_backoff)
         self.last_backoff = d
         self.next_delay = d
         return d
@@ -707,14 +820,16 @@ class WebSocketExchangeClient:
             return
         bids, asks, l2_ts = self._l2[ex].get(ex_symbol, ([], [], ex_ts))
         now_ms = int(time.time() * 1000)
-        lat = (now_ms - ex_ts) if ex_ts else None
+        ex_ts_norm = self._normalize_ts_ms(ex_ts, now_ms)
+        lat = (now_ms - ex_ts_norm) if ex_ts_norm else None
         pk = self.unify_pair_key(ex_symbol, ex)
         if not pk:
-            try:
-                WS_SYMBOL_UNMAPPED_TOTAL.labels(exchange=ex).inc()
-            except Exception:
-                pass
+            WS_SYMBOL_UNMAPPED_TOTAL.labels(exchange=ex).inc()
+            self._note_drop(ex, reason="unknown_pair", kind="emit")
             self._unmapped_seen[ex] += 1
+            return
+        if self._exchange_region_disabled(ex, pk):
+            self._note_drop(ex, reason="region_disabled_jp", kind="emit")
             return
         self.last_update[ex][pk] = now_ms
         self.latency[ex][pk] = lat
@@ -728,16 +843,17 @@ class WebSocketExchangeClient:
                 bid_volume=float(bids[0][1]) if bids else 0.0,
                 ask_volume=float(asks[0][1]) if asks else 0.0,
                 orderbook={"bids": bids, "asks": asks} if (bids or asks) else {},
-                exchange_ts_ms=int(ex_ts) if ex_ts else None,
+                exchange_ts_ms=int(ex_ts_norm) if ex_ts_norm else None,
                 recv_ts_ms=now_ms,
                 latency_ms=lat,
                 active=True,
             ).model_dump(exclude_none=True)
         except Exception:
             logger.exception("[WS] market event validation failed", extra={"exchange": ex, "symbol": ex_symbol})
+            self._note_drop(ex, reason="schema_mismatch", kind="emit")
             return
 
-        key = (ex, ex_symbol, int(ex_ts or 0))
+        key = (ex, ex_symbol, int(ex_ts_norm or 0))
         if key in self._seen_events:
             return
         self._seen_events[key] = True
@@ -766,14 +882,14 @@ class WebSocketExchangeClient:
 
         timeout = max(0.0, float(self._out_queue_put_timeout_s))
         if timeout == 0.0:
-            self._note_backpressure(exchange, reason=reason)
+            self._note_backpressure(exchange, reason="queue_full")
             return False
         try:
             await asyncio.wait_for(self.out_queue.put(payload), timeout=timeout)
             self._note_out_success(exchange)
             return True
         except asyncio.TimeoutError:
-            self._note_backpressure(exchange, reason=reason)
+            self._note_backpressure(exchange, reason="queue_full")
             return False
 
     def _note_out_success(self, exchange: str) -> None:
@@ -782,17 +898,7 @@ class WebSocketExchangeClient:
         ex = exchange.upper()
         self._last_publish_by_exchange[ex] = now
 
-        # helper high-level: "événement WS publié avec succès"
-        try:
-            ws_public_note_event_ok(  # type: ignore[name-defined]
-                exchange=ex,
-                region=getattr(self, "region", "EU"),
-                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
-                kind="combo",
-            )
-        except Exception:
-            pass
-
+        self._note_ok(ex, kind="combo")
         self._flush_control_events()
 
     def _note_backpressure(self, exchange: str, *, reason: str) -> None:
@@ -802,22 +908,9 @@ class WebSocketExchangeClient:
         self._out_queue_last_drop_ts[ex] = time.time()
 
         # métrique legacy (exchange + reason)
-        try:
-            WS_PUBLIC_DROPPED_TOTAL.labels(exchange=ex, reason=reason).inc()  # type: ignore[name-defined]
-        except Exception:
-            pass
+        WS_PUBLIC_DROPPED_TOTAL.labels(exchange=ex, reason=reason).inc()  # type: ignore[name-defined]
 
-        # helper high-level avec labels exchange / region / deployment_mode
-        try:
-            ws_public_note_event_dropped(  # type: ignore[name-defined]
-                exchange=ex,
-                region=getattr(self, "region", "EU"),
-                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
-                reason=reason,
-                kind="combo",
-            )
-        except Exception:
-            pass
+        self._note_drop(ex, reason=reason, kind="combo")
 
         try:
             logger.warning(
@@ -859,10 +952,18 @@ class WebSocketExchangeClient:
 
     # ======================= BINANCE listener =======================
     async def _binance_listener_chunk(self, pairs_subset: List[str]):
-        syms = [self.get_symbol(p, "binance").lower() for p in pairs_subset if
-                self.pair_mapping.get(p, {}).get("binance")]
-        if not syms:
+        if self._exchange_disabled_by_flag("BINANCE"):
+            self._maybe_note_disabled("BINANCE")
             return
+        syms = []
+        for p in pairs_subset:
+            if self._exchange_region_disabled("BINANCE", p):
+                self._note_drop("BINANCE", reason="region_disabled_jp", kind="subscribe")
+                continue
+            if self.pair_mapping.get(p, {}).get("binance"):
+                syms.append(self.get_symbol(p, "binance").lower())
+            if not syms:
+              return
         streams = "/".join([f"{s}@bookTicker" for s in syms] +
                            [f"{s}@depth{self.depth_level}@{self.binance_interval_ms}ms" for s in syms])
         url = f"{self.BINANCE_WS_BASE}?streams={streams}"
@@ -875,33 +976,45 @@ class WebSocketExchangeClient:
                     self._metrics_conn_open("BINANCE")
 
                     async for raw in ws:
-                        msg = self._json_loads(raw)
+                        recv_ts_ms = int(time.time() * 1000)
+                        self._note_frame_received("BINANCE", recv_ts_ms)
+                        try:
+                            msg = self._json_loads(raw)
+                        except Exception:
+                            self._note_drop("BINANCE", reason="parse_error", kind="frame")
+                            continue
                         data = msg.get("data") or {}
                         stream = (msg.get("stream") or "").lower()
                         ex_symbol = stream.split("@")[0].upper() if "@" in stream else data.get("s", " ").upper()
                         if not ex_symbol:
+                            self._note_drop("BINANCE", reason="schema_mismatch", kind="frame")
                             continue
+                        recv_ts_ms = int(time.time() * 1000)
                         if data.get("e") == "bookTicker":
                             try:
                                 bid = float(data.get("b") or data.get("B") or 0)
                                 ask = float(data.get("a") or data.get("A") or 0)
                                 if bid <= 0 or ask <= 0:
+                                    self._note_drop("BINANCE", reason="schema_mismatch", kind="l1")
                                     continue
                             except Exception:
+                                self._note_drop("BINANCE", reason="parse_error", kind="l1")
                                 continue
-                            ex_ts = int(data.get("T") or data.get("E") or time.time() * 1000)
+                            ex_ts = self._normalize_ts_ms(data.get("T") or data.get("E"), recv_ts_ms)
                             self._l1["BINANCE"][ex_symbol] = (bid, ask, ex_ts)
                             await self._emit_if_ready("BINANCE", ex_symbol)
                             continue
                         if "bids" in data and "asks" in data:
+
                             bids = [(float(px), float(q)) for px, q, *_ in data.get("bids", [])]
                             asks = [(float(px), float(q)) for px, q, *_ in data.get("asks", [])]
-                            ex_ts = int(data.get("T") or data.get("E") or time.time() * 1000)
+                            ex_ts = self._normalize_ts_ms(data.get("T") or data.get("E"), recv_ts_ms)
                             bids = bids[: self.depth_level]
                             asks = asks[: self.depth_level]
                             self._l2["BINANCE"][ex_symbol] = (bids, asks, ex_ts)
                             await self._emit_if_ready("BINANCE", ex_symbol)
                             continue
+                        self._note_drop("BINANCE", reason="schema_mismatch", kind="frame")
             except Exception as e:
                 self._queue_control_event({
                     "__ws_error__": True,
@@ -914,7 +1027,7 @@ class WebSocketExchangeClient:
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("BINANCE")
-                await self._sleep_backoff("BINANCE", reason="listener_error")
+                await self._sleep_backoff("BINANCE", reason="backoff")
 
             finally:
                 # si reload demandé -> fin immédiate sans double on_close()
@@ -926,7 +1039,17 @@ class WebSocketExchangeClient:
 
     # ======================= COINBASE listener =======================
     async def _coinbase_listener_chunk(self, pairs_subset: List[str]):
-        prods = [self.get_symbol(p, "coinbase") for p in pairs_subset if self.pair_mapping.get(p, {}).get("coinbase")]
+        if self._exchange_disabled_by_flag("COINBASE"):
+            self._maybe_note_disabled("COINBASE")
+            return
+        prods = []
+        for p in pairs_subset:
+            if self._exchange_region_disabled("COINBASE", p):
+                self._note_drop("COINBASE", reason="region_disabled_jp", kind="subscribe")
+                continue
+            if self.pair_mapping.get(p, {}).get("coinbase"):
+                prods.append(self.get_symbol(p, "coinbase"))
+
         if not prods:
             return
         sub = {
@@ -948,24 +1071,35 @@ class WebSocketExchangeClient:
                     await ws.send(json.dumps(sub))
                     l2_book: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: {"bids": {}, "asks": {}})
                     async for raw in ws:
-                        msg = self._json_loads(raw)
+                        recv_ts_ms = int(time.time() * 1000)
+                        self._note_frame_received("COINBASE", recv_ts_ms)
+                        try:
+                            msg = self._json_loads(raw)
+                        except Exception:
+                            self._note_drop("COINBASE", reason="parse_error", kind="frame")
+                            continue
                         t = msg.get("type")
                         pid = msg.get("product_id")
                         if not pid:
+                            self._note_drop("COINBASE", reason="schema_mismatch", kind="frame")
                             continue
+                        recv_ts_ms = int(time.time() * 1000)
                         if t == "ticker":
                             try:
                                 best_bid = msg.get("best_bid")
                                 best_ask = msg.get("best_ask")
                                 if best_bid is None or best_ask is None:
+                                    self._note_drop("COINBASE", reason="schema_mismatch", kind="l1")
                                     continue
                                 bid = float(best_bid)
                                 ask = float(best_ask)
                                 if bid <= 0 or ask <= 0:
+                                    self._note_drop("COINBASE", reason="schema_mismatch", kind="l1")
                                     continue
                             except Exception:
+                                self._note_drop("COINBASE", reason="parse_error", kind="l1")
                                 continue
-                            ex_ts = int(time.time() * 1000)
+                            ex_ts = self._normalize_ts_ms(msg.get("time"), recv_ts_ms)
                             self._l1["COINBASE"][pid] = (bid, ask, ex_ts)
                             await self._emit_if_ready("COINBASE", pid)
                             continue
@@ -974,10 +1108,10 @@ class WebSocketExchangeClient:
                                 book = l2_book[pid]
                                 book["bids"] = {px: float(sz) for px, sz in msg.get("bids", [])}
                                 book["asks"] = {px: float(sz) for px, sz in msg.get("asks", [])}
-                                ex_ts = int(time.time() * 1000)
+                                ex_ts = self._normalize_ts_ms(msg.get("time"), recv_ts_ms)
                             else:
                                 book = l2_book[pid]
-                                ex_ts = int(time.time() * 1000)
+                                ex_ts = self._normalize_ts_ms(msg.get("time"), recv_ts_ms)
                                 for chg in msg.get("changes", []):
                                     side, px, sz = chg
                                     if side == "buy":
@@ -997,6 +1131,7 @@ class WebSocketExchangeClient:
                             self._l2["COINBASE"][pid] = (bids, asks, ex_ts)
                             await self._emit_if_ready("COINBASE", pid)
                             continue
+                        self._note_drop("COINBASE", reason="schema_mismatch", kind="frame")
             except Exception as e:
                 self._queue_control_event({
                     "__ws_error__": True,
@@ -1008,7 +1143,7 @@ class WebSocketExchangeClient:
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("COINBASE")
-                await self._sleep_backoff("COINBASE", reason="listener_error")
+                await self._sleep_backoff("COINBASE", reason="backoff")
             finally:
                 if self._reload_event.is_set():
                     return
@@ -1018,7 +1153,16 @@ class WebSocketExchangeClient:
 
     # ======================= BYBIT listener =======================
     async def _bybit_listener_chunk(self, pairs_subset: List[str]):
-        syms = [self.get_symbol(p, "bybit") for p in pairs_subset if self.pair_mapping.get(p, {}).get("bybit")]
+        if self._exchange_disabled_by_flag("BYBIT"):
+            self._maybe_note_disabled("BYBIT")
+            return
+        syms = []
+        for p in pairs_subset:
+            if self._exchange_region_disabled("BYBIT", p):
+                self._note_drop("BYBIT", reason="region_disabled_jp", kind="subscribe")
+                continue
+            if self.pair_mapping.get(p, {}).get("bybit"):
+                syms.append(self.get_symbol(p, "bybit"))
         if not syms:
             return
         args = [f"tickers.{s}" for s in syms] + [f"orderbook.50.{s}" for s in syms]
@@ -1033,22 +1177,32 @@ class WebSocketExchangeClient:
 
                     await ws.send(self._json_dumps(sub))
                     async for raw in ws:
-                        msg = self._json_loads(raw)
+                        recv_ts_ms = int(time.time() * 1000)
+                        self._note_frame_received("BYBIT", recv_ts_ms)
+                        try:
+                            msg = self._json_loads(raw)
+                        except Exception:
+                            self._note_drop("BYBIT", reason="parse_error", kind="frame")
+                            continue
                         topic = msg.get("topic") or ""
                         data = msg.get("data")
                         if not topic or data is None:
+                            self._note_drop("BYBIT", reason="schema_mismatch", kind="frame")
                             continue
                         parts = topic.split(".")
                         if len(parts) < 2:
+                            self._note_drop("BYBIT", reason="schema_mismatch", kind="frame")
                             continue
                         ch, sym = parts[0], parts[-1]
+                        recv_ts_ms = int(time.time() * 1000)
                         if ch == "tickers":
                             d = data if isinstance(data, dict) else (data[0] if data else {})
                             bid = float(d.get("bid1Price", 0.0) or d.get("bidPrice", 0.0))
                             ask = float(d.get("ask1Price", 0.0) or d.get("askPrice", 0.0))
                             if bid <= 0 or ask <= 0:
+                                self._note_drop("BYBIT", reason="schema_mismatch", kind="l1")
                                 continue
-                            ex_ts = int(d.get("ts", int(time.time() * 1000)))
+                            ex_ts = self._normalize_ts_ms(d.get("ts"), recv_ts_ms)
                             self._l1["BYBIT"][sym] = (bid, ask, ex_ts)
                             await self._emit_if_ready("BYBIT", sym)
                             continue
@@ -1056,10 +1210,11 @@ class WebSocketExchangeClient:
                             d = data if isinstance(data, dict) else (data[0] if data else {})
                             bids = [(float(px), float(sz)) for px, sz, *_ in d.get("b", [])][: self.depth_level]
                             asks = [(float(px), float(sz)) for px, sz, *_ in d.get("a", [])][: self.depth_level]
-                            ex_ts = int(d.get("ts", int(time.time() * 1000)))
+                            ex_ts = self._normalize_ts_ms(d.get("ts"), recv_ts_ms)
                             self._l2["BYBIT"][sym] = (bids, asks, ex_ts)
                             await self._emit_if_ready("BYBIT", sym)
                             continue
+                        self._note_drop("BYBIT", reason="schema_mismatch", kind="frame")
             except Exception as e:
                 self._queue_control_event({
                     "__ws_error__": True,
@@ -1071,7 +1226,7 @@ class WebSocketExchangeClient:
                 self.on_close();
                 did_close = True
                 self._metrics_conn_closed("BYBIT")
-                await self._sleep_backoff("BYBIT", reason="listener_error")
+                await self._sleep_backoff("BYBIT", reason="backoff")
             finally:
                 if self._reload_event.is_set():
                     return
@@ -1092,21 +1247,24 @@ class WebSocketExchangeClient:
 
             # Créer les tâches listeners
             self.tasks = []
-            if "BINANCE" in self.enabled_exchanges:
+            if "BINANCE" in self.enabled_exchanges and not self._exchange_disabled_by_flag("BINANCE"):
                 for subset in self._chunks(binance_pairs, self.binance_chunk_size):
                     if subset:
                         self.tasks.append(asyncio.create_task(self._binance_listener_chunk(subset)))
-            if "COINBASE" in self.enabled_exchanges:
+            if "COINBASE" in self.enabled_exchanges and not self._exchange_disabled_by_flag("COINBASE"):
                 for subset in self._chunks(coinbase_pairs, self.coinbase_chunk_size):
                     if subset:
                         self.tasks.append(asyncio.create_task(self._coinbase_listener_chunk(subset)))
-            if "BYBIT" in self.enabled_exchanges:
+            if "BYBIT" in self.enabled_exchanges and not self._exchange_disabled_by_flag("BYBIT"):
                 for subset in self._chunks(bybit_pairs, self.bybit_chunk_size):
                     if subset:
                         self.tasks.append(asyncio.create_task(self._bybit_listener_chunk(subset)))
 
             if not self.tasks:
                 # Rien à faire; attendre un reload ou l'arrêt
+                for ex in self.enabled_exchanges:
+                    if self._exchange_disabled_by_flag(ex):
+                        self._maybe_note_disabled(ex)
                 reload_fut = asyncio.create_task(self._reload_event.wait())
                 done, _ = await asyncio.wait({reload_fut}, return_when=asyncio.FIRST_COMPLETED)
                 if reload_fut in done:
@@ -1154,7 +1312,8 @@ class WebSocketExchangeClient:
         # Lancer le superviseur en tâche
         self._supervisor_task = asyncio.create_task(self._supervisor(),
                                                     name=f"{getattr(self, 'name', 'ws')}-supervisor")
-
+        self._staleness_task = asyncio.create_task(self._staleness_loop(),
+                                                   name=f"{getattr(self, 'name', 'ws')}-staleness")
         # Attente best-effort d’un handshake rapide (subscription ack / open)
         try:
             await asyncio.wait_for(self.ready_event.wait(), timeout=float(wait_ready))
@@ -1172,6 +1331,14 @@ class WebSocketExchangeClient:
             except Exception:
                 pass
         self._supervisor_task = None
+        st = getattr(self, "_staleness_task", None)
+        if st:
+            st.cancel()
+            try:
+                await st
+            except Exception:
+                pass
+        self._staleness_task = None
         if hasattr(self, "ready_event"):
             try:
                 self.ready_event.clear()
@@ -1204,7 +1371,7 @@ class WebSocketExchangeClient:
     def reconnect_with_backoff(self) -> None:
         """Entrée legacy : force un reload après un vrai backoff calculé."""
         async def _runner() -> None:
-            await self._sleep_backoff("ALL", reason="manual_reconnect")
+            await self._sleep_backoff("ALL", reason="reconnect")
             self._reload_event.set()
 
         try:

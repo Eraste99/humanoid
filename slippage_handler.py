@@ -43,6 +43,7 @@ try:
         set_slip_age_seconds,
         note_slip_ttl_seconds,
         note_slip_drop,
+        inc_blocked,
     )
 except Exception:  # pragma: no cover
 
@@ -70,11 +71,13 @@ except Exception:  # pragma: no cover
     def set_slip_age_seconds(*_, **__):
         return None
 
-
     def note_slip_ttl_seconds(*_, **__):
         return None
 
     def note_slip_drop(*_, **__):
+        return None
+
+    def inc_blocked(*_, **__):
         return None
 
 # ----------------------------- Frais dynamiques -----------------------------
@@ -162,6 +165,7 @@ class SlippageHandler:
         # (Les args __init__ ne proposent pas TTL/heartbeat, donc cfg -> direct)
         self._ttl_s = getattr_int(s, "ttl_s", 2)
         self._heartbeat_s = getattr_int(s, "heartbeat_s", 1)
+        self._use_vwap_depth = bool(getattr(s, "use_vwap_depth", True))
         # max slippage “dur” autorisé par quote (bps)
         self._max_bps_by_quote = dict(getattr(s, "max_bps_by_quote", {"USDC": 12.0, "EUR": 14.0}))
 
@@ -185,6 +189,12 @@ class SlippageHandler:
 
         self._pair_budget: Dict[str, float] = {}
         self._quote_budget: Dict[str, float] = {"USDC": vol_usdc, "EUR": vol_eur}
+        self._primary_quote = str(getattr(g, "primary_quote", "USDC")).upper()
+        default_strategy = getattr(getattr(self.cfg, "rm", None), "trade_mode", None)
+        if not default_strategy:
+            default_strategy = getattr(g, "trade_mode", None)
+        self._default_strategy = str(default_strategy or "TT").upper()
+
 
         # seuil legacy min (fraction, ex: 0.005 = 50 bps)
         self.slippage_threshold = float(slippage_threshold)
@@ -260,14 +270,28 @@ class SlippageHandler:
     def set_pair_budget(self, pair_key: str, amount: float) -> None:
         self._pair_budget[self._norm_pair(pair_key)] = float(max(0.0, amount))
 
-    def _budget_for(self, symbol: str) -> float:
+    def _budget_for(self, symbol: str, *, strategy: Optional[str] = None) -> Optional[float]:
         sym = self._norm_pair(symbol)
         if sym in self._pair_budget:
             return float(self._pair_budget[sym])
         q = self._infer_quote(sym)
-        if q and q in self._quote_budget:
-            return float(self._quote_budget[q])
-        return float(self._quote_budget.get("USDC", 0.0))
+        if not q:
+            inc_blocked("slippage_handler", "quote_unknown", sym)
+            return None
+        strat = str(strategy or self._default_strategy or "TT").upper()
+        if strat not in ("TT", "TM", "MM", "REB"):
+            inc_blocked("slippage_handler", "strategy_unknown", sym)
+            return None
+        base = float(self._quote_budget.get(q, 0.0))
+        ratio = None
+        try:
+            ratio = (getattr(self.cfg.g, "branch_budgets_quote", {}) or {}).get(q, {}).get(strat)
+        except Exception:
+            ratio = None
+        if isinstance(ratio, (int, float)):
+            base = base * float(ratio)
+        return max(0.0, float(base))
+
 
     def _prune_history(self, now_s: float) -> None:
         cutoff = now_s - self._history_max_age.total_seconds()
@@ -340,25 +364,38 @@ class SlippageHandler:
         orderbook: Dict[str, Any],
         bid_volume: float = 0.0,
         ask_volume: float = 0.0,
+        strategy: Optional[str] = None,
     ) -> None:
         """
         Ingestion d'un snapshot: orderbook = {"bids":[[p,qty],...], "asks":[[p,qty],...]}
         v2.2: priorité au **VWAP budget en devise de cotation** (USDC/EUR) selon le symbole.
         Le mode qty est utilisé seulement si `push_use_qty_mode=True`.
+        Unité interne stockée: fraction (ex: 0.001 = 10 bps). Sortie canonique: get_slippage_bps().
         """
         try:
             sym = self._norm_pair(symbol)
             bids = (orderbook or {}).get("bids") or []
             asks = (orderbook or {}).get("asks") or []
+            if not orderbook:
+                self._note_drop("missing_orderbook", exchange, sym)
+                return
+            if not bids or not asks:
+                self._note_drop("depth_insufficient", exchange, sym)
+                return
 
             buy_slip = None
             sell_slip = None
 
-            if bids and asks:
-                budget = self._budget_for(sym)
+            if bids and asks and self._use_vwap_depth:
+                budget = self._budget_for(sym, strategy=strategy)
+                if budget is None:
+                    return
                 if budget > 0:
                     best_bid = self._to_f(bids[0][0])
                     best_ask = self._to_f(asks[0][0])
+                    if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+                        self._note_drop("bad_bid_ask", exchange, sym)
+                        return
                     if best_bid > 0 and best_ask > best_bid:
                         buy_vwap = self._vwap_depth(asks, budget, side="buy")
                         sell_vwap = self._vwap_depth(bids, budget, side="sell")
@@ -380,6 +417,9 @@ class SlippageHandler:
             if (buy_slip is None or sell_slip is None) and bids and asks:
                 bb = self._to_f(bids[0][0])
                 ba = self._to_f(asks[0][0])
+                if best_bid <= 0 or best_ask <= 0 or best_bid >= best_ask:
+                    self._note_drop("bad_bid_ask", exchange, sym)
+                    return
                 if bb > 0 and ba > bb:
                     mid = 0.5 * (bb + ba)
                     approx = (ba - bb) / mid
@@ -494,13 +534,19 @@ class SlippageHandler:
                 bid = self._to_f((d or {}).get("best_bid"))
                 ask = self._to_f((d or {}).get("best_ask"))
                 if bid <= 0 or ask <= 0 or bid >= ask:
+                    self._note_drop("bad_bid_ask", ex, pair)
                     continue
 
                 bids = (d or {}).get("bids") or []
                 asks = (d or {}).get("asks") or []
+                if not bids or not asks:
+                    self._note_drop("depth_insufficient", ex, pair)
+                    continue
 
-                if bids and asks:
+                if bids and asks and self._use_vwap_depth:
                     budget = self._budget_for(pair)
+                    if budget is None:
+                        continue
                     buy_vwap = self._vwap_depth(asks, budget, side="buy") if budget > 0 else 0.0
                     sell_vwap = self._vwap_depth(bids, budget, side="sell") if budget > 0 else 0.0
                     buy_slip = max(0.0, (buy_vwap - ask) / ask) if buy_vwap > 0 else 0.0
@@ -516,7 +562,7 @@ class SlippageHandler:
                 n += 1
 
                 self._append_history(pair, float(slip), now_s=now_s)
-                if slip >= self.get_dynamic_threshold(pair):
+                if slip >= self.get_dynamic_threshold(pair, strategy=None):
                     asyncio.create_task(self._maybe_alert(pair, slip))
 
         self.last_update = now_s
@@ -589,11 +635,19 @@ class SlippageHandler:
         return round(slippage, 6)
 
     # -------------------------- Seuil dynamique -------------------------------
-    def get_dynamic_threshold(self, symbol: str) -> float:
+    def get_dynamic_threshold(self, symbol: str, *, strategy: Optional[str] = None) -> float:
         try:
             now_s = time.time()
             dq = self._history.get(self._norm_pair(symbol))
             if not dq:
+                return max(self._dyn_min_floor, self.slippage_threshold)
+            q = self._infer_quote(symbol)
+            if not q:
+                inc_blocked("slippage_handler", "quote_unknown", self._norm_pair(symbol))
+                return max(self._dyn_min_floor, self.slippage_threshold)
+            strat = str(strategy or self._default_strategy or "TT").upper()
+            if strat not in ("TT", "TM", "MM", "REB"):
+                inc_blocked("slippage_handler", "strategy_unknown", self._norm_pair(symbol))
                 return max(self._dyn_min_floor, self.slippage_threshold)
             lo_cut = now_s - self._dyn_window.total_seconds()
             window_vals = [v for (ts, v) in dq if ts >= lo_cut]
@@ -602,7 +656,13 @@ class SlippageHandler:
             window_vals.sort()
             k = int(round(0.95 * (len(window_vals) - 1)))
             p95 = window_vals[max(0, min(len(window_vals) - 1, k))]
-            return max(self._dyn_min_floor, p95 * self._dyn_factor)
+            ratio = None
+            try:
+                ratio = (getattr(self.cfg.g, "branch_budgets_quote", {}) or {}).get(q, {}).get(strat)
+            except Exception:
+                ratio = None
+            scale = 1.0 / float(ratio) if isinstance(ratio, (int, float)) and ratio > 0 else 1.0
+            return max(self._dyn_min_floor, p95 * self._dyn_factor * scale)
         except Exception:
             return max(self._dyn_min_floor, self.slippage_threshold)
 
@@ -622,6 +682,15 @@ class SlippageHandler:
 
     def get_all_slippages(self) -> Dict[str, Dict[str, Dict[str, Optional[float]]]]:
         return self.slippage_data
+
+    def last_age_seconds(self, exchange: str, pair_key: str) -> Optional[float]:
+        ex = (exchange or "").upper()
+        pk = (pair_key or "").replace("-", "").upper()
+        tsd = getattr(self, "_slip_ts", {})
+        t = tsd.get((ex, pk))
+        if t is None:
+            return None
+        return max(0.0, time.time() - float(t))
 
     def update_config(
         self,
@@ -777,7 +846,7 @@ class SlippageHandler:
             ex = self._norm_ex(msg.get("exchange"))
             pair = self._norm_pair(msg.get("pair_key") or msg.get("symbol") or "")
             if not ex or not pair:
-                self._note_drop("missing_fields", ex or "UNKNOWN", pair or "UNKNOWN")
+                self._note_drop("missing_orderbook", ex or "UNKNOWN", pair or "UNKNOWN")
                 return
 
             ob = (msg.get("orderbook") or {})
@@ -805,7 +874,7 @@ class SlippageHandler:
 
             if slip_buy_bps is None or slip_sell_bps is None:
                 if not has_book:
-                    self._note_drop("no_book", ex, pair)
+                    self._note_drop("depth_insufficient", ex, pair)
                     return
                 self.ingest_snapshot(
                     exchange=ex,
@@ -821,7 +890,7 @@ class SlippageHandler:
                     slip_sell_bps = max(0.0, float(snap.get("sell"))) * 1e4
 
             if (slip_buy_bps is None or slip_sell_bps is None) and not best_prices_valid:
-                self._note_drop("invalid_prices", ex, pair)
+                self._note_drop("bad_bid_ask", ex, pair)
                 return
 
             if (slip_buy_bps is None or slip_sell_bps is None) and best_prices_valid:
@@ -880,6 +949,7 @@ class SlippageHandler:
     ) -> float | None:
         """
         Retourne le slippage estimé (en bps) si frais (TTL), sinon None.
+        Unité interne stockée en fraction; conversion bps effectuée à l'ingestion.
 
         TTL:
           - si `ttl_s` est fourni à l'appel, on l'utilise directement,
@@ -938,7 +1008,8 @@ class SlippageHandler:
                     age = now - float(t)
                     if age <= ttl:
                         vals.append(float(v))
-                        # Optionnel: on pourrait pousser ici un age réel via set_slip_age_seconds
+                    else:
+                        self._note_drop("ttl_expired", ex, pk)
             return max(vals) if vals else None
 
         v = bps.get((ex, pk, str(side).lower()))
@@ -948,8 +1019,22 @@ class SlippageHandler:
 
         age = now - float(t)
         # (On ne met pas set_slip_age_seconds ici pour ne pas surcharger de calls ; on reste P0.)
-        return float(v) if age <= ttl else None
+        if age <= ttl:
+            return float(v)
+        self._note_drop("ttl_expired", ex, pk)
+        return None
 
+    def get_recent_slippage_bps(
+            self,
+            exchange: str,
+            pair_key: str,
+            side: str | None = None,
+            *,
+            ttl_s: float | None = None,
+            strategy: str | None = None,
+    ) -> float | None:
+        _ = strategy  # stratégie non requise pour la lecture TTL actuelle
+        return self.get_slippage_bps(exchange, pair_key, side, ttl_s=ttl_s)
 
     async def detach_bus_consumers(self) -> None:
         tasks = list(self._bus_tasks.values())

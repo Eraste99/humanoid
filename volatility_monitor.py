@@ -38,6 +38,7 @@ try:
         VOL_SIGNAL_STATE,
         set_vol_age_seconds,
         note_vol_ttl_seconds,
+        inc_blocked,
     )
 except Exception:  # pragma: no cover
 
@@ -68,6 +69,9 @@ except Exception:  # pragma: no cover
 
 
     def note_vol_ttl_seconds(*_, **__):
+        return None
+
+    def inc_blocked(*_, **__):
         return None
 
 def _to_float(x) -> float:
@@ -115,6 +119,9 @@ class VolatilityMonitor:
         self._soft_cap_bps = getattr_float(v, "soft_cap_bps", 80.0)
         self._chaos_cap_bps = getattr_float(v, "chaos_cap_bps", 150.0)
         self._hysteresis = getattr_float(v, "hysteresis", 0.25)
+        self._vol_min_delta_bps = getattr_float(v, "vol_min_delta_bps", 0.5)
+        self._max_silence_s = getattr_float(v, "max_silence_s", 2.0)
+        self._last_forward: Dict[Tuple[str, str], Dict[str, float]] = {}
 
         try:
             note_vol_ttl_seconds(self._ttl_s)
@@ -467,10 +474,18 @@ class VolatilityMonitor:
         exchange: Optional[str] = None,
         now: Optional[datetime] = None,
     ) -> None:
+        """
+               Prudence signal: dépend de la vol en bps (micro) et de l'âge de la mesure.
+               - si âge > TTL -> "élevé"
+               - sinon, mapping basé sur vol_bps (converti depuis la vol relative micro)
+               """
         pair = _norm_pair(pair)
         now = now or datetime.utcnow()
         price_vol_micro = self.get_price_volatility(pair, window="micro", now=now, exchange=exchange)
         spread_vol_micro = self.get_spread_volatility(pair, window="micro", now=now, exchange=exchange)
+        vol_bps = self._to_bps(max(price_vol_micro, spread_vol_micro))
+        age_s = self.last_age_seconds(exchange or "", pair) if exchange else None
+
 
         # Alimente l'historique micro
         if exchange:
@@ -516,9 +531,12 @@ class VolatilityMonitor:
             pass
 
         # --- Mise à jour du statut + gauge état ---
-        prev = self.signal_status.get(pair, "normal")
-        if price_vol_micro > price_thr or spread_vol_micro > spread_thr:
-            new_state = "élevé" if (price_vol_micro > 2 * price_thr or spread_vol_micro > 2 * spread_thr) else "modéré"
+        if age_s is not None and age_s > float(self._ttl_s):
+            new_state = "élevé"
+        elif vol_bps >= float(self._chaos_cap_bps):
+            new_state = "élevé"
+        elif vol_bps >= float(self._soft_cap_bps):
+            new_state = "modéré"
         else:
             new_state = "normal"
         self.signal_status[pair] = new_state
@@ -634,6 +652,71 @@ class VolatilityMonitor:
         x = float(rel_vol) * m["k"]
         return max(m["floor"], min(m["cap"], x))
 
+    def _resolve_region(self, exchange: str) -> str:
+        exu = _norm_ex(exchange)
+        cfg = getattr(self, "cfg", None)
+        g = getattr(cfg, "g", None)
+        region_map = None
+        for obj in (cfg, g):
+            if obj is None:
+                continue
+            for attr in ("exchange_region_map", "cex_region_map", "engine_region_map", "engine_pod_map"):
+                mp = getattr(obj, attr, None)
+                if isinstance(mp, dict):
+                    region_map = mp
+                    break
+            if region_map is not None:
+                break
+        if region_map is None:
+            return "UNKNOWN"
+        region = None
+        if exu in region_map:
+            region = region_map.get(exu)
+        else:
+            for k, v in region_map.items():
+                if _norm_ex(k) == exu:
+                    region = v
+                    break
+        if region is None:
+            return "UNKNOWN"
+        r = str(region).upper()
+        if r.startswith("JP") or r.startswith("TOKYO") or r.startswith("APAC"):
+            return "JP"
+        if r.startswith("US"):
+            return "US"
+        if r.startswith("EU"):
+            return "EU"
+        return "UNKNOWN"
+
+    def _jp_blocked(self, exchange: str) -> bool:
+        cfg = getattr(self, "cfg", None)
+        g = getattr(cfg, "g", None)
+        enable_jp = bool(getattr(g, "enable_jp", False)) if g is not None else bool(getattr(cfg, "enable_jp", False))
+        if enable_jp:
+            return False
+        return self._resolve_region(exchange) in ("JP", "UNKNOWN")
+
+    def last_age_seconds(self, exchange: str, pair_key: str) -> Optional[float]:
+        rec = getattr(self, "_last_vol", {}).get((_norm_ex(exchange), _norm_pair(pair_key)))
+        if not rec:
+            return None
+        return max(0.0, time.time() - float(rec.get("ts_recv_s", 0.0)))
+
+    def _should_forward(self, exchange: str, pair_key: str, vol_bps: float) -> bool:
+        key = (_norm_ex(exchange), _norm_pair(pair_key))
+        now_s = time.time()
+        last = self._last_forward.get(key)
+        if last is None:
+            self._last_forward[key] = {"vol_bps": float(vol_bps), "ts_s": now_s}
+            return True
+        delta = abs(float(vol_bps) - float(last.get("vol_bps", 0.0)))
+        elapsed = now_s - float(last.get("ts_s", 0.0))
+        if delta >= self._vol_min_delta_bps or elapsed >= self._max_silence_s:
+            self._last_forward[key] = {"vol_bps": float(vol_bps), "ts_s": now_s}
+            return True
+        inc_blocked("volatility_monitor", "hysteresis_hold", _norm_pair(pair_key))
+        return False
+
     def on_vol(self, msg: dict) -> None:
         """
         Consomme `cex:EX.vol` ; bid/ask > 0 ; passe par le pipeline interne,
@@ -688,6 +771,11 @@ class VolatilityMonitor:
             except Exception:
                 self.last_update = datetime.utcnow()
 
+            if self._jp_blocked(ex):
+                inc_blocked("volatility_monitor", "region_disabled_jp", pk)
+                return
+            if not self._should_forward(ex, pk, vol_bps):
+                return
 
             self._forward_to_scanner(ex, pk, vol_bps)
 

@@ -619,6 +619,47 @@ def discovery_note_filtered(reason: str, count: int) -> None:
     except Exception:
         OBS_NOOP_TOTAL.labels(metric='discovery_filtered_total', where='discovery_note_filtered').inc()
 
+DISCOVERY_FILTER_REASONS = {
+    "api_error",
+    "combo_not_eligible",
+    "denylist",
+    "min_volume",
+    "missing_base_quote",
+    "missing_quote_field",
+    "no_enabled_exchanges",
+    "unknown_region_hint",
+    "parse_error",
+    "pk_collision",
+    "quote_not_allowed",
+    "rank_cutoff",
+    "region_disabled_jp",
+    "whitelist",
+}
+
+WS_PUBLIC_DROP_REASONS = {
+    "queue_full",
+    "parse_error",
+    "schema_mismatch",
+    "unknown_pair",
+    "region_disabled_jp",
+    "disabled_by_flag",
+    "stale",
+}
+
+ROUTER_DROP_REASONS = {
+    "bad_ts_negative_age",
+    "dedup_coalesce",
+    "exception",
+    "inactive",
+    "l2_missing",
+    "missing_quote",
+    "pair_unmapped",
+    "queue_full",
+    "schema_missing_field",
+    "schema_mismatch",
+    "stale_source",
+    "unit_mismatch",
+}
 
 def discovery_note_api_error(exchange: str) -> None:
     try:

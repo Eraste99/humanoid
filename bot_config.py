@@ -859,6 +859,7 @@ class SlippageCfg:
     ttl_s: int = 2
     heartbeat_s: int = 1
     max_bps_by_quote: Dict[str,float] = field(default_factory=lambda: {"USDC": 12.0, "EUR": 14.0})
+    use_vwap_depth: bool = True
     fee_sync_max_concurrency: int = 4
     fee_sync_backoff_initial_s: float = 1.0
     fee_sync_backoff_max_s: float = 8.0
@@ -880,6 +881,8 @@ class VolatilityCfg:
     soft_cap_bps: float = 80.0
     chaos_cap_bps: float = 150.0
     hysteresis: float = 0.25
+    vol_min_delta_bps: float = 0.5
+    max_silence_s: float = 2.0
     vm_size_factor_map: Dict[str, float] = field(default_factory=lambda: {
         "NORMAL": 1.0,
         "CAREFUL": 0.85,
