@@ -101,6 +101,7 @@ RPC_RETRIES_TOTAL = _get_metric("RPC_RETRIES_TOTAL")
 # Canon P0: RPC_PAYLOAD_REJECTED_TOTAL a le label ["model"]
 RPC_PAYLOAD_REJECTED_TOTAL = _get_metric("RPC_PAYLOAD_REJECTED_TOTAL")
 RPC_METRICS_DISABLED_TOTAL = _get_metric("RPC_METRICS_DISABLED_TOTAL")
+RPC_IDEMPOTENCY_HIT_TOTAL = _get_metric("RPC_IDEMPOTENCY_HIT_TOTAL")
 
 
 # ---------- Idempotency store (TTL) ----------
@@ -119,21 +120,24 @@ class _TTLIdempotencyStore:
             # GC opportuniste
             if len(self._store) > self._maxsize:
                 # drop des plus vieux ~probabiliste (O(n), acceptable P0)
-                expired = [k for k, t in self._store.items() if t < now]
+                expired = [k for k, t in self._store.items() if t[0] <= now]
                 for k in expired[: self._maxsize // 10 or 1]:
                     self._store.pop(k, None)
-            # check
-                entry = self._store.get(key)
-                if entry:
-                    exp, resp = entry
-                    if exp > now:
-                        return True, resp
-                return False, None
+            entry = self._store.get(key)
+            if entry:
+                exp, resp = entry
+                if exp > now:
+                    return True, resp
+                self._store.pop(key, None)
+            return False, None
 
-    async def mark(self, key: str, response: Optional[dict] = None) -> None:
+    async def put(self, key: str, response: Optional[dict] = None) -> None:
         now = time.time()
         async with self._lock:
             self._store[key] = (now + self._ttl_s, response)
+
+    async def mark(self, key: str, response: Optional[dict] = None) -> None:
+        await self.put(key, response)
 
 # ---------- Handlers interface ----------
 
@@ -231,24 +235,30 @@ class RPCServer:
     async def submit_bundle(self, payload: dict) -> dict:
         # Idempotence côté API directe (tests) : on réutilise la même logique que les handlers HTTP
         key = self._derive_idem_key_from_payload(payload)
-        if key:
-            seen, resp = await self._idem.peek(key)
-            if seen:
-                return resp or {"replayed": True}
+        if not key:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
+            raise ValueError("RPC_MISSING_IDEMPOTENCY_KEY")
+        seen, resp = await self._idem.peek(key)
+        if seen:
+            _inc(RPC_IDEMPOTENCY_HIT_TOTAL, 1.0, method="submit_bundle", region=self.settings.region)
+            return resp or {"replayed": True}
         res = await self.handlers.submit_bundle(payload)
-        if key:
-            await self._idem.mark(key, res)
+
+        await self._idem.put(key, res)
         return res
 
     async def cancel(self, payload: dict) -> dict:
         key = self._derive_idem_key_from_payload(payload)
-        if key:
-            seen, resp = await self._idem.peek(key)
-            if seen:
-                return resp or {"replayed": True}
+        if not key:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
+            raise ValueError("RPC_MISSING_IDEMPOTENCY_KEY")
+        seen, resp = await self._idem.peek(key)
+        if seen:
+            _inc(RPC_IDEMPOTENCY_HIT_TOTAL, 1.0, method="cancel", region=self.settings.region)
+            return resp or {"replayed": True}
+
         res = await self.handlers.cancel(payload)
-        if key:
-            await self._idem.mark(key, res)
+        await self._idem.put(key, res)
         return res
 
     async def status(self, req: dict) -> dict:
@@ -427,6 +437,12 @@ class RPCServer:
             if idem:
                 seen, cached = await self._idem.peek(idem)
                 if seen:
+                    _inc(
+                        RPC_IDEMPOTENCY_HIT_TOTAL,
+                        1.0,
+                        method=str(request.path or "").replace("/rpc/", ""),
+                        region=self.settings.region,
+                    )
                     return web.json_response(cached or {"replayed": True}, headers={"X-Idempotent-Replay": "1"})
 
             return await fn(request)
@@ -436,34 +452,36 @@ class RPCServer:
     # ----- endpoint handlers -----
 
     async def _handle_health(self, request: web.Request):
+
         return web.json_response({"ok": True, "region": self.settings.region})
 
     async def _handle_submit_bundle(self, request: web.Request):
+        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
+        if not idem:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
+            raise web.HTTPBadRequest(text="missing idempotency key")
         body = await self._read_json(request, method="submit_bundle")
         if body is None:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
             raise web.HTTPBadRequest(text="invalid JSON")
         body = self._validate_submit_payload(body)
-        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-        if not idem:
-            idem = self._derive_idem_key_from_payload(body)
         res = await self.handlers.submit_bundle(body)
-        if idem:
-            await self._idem.mark(idem, res)
+        await self._idem.put(idem, res)
         return web.json_response(res)
 
     async def _handle_cancel(self, request: web.Request):
+        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
+        if not idem:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
+            raise web.HTTPBadRequest(text="missing idempotency key")
         body = await self._read_json(request, method="cancel")
         if body is None:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
             raise web.HTTPBadRequest(text="invalid JSON")
         body = self._validate_cancel_payload(body)
-        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-        if not idem:
-            idem = self._derive_idem_key_from_payload(body)
+
         res = await self.handlers.cancel(body)
-        if idem:
-            await self._idem.mark(idem, res)
+        await self._idem.put(idem, res)
         return web.json_response(res)
 
     async def _handle_status(self, request: web.Request):

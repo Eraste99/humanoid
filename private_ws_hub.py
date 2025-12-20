@@ -1795,6 +1795,26 @@ class PrivateWSHub:
         """Option: branche un callback externe (AlertDispatcher)."""
         self._alert_cb = cb
 
+    def register_alert(
+            self,
+            severity: str,
+            reason: str,
+            message: str,
+            *,
+            exchange: str = "-",
+            alias: str = "-",
+            kind: str = "-",
+    ) -> None:
+        """Émet une alerte explicite (tests/unitaires, monitoring externe)."""
+        self._notify_alert(
+            severity=severity,
+            reason=reason,
+            exchange=exchange,
+            alias=alias,
+            kind=kind,
+            message=message,
+        )
+
     def _notify_alert(self, severity: str, reason: str, exchange: str = "-", alias: str = "-", kind: str = "-",
                       message: str = "") -> None:
         try:

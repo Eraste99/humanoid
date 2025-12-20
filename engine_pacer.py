@@ -152,6 +152,7 @@ class RegionState:
     bad_win: int = 0
     good_win: int = 0
     last_flag_set_ts: float = 0.0  # hold-time mm_frozen/ioc_only
+    warmup_start_ts: float = 0.0
 
     # policy courante
     pacing_ms: int = 0
@@ -268,6 +269,8 @@ class EnginePacer:
             # Cap inflight purement technique : >=1. Les caps métier restent côté RM/Engine.
             st.inflight_max = 1
             st.state = _STATE_WARMUP if cold_start else _STATE_NORMAL
+            if st.state == _STATE_WARMUP:
+                st.warmup_start_ts = time.monotonic()
             self._regions[region] = st
         return st
 
@@ -584,7 +587,9 @@ class EnginePacer:
 
         # warmup court : on descend rapidement vers NORMAL
         if st.state == _STATE_WARMUP:
-            if (now - st.last_update_ts) >= _WARMUP_SECS:
+            if not st.warmup_start_ts:
+                st.warmup_start_ts = now
+            if (now - st.warmup_start_ts) >= _WARMUP_SECS:
                 st.state = _STATE_NORMAL
             else:
                 # pas d'escalade en warmup

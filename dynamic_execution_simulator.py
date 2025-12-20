@@ -413,6 +413,9 @@ class DynamicExecutionSimulator:
         symbol = str(opportunity.get("pair", "UNKNOWN")).replace("-", "").upper()
         buy_ex = str(opportunity.get("buy_exchange", "")).upper()
         sell_ex = str(opportunity.get("sell_exchange", "")).upper()
+        notional_quote = opportunity.get("notional_quote") or {}
+        notional_ccy = str(notional_quote.get("ccy") or "")
+        notional_amount = float(notional_quote.get("amount") or 0.0)
 
         # slippage par jambe (depuis état local)
         slip_buy = self._slip(buy_ex, symbol, "BUY")
@@ -646,9 +649,13 @@ class DynamicExecutionSimulator:
         - ``guards`` (supplémentaire, non-breaking) pouvant agréger
           ``net_final_spread``, ``usage_ratio`` et ``status``.
         """
+        _t0 = time.perf_counter()
         symbol = str(opportunity.get("pair", "UNKNOWN")).replace("-", "").upper()
         buy_ex = str(opportunity.get("buy_exchange", "")).upper()
         sell_ex = str(opportunity.get("sell_exchange", "")).upper()
+        notional_quote = opportunity.get("notional_quote") or {}
+        notional_ccy = str(notional_quote.get("ccy") or "")
+        notional_amount = float(notional_quote.get("amount") or 0.0)
 
         meta = dict(opportunity.get("meta") or {})
         opp_type = str(opportunity.get("type") or meta.get("type") or "").lower()
@@ -664,6 +671,46 @@ class DynamicExecutionSimulator:
         if rebalancing_mode:
             strategy = "TM"
 
+        def _record_latency() -> float:
+            try:
+                self.last_latency_ms = (time.perf_counter() - _t0) * 1000.0
+            except Exception:
+                self.last_latency_ms = 0.0
+            try:
+                SIM_DECISION_MS.observe(self.last_latency_ms)
+            except Exception:
+                pass
+            return float(self.last_latency_ms)
+
+        def _fail_result(reason: str, *, guards: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            lat_ms = _record_latency()
+            try:
+                sim_on_run("rebalancing" if rebalancing_mode else "standard", blocked=True)
+            except Exception as e:
+                report_nonfatal("DynamicExecutionSimulator", "sim_on_run_failed", e, phase="simulate")
+            return {
+                "ok": False,
+                "reason": reason,
+                "dev_bps": float("inf"),
+                "fills_ratio": 0.0,
+                "lat_ms": lat_ms,
+                "guards": {
+                    "notional_ccy": notional_ccy,
+                    "notional_amount": notional_amount,
+                    **(guards or {}),
+                },
+            }
+
+        region_vals = {
+            str(meta.get("region") or "").upper(),
+            str(meta.get("region_buy") or "").upper(),
+            str(meta.get("region_sell") or "").upper(),
+            str(opportunity.get("region_buy") or "").upper(),
+            str(opportunity.get("region_sell") or "").upper(),
+        }
+        if "JP" in region_vals:
+            return _fail_result("SIM_REGION_UNSUPPORTED", guards={"region": "JP"})
+
         if not self._combo_allowed(buy_ex, sell_ex):
             logger.debug(f"[Sim] Combo non autorisé: {buy_ex}->{sell_ex}")
             self.last_result = {
@@ -671,27 +718,26 @@ class DynamicExecutionSimulator:
                 "reason": "route_not_allowed",
                 "route": f"{buy_ex}->{sell_ex}",
             }
-            return None
+            return _fail_result("SIM_INPUT_INVALID", guards={"combo": f"{buy_ex}->{sell_ex}"})
         if capital_available_usdc <= 0:
-            return None
+            return _fail_result("SIM_INPUT_INVALID", guards={"capital_usdc": capital_available_usdc})
 
         # Livres: asks asc / bids desc
         buy_levels  = self._sanitize_levels(buy_levels_raw,  sort_asc=True)
         sell_levels = self._sanitize_levels(sell_levels_raw, sort_asc=False)
         if not buy_levels or not sell_levels:
-            return None
+            return _fail_result("SIM_INPUT_INVALID", guards={"capital_usdc": capital_available_usdc})
 
         combo_key = self._combo_key(buy_ex, sell_ex)
         params = dict(self.trade_parameters.get(symbol, {}))
         if bool(params.get("block_trade", False)):
             self.blocked_trade_count += 1
-            sim_on_run("rebalancing" if rebalancing_mode else "standard", blocked=True)
-            return None
+            return _fail_result("SIM_INPUT_INVALID", guards={"blocked": True})
 
         max_usdc_opportunity = float(opportunity.get("volume_possible_usdc", float("inf")))
         budget_total_raw = min(float(capital_available_usdc), max_usdc_opportunity)
         if budget_total_raw <= 0:
-            return None
+            return _fail_result("SIM_INPUT_INVALID", guards={"budget_total_raw": budget_total_raw})
 
         # Règles dynamiques
         vol = dict(self.volatility_metrics.get(symbol, {}))
@@ -699,7 +745,7 @@ class DynamicExecutionSimulator:
         volume_factor = float(params.get("volume_factor", getattr(self.config, "volume_factor", 1.0))) * max(0.0, min(size_factor, 1.0))
         budget_total = max(0.0, min(1.0, volume_factor)) * budget_total_raw
         if budget_total <= 0:
-            return None
+            return _fail_result("SIM_INPUT_INVALID", guards={"budget_total": budget_total})
 
         # Fragmentation
         auto_fragment = bool(params.get("auto_fragment", getattr(self.config, "auto_fragment", True)))
@@ -752,8 +798,8 @@ class DynamicExecutionSimulator:
             fees_sell_pct = float(fees_total_pct) * 0.5
 
         # Mesure latence (simulateur)
-        # Mesure latence (simulateur) + exécution
-        _t0 = time.perf_counter()
+
+
         result = None
         deviation = 0.0
         try:
@@ -777,22 +823,10 @@ class DynamicExecutionSimulator:
         except asyncio.TimeoutError as e:
             report_nonfatal("DynamicExecutionSimulator", "simulate_timeout", e, phase="simulate")
             logger.error("[Sim] ⏱️ Timeout (%ss)", timeout)
-            raise SimulationError("TIMEOUT")  # pas de retour “None” silencieux
+            reason = f"{strategy}_TIMEOUT" if strategy in {"TT", "TM"} else "SIM_TIMEOUT"
+            return _fail_result(reason, guards={"timeout_s": timeout})
 
-
-
-        finally:
-            try:
-                self.last_latency_ms = (time.perf_counter() - _t0) * 1000.0
-            except Exception:
-                self.last_latency_ms = 0.0
-
-        # Prometheus: latence de décision (ms)
-        try:
-            SIM_DECISION_MS.observe(self.last_latency_ms)
-        except Exception:
-            pass
-
+        _record_latency()
             # Prometheus: écart VWAP en bps si résultat dispo
         if result is not None:
             if rebalancing_mode:
@@ -827,7 +861,18 @@ class DynamicExecutionSimulator:
                     except Exception as e:
                         report_nonfatal("DynamicExecutionSimulator", "event_sink_error", e, phase="simulate")
                         logger.exception("[DynamicExecutionSimulator] event_sink callback error")
+        if result is None:
+            return _fail_result("SIM_INPUT_INVALID")
 
+        result.setdefault("ok", True)
+        result.setdefault("reason", None)
+        result.setdefault("dev_bps", float("inf"))
+        result.setdefault("fills_ratio", 0.0)
+        result.setdefault("lat_ms", float(self.last_latency_ms))
+        result.setdefault("guards", {})
+        if isinstance(result.get("guards"), dict):
+            result["guards"].setdefault("notional_ccy", notional_ccy)
+            result["guards"].setdefault("notional_amount", notional_amount)
         return result
 
     async def simulate_rebalancing(
@@ -882,8 +927,28 @@ class DynamicExecutionSimulator:
         buy_ex = payload.get("buy_ex") or route.get("buy_ex")
         sell_ex = payload.get("sell_ex") or route.get("sell_ex")
 
+        def _fail(reason: str, *, guards: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return {
+                "ok": False,
+                "reason": reason,
+                "dev_bps": float("inf"),
+                "fills_ratio": 0.0,
+                "lat_ms": float(getattr(self, "timeout_each_s", 1.2)) * 1000.0,
+                "guards": guards or {},
+            }
+
+        meta_payload = dict(payload.get("meta") or {})
+        region_vals = {
+            str(meta_payload.get("region") or "").upper(),
+            str(meta_payload.get("region_buy") or "").upper(),
+            str(meta_payload.get("region_sell") or "").upper(),
+        }
+        if "JP" in region_vals:
+            return _fail("SIM_REGION_UNSUPPORTED", guards={"region": "JP"})
+
         if not pair or not buy_ex or not sell_ex:
-            return None
+            return _fail("SIM_INPUT_INVALID")
+
 
         # 2) Top-of-book → mini livres (un seul niveau)
         buy_tob = payload.get("buy_tob") or {}
@@ -904,7 +969,7 @@ class DynamicExecutionSimulator:
         sell_levels_raw = _levels_from_tob(sell_tob, "bid")  # taker sur SELL
 
         if not buy_levels_raw or not sell_levels_raw:
-            return None
+            return _fail("SIM_MARKETDATA_MISSING")
 
         # 3) Budget capital
         capital_usdc = 0.0
@@ -923,7 +988,7 @@ class DynamicExecutionSimulator:
             capital_usdc = vol_opp
 
         if capital_usdc <= 0.0:
-            return None
+            return _fail("SIM_INPUT_INVALID")
 
         # 4) Opportunité minimale TT
         opportunity: Dict[str, Any] = {
@@ -956,7 +1021,7 @@ class DynamicExecutionSimulator:
 
         # Si la simu retourne None (combo interdit, depth insuffisante, spread négatif, etc.)
         if not result:
-            return None
+            return _fail("TT_NONE_RESULT")
 
         # 7) Dérivés pour le score
         try:
@@ -1012,8 +1077,27 @@ class DynamicExecutionSimulator:
         buy_ex = payload.get("buy_ex") or route.get("buy_ex")
         sell_ex = payload.get("sell_ex") or route.get("sell_ex")
 
+        def _fail(reason: str, *, guards: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+            return {
+                "ok": False,
+                "reason": reason,
+                "dev_bps": float("inf"),
+                "fills_ratio": 0.0,
+                "lat_ms": float(getattr(self, "timeout_each_s", 1.2)) * 1000.0,
+                "guards": guards or {},
+            }
+
+        meta_payload = dict(payload.get("meta") or {})
+        region_vals = {
+            str(meta_payload.get("region") or "").upper(),
+            str(meta_payload.get("region_buy") or "").upper(),
+            str(meta_payload.get("region_sell") or "").upper(),
+        }
+        if "JP" in region_vals:
+            return _fail("SIM_REGION_UNSUPPORTED", guards={"region": "JP"})
+
         if not pair or not buy_ex or not sell_ex:
-            return None
+            return _fail("SIM_INPUT_INVALID")
 
         # 2) Top-of-book → mini livres (un seul niveau)
         buy_tob = payload.get("buy_tob") or {}
@@ -1034,7 +1118,7 @@ class DynamicExecutionSimulator:
         sell_levels_raw = _levels_from_tob(sell_tob, "bid")  # profondeur côté SELL (maker)
 
         if not buy_levels_raw or not sell_levels_raw:
-            return None
+            return _fail("SIM_MARKETDATA_MISSING")
 
         # On essaie aussi de récupérer un best_ask côté SELL pour le calcul maker_price
         sell_best_ask_px: Optional[float] = None
@@ -1063,7 +1147,7 @@ class DynamicExecutionSimulator:
             capital_usdc = vol_opp
 
         if capital_usdc <= 0.0:
-            return None
+            return _fail("SIM_INPUT_INVALID")
 
         # 4) Opportunité minimale TM
         opportunity: Dict[str, Any] = {
@@ -1118,7 +1202,7 @@ class DynamicExecutionSimulator:
         )
 
         if not result:
-            return None
+            return _fail("TM_NONE_RESULT")
 
         # 7) Dérivés pour le score
         try:
@@ -1181,15 +1265,59 @@ class DynamicExecutionSimulator:
             cb_bonus = 0.0
             if split_mode == "SPLIT":
                 cb_bonus = float(getattr(self, "cb_coalescing_ms", 10.0)) / 1000.0
+            meta_payload = dict(payload.get("meta") or {})
+            region_vals = {
+                str(meta_payload.get("region") or "").upper(),
+                str(meta_payload.get("region_buy") or "").upper(),
+                str(meta_payload.get("region_sell") or "").upper(),
+            }
+            if str(payload.get("type") or meta_payload.get("type") or "").lower() in {
+                "rebalancing",
+                "rebalancing_trade",
+            }:
+                try:
+                    sim_on_run("rebalancing", blocked=True)
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "reason": "SIM_REB_UNSUPPORTED_PATH",
+                    "dev_bps": float("inf"),
+                    "fills_ratio": 0.0,
+                    "lat_ms": float(timeout_each) * 1000.0,
+                    "guards": {
+                        "split_mode": split_mode,
+                        "rebalancing": True,
+                    },
+                    "sim_vwap_dev_bps": 1e6,
+                    "fills_expected_ratio": 0.0,
+                    "sim_latency_ms": int(timeout_each * 1000.0),
+                }
+            if "JP" in region_vals:
+                try:
+                    sim_on_run("standard", blocked=True)
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "reason": "SIM_REGION_UNSUPPORTED",
+                    "dev_bps": float("inf"),
+                    "fills_ratio": 0.0,
+                    "lat_ms": float(timeout_each) * 1000.0,
+                    "guards": {"split_mode": split_mode, "region": "JP"},
+                    "sim_vwap_dev_bps": 1e6,
+                    "fills_expected_ratio": 0.0,
+                    "sim_latency_ms": int(timeout_each * 1000.0),
+                }
 
-            # --- 1) Définition des jobs TT/TM ------------------------------------
-            async def _sim_tt():
-                # Calcule un VWAP dev “taker/taker” sensible à la profondeur
-                return await self._simulate_tt(payload, extra_latency_s=cb_bonus)
+    # --- 1) Définition des jobs TT/TM ------------------------------------
+        async def _sim_tt():
+            # Calcule un VWAP dev “taker/taker” sensible à la profondeur
+            return await self._simulate_tt(payload, extra_latency_s=cb_bonus)
 
-            async def _sim_tm():
-                # Calcule un score maker/taker + probabilité de fill/hedge
-                return await self._simulate_tm(payload, extra_latency_s=cb_bonus)
+        async def _sim_tm():
+            # Calcule un score maker/taker + probabilité de fill/hedge
+            return await self._simulate_tm(payload, extra_latency_s=cb_bonus)
 
             # --- 2) Run en parallèle + annulation croisée -------------------------
             tt = asyncio.create_task(_sim_tt())
@@ -1203,13 +1331,22 @@ class DynamicExecutionSimulator:
 
             # --- 3) Agrégation des résultats -------------------------------------
             # --- 3) Agrégation des résultats — STRICT, pas de fallback muet ---
+            notional = {}
+            try:
+                notional = (payload.get("bundle") or {}).get("notional_quote") or {}
+            except Exception:
+                notional = {}
+            notional_ccy = str(notional.get("ccy") or "")
+            notional_amount = float(notional.get("amount") or 0.0)
+
             def _extract(task, label: str):
                 # task annulée (timeout partiel) => TIMEOUT explicite
                 if task.cancelled():
                     return {
                         "ok": False, "reason": f"{label}_TIMEOUT",
                         "dev_bps": float("inf"), "fills_ratio": 0.0,
-                        "lat_ms": timeout_each * 1000.0, "guards": {}
+                        "lat_ms": timeout_each * 1000.0,
+                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
                     }
                 try:
                     r = task.result()
@@ -1218,7 +1355,8 @@ class DynamicExecutionSimulator:
                         return {
                             "ok": False, "reason": f"{label}_NONE_RESULT",
                             "dev_bps": float("inf"), "fills_ratio": 0.0,
-                            "lat_ms": timeout_each * 1000.0, "guards": {}
+                            "lat_ms": timeout_each * 1000.0,
+                            "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
                         }
                     # Normalisation champs attendus
                     r.setdefault("ok", False)
@@ -1227,19 +1365,24 @@ class DynamicExecutionSimulator:
                     r.setdefault("lat_ms", timeout_each * 1000.0)
                     r.setdefault("guards", {})
                     r.setdefault("reason", None)
+                    if isinstance(r.get("guards"), dict):
+                        r["guards"].setdefault("notional_ccy", notional_ccy)
+                        r["guards"].setdefault("notional_amount", notional_amount)
                     return r
                 except SimulationError as e:
                     return {
-                        "ok": False, "reason": f"{label}_SIM_ERROR:{e}",
+                        "ok": False, "reason": f"{label}_SIM_ERROR",
                         "dev_bps": float("inf"), "fills_ratio": 0.0,
-                        "lat_ms": timeout_each * 1000.0, "guards": {}
+                        "lat_ms": timeout_each * 1000.0,
+                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
                     }
                 except Exception as e:
                     # Pas de “pass” : on expose la classe d’erreur
                     return {
                         "ok": False, "reason": f"{label}_TASK_ERROR:{e.__class__.__name__}",
                         "dev_bps": float("inf"), "fills_ratio": 0.0,
-                        "lat_ms": timeout_each * 1000.0, "guards": {}
+                        "lat_ms": timeout_each * 1000.0,
+                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
                     }
 
             tt_r = _extract(tt, "TT")
@@ -1254,9 +1397,18 @@ class DynamicExecutionSimulator:
                 dev_bps = float(tm_r.get("dev_bps", float("inf")))
                 fills_ratio = float(tm_r.get("fills_ratio", 0.0))
                 sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
+                try:
+                    sim_on_run("standard", blocked=True)
+                except Exception:
+                    pass
+                if not math.isfinite(dev_bps):
+                    dev_bps = 1e6
                 return {
                     "ok": False,
                     "reason": tm_r.get("reason"),
+                    "dev_bps": float(dev_bps),
+                    "fills_ratio": float(fills_ratio),
+                    "lat_ms": float(sim_lat_ms),
                     "sim_vwap_dev_bps": float(dev_bps if math.isfinite(dev_bps) else 1e6),
                     "fills_expected_ratio": float(fills_ratio),
                     "sim_latency_ms": sim_lat_ms,
@@ -1266,6 +1418,8 @@ class DynamicExecutionSimulator:
                         "tt_reason": tt_r.get("reason"),
                         "tm_reason": tm_r.get("reason"),
                         "split_mode": split_mode,
+                        "notional_ccy": notional_ccy,
+                        "notional_amount": notional_amount,
                     },
                 }
 
@@ -1286,10 +1440,20 @@ class DynamicExecutionSimulator:
                 reason = f"TT:{tt_r.get('reason')}|TM:{tm_r.get('reason')}"
 
             sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
+            if not math.isfinite(dev_bps):
+                dev_bps = 1e6
+            if reason:
+                try:
+                    sim_on_run("standard", blocked=True)
+                except Exception:
+                    pass
 
             return {
-                "ok": math.isfinite(dev_bps),
+                "ok": reason is None and math.isfinite(dev_bps),
                 "reason": reason,
+                "dev_bps": float(dev_bps),
+                "fills_ratio": float(fills_ratio),
+                "lat_ms": float(sim_lat_ms),
                 "sim_vwap_dev_bps": float(dev_bps if math.isfinite(dev_bps) else 1e6),
                 "fills_expected_ratio": float(fills_ratio),
                 "sim_latency_ms": sim_lat_ms,
@@ -1298,7 +1462,9 @@ class DynamicExecutionSimulator:
                     "tm_ok": ok_tm,
                     "tt_reason": tt_r.get("reason"),
                     "tm_reason": tm_r.get("reason"),
-                    "split_mode": split_mode
+                    "split_mode": split_mode,
+                    "notional_ccy": notional_ccy,
+                    "notional_amount": notional_amount,
                 }
             }
 

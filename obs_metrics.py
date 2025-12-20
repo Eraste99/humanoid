@@ -470,6 +470,12 @@ RPC_LATENCY_MS = _metric(Histogram, 'rpc_latency_ms', 'RPC latency (ms)', ['meth
 RPC_ERR_TOTAL = _metric(Counter, 'rpc_err_total', 'RPC errors', ['code', 'method', 'region'])
 RPC_RETRIES_TOTAL = _metric(Counter, 'rpc_retries_total', 'RPC retries', ['method', 'region'])
 RPC_PAYLOAD_REJECTED_TOTAL = _metric(Counter, 'rpc_payload_rejected_total', 'Rejected RPC payloads', ['model'])
+RPC_IDEMPOTENCY_HIT_TOTAL = _metric(
+    Counter,
+    'rpc_idempotency_hit_total',
+    'Idempotency cache hits',
+    ['method', 'region'],
+)
 ROUTER_QUEUE_DEPTH = _metric(Gauge, 'router_queue_depth', 'Router queue depth', ['queue'])
 ROUTER_PAIR_QUEUE_DEPTH = _metric(Gauge, 'router_pair_queue_depth', 'Router per-pair queue depth', ['pair', 'tier'])
 ROUTER_QUEUE_HIGH_WATERMARK_TOTAL = _metric(Counter, 'router_queue_high_watermark_total', 'Router queue high watermark hits', ['queue'])
@@ -683,6 +689,30 @@ SCANNER_EVAL_MS = _metric(
     ['pair', 'route'],
     buckets=BUCKETS_MS,
 )
+SCANNER_REJECT_REASONS = {
+    "fee_unknown",
+    "rm_ack_timeout",
+    "region_disabled_jp",
+    "slip_unknown_or_stale",
+    "vol_unknown_or_stale",
+    "bad_ts_negative_age",
+}
+
+SLIP_REASONS = {
+    "slip_unknown_or_stale",
+}
+
+VOL_REASONS = {
+    "vol_unknown_or_stale",
+}
+
+OBS_REASON_REGISTRY = {
+    "router": ROUTER_DROP_REASONS,
+    "ws_public": WS_PUBLIC_DROP_REASONS,
+    "scanner": SCANNER_REJECT_REASONS,
+    "slip": SLIP_REASONS,
+    "vol": VOL_REASONS,
+}
 SCANNER_GLOBAL_LOAD = _metric(Gauge, 'scanner_global_load', 'Scanner global load (0..1)')
 SCANNER_RATE_LIMITED_TOTAL = _metric(Counter, 'scanner_rate_limited_total', 'Scanner rate limited hits', ['kind', 'cohort'])
 SCANNER_EMITTED_TOTAL = _metric(Counter, 'scanner_emitted_total', 'Opportunities emitted')
@@ -928,9 +958,12 @@ def mark_scanner_to_rm_ts(
     try:
         now_ns = time.perf_counter_ns()
         dt_ms = max(0.0, (float(now_ns - int(ts_start_ns)) / 1e6))
-        enriched = dict(labels) if labels else {}
-        # On force la présence d'un reason dans les labels pour inc_blocked
-        enriched.setdefault("reason", reason)
+        enriched = {
+            "region": labels.get("region"),
+            "strategy": labels.get("strategy"),
+            "pair": labels.get("pair"),
+            "reason": reason,
+        }
         mark_scanner_to_rm(ok, dt_ms, **enriched)
     except Exception:
         # Best-effort
@@ -957,6 +990,7 @@ REBAL_CROSS_TOO_EXPENSIVE_TOTAL = _metric(
     'Cross-CEX opportunities rejected because estimated net bps is below the allowed loss',
     ['stage']
 )
+
 RM_PAUSED_COUNT = _metric(Gauge, 'rm_paused_count', 'Number of paused routes/pairs')
 LAST_BOOKS_FRESH_TS = _metric(Gauge, 'last_books_fresh_ts_seconds', 'Last books fresh ts', ['pair'])
 LAST_BALANCES_FRESH_TS = _metric(Gauge, 'last_balances_fresh_ts_seconds', 'Last balances fresh ts', ['exchange', 'alias'])

@@ -53,6 +53,7 @@ import math
 import asyncio, random, time
 import uuid
 import logging
+import inspect
 from decimal import Decimal, InvalidOperation, getcontext
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.errors import DataStaleError
@@ -838,8 +839,12 @@ class OpportunityScanner:
         """MAJ unitaire du cache fees (fractions, ex: 0.001 = 10 bps)."""
         ex = _norm_ex(exchange); pk = _norm_pair(pair_key)
         d = self._fees_cache.setdefault((ex, pk), {"taker": None, "maker": None, "ts": 0.0})
-        if taker is not None: d["taker"] = float(max(0.0, taker))
-        if maker is not None: d["maker"] = float(max(0.0, maker))
+        if taker is not None:
+            taker_val = float(taker)
+            d["taker"] = taker_val if taker_val > 0.0 else None
+        if maker is not None:
+            maker_val = float(maker)
+            d["maker"] = maker_val if maker_val >= 0.0 else None
         d["ts"] = time.time()
 
     def ingest_fees_bulk(self, payload: Dict[str, Dict[str, Dict[str, Optional[float]]]]) -> None:
@@ -854,10 +859,14 @@ class OpportunityScanner:
     # -- helpers de lecture (cache → fallback RM) --
     def _fee_bps(self, ex: str, role: str, pair: str) -> Optional[float]:
         """Retourne les fees en bps, priorité au cache; fallback RM (signatures tolérées)."""
+        role_norm = str(role or "").lower()
         try:
             d = self._fees_cache.get((_norm_ex(ex), _norm_pair(pair)))
             if d and d.get(role) is not None:
-                return float(d[role]) * 1e4
+                fee_val = float(d[role])
+                if role_norm == "taker" and fee_val <= 0.0:
+                    return None
+                return fee_val * 1e4
         except Exception:
             logging.exception("Unhandled exception")
 
@@ -866,19 +875,22 @@ class OpportunityScanner:
             return None
 
         try:
-            return float(g(_norm_ex(ex), _norm_pair(pair), role)) * 1e4
+            fee_val = float(g(_norm_ex(ex), _norm_pair(pair), role))
+            if role_norm == "taker" and fee_val <= 0.0:
+                return None
+            return fee_val * 1e4
         except TypeError:
             logger.exception("Scanner get_fee_pct signature mismatch for %s/%s", ex, pair)
         except Exception:
             logger.exception("Scanner get_fee_pct error for %s/%s", ex, pair)
         return None
 
-    def _fee_frac(self, ex: str, role: str, pair: str) -> float:
-        """Retourne les fees en fraction (ex: 0.001), cache → fallback RM → 0.0."""
+    def _fee_frac(self, ex: str, role: str, pair: str) -> Optional[float]:
+        """Retourne les fees en fraction (ex: 0.001), cache → fallback RM."""
         bps = self._fee_bps(ex, role, pair)
         if isinstance(bps, (int, float)):
             return float(bps) / 1e4
-        return 0.0
+        return None
 
     # ---------------- Entrées (push) ----------------
     def update_orderbook(self, data: dict) -> None:
@@ -890,7 +902,7 @@ class OpportunityScanner:
         except Exception:
             logging.exception("Unhandled exception")
 
-        if not data or not data.get("active", False):
+        if not data:
             return
 
         ex = _norm_ex(data.get("exchange"))
@@ -898,6 +910,49 @@ class OpportunityScanner:
         if not pair_raw:
             return
         pair = _norm_pair(pair_raw)
+        if not data.get("active", False):
+            self._record_rejection(reason="inactive", route="*", pair=pair, ctx={"exchange": ex})
+            return
+
+        now_ms = int(time.time() * 1000)
+        recv_ts_ms = data.get("recv_ts_ms")
+        book_ttl_ms = data.get("book_ttl_ms")
+        if recv_ts_ms is None:
+            self._record_rejection(
+                reason="schema_missing_field",
+                route="*",
+                pair=pair,
+                ctx={"exchange": ex, "field": "recv_ts_ms"},
+            )
+            return
+        if book_ttl_ms is None:
+            book_ttl_ms = self._book_ttl_ms_default(ex)
+        if book_ttl_ms is None or float(book_ttl_ms) <= 0.0:
+            self._record_rejection(
+                reason="schema_missing_field",
+                route="*",
+                pair=pair,
+                ctx={"exchange": ex, "field": "book_ttl_ms"},
+            )
+            return
+        try:
+            age_ms = now_ms - int(recv_ts_ms)
+        except Exception:
+            self._record_rejection(
+                reason="schema_missing_field",
+                route="*",
+                pair=pair,
+                ctx={"exchange": ex, "field": "recv_ts_ms"},
+            )
+            return
+        if age_ms > int(book_ttl_ms):
+            self._record_rejection(
+                reason="book_stale",
+                route="*",
+                pair=pair,
+                ctx={"exchange": ex, "age_ms": age_ms, "ttl_ms": int(book_ttl_ms)},
+            )
+            return
 
         # Univers/pauses (LHM)
         if self._universe is not None and pair not in self._universe:
@@ -1040,27 +1095,54 @@ class OpportunityScanner:
         """Pré-filtre rapide STRICT: (frais taker buy + sell) + max(slippage buy/sell) — pas de valeurs inventées."""
         pk = _norm_pair(pair)
 
-        # Fees: cache -> RM (ok d'avoir 0 si non trouvées, c'est un coût)
-        f_buy = self._fees_cache.get((_norm_ex(buy_ex), pk), {}).get("taker")
-        f_sell = self._fees_cache.get((_norm_ex(sell_ex), pk), {}).get("taker")
+        # Fees: cache -> RM (fail-closed si inconnues ou ambiguës)
+        try:
+            f_buy = float(self.risk_manager.get_fee_pct(buy_ex, pk, "taker"))
+        except DataStaleError:
+            raise
+        except Exception:
+            raise DataStaleError("fee_unknown")
+        try:
+            f_sell = float(self.risk_manager.get_fee_pct(sell_ex, pk, "taker"))
+        except DataStaleError:
+            raise
+        except Exception:
+            raise DataStaleError("fee_unknown")
+
+        if f_buy is None or f_sell is None or f_buy <= 0.0 or f_sell <= 0.0:
+            raise DataStaleError("fee_unknown")
+
+        slip_ttl = min(
+            self._public_ttl(buy_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
+            self._public_ttl(sell_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
+        )
+        slip_age = self._slip_age_seconds(pk)
+        if not math.isfinite(slip_age) or slip_age > slip_ttl:
+            raise DataStaleError("slip_unknown_or_stale")
         if f_buy is None:
             f_buy = float(self.risk_manager.get_fee_pct(buy_ex, pk, "taker"))
         if f_sell is None:
             f_sell = float(self.risk_manager.get_fee_pct(sell_ex, pk, "taker"))
 
         # Slippage: cache -> RM, sinon REJET en amont (pas de "0" de confort)
-        slip_buy = self._cached_slip(buy_ex, pk, "buy")
+        try:
+            slip_buy = self.risk_manager.get_slippage(buy_ex, pk, "buy")
+        except DataStaleError:
+            raise
         if slip_buy is None:
             slip_buy = self.risk_manager.get_slippage(buy_ex, pk, "buy")
             if slip_buy is None:
-                # le rejet se fera au niveau appelant (évaluation opportunité)
-                raise RuntimeError(f"slippage missing {buy_ex} {pk} BUY")
+                raise DataStaleError("slip_unknown_or_stale")
 
-        slip_sell = self._cached_slip(sell_ex, pk, "sell")
+        try:
+            slip_sell = self.risk_manager.get_slippage(sell_ex, pk, "sell")
+        except DataStaleError:
+            raise
+
         if slip_sell is None:
             slip_sell = self.risk_manager.get_slippage(sell_ex, pk, "sell")
             if slip_sell is None:
-                raise RuntimeError(f"slippage missing {sell_ex} {pk} SELL")
+                raise DataStaleError("slip_unknown_or_stale")
 
         slip = max(float(slip_buy), float(slip_sell))
         if getattr(self, "sum_slippage_tt", False):
@@ -1108,8 +1190,70 @@ class OpportunityScanner:
         return float(val) if val is not None else None
 
     # ---------------- Détection (mode push) ----------------
+    def _book_ttl_ms_default(self, exchange: str) -> Optional[int]:
+        ttl_ms = None
+        try:
+            router_cfg = getattr(self.cfg, "router", None)
+            ttl_ms = getattr(router_cfg, "stale_ms", None) if router_cfg is not None else None
+            if isinstance(ttl_ms, (int, float)) and ttl_ms > 0:
+                return int(ttl_ms)
+        except Exception:
+            ttl_ms = None
+        try:
+            max_book_age_s = getattr(self.cfg, "max_book_age_s", None)
+            if isinstance(max_book_age_s, (int, float)) and max_book_age_s > 0:
+                return int(float(max_book_age_s) * 1000.0)
+        except Exception:
+            pass
+        return None
+
     def _snapshot_ts_seconds(self, snap: dict, *, pair_key: str, exchange: str) -> Optional[float]:
-        ts_ms = snap.get("exchange_ts_ms") or snap.get("recv_ts_ms")
+        if not snap.get("active", False):
+            self._record_rejection(
+                reason="inactive",
+                route="*",
+                pair=pair_key,
+                ctx={"exchange": exchange},
+            )
+            return None
+
+        recv_ts_ms = snap.get("recv_ts_ms")
+        if recv_ts_ms is None:
+            self._record_rejection(
+                reason="schema_missing_field",
+                route="*",
+                pair=pair_key,
+                ctx={"exchange": exchange, "field": "recv_ts_ms"},
+            )
+            return None
+
+        book_ttl_ms = snap.get("book_ttl_ms")
+        if book_ttl_ms is None:
+            book_ttl_ms = self._book_ttl_ms_default(exchange)
+        if book_ttl_ms is None or float(book_ttl_ms) <= 0.0:
+            self._record_rejection(
+                reason="schema_missing_field",
+                route="*",
+                pair=pair_key,
+                ctx={"exchange": exchange, "field": "book_ttl_ms"},
+            )
+            return None
+
+        now_ms = int(time.time() * 1000)
+        try:
+            age_ms = now_ms - int(recv_ts_ms)
+        except Exception:
+            self._record_rejection(reason="schema_missing_field", route="*", pair=pair_key)
+            return None
+        if age_ms > int(book_ttl_ms):
+            self._record_rejection(
+                reason="book_stale",
+                route="*",
+                pair=pair_key,
+                ctx={"exchange": exchange, "age_ms": age_ms, "ttl_ms": int(book_ttl_ms)},
+            )
+            return None
+        ts_ms = snap.get("exchange_ts_ms") or recv_ts_ms
         if ts_ms is None:
             self._record_rejection(reason="missing_ts", route="*", pair=pair_key)
             return None
@@ -1957,7 +2101,7 @@ class OpportunityScanner:
             ttl = float(cfg_default)
         return float(ttl)
 
-    def _risk_feeds_fresh(self, pair: str) -> bool:
+    def _risk_feeds_fresh(self, pair: str) -> tuple[bool, Optional[str], dict]:
         """
         Vérifie la fraicheur des flux auxiliaires (slippage/volatility)
         en se basant EXCLUSIVEMENT sur les SLO publics (fallback cfg.slip/vol.ttl_s).
@@ -1968,7 +2112,48 @@ class OpportunityScanner:
 
         slip_age = self._slip_age_seconds(pair)  # suppose des compteurs internes existants
         vol_age = self._vol_age_seconds(pair)
-        return (slip_age is not None and slip_age <= slip_ttl) and (vol_age is not None and vol_age <= vol_ttl)
+        if not math.isfinite(slip_age) or slip_age > slip_ttl:
+            return False, "slip_unknown_or_stale", {"age_s": slip_age, "ttl_s": slip_ttl}
+        if not math.isfinite(vol_age) or vol_age > vol_ttl:
+            return False, "vol_unknown_or_stale", {"age_s": vol_age, "ttl_s": vol_ttl}
+        return True, None, {}
+
+    def _resolve_exchange_region(self, exchange: str) -> str:
+        exu = _norm_ex(exchange)
+        rm = getattr(self, "risk_manager", None)
+        rm_resolve = getattr(rm, "_resolve_exchange_region", None)
+        if callable(rm_resolve):
+            try:
+                region = rm_resolve(exu)
+                if region:
+                    return str(region).upper()
+            except Exception:
+                pass
+        cfg = getattr(self, "cfg", None)
+        g_cfg = getattr(cfg, "g", None) if cfg is not None else None
+        region_map = None
+        if g_cfg is not None:
+            for attr in ("exchange_region_map", "cex_region_map", "engine_region_map", "engine_pod_map"):
+                mp = getattr(g_cfg, attr, None)
+                if isinstance(mp, dict) and mp:
+                    region_map = mp
+                    break
+        if region_map:
+            if exu in region_map:
+                return str(region_map[exu]).upper()
+            for key, val in region_map.items():
+                if str(key).upper() == exu:
+                    return str(val).upper()
+        return "UNKNOWN"
+
+    def _jp_disabled(self, region: Optional[str]) -> bool:
+        cfg = getattr(self, "cfg", None)
+        g_cfg = getattr(cfg, "g", None) if cfg is not None else None
+        enable_jp = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else bool(
+            getattr(cfg, "enable_jp", False)
+        )
+        region_norm = str(region or "UNKNOWN").upper()
+        return (region_norm in {"JP", "UNKNOWN"}) and not enable_jp
 
     def _dynamic_thresholds_for(self, pair: str) -> tuple[float, float]:
         """
@@ -2010,11 +2195,73 @@ class OpportunityScanner:
         route_combo = f"{min(buy_ex, sell_ex)}/{max(buy_ex, sell_ex)}"
         quote = _quote_of_pair(pair)
 
+        def _book_fresh(snapshot: dict, ex_name: str) -> bool:
+            if not snapshot.get("active", False):
+                self._record_rejection(reason="inactive", route=route_combo, pair=pair, ctx={"exchange": ex_name})
+                return False
+            recv_ts_ms = snapshot.get("recv_ts_ms")
+            if recv_ts_ms is None:
+                self._record_rejection(
+                    reason="schema_missing_field",
+                    route=route_combo,
+                    pair=pair,
+                    ctx={"exchange": ex_name, "field": "recv_ts_ms"},
+                )
+                return False
+            book_ttl_ms = snapshot.get("book_ttl_ms")
+            if book_ttl_ms is None:
+                book_ttl_ms = self._book_ttl_ms_default(ex_name)
+            if book_ttl_ms is None or float(book_ttl_ms) <= 0.0:
+                self._record_rejection(
+                    reason="schema_missing_field",
+                    route=route_combo,
+                    pair=pair,
+                    ctx={"exchange": ex_name, "field": "book_ttl_ms"},
+                )
+                return False
+            try:
+                age_ms = int(time.time() * 1000) - int(recv_ts_ms)
+            except Exception:
+                self._record_rejection(
+                    reason="schema_missing_field",
+                    route=route_combo,
+                    pair=pair,
+                    ctx={"exchange": ex_name, "field": "recv_ts_ms"},
+                )
+                return False
+            if age_ms > int(book_ttl_ms):
+                self._record_rejection(
+                    reason="book_stale",
+                    route=route_combo,
+                    pair=pair,
+                    ctx={"exchange": ex_name, "age_ms": age_ms, "ttl_ms": int(book_ttl_ms)},
+                )
+                return False
+            return True
+
+        if not _book_fresh(buy_data, buy_ex) or not _book_fresh(sell_data, sell_ex):
+            return
+
         buy_price = D(buy_data.get("best_ask"))
         sell_price = D(sell_data.get("best_bid"))
         buy_vol = D(buy_data.get("ask_volume") or 0)
         sell_vol = D(sell_data.get("bid_volume") or 0)
         if buy_price <= 0 or sell_price <= 0:
+            return
+
+        slip_ttl = min(
+            self._public_ttl(buy_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
+            self._public_ttl(sell_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
+        )
+        slip_age = self._slip_age_seconds(pair)
+        if not math.isfinite(slip_age) or slip_age > slip_ttl:
+            self.blocks["slip"] += 1
+            self._record_rejection(
+                reason="slip_unknown_or_stale",
+                route=route_combo,
+                pair=pair,
+                ctx={"age_s": slip_age, "ttl_s": slip_ttl},
+            )
             return
 
         # Slippage pré-filtre (feed RM si dispo)
@@ -2087,12 +2334,16 @@ class OpportunityScanner:
             v = self._cached_slip(ex, pair, side)
             if v is None:
                 # 2) source stricte via RM -> SFC
-                v = self.risk_manager.get_slippage(ex, pair, side=side)
+                try:
+                    v = self.risk_manager.get_slippage(ex, pair, side=side)
+                except DataStaleError:
+                    v = None
+
             if v is None:
                 # Rejet explicite: pas de valeur inventée
                 self.blocks["slip"] += 1
                 self._record_rejection(
-                    reason="slippage_missing",
+                    reason="slip_unknown_or_stale",
                     route=route_combo,
                     pair=pair,
                     ctx={"ex": ex, "side": side},
@@ -2103,7 +2354,7 @@ class OpportunityScanner:
             except Exception:
                 self.blocks["slip"] += 1
                 self._record_rejection(
-                    reason="slippage_invalid",
+                    reason="slip_unknown_or_stale",
                     route=route_combo,
                     pair=pair,
                     ctx={"ex": ex, "side": side, "raw": v},
@@ -2114,17 +2365,25 @@ class OpportunityScanner:
         try:
             fb = self.risk_manager.get_fee_pct(buy_ex, pair, "taker")
             fs = self.risk_manager.get_fee_pct(sell_ex, pair, "taker")
+        except DataStaleError:
+            self._record_rejection(
+                reason="fee_unknown",
+                route=route_combo,
+                pair=pair,
+                ctx={"buy_ex": buy_ex, "sell_ex": sell_ex},
+            )
+            return
         except Exception as e:
             self._record_rejection(
-                reason="fee_missing",
+                reason="fee_unknown",
                 route=route_combo,
                 pair=pair,
                 ctx={"err": type(e).__name__, "buy_ex": buy_ex, "sell_ex": sell_ex}
             )
             return
-        if fb is None or fs is None:
+        if fb is None or fs is None or float(fb) <= 0.0 or float(fs) <= 0.0:
             self._record_rejection(
-                reason="fee_missing",
+                reason="fee_unknown",
                 route=route_combo,
                 pair=pair,
                 ctx={"buy_ex": buy_ex, "sell_ex": sell_ex}
@@ -2141,14 +2400,23 @@ class OpportunityScanner:
         spread_net = spread_norm - total_cost
 
         # -------- VOL PATCH + NOUVEAU boost charge -------------------------
-        vol_bps_scanner = self.get_volatility_bps(pair, ema=True)
+        vol_ttl = min(
+            self._public_ttl(buy_ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s", 5.0)),
+            self._public_ttl(sell_ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s", 5.0)),
+        )
+        vol_bps_scanner = self.get_volatility_bps(pair, ema=True, ttl_s=vol_ttl)
         vol_penalty_bps = 0.0
-        if isinstance(vol_bps_scanner, (int, float)):
-            excess = max(0.0, float(vol_bps_scanner) - self.vol_soft_cap_bps)
-            vol_penalty_bps = excess * self.vol_alpha_penalty  # bps
-            local_min_required_bps = float(self.min_required_bps) + self.vol_beta_min_req * excess
-        else:
-            local_min_required_bps = float(self.min_required_bps)
+        if not isinstance(vol_bps_scanner, (int, float)):
+            self._record_rejection(
+                reason="vol_unknown_or_stale",
+                route=route_combo,
+                pair=pair,
+                ctx={"ttl_s": vol_ttl},
+            )
+            return
+        excess = max(0.0, float(vol_bps_scanner) - self.vol_soft_cap_bps)
+        vol_penalty_bps = excess * self.vol_alpha_penalty  # bps
+        local_min_required_bps = float(self.min_required_bps) + self.vol_beta_min_req * excess
 
         # >>> NOUVEAU : boost bps sous charge (audition d'abord)
         local_min_required_bps += float(boost_bps_dyn)
@@ -2178,7 +2446,7 @@ class OpportunityScanner:
 
         if buy_taker_fee_bps is None or sell_taker_fee_bps is None:
             self._record_rejection(
-                reason="fee_missing_hints",
+                reason="fee_unknown",
                 route=route_combo,
                 pair=pair,
                 ctx={"stage": "tm_estimate"}
@@ -2209,15 +2477,11 @@ class OpportunityScanner:
         weight_sell_taker = self._depth_weight(depth_ratio_sell_total)
         weight_buy_taker = self._depth_weight(depth_ratio_buy_total)
 
-        vol_bps_rm = 0.0
-        try:
-            vol_bps_rm = float(getattr(self.risk_manager, "get_volatility_bps", lambda _pair: 0.0)(pair))
-        except Exception:
-            logging.exception("Unhandled exception")
-        vol_final = float(vol_bps_scanner if isinstance(vol_bps_scanner, (int, float)) else vol_bps_rm)
+        vol_final = float(vol_bps_scanner)
         soft = float(self.vol_soft_cap_bps)
         chaos = float(self.vol_chaos_bps)
         vol_factor = 0.0
+        vol_bps_rm = 0.0
         if vol_final > soft and chaos > soft:
             vol_factor = min(1.0, (vol_final - soft) / max(1e-9, (chaos - soft)))
 
@@ -2350,6 +2614,15 @@ class OpportunityScanner:
         except Exception:
             logging.exception("Unhandled exception")
         allow_loss_bps = float(self.allow_loss_bps_rebal) if is_rebal else 0.0
+        decision_ts_ms = int(now * 1000)
+        buy_recv_ts_ms = int(buy_data.get("recv_ts_ms") or 0)
+        sell_recv_ts_ms = int(sell_data.get("recv_ts_ms") or 0)
+        recv_candidates = [ts for ts in (buy_recv_ts_ms, sell_recv_ts_ms) if ts > 0]
+        book_age_ms = max(0, decision_ts_ms - min(recv_candidates)) if recv_candidates else 0
+        region_buy = self._resolve_exchange_region(buy_ex)
+        region_sell = self._resolve_exchange_region(sell_ex)
+        deployment_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "UNKNOWN")).upper()
+        tier = self._cohort_of(pair)
 
         leg_buy = {
             "exchange": buy_ex,
@@ -2380,7 +2653,25 @@ class OpportunityScanner:
             "type": ("rebalancing" if is_rebal else "bundle"),
             "legs": [leg_buy, leg_sell],
             "pair_key": pair,
+            "buy_ex": buy_ex,
+            "sell_ex": sell_ex,
+            "strategy": ("REB" if is_rebal else self.scanner_mode),
             "quote": quote,
+            "quote_ccy": quote,
+            "notional_quote": {"ccy": quote, "amount": float(target_quote)},
+            "notional_quote_amount": float(target_quote),
+            "volume_usdc": float(target_quote),
+            "book_age_ms": int(book_age_ms),
+            "fees_buy": float(fees_buy_taker),
+            "fees_sell": float(fees_sell_taker),
+            "slip_buy": float(slip_buy),
+            "slip_sell": float(slip_sell),
+            "vol_bps": float(vol_bps_scanner),
+            "decision_ts_ms": decision_ts_ms,
+            "region_buy": region_buy,
+            "region_sell": region_sell,
+            "deployment_mode": deployment_mode,
+            "tier": tier,
             "expected_net_spread": expected_net,
             "timeout_s": float(self.default_timeout_s),
             "meta": {"allow_loss_bps": allow_loss_bps} if allow_loss_bps > 0 else {},
@@ -2390,6 +2681,43 @@ class OpportunityScanner:
             "ts_buy_ex_ms": int(buy_data.get("exchange_ts_ms") or buy_data.get("recv_ts_ms") or 0),
             "ts_sell_ex_ms": int(sell_data.get("exchange_ts_ms") or sell_data.get("recv_ts_ms") or 0),
         }
+
+        if self._jp_disabled(region_buy) or self._jp_disabled(region_sell):
+            self._record_rejection(
+                reason="region_disabled_jp",
+                route=route_combo,
+                pair=pair,
+                ctx={"region_buy": region_buy, "region_sell": region_sell},
+            )
+            return
+
+        required_fields = [
+            "pair_key",
+            "buy_ex",
+            "sell_ex",
+            "strategy",
+            "quote",
+            "notional_quote",
+            "book_age_ms",
+            "fees_buy",
+            "fees_sell",
+            "slip_buy",
+            "slip_sell",
+            "vol_bps",
+            "decision_ts_ms",
+        ]
+        missing = [key for key in required_fields if payload.get(key) is None]
+        notional_quote = payload.get("notional_quote")
+        if not (isinstance(notional_quote, dict) and float(notional_quote.get("amount") or 0.0) > 0.0):
+            missing.append("notional_quote")
+        if missing:
+            self._record_rejection(
+                reason="missing_required_field",
+                route=route_combo,
+                pair=pair,
+                ctx={"missing": sorted(set(missing))},
+            )
+            return
 
         # Hints TT/TM (inchangés)
         hints: Dict[str, Any] = {}
@@ -2593,22 +2921,68 @@ class OpportunityScanner:
         try:
             cb = self.on_opportunity
             if cb:
+                ack_timeout_s = float(getattr(getattr(self.cfg, "scanner", object()), "rm_ack_timeout_s", 0.0) or 0.0)
                 if asyncio.iscoroutinefunction(cb):
                     # On ne bloque pas sur le RM : tâche async
-                    asyncio.create_task(cb(opp))
+                    task = asyncio.create_task(cb(opp))
                     ok_rm = True
                     reason_rm = "async_task"
                 else:
-                    cb(opp)
-                    ok_rm = True
-                    reason_rm = "ok"
+                    result = cb(opp)
+                    if inspect.isawaitable(result):
+                        task = asyncio.create_task(result)
+                        ok_rm = True
+                        reason_rm = "async_task"
+                    else:
+                        task = None
+                        ok_rm = True
+                        reason_rm = "ok"
+
+                if ack_timeout_s > 0.0 and task is not None:
+                    async def _await_ack(wait_task: asyncio.Task) -> None:
+                        try:
+                            await asyncio.wait_for(wait_task, timeout=ack_timeout_s)
+                        except asyncio.TimeoutError:
+                            self._record_rejection(
+                                reason="rm_ack_timeout",
+                                route=route_combo,
+                                pair=pair,
+                                ctx={"timeout_s": ack_timeout_s},
+                            )
+                            try:
+                                mark_scanner_to_rm_ts(
+                                    ts_rm_ns,
+                                    ok=False,
+                                    reason="rm_ack_timeout",
+                                    pair=pair,
+                                    route=route_combo,
+                                    region=region_buy,
+                                    strategy=payload.get("strategy"),
+                                )
+                            except Exception:
+                                pass
+                        except Exception:
+                            self._record_rejection(
+                                reason="rm_enqueue_failed",
+                                route=route_combo,
+                                pair=pair,
+                                ctx={"phase": "ack_wait"},
+                            )
+
+                    asyncio.create_task(_await_ack(task))
             else:
                 # Pas de callback configuré → on logge et on marque en NOK
                 reason_rm = "no_callback"
         except Exception as e:
             ok_rm = False
-            reason_rm = "exception"
+            reason_rm = "rm_enqueue_failed"
             self.logger.exception("on_opportunity callback error: %s", e)
+            self._record_rejection(
+                reason="rm_enqueue_failed",
+                route=route_combo,
+                pair=pair,
+                ctx={"err": type(e).__name__},
+            )
         finally:
             try:
                 # Mesure Scanner → RM avec labels minimaux (pair, route)
@@ -2618,6 +2992,8 @@ class OpportunityScanner:
                     reason=reason_rm,
                     pair=pair,
                     route=route_combo,
+                    region=region_buy,
+                    strategy=payload.get("strategy"),
                 )
             except Exception:
                 # Observabilité best-effort
@@ -2672,9 +3048,11 @@ class OpportunityScanner:
                     gross = (bid - ask) / max(mid, 1e-12)
                     try:
                         cost = self._fee_cost_fast(buy_ex, sell_ex, pk)
-                    except (DataStaleError, RuntimeError) as e:
+                    except DataStaleError as e:
+                        reason = str(e) if str(e) in {"fee_unknown",
+                                                      "slip_unknown_or_stale"} else "prefilter_cost_unavailable"
                         self._record_rejection(
-                            reason="prefilter_cost_unavailable",
+                            reason=reason,
                             route=_route_combo(buy_ex, sell_ex),
                             pair=_norm_pair(pk),
                             ctx={"err": type(e).__name__}
@@ -2684,10 +3062,21 @@ class OpportunityScanner:
 
                     # Min requis dynamique (vol + charge)
                     local_min_req_bps = self.min_required_bps
-                    vol_bps_scanner = self.get_volatility_bps(pk, ema=True)
-                    if isinstance(vol_bps_scanner, (int, float)):
-                        excess = max(0.0, float(vol_bps_scanner) - self.vol_soft_cap_bps)
-                        local_min_req_bps = float(self.min_required_bps) + self.vol_beta_min_req * excess
+                    vol_ttl = min(
+                        self._public_ttl(buy_ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s", 5.0)),
+                        self._public_ttl(sell_ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s", 5.0)),
+                    )
+                    vol_bps_scanner = self.get_volatility_bps(pk, ema=True, ttl_s=vol_ttl)
+                    if not isinstance(vol_bps_scanner, (int, float)):
+                        self._record_rejection(
+                            reason="vol_unknown_or_stale",
+                            route=_route_combo(buy_ex, sell_ex),
+                            pair=_norm_pair(pk),
+                            ctx={"ttl_s": vol_ttl},
+                        )
+                        continue
+                    excess = max(0.0, float(vol_bps_scanner) - self.vol_soft_cap_bps)
+                    local_min_req_bps = float(self.min_required_bps) + self.vol_beta_min_req * excess
                     boost_bps, _mult = self._dynamic_thresholds_for(pk)
                     min_req = (local_min_req_bps + boost_bps) / 1e4
 
@@ -2703,6 +3092,9 @@ class OpportunityScanner:
 
                     # Construire snapshots "compat router" puis évaluer
                     now_ms = int(time.time() * 1000)
+                    book_ttl_ms = b_buy.get("book_ttl_ms")
+                    if book_ttl_ms is None:
+                        book_ttl_ms = self._book_ttl_ms_default(buy_ex)
                     buy_data = {
                         "exchange": buy_ex,
                         "pair_key": pk,
@@ -2717,7 +3109,11 @@ class OpportunityScanner:
                         },
                         "exchange_ts_ms": int(b_buy.get("exchange_ts_ms") or b_buy.get("recv_ts_ms") or now_ms),
                         "recv_ts_ms": int(b_buy.get("recv_ts_ms") or b_buy.get("exchange_ts_ms") or now_ms),
+                        "book_ttl_ms": int(book_ttl_ms) if book_ttl_ms is not None else None,
                     }
+                    book_ttl_ms = b_sell.get("book_ttl_ms")
+                    if book_ttl_ms is None:
+                        book_ttl_ms = self._book_ttl_ms_default(sell_ex)
                     sell_data = {
                         "exchange": sell_ex,
                         "pair_key": pk,
@@ -2732,6 +3128,7 @@ class OpportunityScanner:
                         },
                         "exchange_ts_ms": int(b_sell.get("exchange_ts_ms") or b_sell.get("recv_ts_ms") or now_ms),
                         "recv_ts_ms": int(b_sell.get("recv_ts_ms") or b_sell.get("exchange_ts_ms") or now_ms),
+                        "book_ttl_ms": int(book_ttl_ms) if book_ttl_ms is not None else None,
                     }
                     self._evaluate_pair(buy_data, sell_data)
 
@@ -3002,8 +3399,10 @@ class OpportunityScanner:
                 if not ev:
                     continue
 
-                if not self._risk_feeds_fresh(pair):
-                    self._record_rejection(reason="stale_risk_feeds", route="*", pair=pair)
+                feeds_ok, feeds_reason, feeds_ctx = self._risk_feeds_fresh(pair)
+                if not feeds_ok:
+                    self._record_rejection(reason=feeds_reason or "stale_risk_feeds", route="*", pair=pair,
+                                           ctx=feeds_ctx)
                     continue
 
                 self._evaluate_routes_for_pair(pair, ev, enable_mm=self._enable_mm_hints)

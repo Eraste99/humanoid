@@ -105,7 +105,7 @@ ENGINE_NACK_429 = "ENGINE_NACK_429"
 ENGINE_NACK_5XX = "ENGINE_NACK_5XX"
 ENGINE_BAD_META_BRANCH = "ENGINE_BAD_META_BRANCH"
 ENGINE_BAD_META_PROFILE = "ENGINE_BAD_META_PROFILE"
-
+ENGINE_NOT_READY = "ENGINE_NOT_READY"
 ENGINE_ALIAS_TTL_BLOCK = "ENGINE_ALIAS_TTL_BLOCK"
 ENGINE_MM_DISABLED_BY_CAPITAL = "ENGINE_MM_DISABLED_BY_CAPITAL"
 
@@ -3736,8 +3736,34 @@ class ExecutionEngine:
             # Observabilité best-effort : jamais bloquant
             pass
 
-    def _raise_engine_submit_error(self, reason: str, *, branch: str | None = None, profile: str | None = None):
-        self._engine_reject_metric(reason, branch=branch, profile=profile)
+    def _raise_engine_submit_error(
+        self,
+        reason: str,
+        *,
+        branch: str | None = None,
+        profile: str | None = None,
+        payload: Optional[dict] = None,
+    ):
+        emitted = False
+        try:
+            if payload is not None:
+                pair = (
+                    payload.get("pair")
+                    or payload.get("symbol")
+                    or (payload.get("route") or {}).get("pair")
+                    or "UNKNOWN"
+                )
+                _reject(self, str(pair), payload, reason)
+                emitted = True
+        except Exception:
+            emitted = False
+
+        if not emitted:
+            try:
+                meta = {"meta": {"branch": branch, "capital_profile": profile}}
+                _reject(self, "UNKNOWN", meta, reason)
+            except Exception:
+                self._engine_reject_metric(reason, branch=branch, profile=profile)
         err = EngineSubmitError(reason)
         try:
             err.reason = reason
@@ -3803,6 +3829,15 @@ class ExecutionEngine:
             except Exception:
                 pass
             try:
+                ENGINE_QUEUEPOS_BLOCKED_TOTAL.labels(exchange="ALL").inc()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_update_submit_queue_gauge"):
+                    self._update_submit_queue_gauge()
+            except Exception:
+                pass
+            try:
                 self._engine_backpressure_metric("CAP_BRANCH", branch=branch, profile=profile)
             except Exception:
                 pass
@@ -3839,8 +3874,10 @@ class ExecutionEngine:
             except Exception:
                 pass
             self._raise_engine_submit_error(
-                ENGINE_BAD_META_BRANCH, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
-            )
+                ENGINE_BAD_META_BRANCH,
+                branch=branch or "UNKNOWN",
+                profile=profile or "UNKNOWN",
+                payload={"meta": meta},            )
 
         if not profile or profile not in ALLOWED_CAPITAL_PROFILES:
             try:
@@ -3851,7 +3888,10 @@ class ExecutionEngine:
             except Exception:
                 pass
             self._raise_engine_submit_error(
-                ENGINE_BAD_META_PROFILE, branch=branch or "UNKNOWN", profile=profile or "UNKNOWN"
+                ENGINE_BAD_META_PROFILE,
+                branch=branch or "UNKNOWN",
+                profile=profile or "UNKNOWN",
+                payload={"meta": meta},
             )
 
         return branch, profile
@@ -3872,7 +3912,12 @@ class ExecutionEngine:
             kind = (bundle.get("meta", {}).get("kind") or "").upper()
             if drop_makers or kind in ("MAKER", "MAKER_TM", "MAKER_MM"):
                 # On garde RuntimeError pour compat, mais message explicite
-                raise RuntimeError("ENGINE_NOT_READY")
+                self._raise_engine_submit_error(
+                    ENGINE_NOT_READY,
+                    branch=str(bundle.get("meta", {}).get("branch") or "").upper(),
+                    profile=str(bundle.get("meta", {}).get("capital_profile") or "").upper(),
+                    payload=bundle,
+                )
 
         # 1) Idempotence via CID stable
         # 1) Idempotence via CID stable (bundle canonique)
@@ -4115,9 +4160,22 @@ class ExecutionEngine:
                 )
             except Exception:
                 pass
+                try:
+                    ENGINE_QUEUEPOS_BLOCKED_TOTAL.labels(exchange="ALL").inc()
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "_update_submit_queue_gauge"):
+                        self._update_submit_queue_gauge()
+                except Exception:
+                    pass
                 self._engine_backpressure_metric("QUEUE_FULL", branch=branch, profile=profile)
-                self._raise_engine_submit_error(ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile)
-
+                self._raise_engine_submit_error(
+                    ENGINE_BACKPRESSURE_QUEUE_FULL,
+                    branch=branch,
+                    profile=profile,
+                    payload=bundle,
+                )
                 # 2-b) Hard backpressure: caps_local par branche (optionnel)
         if bundle_concurrency is not None:
             self._branch_concurrency_guard(
@@ -4139,11 +4197,24 @@ class ExecutionEngine:
                 )
             except Exception:
                 pass
+            try:
+                ENGINE_QUEUEPOS_BLOCKED_TOTAL.labels(exchange="ALL").inc()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_update_submit_queue_gauge"):
+                    self._update_submit_queue_gauge()
+            except Exception:
+                pass
             # Backpressure spécifique MM pour l'observabilité
             self._engine_backpressure_metric("MM_HIGH_WM", branch=branch, profile=profile)
             # Refus immédiat du bundle MM, sans sleep, pour préserver la capacité TT/TM
-            self._raise_engine_submit_error(ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile)
-
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_HIGH_WM,
+                branch=branch,
+                profile=profile,
+                payload=bundle,
+            )
         # High watermark générique (TT/TM/REB, éventuellement MM en dernier recours)
         if queue_max and high_wm and depth >= high_wm and overflow_policy == "defer":
             sleep_ms = int(getattr(self.config, "engine_defer_sleep_ms", 8))
@@ -4158,9 +4229,22 @@ class ExecutionEngine:
                 )
             except Exception:
                 pass
+            try:
+                ENGINE_QUEUEPOS_BLOCKED_TOTAL.labels(exchange="ALL").inc()
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "_update_submit_queue_gauge"):
+                    self._update_submit_queue_gauge()
+            except Exception:
+                pass
             self._engine_backpressure_metric("HIGH_WM", branch=branch, profile=profile)
-            self._raise_engine_submit_error(ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile)
-
+            self._raise_engine_submit_error(
+                ENGINE_BACKPRESSURE_HIGH_WM,
+                branch=branch,
+                profile=profile,
+                payload=bundle,
+            )
 
         # 3) Lock REB éventuel (on garde le comportement existant)
         combo = self._bundle_combo_signature(bundle)
@@ -4173,6 +4257,10 @@ class ExecutionEngine:
             if locked:
                 combo_key = f"{combo[0]}|{combo[1]}->{combo[2]}"
                 logger.info("[ExecutionEngine] combo lock actif (%s) — bundle ignoré", combo_key)
+                try:
+                    ENGINE_QUEUEPOS_BLOCKED_TOTAL.labels(exchange="ALL").inc()
+                except Exception:
+                    pass
                 return
 
         # 4) Enqueue + obs

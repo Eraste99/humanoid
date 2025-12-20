@@ -24,9 +24,6 @@ except Exception:
         def state(self): return "NORMAL"
     PACER = _P0Pacer()
 
-import time, collections
-from typing import Deque, Optional, Dict, Any
-
 def _now() -> float:
     """Horodatage local en secondes (float)."""
     return time.time()
@@ -164,7 +161,6 @@ class PrivateWSReconciler:
         self._resync_order: Optional[Callable[[str, str, str], Awaitable[bool]]] = None
         self._resync_alias: Optional[Callable[[str, str], Awaitable[bool]]] = None
 
-        # Dédup bornée (client_id/fill-key)
         # Dédup bornée (client_id/fill-key)
         self._seen_keys = _LRUSet(maxlen=int(dedup_max))
 

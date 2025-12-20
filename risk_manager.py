@@ -43,7 +43,9 @@ from modules.obs_metrics import inc_blocked
 import logging
 from collections import defaultdict
 from modules.obs_metrics import TIME_SKEW_MS
-from contracts.payloads import make_submit_bundle, submit_leg_from_intent, normalize_leg_dict, normalize_reason_codefrom dataclasses import dataclass, asdict
+from contracts.payloads import make_submit_bundle, submit_leg_from_intent, normalize_leg_dict, normalize_reason_code
+
+from dataclasses import dataclass, asdict
 import json
 from contracts import payloads as fraglib
 
@@ -84,6 +86,9 @@ RM_REASON_PRIORITY = (
     "RM_SFC_UNAVAILABLE",
     "RM_BUNDLE_EMPTY_PARAMS",
     "RM_REB_FACTORY_REJECT",
+    "RM_OPP_BAD_INPUTS",
+    "RM_REGION_UNSUPPORTED",
+    "RM_REGION_UNKNOWN",
 
     # B) Readiness
     "RM_ENGINE_NOT_READY",
@@ -91,6 +96,7 @@ RM_REASON_PRIORITY = (
     # C) Freshness / TTL strict
     "RM_BALANCE_TTL_BLOCK",
     "RM_STALE_VOL",
+    "RM_MARKETDATA_STALE",
 
     # D) Guards (risque / intégrité trade)
     "RM_TTTM_DELTA_HARD_LIMIT",
@@ -135,6 +141,10 @@ RM_REASON_PRIORITY = (
     "RM_ALIAS_COLLAT_LOW",
     "RM_BELOW_MIN_NOTIONAL",
     "RM_BELOW_MIN_BPS",
+    "RM_INTERNAL_ERROR",
+    "RM_INTERNAL_SKIP",
+    "RM_NOTIONAL_QUOTE_INVALID",
+    "RM_QUOTE_MISMATCH",
 
     "GLOBAL_KILL_SWITCH",
     "RM_MODE_SEVERE_MM_OFF",
@@ -257,6 +267,14 @@ RM_STALE_VOL = "RM_STALE_VOL"
 RM_SFC_UNAVAILABLE = "RM_SFC_UNAVAILABLE"
 RM_COST_COMPUTE_ERROR = "RM_COST_COMPUTE_ERROR"
 RM_BUNDLE_EMPTY_PARAMS = "RM_BUNDLE_EMPTY_PARAMS"
+RM_OPP_BAD_INPUTS = "RM_OPP_BAD_INPUTS"
+RM_MARKETDATA_STALE = "RM_MARKETDATA_STALE"
+RM_REGION_UNSUPPORTED = "RM_REGION_UNSUPPORTED"
+RM_REGION_UNKNOWN = "RM_REGION_UNKNOWN"
+RM_INTERNAL_ERROR = "RM_INTERNAL_ERROR"
+RM_INTERNAL_SKIP = "RM_INTERNAL_SKIP"
+RM_NOTIONAL_QUOTE_INVALID = "RM_NOTIONAL_QUOTE_INVALID"
+RM_QUOTE_MISMATCH = "RM_QUOTE_MISMATCH"
 
 # Famille RM_* mais pour causes techniques côté Engine vues par le RM
 RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
@@ -4668,7 +4686,8 @@ class RiskManager:
         if not pair_key or not buy_u or not sell_u:
             return None
 
-        return f"{pair_key}|{buy_u}->{sell_u}"
+        quote = _pair_quote(pair_key)
+        return f"{pair_key}|{quote}|{buy_u}->{sell_u}"
 
     def _get_combo_inflight_notional(self, combo_key: str, now: float) -> float:
         entries = self._combo_inflight_notional.get(combo_key, [])
@@ -6884,6 +6903,23 @@ class RiskManager:
             buy = str(opp.get("buy_exchange") or "").upper()
             sell = str(opp.get("sell_exchange") or "").upper()
             ctx.update({"pair": pair, "buy": buy, "sell": sell})
+            missing_fields = [k for k, v in (("pair", pair), ("buy_exchange", buy), ("sell_exchange", sell)) if not v]
+            if missing_fields:
+                ctx["missing_fields"] = missing_fields
+                return (False, RM_OPP_BAD_INPUTS, ctx)
+
+            buy_region = self._resolve_exchange_region(buy)
+            sell_region = self._resolve_exchange_region(sell)
+            ctx["buy_region"] = buy_region
+            ctx["sell_region"] = sell_region
+            if buy_region in ("JP",) or sell_region in ("JP",):
+                return (
+                    False,
+                    RM_REGION_UNSUPPORTED,
+                    {"exchange": buy or sell, "region": buy_region or sell_region, "pair": pair, **ctx},
+                )
+            if buy_region in (None, "UNKNOWN") or sell_region in (None, "UNKNOWN"):
+                return (False, RM_REGION_UNKNOWN, ctx)
 
             # Horloge
             try:
@@ -6891,13 +6927,21 @@ class RiskManager:
             except Exception:
                 ctx["time_skew_ms"] = 0.0
             if ctx["time_skew_ms"] > float(self.max_clock_skew_ms):
-                return (False, "TIME_SKEW", ctx)
+                try:
+                    TIME_SKEW_MS.set(float(ctx["time_skew_ms"]))
+                except Exception:
+                    pass
+                return (False, RM_MARKETDATA_STALE, ctx)
 
             # Fraîcheur OB (inchangé côté alimentation : volatility monitor -> RM -> VM ; ici on lit juste les OB du RM)
             b = self.get_book_snapshot(buy, pair)
             s = self.get_book_snapshot(sell, pair)
             if not (self._fresh_enough(b) and self._fresh_enough(s)):
-                return (False, "STALE_BOOKS", ctx)
+                try:
+                    STALE_OPPORTUNITY_DROPPED_TOTAL.inc()
+                except Exception:
+                    pass
+                return (False, RM_MARKETDATA_STALE, ctx)
 
             # Prudence (VM) — on ne bloque que si ALERT
             prudence = self._current_prudence(pair)
@@ -7342,16 +7386,40 @@ class RiskManager:
             res = self.on_scanner_opportunity(opp, decision_ctx=decision_ctx)
             if inspect.iscoroutine(res):
                 res = await res
-        except Exception:
+        except Exception as exc:
             logging.exception("Unhandled exception during on_scanner_opportunity")
+            try:
+                if RM_DROPPED_TOTAL is not None:
+                    RM_DROPPED_TOTAL.labels(RM_INTERNAL_ERROR).inc()
+            except Exception:
+                pass
+            try:
+                self._hist_rm_event(
+                    "rm.decision",
+                    {
+                        "ts_ns": time.time_ns(),
+                        "status": "SKIPPED",
+                        "reason": RM_INTERNAL_ERROR,
+                        "pair": str(opp.get("pair") or opp.get("symbol") or ""),
+                        "exchange": str(opp.get("buy_exchange") or ""),
+                        "exc_class": type(exc).__name__,
+                        "stage": "handle_opportunity",
+                    },
+                )
+            except Exception:
+                pass
+            decision_ctx.setdefault("reasons", []).append(RM_INTERNAL_ERROR)
             res = decision_ctx
 
         summary = res if isinstance(res, dict) else decision_ctx
         reasons = summary.get("reasons") or []
         primary_reason = _rm_pick_reason(*reasons) if reasons else ""
         status_final = "submitted" if summary.get("submitted") else "skipped"
-        primary_reason = _rm_pick_reason(primary_reason or "", "RM_INTERNAL_SKIP") if not summary.get(
-            "submitted") else primary_reason
+        primary_reason = (
+            _rm_pick_reason(primary_reason or "", RM_INTERNAL_SKIP)
+            if not summary.get("submitted")
+            else primary_reason
+        )
         self._emit_decision_record(status_final, primary_reason, opp, ctx)
 
     # =============================================================================
@@ -10377,7 +10445,7 @@ class RiskManager:
             "from_alias": from_alias,
             "to_alias": to_alias,
             "amount_usdc": float(amount_usdc),
-            "meta": {"source": "RebalancingManager"},
+            "meta": {"source": "RebalancingManager", "kind": "REB_TRANSFER"},
         }
 
     def _make_cross_cex_opportunity(self, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -10453,7 +10521,8 @@ class RiskManager:
         if not hasattr(self, "_reb_locks"):
             self._reb_locks = {}
         pk = self._norm_pair(pair_key)
-        combo_key = f"{pk}|{str(buy_exchange).upper()}->{str(sell_exchange).upper()}"
+        quote = _pair_quote(pk)
+        combo_key = f"{pk}|{quote}|{str(buy_exchange).upper()}->{str(sell_exchange).upper()}"
         expiry = float(self._reb_locks.get(combo_key, 0.0) or 0.0)
         now = time.time()
         if expiry <= now:
@@ -12617,7 +12686,39 @@ class RiskManager:
                 return
             decision_ctx.setdefault("reasons", []).append(str(reason))
 
+        pair = opp.get("pair") or opp.get("symbol") or "UNKNOWN"
+        notional_quote = opp.get("notional_quote")
+        if (
+                not isinstance(notional_quote, dict)
+                or not str(notional_quote.get("ccy") or "").strip()
+                or float(notional_quote.get("amount") or 0.0) <= 0.0
+        ):
+            _record_reason(RM_NOTIONAL_QUOTE_INVALID)
+            try:
+                if RM_DROPPED_TOTAL is not None:
+                    RM_DROPPED_TOTAL.labels(RM_NOTIONAL_QUOTE_INVALID).inc()
+            except Exception:
+                pass
+            try:
+                inc_rm_reject(reason=RM_NOTIONAL_QUOTE_INVALID, pair=pair)
+            except Exception:
+                pass
+            return decision_ctx
 
+        pair_quote = _pair_quote(pair)
+        notional_ccy = str(notional_quote.get("ccy") or "").upper()
+        if notional_ccy != pair_quote:
+            _record_reason(RM_QUOTE_MISMATCH)
+            try:
+                if RM_DROPPED_TOTAL is not None:
+                    RM_DROPPED_TOTAL.labels(RM_QUOTE_MISMATCH).inc()
+            except Exception:
+                pass
+            try:
+                inc_rm_reject(reason=RM_QUOTE_MISMATCH, pair=pair)
+            except Exception:
+                pass
+            return decision_ctx
 
         # --- 0) Freshness guards (TTL strict) ------------------------------------
         # On aligne le TTL sur les briques réellement utilisées :
@@ -12756,16 +12857,20 @@ class RiskManager:
             return
 
         # --- 1) Contexte & combo --------------------------------------------------
-        pair = opp.get("pair") or opp.get("symbol") or "UNKNOWN"
         buy_ex = (opp.get("buy_ex") or opp.get("route", {}).get("buy_ex") or "").upper()
         sell_ex = (opp.get("sell_ex") or opp.get("route", {}).get("sell_ex") or "").upper()
-        combo_key = f"{pair}|{buy_ex}->{sell_ex}"
+        combo_key = f"{self._norm_pair(pair)}|{pair_quote}|{buy_ex}->{sell_ex}"
 
         if not hasattr(self, "_reb_locks"): self._reb_locks = {}
 
         # --- 2) REB lock ----------------------------------------------------------
         if self._reb_locks.get(combo_key, 0) > now:
             if getattr(self, "log", None): self.log.debug(f"RM.REB_LOCK active for {combo_key}")
+            _record_reason(REB_LOCK)
+            try:
+                inc_rm_reject(reason=REB_LOCK, pair=pair)
+            except Exception:
+                pass
             return
 
         needs_reb = False
@@ -12777,10 +12882,7 @@ class RiskManager:
         if needs_reb:
             lock_ttl = getattr(self, "reb_lock_ttl_sec", 15.0)
             self._reb_locks[combo_key] = now + lock_ttl
-            reb_bundle = self._build_bundle(opp, strategy="REB")
-            if reb_bundle:
-                self._multicast_shadow(reb_bundle)  # engine enqueue + shadow (helper)
-            return
+
 
         # --- 3) Budgets d’in-flight (branche×profil) & pacer ----------------------
         # Hiérarchie des caps:
@@ -13003,7 +13105,13 @@ class RiskManager:
         except Exception:
             if getattr(self, "log", None):
                 self.log.exception("RM.on_scanner_opportunity: mm_inventory_single failed")
-
+            # --- 6) REB (après TT/TM) : non-interférence -----------------------------
+        if needs_reb and not sent_any:
+            reb_bundle = self._build_bundle(opp, strategy="REB", decision_ctx=decision_ctx)
+            if reb_bundle:
+                self._multicast_shadow(reb_bundle)
+                decision_ctx["attempted"] = True
+                decision_ctx["submitted"] = decision_ctx.get("submitted") or True
         return decision_ctx
 
 
@@ -13304,7 +13412,26 @@ class RiskManager:
         profile = str(getattr(self, "capital_profile", "LARGE") or "LARGE").upper()
         tif = "IOC" if strategy in ("TT", "TM") else "GTC"
         client_id = getattr(self, "client_id", "default")
-        notional = opp.get("notional_quote") or {"ccy": "USDC", "amount": float(opp.get("notional_usdc", 0) or 0)}
+        notional = opp.get("notional_quote")
+        if (
+                not isinstance(notional, dict)
+                or not str(notional.get("ccy") or "").strip()
+                or float(notional.get("amount") or 0.0) <= 0.0
+        ):
+            _record_decision_reason(RM_NOTIONAL_QUOTE_INVALID)
+            try:
+                inc_rm_reject(reason=RM_NOTIONAL_QUOTE_INVALID, pair=pair, route=f"{buy_ex}->{sell_ex}")
+            except Exception:
+                pass
+            return None
+        pair_quote = _pair_quote(pair or "")
+        if str(notional.get("ccy") or "").upper() != pair_quote:
+            _record_decision_reason(RM_QUOTE_MISMATCH)
+            try:
+                inc_rm_reject(reason=RM_QUOTE_MISMATCH, pair=pair, route=f"{buy_ex}->{sell_ex}")
+            except Exception:
+                pass
+            return None
 
         strategy_u = str(strategy or "").upper()
         if strategy_u in ("TT", "TM"):
@@ -13363,9 +13490,9 @@ class RiskManager:
 
 
         try:
-            total = float((notional or {}).get("amount") or opp.get("notional_usdc") or 0.0)
+            total = float((notional or {}).get("amount") or 0.0)
         except Exception:
-            total = float(opp.get("notional_usdc") or 0.0)
+            total = 0.0
 
 
         degraded = self._rm_guard_or_raise(pair_key=pk, buy_ex=buy_ex, sell_ex=sell_ex)
@@ -13382,6 +13509,30 @@ class RiskManager:
             qty = float(opp.get("qty") or opp.get("size") or 0)
             pxb = float(opp.get("buy_px") or opp.get("px_buy") or 0)
             pxs = float(opp.get("sell_px") or opp.get("px_sell") or 0)
+            if qty <= 0.0:
+                buy_book = self.get_book_snapshot(buy_ex, pk)
+                sell_book = self.get_book_snapshot(sell_ex, pk)
+                if not (self._fresh_enough(buy_book) and self._fresh_enough(sell_book)):
+                    _record_decision_reason(RM_MARKETDATA_STALE)
+                    try:
+                        inc_rm_reject(reason=RM_MARKETDATA_STALE, pair=pair, route=f"{buy_ex}->{sell_ex}")
+                    except Exception:
+                        pass
+                    return None
+                if pxb <= 0.0:
+                    pxb = float(buy_book.get("best_ask") or 0.0)
+                if pxs <= 0.0:
+                    pxs = float(sell_book.get("best_bid") or 0.0)
+                ref_px = pxb if pxb > 0 else pxs
+                if ref_px > 0.0:
+                    qty = float(notional.get("amount") or 0.0) / ref_px
+                if qty <= 0.0:
+                    _record_decision_reason(RM_OPP_BAD_INPUTS)
+                    try:
+                        inc_rm_reject(reason=RM_OPP_BAD_INPUTS, pair=pair, route=f"{buy_ex}->{sell_ex}")
+                    except Exception:
+                        pass
+                    return None
             if strategy in ("TT", "REB"):
                 # Deux takers (ou TM NEUTRAL pour REB plus bas)
                 legs = [
@@ -13700,13 +13851,25 @@ class RiskManager:
 
 
         for i, leg in enumerate(legs):
+            q = float(leg.get("qty") or leg.get("quantity") or leg.get("size") or 0.0)
             px = float(leg.get("px_limit") or leg.get("price") or 0.0)
-            px = float(leg.get("px_limit") or 0.0)
             if q <= 0.0 or px <= 0.0:
                 inc_rm_reject(reason=RM_BUNDLE_EMPTY_PARAMS,
                               pair=pair,
                               route=f"{buy_ex}->{sell_ex}")
                 raise RMError(f"{RM_BUNDLE_EMPTY_PARAMS} leg={i} qty={q} px={px}")
+
+        leg_kind_default = "TAKER" if strategy_u in ("TT", "REB") else "MAKER_TM" if strategy_u == "TM" else "MAKER_MM"
+        for leg in legs:
+            meta_leg = leg.setdefault("meta", {}) or {}
+            if not meta_leg.get("kind"):
+                if meta_leg.get("maker") and strategy_u == "TM":
+                    meta_leg["kind"] = "MAKER_TM"
+                elif meta_leg.get("maker") and strategy_u == "MM":
+                    meta_leg["kind"] = "MAKER_MM"
+                else:
+                    meta_leg["kind"] = leg_kind_default
+            leg["meta"] = meta_leg
 
         bundle = make_submit_bundle(
             legs=legs,
@@ -13747,6 +13910,39 @@ class RiskManager:
         # Injection explicite de la décision TM dans le payload pour l'Engine
         if tm_meta and isinstance(bundle, dict):
             bundle.setdefault("tm", tm_meta)
+
+        if isinstance(bundle, dict):
+            meta_root = bundle.setdefault("meta", {}) or {}
+            meta_root.setdefault("kind", leg_kind_default)
+            meta_root.setdefault("buy_ex", buy_ex)
+            meta_root.setdefault("sell_ex", sell_ex)
+            meta_root.setdefault("quote", pair_quote)
+            opportunity_id = (
+                    opp.get("opportunity_id")
+                    or opp.get("opp_id")
+                    or (opp.get("meta") or {}).get("opportunity_id")
+            )
+            decision_id = (
+                    opp.get("decision_id")
+                    or (opp.get("meta") or {}).get("decision_id")
+            )
+            if decision_id is None:
+                decision_ts_ms = int(
+                    opp.get("decision_ts_ms")
+                    or (float(opp.get("t_detect") or opp.get("timestamp") or time.time()) * 1000.0)
+                )
+                decision_id = self._hash_decision_id(pk, buy_ex or "", sell_ex or "", int(decision_ts_ms * 1_000_000))
+            trace_id = (
+                    opp.get("trace_id")
+                    or (opp.get("meta") or {}).get("trace_id")
+                    or opportunity_id
+                    or decision_id
+            )
+            if opportunity_id:
+                meta_root.setdefault("opportunity_id", opportunity_id)
+            meta_root.setdefault("decision_id", decision_id)
+            meta_root.setdefault("trace_id", trace_id)
+            bundle["meta"] = meta_root
 
         if strategy_u == "MM" and isinstance(bundle, dict):
             meta_mm = bundle.setdefault("meta", {}) or {}
