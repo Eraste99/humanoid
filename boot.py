@@ -41,6 +41,7 @@ from modules.balance_fetcher import MultiBalanceFetcher
 from modules.utils.rate_limiter import RateLimiter
 from modules import obs_metrics
 from modules.retry_policy import BackoffPolicy
+from contracts import  payloads as contracts
 
 # Config type (indicatif)
 try:
@@ -145,6 +146,8 @@ class Boot:
         self._pnl_unhealthy_since: Optional[float] = None
         self._obs_inc_cb: Optional[Any] = None
         self._obs_counter_cache: Dict[Tuple[str, tuple[str, ...]], Any] = {}
+        self._critical_deps = ["config", "obs", "rate_limiter", "pacer"]
+        self._module_state: Dict[str, Any] = {}
 
         # --- boot.py ---
     def _ensure_engine_dependencies(self) -> None:
@@ -162,12 +165,22 @@ class Boot:
                 self.ctx.rate_limiter = RateLimiter(None)
             except Exception:
                 self.ctx.rate_limiter = None
+                self._mark_degraded("BOOT_DEP_START_FAIL", where="rate_limiter")
 
         try:
             if getattr(self.ctx, "retry_policy", None) is None:
                 self.ctx.retry_policy = BackoffPolicy.from_cfg(getattr(self.cfg, "retry", None))
         except Exception:
             self.ctx.retry_policy = BackoffPolicy()
+            self._mark_degraded("BOOT_DEP_START_FAIL", where="retry_policy")
+
+        if getattr(self.ctx, "rate_limiter", None) is None:
+            self._mark_degraded("BOOT_DEP_MISSING", where="rate_limiter")
+        if getattr(self.ctx, "retry_policy", None) is None:
+            self._mark_degraded("BOOT_DEP_MISSING", where="retry_policy")
+        pacer = getattr(self.cfg, "pacer", None) or getattr(self.cfg, "engine_pacer", None)
+        if pacer is None:
+            self._mark_degraded("BOOT_DEP_MISSING", where="pacer")
 
     def _get_obs_inc_callback(self) -> Optional[Any]:
         """Retourne un callback best-effort pour obs_inc (RM/Engine).
@@ -205,7 +218,26 @@ class Boot:
                 or getattr(getattr(self.cfg, "bot_cfg", None), "deployment_mode", None)
                 or "EU_ONLY"
         )
+        try:
+            snapshot_hash = getattr(self.cfg, "snapshot_hash", None)
+            snapshot_dict = getattr(self.cfg, "snapshot_dict", None)
+            if callable(snapshot_hash):
+                cfg_hash = snapshot_hash()
+                self.log.info("[Boot] config snapshot hash=%s", cfg_hash)
+            if callable(snapshot_dict):
+                self.log.debug("[Boot] config snapshot=%s", snapshot_dict())
+        except Exception:
+            self.log.warning("[Boot] failed to log config snapshot", exc_info=True)
 
+        region = str(getattr(getattr(self.cfg, "g", object()), "pod_region", "EU")).upper()
+        enable_jp = False
+        try:
+            g_cfg = getattr(self.cfg, "g", None)
+            enable_jp = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else bool(
+                getattr(self.cfg, "enable_jp", False)
+            )
+        except Exception:
+            enable_jp = False
 
         if self._running:
             return self.ctx
@@ -224,7 +256,17 @@ class Boot:
             ev.clear()
         self._running = True
         self._mark_stage("starting")
+        try:
+            obs_metrics.safe_inc(obs_metrics.BOT_STARTUPS_TOTAL, "bot_startups_total", "boot.start")
+            obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.start", 1.0)
+        except Exception:
+            pass
+        self._emit_lifecycle("boot.starting")
         self.log.info("[Boot] 🚀 start… mode=%s", str(mode).upper())
+
+        if region == "JP" and not enable_jp:
+            self._mark_degraded("REGION_JP_DISABLED_BY_DEFAULT", where="region_guard")
+            return self.ctx
 
         # 1) LHM
         try:
@@ -245,19 +287,26 @@ class Boot:
             await self._start_private_plane()
             # 7bis) Dépendances Engine (RL + retry)
             self._ensure_engine_dependencies()
+
+            if any(
+                    r in self.state.get("reasons", [])
+                    for r in ("BOOT_DEP_MISSING", "BOOT_DEP_START_FAIL")
+            ):
+                self.log.error("[Boot] critical dependencies missing; aborting start")
+                return self.ctx
+
             # 8) Engine + RPC
             await self._start_engine_and_rpc()
             # 9) READY
             await self._evaluate_ready()
         except Exception:
             reason = f"boot_start_exception:{self.state.get('stage', 'starting')}"
-            self.state["degraded"] = True
-            self.state.setdefault("reasons", [])
-            if reason not in self.state["reasons"]:
-                self.state["reasons"].append(reason)
+            self._mark_degraded("BOOT_DEP_START_FAIL", where=reason)
             self.log.exception("[Boot] start failed, rolling back")
-            with contextlib.suppress(Exception):
+            try:
                 await self.stop()
+            except Exception:
+                pass
             self._running = False
             return self.ctx
 
@@ -265,6 +314,10 @@ class Boot:
             "[Boot] ✅ ready=%s degraded=%s reasons=%s",
             self.ready_all.is_set(), self.state["degraded"], ",".join(self.state["reasons"]) or "none",
         )
+        if self.ready_all.is_set():
+            self._emit_lifecycle("boot.ready")
+        else:
+            self._emit_lifecycle("boot.degraded", reason_code="BOOT_READY_BLOCKED")
         return self.ctx
 
     # dans Boot (section API publique, juste après async def start(...))
@@ -286,64 +339,63 @@ class Boot:
         Arrêt global en ordre inverse strict. Idempotent.
         Chaque étape est protégée (best-effort) et loggée.
         """
+        self._emit_lifecycle("boot.stopping")
+        try:
+            obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.stopping", 3.0)
+        except Exception:
+            pass
         self._running = False
         # Annule la tâche de sync cohortes si active
-        with contextlib.suppress(Exception):
-            t = getattr(self, "_cohort_sync_task", None)
-            if t:
-                t.cancel()
-                try:
-                    await asyncio.wait_for(t, timeout=timeout_s)
-                except asyncio.TimeoutError:
-                    pass
-        # Moniteur santé private WS
-        with contextlib.suppress(Exception):
-            t = getattr(self, "_private_health_task", None)
-            if t:
-                t.cancel()
+        t = getattr(self, "_cohort_sync_task", None)
+        if t:
+            t.cancel()
+            try:
                 await asyncio.wait_for(t, timeout=timeout_s)
-            self._private_health_task = None
+            except asyncio.TimeoutError:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="cohort_sync_task")
+            except Exception:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="cohort_sync_task")
+
+        # Moniteur santé private WS
+        t = getattr(self, "_private_health_task", None)
+        if t:
+            t.cancel()
+            try:
+                await asyncio.wait_for(t, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="private_health_task")
+            except Exception:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="private_health_task")
+        self._private_health_task = None
 
         # Moniteur santé pipeline PnL (LHM/JSONL/DB)
-        with contextlib.suppress(Exception):
-            t = getattr(self, "_pnl_pipeline_task", None)
-            if t:
-                t.cancel()
+        t = getattr(self, "_pnl_pipeline_task", None)
+        if t:
+            t.cancel()
+            try:
                 await asyncio.wait_for(t, timeout=timeout_s)
-            self._pnl_pipeline_task = None
-        with contextlib.suppress(Exception):
-            t = getattr(self, "_rm_ready_sync_task", None)
-            if t:
-                t.cancel()
+            except asyncio.TimeoutError:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="pnl_pipeline_task")
+            except Exception:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="pnl_pipeline_task")
+        self._pnl_pipeline_task = None
+        t = getattr(self, "_rm_ready_sync_task", None)
+        if t:
+            t.cancel()
+            try:
                 await asyncio.wait_for(t, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="rm_ready_sync_task")
+            except Exception:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="rm_ready_sync_task")
             self._rm_ready_sync_task = None
 
-
-
-        # 1) RPC
-        with contextlib.suppress(Exception):
-            srv = getattr(self.ctx, "rpc_server", None)
-            if srv and hasattr(srv, "stop"):
-                await asyncio.wait_for(srv.stop(), timeout=timeout_s)
-                self._send_status("rpc_server", "stopped")
-        with contextlib.suppress(Exception):
-            cli = getattr(self.ctx, "rpc_client", None)
-            if cli and hasattr(cli, "close"):
-                await asyncio.wait_for(cli.close(), timeout=timeout_s)
-
-        # 1) RPC
-        with contextlib.suppress(Exception):
-            rpc = getattr(self.ctx, "rpc", None)
-            if rpc and hasattr(rpc, "stop"):
-                await asyncio.wait_for(rpc.stop(), timeout=timeout_s)
-                self._send_status("rpc", "stopped")
+        await self._stop_component("rpc_server", getattr(self.ctx, "rpc_server", None), "stop", timeout_s)
+        await self._stop_component("rpc_client", getattr(self.ctx, "rpc_client", None), "close", timeout_s)
+        await self._stop_component("rpc", getattr(self.ctx, "rpc", None), "stop", timeout_s)
 
         # 2) Scanner
-        with contextlib.suppress(Exception):
-            sc = getattr(self.ctx, "scanner", None)
-            if sc and hasattr(sc, "stop"):
-                await asyncio.wait_for(sc.stop(), timeout=timeout_s)
-                self._send_status("scanner", "stopped")
+        await self._stop_component("scanner", getattr(self.ctx, "scanner", None), "stop", timeout_s)
 
         # 3) RM
         rm_timeout = timeout_s
@@ -352,55 +404,23 @@ class Boot:
             rm_timeout = float(getattr(cfg_rm, "rm_stop_join_timeout_s", rm_timeout))
             if rm_timeout != timeout_s:
                 self.log.debug("[Boot] using RM-specific stop timeout %.2fs", rm_timeout)
-        with contextlib.suppress(Exception):
-            rm = getattr(self.ctx, "rm", None)
-            if rm and hasattr(rm, "stop"):
-                await asyncio.wait_for(rm.stop(), timeout=rm_timeout)
-                self._send_status("rm", "stopped")
+        await self._stop_component("rm", getattr(self.ctx, "rm", None), "stop", rm_timeout)
 
         # 4) Engine
-        with contextlib.suppress(Exception):
-            eng = getattr(self.ctx, "engine", None)
-            if eng and hasattr(eng, "stop"):
-                await asyncio.wait_for(eng.stop(), timeout=timeout_s)
-                self._send_status("engine", "stopped")
+        await self._stop_component("engine", getattr(self.ctx, "engine", None), "stop", timeout_s)
 
         # 5) Private plane (Reconciler → Hub → Balances)
-        with contextlib.suppress(Exception):
-            # Reconciler: no-op si pas de stop()
-            rec = getattr(self.ctx, "reconciler", None)
-            if rec and hasattr(rec, "stop"):
-                await asyncio.wait_for(rec.stop(), timeout=timeout_s)
-        with contextlib.suppress(Exception):
-            hub = getattr(self.ctx, "pws_hub", None)
-            if hub and hasattr(hub, "stop"):
-                await asyncio.wait_for(hub.stop(), timeout=timeout_s)
-                self._send_status("private", "stopped")
-        with contextlib.suppress(Exception):
-            bal = getattr(self.ctx, "balances", None)
-            if bal and hasattr(bal, "stop"):
-                await asyncio.wait_for(bal.stop(), timeout=timeout_s)
-                self._send_status("balances", "stopped")
+        await self._stop_component("reconciler", getattr(self.ctx, "reconciler", None), "stop", timeout_s)
+        await self._stop_component("private", getattr(self.ctx, "pws_hub", None), "stop", timeout_s)
+        await self._stop_component("balances", getattr(self.ctx, "balances", None), "stop", timeout_s)
+
 
         # 6) Router/WS publics
-        with contextlib.suppress(Exception):
-            rt = getattr(self.ctx, "router", None)
-            if rt and hasattr(rt, "stop"):
-                await asyncio.wait_for(rt.stop(), timeout=timeout_s)
-                self._send_status("router", "stopped")
-        with contextlib.suppress(Exception):
-            ws = getattr(self.ctx, "ws_public", None)
-            if ws and hasattr(ws, "stop"):
-                await asyncio.wait_for(ws.stop(), timeout=timeout_s)
-                self._send_status("ws", "stopped")
+        await self._stop_component("router", getattr(self.ctx, "router", None), "stop", timeout_s)
+        await self._stop_component("ws", getattr(self.ctx, "ws_public", None), "stop", timeout_s)
 
         # 7) LoggerHistoriqueManager (LHM)
-        with contextlib.suppress(Exception):
-            lhm = getattr(self.ctx, "lhm", None)
-            if lhm and hasattr(lhm, "stop"):
-                await asyncio.wait_for(lhm.stop(), timeout=timeout_s)
-                self._send_status("lhm", "stopped")
-
+        await self._stop_component("lhm", getattr(self.ctx, "lhm", None), "stop", timeout_s)
 
         # Nettoyage des flags/events pour autoriser un restart sain
         for ev in (
@@ -415,9 +435,17 @@ class Boot:
                 self.ready_all,
                 self.boot_complete,
         ):
-            with contextlib.suppress(Exception):
+            try:
                 ev.clear()
-        self._mark_stage("stopped")
+            except Exception:
+                pass
+            self._mark_stage("stopped")
+            try:
+                obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.stop", 0.0)
+            except Exception:
+                pass
+            self._emit_lifecycle("boot.stopped")
+
 
     async def wait_ready(self, timeout_s: Optional[float] = None) -> bool:
         try:
@@ -445,6 +473,7 @@ class Boot:
             "scanner_proxy_dropped": getattr(self._scanner_proxy, "dropped", 0),
             "active_pairs": list(self.ctx.active_pairs),
             "discovered": len(self.ctx.discovered_pairs),
+            "module_state": dict(self._module_state),
         })
         rc = self._get_router_ready_pairs_count()
         if rc is not None:
@@ -492,6 +521,64 @@ class Boot:
         """
         self._status_sink = callback
 
+    def _normalize_reason(self, reason: str) -> str:
+        try:
+            return contracts.normalize_reason_code(reason) or str(reason)
+        except Exception:
+            return str(reason)
+
+    def _mark_degraded(self, reason: str, *, where: str | None = None) -> None:
+        reason_code = self._normalize_reason(reason)
+        self.state["degraded"] = True
+        self.state.setdefault("reasons", [])
+        if reason_code not in self.state["reasons"]:
+            self.state["reasons"].append(reason_code)
+        try:
+            obs_metrics.safe_inc(
+                obs_metrics.NONFATAL_ERRORS_TOTAL,
+                "nonfatal_errors_total",
+                "boot.degraded",
+                module="boot",
+                kind=reason_code,
+            )
+        except Exception:
+            pass
+        try:
+            obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.degraded", 2.0)
+        except Exception:
+            pass
+        if where:
+            try:
+                obs_metrics.safe_inc(
+                    obs_metrics.BLOCKED_TOTAL,
+                    "blocked_total",
+                    "boot.degraded",
+                    module="boot",
+                    reason=reason_code,
+                    pair=str(where),
+                )
+            except Exception:
+                pass
+        self._emit_lifecycle("boot.degraded", reason_code=reason_code, payload={"where": where})
+
+    def _emit_lifecycle(self, event: str, *, reason_code: str | None = None,
+                        payload: Dict[str, Any] | None = None) -> None:
+        meta = dict(payload or {})
+        if reason_code:
+            meta["reason_code"] = self._normalize_reason(reason_code)
+        self._send_status("boot", event, meta)
+
+    async def _stop_component(self, name: str, obj: Any, method: str, timeout_s: float) -> None:
+        if not obj or not hasattr(obj, method):
+            return
+        try:
+            await asyncio.wait_for(getattr(obj, method)(), timeout=timeout_s)
+            self._send_status(name, "stopped")
+        except asyncio.TimeoutError:
+            self._mark_degraded("BOOT_STOP_TIMEOUT", where=name)
+        except Exception:
+            self._mark_degraded("BOOT_STOP_TIMEOUT", where=name)
+
     def _send_status(self, component: str, status: str, payload: Optional[Dict[str, Any]] = None) -> None:
         """
         Helper interne: publie un statut vers le status_sink s'il est configuré.
@@ -501,6 +588,18 @@ class Boot:
         """
         sink = getattr(self, "_status_sink", None)
         if not callable(sink):
+            try:
+                obs_metrics.OBS_NOOP_TOTAL.labels(metric="boot_status_sink", where="boot._send_status").inc()
+            except Exception:
+                pass
+            try:
+                self._module_state[str(component)] = {
+                    "status": status,
+                    "payload": payload or {},
+                    "ts": time.time(),
+                }
+            except Exception:
+                pass
             return
 
         try:
@@ -510,6 +609,7 @@ class Boot:
                 "payload": payload or {},
                 "ts": time.time(),
             }
+            self._module_state[str(component)] = {"status": status, "payload": payload or {}, "ts": msg["ts"]}
             sink(msg)
         except Exception:
             # On loggue mais on ne casse jamais le Boot à cause du sink.
@@ -1500,7 +1600,21 @@ class Boot:
         warmup_n = int(getattr(boot_cfg, "warmup_pairs", 0) or 0)
         warmup_timeout = float(getattr(boot_cfg, "warmup_timeout_s", 0.0) or 0.0)
 
-        req = [self.ready_ws, self.ready_router, self.ready_scanner, self.ready_rm]
+        required = getattr(getattr(self.cfg, "boot", object()), "required_ready_components", None)
+        if not required:
+            required = ["router", "scanner", "rm", "engine"]
+        required = [str(x).lower() for x in required]
+        req_map = {
+            "ws": self.ready_ws,
+            "router": self.ready_router,
+            "scanner": self.ready_scanner,
+            "rm": self.ready_rm,
+            "engine": self.ready_engine,
+            "private": self.ready_private,
+            "balances": self.ready_balances,
+            "rpc": self.ready_rpc,
+        }
+        req = [req_map[k] for k in required if k in req_map]
 
         g = getattr(self.cfg, "g", None)
         fs = getattr(g, "feature_switches", {}) if g else {}
@@ -1510,14 +1624,14 @@ class Boot:
         rm_status: Dict[str, Any] = {}
         engine_status: Dict[str, Any] = {}
 
-        if live:
+        if live and self.ready_engine not in req:
             req.append(self.ready_engine)
-            if private_ws_enabled:
+            if live and private_ws_enabled and self.ready_private not in req:
                 req.append(self.ready_private)
 
         rpc_cfg = getattr(self.cfg, "rpc", object())
         rpc_enabled = bool(getattr(rpc_cfg, "enabled", False))
-        if rpc_enabled:
+        if rpc_enabled and self.ready_rpc not in req:
             req.append(self.ready_rpc)
 
         # Attente des flags READY avec timeout optionnel
@@ -1597,11 +1711,33 @@ class Boot:
                 elif not eng_private.get("hub_wiring_ok", False):
                     reasons.append("engine_private_hub_wiring_incomplete")
 
+        dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY")).upper()
+        if dep_mode not in {"EU_ONLY", "SPLIT", "JP"}:
+            reasons.append("BOOT_MODE_FALLBACK")
+
         # Décision READY / DEGRADED
         self.state["degraded"] = bool(reasons)
         self.state["reasons"] = reasons
         if not reasons:
             self.ready_all.set()
+            try:
+                obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.ready", 2.0)
+            except Exception:
+                pass
+            else:
+                if "BOOT_READY_BLOCKED" not in reasons:
+                    reasons.append("BOOT_READY_BLOCKED")
+                try:
+                    obs_metrics.safe_inc(
+                        obs_metrics.BLOCKED_TOTAL,
+                        "blocked_total",
+                        "boot.ready_blocked",
+                        module="boot",
+                        reason=self._normalize_reason("BOOT_READY_BLOCKED"),
+                        pair="ready",
+                    )
+                except Exception:
+                    pass
 
         self._mark_stage("ready")
 

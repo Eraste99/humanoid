@@ -1096,8 +1096,8 @@ PNL_RECO_LAST_RUN_TS_SECONDS = _metric(
 PNL_RECO_STATE = _metric(
     Gauge,
     'pnl_reco_state',
-    'PnL reconciliation state (0=OK,1=WARN,2=CRIT)',
-    ['region', 'exchange', 'account_alias'],
+    'PnL reconciliation state (OK/MISMATCH/ERROR/SKIPPED)',
+    ['region', 'exchange', 'account_alias', 'state'],
 )
 
 PNL_RECO_ABS_DIFF_QUOTE = _metric(
@@ -1110,17 +1110,31 @@ PNL_RECO_ABS_DIFF_QUOTE = _metric(
 PNL_RECO_MISMATCH_TOTAL = _metric(
     Counter,
     'pnl_reco_mismatch_total',
-    'PnL reconciliation mismatches by severity',
-    ['region', 'exchange', 'account_alias', 'level'],
+    'PnL reconciliation mismatches by reason',
+    ['region', 'exchange', 'account_alias', 'reason'],
 )
 
 PNL_RECO_ERRORS_TOTAL = _metric(
     Counter,
     'pnl_reco_errors_total',
     'PnL reconciliation errors',
-    ['region', 'exchange', 'account_alias', 'kind'],
+    ['region', 'exchange', 'account_alias', 'stage'],
 )
 
+PNL_DERIVED_FROM_BPS_TOTAL = _metric(
+    Counter,
+    'pnl_derived_from_bps_total',
+    'PnL derived from bps (approximate accounting)',
+    ['route'],
+)
+
+PNL_VIEW_BUILD_MS = _metric(
+    Histogram,
+    'pnl_view_build_ms',
+    'PnL view build latency (ms)',
+    ['view'],
+    buckets=BUCKETS_MS if 'BUCKETS_MS' in globals() else (1, 2, 5, 10, 25, 50, 100, 250, 500, 1000),
+)
 
 ENGINE_PACER_DELAY_MS = _metric(
     Gauge,
@@ -1544,6 +1558,13 @@ LOGGERH_DB_LANE_QUEUE_DEPTH = _metric(Gauge, 'loggerh_db_lane_queue_depth', 'DB 
 LOGGERH_DB_LANE_DROPS_TOTAL = _metric(Counter, 'loggerh_db_lane_drops_total', 'DB lane drops when queue is full', ['op'])
 
 LHM_JSONL_QUEUE_CAP = _metric(Gauge, 'lhm_jsonl_queue_cap', 'Configured JSONL queue capacity (records)')
+
+LOGGERH_DB_LANE_DROPPED_TOTAL = _metric(
+    Counter,
+    'loggerh_db_lane_dropped_total',
+    'DB lane drops (queue full/timeouts)',
+    ['lane', 'reason'],
+)
 
 # --- [LHM SLO] Cibles & lag pipeline LHM (M5-B3) ------------------------------
 
@@ -2825,6 +2846,10 @@ __all__ += [
     'PWS_ALERT_TOTAL',
     'WS_RECO_MISS_PER_MINUTE',
     'WS_RECO_MISS_BURST_TOTAL',
+]
+__all__ += [
+    'PNL_DERIVED_FROM_BPS_TOTAL',
+    'PNL_VIEW_BUILD_MS',
 ]
 __all__ += [
     'ObsServer',

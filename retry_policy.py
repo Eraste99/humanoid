@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio, random, time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple
-
+from contracts.errors import RMError, RateLimitTimeoutError
 # ======================== Taxonomie ========================
 
 class ErrKind:
@@ -36,6 +36,12 @@ def map_error(venue: str, exc: BaseException) -> str:
     Classifie l'erreur -> ErrKind.
     'venue' peut encoder {pod}:{cex}:{family} pour l'observabilité.
     """
+    if isinstance(exc, RateLimitTimeoutError):
+        return ErrKind.RATELIMIT
+    if isinstance(exc, RMError):
+        error_kind = getattr(exc, "error_kind", "")
+        if "rate_limit" in error_kind:
+            return ErrKind.RATELIMIT
     m = (str(exc) or "").lower()
 
     # timeouts / réseau transitoire

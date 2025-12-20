@@ -34,6 +34,47 @@ except Exception as exc:  # pragma: no cover - erreur d'import précoce
 
 logger = logging.getLogger("EODPnLRunner")
 
+def _resolve_window(local_day: Optional[str], region: str) -> tuple[int | None, int | None]:
+    try:
+        from datetime import datetime, timezone, timedelta
+        try:
+            from zoneinfo import ZoneInfo  # type: ignore
+        except Exception:
+            ZoneInfo = None  # type: ignore
+        tz_name = {
+            "EU": "Europe/Rome",
+            "US": "America/New_York",
+            "JP": "Asia/Tokyo",
+        }.get(region, "Europe/Rome")
+        if local_day and str(local_day).strip():
+            day = str(local_day).strip()
+        else:
+            if ZoneInfo is not None:
+                dt_now = datetime.now(ZoneInfo(tz_name))
+            else:
+                dt_now = datetime.now()
+            day = dt_now.strftime("%Y-%m-%d")
+        dt_start = datetime.strptime(day, "%Y-%m-%d")
+        if ZoneInfo is not None:
+            dt_start = dt_start.replace(tzinfo=ZoneInfo(tz_name))
+        else:
+            dt_start = dt_start.replace(tzinfo=timezone.utc)
+        dt_end = dt_start + timedelta(days=1)
+        dt_start_utc = dt_start.astimezone(timezone.utc)
+        dt_end_utc = dt_end.astimezone(timezone.utc)
+        since_ms = int(dt_start_utc.timestamp() * 1000)
+        until_ms = int(dt_end_utc.timestamp() * 1000) - 1
+        return since_ms, until_ms
+    except Exception:
+        return None, None
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.parent.mkdir(parents=True, exist_ok=True)
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+    tmp_path.replace(path)
 
 # ---------------------------------------------------------------------------
 # Core runner
@@ -85,6 +126,47 @@ async def run_eod(
         region_effective,
     )
 
+    enable_jp = False
+    try:
+        g_cfg = getattr(cfg, "g", None)
+        enable_jp = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else bool(
+            getattr(cfg, "enable_jp", False)
+        )
+    except Exception:
+        enable_jp = False
+    if region_effective == "JP" and not enable_jp:
+        reason_code = "REGION_UNSUPPORTED_JP"
+        since_ms, until_ms = _resolve_window(local_day, region_effective)
+        result = {
+            "status": "ERROR",
+            "reason_code": reason_code,
+            "region": region_effective,
+            "day_local": local_day,
+            "window_since_ms": since_ms,
+            "window_until_ms": until_ms,
+            "pnl_reconciliation": {
+                "state": "SKIPPED",
+                "reason_code": reason_code,
+            },
+            "cutoff_definition": f"local_day[{region_effective}] -> UTC window",
+            "thresholds": {
+                "abs_diff_quote": None,
+                "ratio_diff": None,
+            },
+            "conventions": {"base_ccy": "USDC", "quote_ccy": "USDC"},
+        }
+        if output_path:
+            try:
+                _atomic_write_json(Path(output_path), result)
+                logger.info("EOD report written to %s", output_path)
+            except Exception:
+                logger.exception("Failed to write EOD report to %s", output_path)
+        else:
+            json.dump(result, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        return result
+
     lhm = LoggerHistoriqueManager(cfg, out_dir)
 
     fetch_pnl_cex_fn: Callable[[str, str, str, str], Any] | None = None
@@ -95,40 +177,81 @@ async def run_eod(
             adapter = PnlRecoCexAdapter(cfg)
             fetch_pnl_cex_fn = adapter.fetch_pnl_for_day
         except Exception:
-            logger.warning("PnlRecoCexAdapter unavailable; skipping CEX reconciliation")
-            skip_cex = True
+            logger.error("PnlRecoCexAdapter unavailable; cannot run CEX reconciliation")
+            skip_cex = False
     await lhm.start()
     try:
-        result = await lhm.run_eod(
-            local_day=local_day,
-            pod_region=region_effective,
-            sign_priv_pem_path=sign_priv_pem_path,
-            fetch_pnl_cex_fn=fetch_pnl_cex_fn,
-            skip_cex=skip_cex,
-            dry_run=dry_run,
-            skip_finalize=skip_finalize,
-        )
+        if fetch_pnl_cex_fn is None and not skip_cex:
+            lhm._emit_pnl_reco_metrics(
+                region=region_effective,
+                exchange="NA",
+                account_alias="NA",
+                state="ERROR",
+                reason_code="PNL_RECO_SKIPPED_ADAPTER_MISSING",
+                abs_diff_quote=0.0,
+                error_stage="adapter_missing",
+            )
+            result = {
+                "status": "ERROR",
+                "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
+                "region": region_effective,
+                "day_local": local_day,
+                "pnl_reconciliation": {
+                    "state": "ERROR",
+                    "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
+                },
+            }
+        else:
+            result = await lhm.run_eod(
+                local_day=local_day,
+                pod_region=region_effective,
+                sign_priv_pem_path=sign_priv_pem_path,
+                fetch_pnl_cex_fn=fetch_pnl_cex_fn,
+                skip_cex=skip_cex,
+                dry_run=dry_run,
+                skip_finalize=skip_finalize,
+            )
     finally:
         await lhm.stop()
 
-    # Écriture du rapport
-    if output_path:
-        try:
-            path = Path(output_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("w", encoding="utf-8") as f:
-                json.dump(result, f, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-            logger.info("EOD report written to %s", path)
-        except Exception:
-            logger.exception("Failed to write EOD report to %s", output_path)
-    else:
-        # stdout pour les usages en CLI simple / dev
-        json.dump(result, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+        # Écriture du rapport
+        since_ms, until_ms = _resolve_window(local_day, region_effective)
+        pnl_reco = result.get("pnl_reconciliation") if isinstance(result, dict) else {}
+        report = dict(result or {})
+        report.setdefault("region", region_effective)
+        report.setdefault("day_local", local_day)
+        report.setdefault("window_since_ms", pnl_reco.get("window_since_ms") or since_ms)
+        report.setdefault("window_until_ms", pnl_reco.get("window_until_ms") or until_ms)
+        if isinstance(pnl_reco, dict):
+            report.setdefault("pnl_reconciliation", pnl_reco)
+        report.setdefault(
+            "cutoff_definition",
+            f"local_day[{region_effective}] -> UTC window",
+        )
+        report.setdefault(
+            "thresholds",
+            {
+                "abs_diff_quote": getattr(lhm, "_pnl_reco_tol_abs_quote", None),
+                "ratio_diff": getattr(lhm, "_pnl_reco_tol_pct", None),
+            },
+        )
 
-    return result
 
+        report.setdefault("conventions", {"base_ccy": "USDC", "quote_ccy": "USDC"})
+
+        if output_path:
+            try:
+                _atomic_write_json(Path(output_path), report)
+                logger.info("EOD report written to %s", output_path)
+            except Exception:
+                logger.exception("Failed to write EOD report to %s", output_path)
+        else:
+            # stdout pour les usages en CLI simple / dev
+            json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        return report
 
 # Backward compatibility alias
 async def run_eod_pnl_reconciliation(**kwargs):
@@ -185,6 +308,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Ne pas appeler finalize_day côté LogWriter (utile pour reco seule).",
     )
     parser.add_argument(
+        "--mismatch-exit-code",
+        type=int,
+        default=2,
+        help="Exit code en cas de mismatch PnL détecté.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -205,7 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     _setup_logging(args.log_level)
 
     try:
-        asyncio.run(
+        report = asyncio.run(
             run_eod(
                 out_dir=args.out_dir,
                 local_day=args.local_day,
@@ -223,6 +352,20 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         logger.exception("EOD run failed")
         return 1
+
+    try:
+        if isinstance(report, dict):
+            pnl_reco = report.get("pnl_reconciliation") or {}
+            state = pnl_reco.get("state") or report.get("state") or report.get("status")
+            reason_code = pnl_reco.get("reason_code") or report.get("reason_code")
+            if reason_code == "PNL_RECO_SKIPPED_ADAPTER_MISSING" and not args.skip_cex:
+                return 1
+            if state == "MISMATCH":
+                return int(args.mismatch_exit_code)
+            if state == "ERROR" or report.get("status") == "ERROR":
+                return 1
+    except Exception:
+        pass
 
     return 0
 

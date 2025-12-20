@@ -358,9 +358,10 @@ class LogWriter:
                 os.remove(rotated)
         except FileNotFoundError:
             # rien à déplacer (DB n'existait pas encore)
-            pass
+            logger.info("rotate_now skipped: db_path not found")
         except Exception:
-            logger.exception("rotate_now move/compress failed")
+            logger.exception("rotate_now move/compress failed", extra={"reason_code": "DB_ROTATE_FAILED"})
+
 
         # Re-crée le fichier DB du jour
         with self._conn() as conn:
@@ -484,6 +485,7 @@ class LogWriter:
                 net_profit REAL,
                 trade_type TEXT,
                 side TEXT,
+                ts_ms INTEGER,
                 strategy TEXT,
                 source TEXT,
 
@@ -538,6 +540,7 @@ class LogWriter:
         # Index utiles
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_asset ON trades(asset);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts_ms ON trades(ts_ms);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_trade_id ON trades(trade_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_route_id ON trades(route_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_mode ON trades(trade_mode);")
@@ -547,6 +550,13 @@ class LogWriter:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_buy_ex ON trades(buy_ex);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_sell_ex ON trades(sell_ex);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trades_leg_role ON trades(leg_role);")
+        try:
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_exchange_trade_id "
+                "ON trades(exchange, trade_id);"
+            )
+        except Exception:
+            logger.exception("unique index on trades(exchange, trade_id) failed")
 
         # ---------------- pair_history ----------------
         cur.execute(
@@ -605,6 +615,7 @@ class LogWriter:
               spread_net REAL,
               volume_possible_usdc REAL,
               score REAL,
+              ts_ms INTEGER,
               typ TEXT,
               trade_mode TEXT,     -- "TT" | "TM" | "REB"
               route_id TEXT,
@@ -614,6 +625,7 @@ class LogWriter:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_opp_pair ON opportunities(pair_key);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_opp_ts ON opportunities(ts);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_opp_ts_ms ON opportunities(ts_ms);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_opp_mode ON opportunities(trade_mode);")
         # tri-CEX (pour requêtes buy/sell rapide)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_opp_buy_ex ON opportunities(buy_ex);")
@@ -661,6 +673,7 @@ class LogWriter:
         conn.commit()
         # [PATCH-SCHEMA] Tags SPLIT / profil / pacer + qualité PnL (idempotent)
         self._ensure_columns(conn, "trades", {
+            "ts_ms": "INTEGER",
             "deployment_mode": "TEXT",
             "pod_region": "TEXT",
             "capital_profile": "TEXT",
@@ -672,6 +685,7 @@ class LogWriter:
         })
 
         self._ensure_columns(conn, "opportunities", {
+            "ts_ms": "INTEGER",
             "deployment_mode": "TEXT",
             "pod_region": "TEXT",
             "capital_profile": "TEXT",
@@ -685,6 +699,8 @@ class LogWriter:
             {
                 # modes / comptes
                 "trade_mode": "TEXT",
+                "exchange": "TEXT",
+                "trade_id": "TEXT",
                 "account_alias": "TEXT",
                 "sub_account_id": "TEXT",
                 # ids
@@ -708,6 +724,8 @@ class LogWriter:
                 "buy_ex": "TEXT",
                 "sell_ex": "TEXT",
                 "leg_role": "TEXT",
+                "quote_ccy": "TEXT",
+                "fx_rate_used": "REAL",
                 # --- MM (si présents dans record) ---
                 "p_both_est": "REAL",
                 "inventory_delta_usd": "REAL",
@@ -765,10 +783,33 @@ class LogWriter:
     # Inserts — trades / pairs / opps / alerts / latency
     # ------------------------------------------------------------------
 
-    def insert_trades_bulk(self, rows: Iterable[Dict[str, Any]]) -> int:
+    def insert_trades_bulk(self, rows: Iterable[Dict[str, Any]]) -> dict:
         rows = list(rows or [])
         if not rows:
             return 0
+
+        def _coerce_ts_ms(payload: dict) -> int:
+            raw = payload.get("ts_ms")
+            if raw is None:
+                raw = payload.get("timestamp_ms")
+            if raw is None:
+                raw = payload.get("t_done_ms") or payload.get("t_filled_ms") or payload.get("t_ack_ms")
+            if raw is None:
+                raw = payload.get("t_sent_ms")
+            if raw is None:
+                raw = payload.get("timestamp")
+            try:
+                if isinstance(raw, (int, float)):
+                    return int(raw) if raw > 10_000_000_000 else int(float(raw) * 1000.0)
+                if isinstance(raw, str):
+                    return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1000)
+            except Exception:
+                pass
+            logger.warning(
+                "trade missing ts_ms",
+                extra={"reason_code": "DB_SCHEMA_MISSING_TS_MS"},
+            )
+            return int(time.time() * 1000)
 
         def _safe(v: Any) -> Any:
             if isinstance(v, (dict, list, tuple)):
@@ -794,6 +835,7 @@ class LogWriter:
                         # timestamp ISO UTC si absent
                         if not p.get("timestamp"):
                             p["timestamp"] = datetime.utcnow().isoformat()
+                        p.setdefault("ts_ms", _coerce_ts_ms(p0))
 
                         # dérivés horaires best-effort si ts_ms présent et champs manquants
                         if p.get("ts_ms") and (("hour_utc" not in p) or ("local_day" not in p)):
@@ -814,16 +856,20 @@ class LogWriter:
                     # Union de colonnes (ordre stable)
                     col_union = sorted({k for p in payloads for k in p.keys()})
                     qmarks = ", ".join(["?"] * len(col_union))
-                    sql = f"INSERT INTO trades ({', '.join(col_union)}) VALUES ({qmarks})"
+                    sql = f"INSERT OR IGNORE INTO trades ({', '.join(col_union)}) VALUES ({qmarks})"
 
                     params = [tuple(p.get(c) for c in col_union) for p in payloads]
+                    before = conn.total_changes
                     cur.executemany(sql, params)
                     conn.commit()
+                    inserted = max(0, conn.total_changes - before)
+                    ignored = max(0, len(params) - inserted)
 
                     self.log_count += len(params)
-                    return len(params)
+                    return {"inserted": int(inserted), "ignored": int(ignored)}
 
-        return int(self._run_db("trades", _do))
+        res = self._run_db("trades", _do)
+        return res if isinstance(res, dict) else {"inserted": int(res or 0), "ignored": 0}
 
 
     def write_pair_history(self, pair_data_list: Iterable[Dict[str, Any]]) -> None:
@@ -1096,6 +1142,7 @@ class LogWriter:
         import time
         import sqlite3
 
+        t0 = time.perf_counter()
         now_ms = int(time.time() * 1000)
         if since_ms is None:
             since_ms = now_ms - 24 * 3600 * 1000
@@ -1123,8 +1170,11 @@ class LogWriter:
                 "quality": {
                     "pnl_missing": 0,
                     "pnl_missing_share": 0.0,
+                    "missing_net_profit_quote": 0,
                     "derived_from_bps": 0,
                     "derived_share": 0.0,
+                    "pnl_incomplete_count": 0,
+                    "pnl_exploitable_count": 0,
                 },
             },
             "pnl_by_exchange": [],
@@ -1134,8 +1184,11 @@ class LogWriter:
                 "trades": 0,
                 "pnl_missing": 0,
                 "pnl_missing_share": 0.0,
+                "missing_net_profit_quote": 0,
                 "derived_from_bps": 0,
                 "derived_share": 0.0,
+                "pnl_incomplete_count": 0,
+                "pnl_exploitable_count": 0,
             },
         }
 
@@ -1184,6 +1237,8 @@ class LogWriter:
                     "net_profit_sign",
                     "pnl_missing",
                     "pnl_derived_from_bps",
+                    "quote_ccy",
+                    "fx_rate_used",
                 ]
                 dim_cols = ["exchange", "account_alias", "trade_mode"]
 
@@ -1206,6 +1261,7 @@ class LogWriter:
                 losses = 0
                 pnl_missing_count = 0
                 derived_from_bps_count = 0
+                pnl_incomplete_count = 0
 
                 # Agrégats par dimension
                 by_exchange: dict[str, dict] = {}
@@ -1236,23 +1292,33 @@ class LogWriter:
                     np_raw = rec.get("net_profit")
                     fee_raw = rec.get("fees")
                     vol_raw = rec.get("executed_volume_usdc")
+                    quote_ccy = rec.get("quote_ccy")
+                    fx_rate_used = rec.get("fx_rate_used")
+                    fx_missing = False
+                    if quote_ccy is not None:
+                        try:
+                            fx_missing = str(quote_ccy).upper() != "USDC" and not fx_rate_used
+                        except Exception:
+                            fx_missing = False
+                    if fx_missing:
+                        pnl_incomplete_count += 1
 
                     np_val = None
-                    if np_raw is not None:
+                    if np_raw is not None and not fx_missing:
                         try:
                             np_val = float(np_raw)
                             sum_net_profit += np_val
                         except Exception:
                             np_val = None
 
-                    if fee_raw is not None:
+                    if fee_raw is not None and not fx_missing:
                         try:
                             sum_fees += float(fee_raw)
                         except Exception:
                             pass
 
                     vol_val = None
-                    if vol_raw is not None:
+                    if vol_raw is not None and not fx_missing:
                         try:
                             vol_val = float(vol_raw)
                             sum_turnover += abs(vol_val)
@@ -1269,12 +1335,12 @@ class LogWriter:
                             sign_int = None
 
                     # Compteurs globaux wins/losses
-                    if sign_int is not None:
+                    if not fx_missing and sign_int is not None:
                         if sign_int > 0:
                             wins += 1
                         elif sign_int < 0:
                             losses += 1
-                    elif np_val is not None:
+                    elif not fx_missing and np_val is not None:
                         if np_val > 0:
                             wins += 1
                         elif np_val < 0:
@@ -1308,21 +1374,21 @@ class LogWriter:
                     if ex is not None:
                         b_ex = _ensure_bucket(by_exchange, str(ex))
                         b_ex["trades"] += 1
-                        if np_val is not None:
+                        if np_val is not None and not fx_missing:
                             b_ex["net_profit"] += np_val
-                        if fee_raw is not None:
+                        if fee_raw is not None and not fx_missing:
                             try:
                                 b_ex["fees"] += float(fee_raw)
                             except Exception:
                                 pass
-                        if vol_val is not None:
+                        if vol_val is not None and not fx_missing:
                             b_ex["turnover"] += abs(vol_val)
-                        if sign_int is not None:
+                        if not fx_missing and sign_int is not None:
                             if sign_int > 0:
                                 b_ex["wins"] += 1
                             elif sign_int < 0:
                                 b_ex["losses"] += 1
-                        elif np_val is not None:
+                        elif not fx_missing and np_val is not None:
                             if np_val > 0:
                                 b_ex["wins"] += 1
                             elif np_val < 0:
@@ -1337,21 +1403,21 @@ class LogWriter:
                         key_acc = (str(ex), str(alias))
                         b_acc = _ensure_bucket(by_account, key_acc)
                         b_acc["trades"] += 1
-                        if np_val is not None:
+                        if np_val is not None and not fx_missing:
                             b_acc["net_profit"] += np_val
-                        if fee_raw is not None:
+                        if fee_raw is not None and not fx_missing:
                             try:
                                 b_acc["fees"] += float(fee_raw)
                             except Exception:
                                 pass
-                        if vol_val is not None:
+                        if vol_val is not None and not fx_missing:
                             b_acc["turnover"] += abs(vol_val)
-                        if sign_int is not None:
+                        if not fx_missing and sign_int is not None:
                             if sign_int > 0:
                                 b_acc["wins"] += 1
                             elif sign_int < 0:
                                 b_acc["losses"] += 1
-                        elif np_val is not None:
+                        elif not fx_missing and np_val is not None:
                             if np_val > 0:
                                 b_acc["wins"] += 1
                             elif np_val < 0:
@@ -1366,21 +1432,21 @@ class LogWriter:
                         key_br = (str(branch), str(ex))
                         b_br = _ensure_bucket(by_branch, key_br)
                         b_br["trades"] += 1
-                        if np_val is not None:
+                        if np_val is not None and not fx_missing:
                             b_br["net_profit"] += np_val
-                        if fee_raw is not None:
+                        if fee_raw is not None and not fx_missing:
                             try:
                                 b_br["fees"] += float(fee_raw)
                             except Exception:
                                 pass
-                        if vol_val is not None:
+                        if vol_val is not None and not fx_missing:
                             b_br["turnover"] += abs(vol_val)
-                        if sign_int is not None:
+                        if not fx_missing and sign_int is not None:
                             if sign_int > 0:
                                 b_br["wins"] += 1
                             elif sign_int < 0:
                                 b_br["losses"] += 1
-                        elif np_val is not None:
+                        elif not fx_missing and np_val is not None:
                             if np_val > 0:
                                 b_br["wins"] += 1
                             elif np_val < 0:
@@ -1401,8 +1467,12 @@ class LogWriter:
                 pnl_global["win_rate"] = float(wins) / float(denom)
 
                 quality = out["pnl_global"]["quality"]
-                quality["pnl_missing"] = int(pnl_missing_count)
+                quality["missing_net_profit_quote"] = int(pnl_missing_count)
                 quality["derived_from_bps"] = int(derived_from_bps_count)
+                quality["pnl_incomplete_count"] = int(pnl_incomplete_count)
+                quality["pnl_exploitable_count"] = int(
+                    max(0, total_trades - pnl_missing_count - pnl_incomplete_count)
+                )
 
                 if total_trades > 0:
                     quality["pnl_missing_share"] = float(pnl_missing_count) / float(total_trades)
@@ -1416,7 +1486,12 @@ class LogWriter:
                     quality_global["derived_share"] = 0.0
 
                 quality_global["pnl_missing"] = int(pnl_missing_count)
+                quality_global["missing_net_profit_quote"] = int(pnl_missing_count)
                 quality_global["derived_from_bps"] = int(derived_from_bps_count)
+                quality_global["pnl_incomplete_count"] = int(pnl_incomplete_count)
+                quality_global["pnl_exploitable_count"] = int(
+                    max(0, total_trades - pnl_missing_count - pnl_incomplete_count)
+                )
 
                 # --- Construction des vues multi-dimensions à partir des buckets ---
 
@@ -1448,6 +1523,7 @@ class LogWriter:
                         "quality": {
                             "pnl_missing": pnl_missing_b,
                             "pnl_missing_share": missing_share_b,
+                            "missing_net_profit_quote": pnl_missing_b,
                             "derived_from_bps": derived_b,
                             "derived_share": derived_share_b,
                         },
@@ -1477,6 +1553,14 @@ class LogWriter:
         except Exception:
             # Best-effort : ne doit jamais casser le pipeline appelant
             logger.exception("compute_pnl_views failed")
+        finally:
+            try:
+                from modules.obs_metrics import PNL_VIEW_BUILD_MS
+                PNL_VIEW_BUILD_MS.labels(view="pnl_views").observe(
+                    (time.perf_counter() - t0) * 1000.0
+                )
+            except Exception:
+                pass
         return out
 
     def compute_pnl_views_for_local_day(
@@ -1569,6 +1653,7 @@ class LogWriter:
             since_ms = now_ms - 24 * 3600 * 1000
         if until_ms is None:
             until_ms = now_ms
+        t0 = time.perf_counter()
 
         out = {
             "window": {"since_ms": since_ms, "until_ms": until_ms},
@@ -1580,6 +1665,8 @@ class LogWriter:
                 "losses": 0,
                 "pnl_missing": 0,
                 "derived_from_bps": 0,
+                "missing_net_profit_quote": 0,
+                "pnl_incomplete_count": 0,
             },
         }
 
@@ -1596,7 +1683,16 @@ class LogWriter:
         with sqlite3.connect(self.db_path, timeout=10) as conn:
             cur = conn.cursor()
 
-            needed = {"ts_ms", "net_profit", "fees", "net_profit_sign", "pnl_missing", "pnl_derived_from_bps"}
+            needed = {
+                "ts_ms",
+                "net_profit",
+                "fees",
+                "net_profit_sign",
+                "pnl_missing",
+                "pnl_derived_from_bps",
+                "quote_ccy",
+                "fx_rate_used",
+            }
             cols = _has_cols(conn, "trades", needed)
 
             # Si la table trades n'existe pas ou ne contient aucune des colonnes attendues,
@@ -1610,78 +1706,93 @@ class LogWriter:
                 where = " WHERE ts_ms BETWEEN ? AND ?"
                 params = (since_ms, until_ms)
 
-            # net_profit + nombre total de trades
-            try:
-                if "net_profit" in cols:
-                    cur.execute(f"SELECT COALESCE(SUM(net_profit), 0.0), COUNT(1) FROM trades{where};", params)
-                else:
-                    cur.execute(f"SELECT 0.0, COUNT(1) FROM trades{where};", params)
-                row = cur.fetchone() or (0.0, 0)
-                net_profit_sum = float(row[0] or 0.0)
-                trades_count = int(row[1] or 0)
-            except Exception:
-                # best-effort: en cas d'erreur, on préfère retourner l'out partiel
-                return out
 
-            # fees
+            try:
+                cur.execute(f"SELECT COUNT(1) FROM trades{where};", params)
+                row = cur.fetchone() or (0,)
+                trades_count = int(row[0] or 0)
+            except Exception:
+                trades_count = 0
+
+            net_profit_sum = 0.0
             fees_sum = 0.0
-            if "fees" in cols:
-                try:
-                    cur.execute(f"SELECT COALESCE(SUM(fees), 0.0) FROM trades{where};", params)
-                    fees_row = cur.fetchone() or (0.0,)
-                    fees_sum = float(fees_row[0] or 0.0)
-                except Exception:
-                    fees_sum = 0.0
 
-            # wins / losses
             wins = losses = 0
-            try:
-                if "net_profit_sign" in cols:
-                    cur.execute(
-                        f"""SELECT
-                        SUM(CASE WHEN net_profit_sign > 0 THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN net_profit_sign < 0 THEN 1 ELSE 0 END)
-                        FROM trades{where};""",
-                        params,
-                    )
-                elif "net_profit" in cols:
-                    cur.execute(
-                        f"""SELECT
-                        SUM(CASE WHEN net_profit > 0 THEN 1 ELSE 0 END),
-                        SUM(CASE WHEN net_profit < 0 THEN 1 ELSE 0 END)
-                        FROM trades{where};""",
-                        params,
-                    )
-                row = cur.fetchone() or (0, 0)
-                wins = int(row[0] or 0)
-                losses = int(row[1] or 0)
-            except Exception:
-                wins = losses = 0
-
-            # flags de qualité PnL
             pnl_missing = 0
-            if "pnl_missing" in cols:
-                try:
-                    cur.execute(
-                        f"SELECT SUM(CASE WHEN pnl_missing THEN 1 ELSE 0 END) FROM trades{where};",
-                        params,
-                    )
-                    row = cur.fetchone() or (0,)
-                    pnl_missing = int(row[0] or 0)
-                except Exception:
-                    pnl_missing = 0
-
             derived_from_bps = 0
-            if "pnl_derived_from_bps" in cols:
-                try:
-                    cur.execute(
-                        f"SELECT SUM(CASE WHEN pnl_derived_from_bps THEN 1 ELSE 0 END) FROM trades{where};",
-                        params,
-                    )
-                    row = cur.fetchone() or (0,)
-                    derived_from_bps = int(row[0] or 0)
-                except Exception:
-                    derived_from_bps = 0
+            pnl_incomplete = 0
+
+            try:
+                select_cols = ["net_profit", "fees", "net_profit_sign", "pnl_missing", "pnl_derived_from_bps"]
+                if "quote_ccy" in cols:
+                    select_cols.append("quote_ccy")
+                if "fx_rate_used" in cols:
+                    select_cols.append("fx_rate_used")
+                cur.execute(
+                    f"SELECT {', '.join(select_cols)} FROM trades{where};",
+                    params,
+                )
+                for row in cur.fetchall():
+                    rec = dict(zip(select_cols, row))
+                    fx_missing = False
+                    if "quote_ccy" in rec:
+                        try:
+                            fx_missing = str(rec.get("quote_ccy") or "USDC").upper() != "USDC" and not rec.get(
+                                "fx_rate_used"
+                            )
+                        except Exception:
+                            fx_missing = False
+                    if fx_missing:
+                        pnl_incomplete += 1
+                        continue
+                    np_raw = rec.get("net_profit")
+                    if np_raw is not None:
+                        try:
+                            net_profit_sum += float(np_raw)
+                        except Exception:
+                            pass
+                    fee_raw = rec.get("fees")
+                    if fee_raw is not None:
+                        try:
+                            fees_sum += float(fee_raw)
+                        except Exception:
+                            pass
+                    sign_val = rec.get("net_profit_sign")
+                    if sign_val is not None:
+                        try:
+                            sign_int = int(sign_val)
+                        except Exception:
+                            sign_int = None
+                        if sign_int is not None:
+                            if sign_int > 0:
+                                wins += 1
+                            elif sign_int < 0:
+                                losses += 1
+                    elif np_raw is not None:
+                        try:
+                            np_val = float(np_raw)
+                        except Exception:
+                            np_val = None
+                        if np_val is not None:
+                            if np_val > 0:
+                                wins += 1
+                            elif np_val < 0:
+                                losses += 1
+
+                    if "pnl_missing" in rec:
+                        try:
+                            if int(rec.get("pnl_missing") or 0) != 0:
+                                pnl_missing += 1
+                        except Exception:
+                            pass
+                    if "pnl_derived_from_bps" in rec:
+                        try:
+                            if int(rec.get("pnl_derived_from_bps") or 0) != 0:
+                                derived_from_bps += 1
+                        except Exception:
+                            pass
+            except Exception:
+                return out
 
         out["pnl"]["net_profit"] = net_profit_sum
         out["pnl"]["fees"] = fees_sum
@@ -1690,6 +1801,16 @@ class LogWriter:
         out["pnl"]["losses"] = losses
         out["pnl"]["pnl_missing"] = pnl_missing
         out["pnl"]["derived_from_bps"] = derived_from_bps
+        out["pnl"]["missing_net_profit_quote"] = pnl_missing
+        out["pnl"]["pnl_incomplete_count"] = pnl_incomplete
+
+        try:
+            from modules.obs_metrics import PNL_VIEW_BUILD_MS
+            PNL_VIEW_BUILD_MS.labels(view="pnl_summary").observe(
+                (time.perf_counter() - t0) * 1000.0
+            )
+        except Exception:
+            pass
 
         return out
 
@@ -1704,6 +1825,7 @@ class LogWriter:
         ts_ms = opp.get("ts_ms") or int(float(opp.get("timestamp") or time.time()) * 1000)
         tf = _derive_time_fields(ts_ms, opp.get("pod_region") or "EU")
         opp.update(tf)
+        opp.setdefault("ts_ms", ts_ms)
 
         with self._lock:
             self._rotate_if_needed()
@@ -1718,12 +1840,12 @@ class LogWriter:
 
                 keys = ",".join(data.keys())
                 q = ",".join(["?"] * len(data))
-                sql = f"INSERT OR REPLACE INTO opportunities ({keys}) VALUES ({q})"
+                sql = f"INSERT OR IGNORE INTO opportunities ({keys}) VALUES ({q})"
                 cur.execute(sql, tuple(data.values()))
                 conn.commit()
                 return 1
 
-    def insert_opportunities_bulk(self, opps: Iterable[Dict[str, Any]]) -> int:
+    def insert_opportunities_bulk(self, opps: Iterable[Dict[str, Any]]) -> dict:
         opps = list(opps or [])
         if not opps:
             return 0
@@ -1731,9 +1853,13 @@ class LogWriter:
         # Prépare hors lock (évite de bloquer la DB)
         rows = []
         for o in opps:
+            ts_ms = o.get("ts_ms") or int(float(o.get("timestamp", 0.0) or time.time()) * 1000)
+            ts_sec = float(o.get("timestamp") or (float(ts_ms) / 1000.0))
             rows.append(
                 (
                     o.get("id"),
+                    ts_sec,
+                    ts_ms,
                     float(o.get("timestamp", 0.0) or 0.0),
                     (o.get("pair") or o.get("pair_key")),
                     self._norm_ex(o.get("buy_exchange") or o.get("buy_ex")),
@@ -1751,6 +1877,7 @@ class LogWriter:
                     o.get("pod_region"),
                     o.get("capital_profile"),
                     o.get("pacer_mode"),
+
                     str(o),
                 )
             )
@@ -1760,20 +1887,24 @@ class LogWriter:
                 self._rotate_if_needed()
                 with self._conn() as conn:
                     cur = conn.cursor()
+                    before = conn.total_changes
                     cur.executemany(
                         """
-                        INSERT OR REPLACE INTO opportunities(
-                            id, ts, pair_key, buy_ex, sell_ex, buy_price, sell_price, spread_brut,
+                        INSERT OR IGNORE INTO opportunities(
+                            id, ts,ts_ms, pair_key, buy_ex, sell_ex, buy_price, sell_price, spread_brut,
                             spread_net, volume_possible_usdc, score, typ, trade_mode, route_id,
                             deployment_mode, pod_region, capital_profile, pacer_mode, raw_json
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         rows,
                     )
                     conn.commit()
-                    return len(rows)
+                    inserted = max(0, conn.total_changes - before)
+                    ignored = max(0, len(rows) - inserted)
+                    return {"inserted": int(inserted), "ignored": int(ignored)}
 
-        return int(self._run_db("opportunities", _do))
+        res = self._run_db("opportunities", _do)
+        return res if isinstance(res, dict) else {"inserted": int(res or 0), "ignored": 0}
 
 
     def insert_alert(self, module: str, level: str, pair_key: str | None, message: str, ctx: str | None = None) -> None:
@@ -2019,6 +2150,7 @@ class LogWriter:
 
         # s'assurer que la DB source existe
         if not os.path.exists(self.db_path):
+            logger.info("backup_database: db_path not found, creating empty db")
             open(self.db_path, "a").close()
 
         with self._conn() as src:
@@ -2059,6 +2191,10 @@ class LogWriter:
             "sha256_db": None,
             "sha256_backup": None,
             "signing": None,
+            "status": "ok",
+            "errors": [],
+            "pnl_incomplete_count": 0,
+            "pnl_derived_count": 0,
         }
 
         def _sha256_file(path: str) -> Optional[str]:
@@ -2079,19 +2215,23 @@ class LogWriter:
                 meta["wal_checkpoint"] = "FULL"
             except Exception:
                 logger.exception("finalize_day: wal_checkpoint failed")
+                meta["status"] = "partial"
+                meta["errors"].append({"reason_code": "DB_ROTATE_FAILED", "stage": "wal_checkpoint"})
 
             try:
                 self.optimize()
                 meta["optimize"] = True
             except Exception:
-                logger.exception("finalize_day: optimize failed")
+                meta["status"] = "partial"
+                meta["errors"].append({"reason_code": "DB_ROTATE_FAILED", "stage": "optimize"})
 
             try:
                 bp = self.backup_database()
                 meta["backup_path"] = bp
             except Exception:
                 logger.exception("finalize_day: backup_database failed")
-
+                meta["status"] = "partial"
+                meta["errors"].append({"reason_code": "DB_ROTATE_FAILED", "stage": "backup"})
         # checksums hors lock
         try:
             meta["sha256_db"] = _sha256_file(self.db_path)
@@ -2108,6 +2248,14 @@ class LogWriter:
             meta["signing"] = {"requested": True, "done": False, "error": "not_implemented"}
         else:
             meta["signing"] = {"requested": False}
+
+        try:
+            pnl_summary = self.compute_pnl_summary()
+            pnl_block = pnl_summary.get("pnl") or {}
+            meta["pnl_incomplete_count"] = int(pnl_block.get("pnl_incomplete_count") or 0)
+            meta["pnl_derived_count"] = int(pnl_block.get("derived_from_bps") or 0)
+        except Exception:
+            pass
 
         return meta
 

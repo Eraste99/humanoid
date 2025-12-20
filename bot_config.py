@@ -17,8 +17,11 @@ import os
 import json
 import ast
 import logging
+import hashlib
+import time
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Tuple, Optional, Union
+from contracts import payloads as contracts
 
 # ------------------------------
 # Taxonomie canonique (branches / profils capital)
@@ -70,20 +73,30 @@ class _Env:
             return default
 
     @staticmethod
-    def get_list(name: str, default: Optional[List[str]]=None) -> List[str]:
+    def get_list(name: str, default: Optional[List[str]]=None, sep: str = ",") -> List[str]:
         v = _Env.get(name)
         if v is None:
             return list(default or [])
+        if isinstance(v, str) and not v.strip():
+            return []
         # try JSON first
         try:
             x = json.loads(v)
             if isinstance(x, list):
                 return x
+
         except Exception:
             pass
+            # try Python literal list/tuple
+            try:
+                x = ast.literal_eval(v)
+                if isinstance(x, (list, tuple)):
+                    return list(x)
+            except Exception:
+                pass
         # fallback: CSV
-        separator = ',' if sep is None else sep
-        return [t.strip() for t in v.split(separator) if t.strip()]
+        separator = "," if sep is None else sep
+        return [t.strip() for t in str(v).split(separator) if t.strip()]
 
     @staticmethod
     def get_dict(name: str, default: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
@@ -130,6 +143,12 @@ class _Env:
                     pairs.append((a,b))
         return pairs
 
+class ConfigError(Exception):
+    def __init__(self, reason_code: str, field: str) -> None:
+        self.error_kind = "config_error"
+        self.reason_code = contracts.normalize_reason_code(reason_code) or str(reason_code)
+        self.field = field
+        super().__init__(f"{self.reason_code}:{field}")
 
 # ------------------------------
 # Sections de config
@@ -139,6 +158,7 @@ class _Env:
 class Globals:
     deployment_mode: str = "SPLIT"              # "EU_ONLY" | "SPLIT"
     pod_region: str = "EU"                      # "EU" | "US"
+    enable_jp: bool = False
     engine_pod_map: Dict[str,str] = field(default_factory=lambda: {
         "BINANCE":"EU", "BYBIT":"EU", "COINBASE":"US"
     })
@@ -1123,12 +1143,14 @@ class BotConfig:
     lhm: LoggerCfg = field(default_factory=LoggerCfg)
     dashboard: DashboardCfg = field(default_factory=DashboardCfg)
     tests: TestsCfg = field(default_factory=TestsCfg)
+    overrides: List[Dict[str, Any]] = field(default_factory=list)
 
     # cache à plat pour l'accès rétro-compat
     _flat_cache: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
     _alias_map: Dict[str, str] = field(default_factory=dict, init=False, repr=False)
     # dans la dataclass BotConfig (ou équivalent)
     scanner_global_eval_hz: float | None = None
+    resolution_version: str = "v1"
 
     # --- Aliases pratiques pour les modules WS / Router -------------------
 
@@ -1216,6 +1238,7 @@ class BotConfig:
         g = cfg.g
         g.deployment_mode = _Env.get("DEPLOYMENT_MODE", g.deployment_mode)
         g.pod_region = _Env.get("POD_REGION", g.pod_region)
+        g.enable_jp = _Env.get_bool("ENABLE_JP", g.enable_jp)
         g.pacer_mode = _Env.get("PACER_MODE", g.pacer_mode)
         g.engine_pod_map = _Env.get_dict("ENGINE_POD_MAP", g.engine_pod_map)
         g.split_latency = _Env.get_dict("SPLIT_LATENCY", g.split_latency)
@@ -1245,14 +1268,40 @@ class BotConfig:
         if str(g.mode).upper() in ("DEV", "DEVELOPMENT"):
             g.mode = "DRY_RUN"
         g.feature_switches = _Env.get_dict("FEATURE_SWITCHES", g.feature_switches)
+        overrides_raw = _Env.get("CONFIG_OVERRIDES", None)
+        if overrides_raw:
+            try:
+                parsed = json.loads(overrides_raw)
+                if not isinstance(parsed, list):
+                    raise ConfigError("CONFIG_PARSE_ERROR", "CONFIG_OVERRIDES")
+                cfg.overrides = [x for x in parsed if isinstance(x, dict)]
+            except ConfigError:
+                raise
+            except Exception:
+                raise ConfigError("CONFIG_PARSE_ERROR", "CONFIG_OVERRIDES") from None
 
         # --- Router cfg ---------------------------------------------------
         cfg.router.coalesce_window_ms = _Env.get_int("ROUTER_COALESCE_WINDOW_MS", cfg.router.coalesce_window_ms)
         cfg.router.stale_ms = _Env.get_int("ROUTER_STALE_MS", cfg.router.stale_ms)
         # P0: shards_per_exchange = (BINANCE, BYBIT, COINBASE)
-        cfg.router.shards_per_exchange = tuple(
-            _Env.get_int("ROUTER_SHARDS_PER_EXCHANGE", cfg.router.shards_per_exchange) for _ in range(3)
-        )
+        shards_raw = _Env.get("ROUTER_SHARDS_PER_EXCHANGE", None)
+        if shards_raw is None:
+            cfg.router.shards_per_exchange = tuple(cfg.router.shards_per_exchange)
+        else:
+            parsed = _Env.get_list("ROUTER_SHARDS_PER_EXCHANGE", [], sep=",")
+            if len(parsed) == 1:
+                try:
+                    val = int(parsed[0])
+                except Exception:
+                    raise ConfigError("CONFIG_PARSE_ERROR", "router_shards_per_exchange") from None
+                cfg.router.shards_per_exchange = (val, val, val)
+            elif len(parsed) == 3:
+                try:
+                    cfg.router.shards_per_exchange = tuple(int(v) for v in parsed)
+                except Exception:
+                    raise ConfigError("CONFIG_PARSE_ERROR", "router_shards_per_exchange") from None
+            else:
+                raise ConfigError("CONFIG_PARSE_ERROR", "router_shards_per_exchange")
         # Quota global (fallback) + quotas stream-centrics optionnels
         cfg.router.out_queues_maxlen = _Env.get_int("ROUTER_OUT_QUEUES_MAXLEN", cfg.router.out_queues_maxlen)
         cfg.router.out_queues_maxlen_by_kind = _Env.get_dict(
@@ -1312,9 +1361,10 @@ class BotConfig:
             cfg.discovery.min_quote_volume_by_quote = mv
 
         # --- Fallback coppie (g.pairs) ---
-        pairs_csv = _Env.get("PAIRS", "").strip()
-        if pairs_csv:
-            cfg.g.pairs = [p.strip().upper() for p in pairs_csv.split(",") if p.strip()]
+        pairs_list = _Env.get_list("PAIRS", [])
+        if pairs_list:
+            cfg.g.pairs = [str(p).strip().upper() for p in pairs_list if str(p).strip()]
+
         # fallback: se PAIRS assente ma hai PAIR_WHITELIST popolata, usa quella
         if not getattr(cfg.g, "pairs", None) and getattr(cfg.g, "pair_whitelist", None):
             cfg.g.pairs = list(cfg.g.pair_whitelist)
@@ -2077,7 +2127,154 @@ class BotConfig:
         # --- Aliases & flatten ---
         cfg._init_aliases()
         cfg._rebuild_flat_cache()
+        # --- Validation fail-closed ---
+        dep_mode = str(cfg.g.deployment_mode or "").upper()
+        if dep_mode not in {"EU_ONLY", "SPLIT", "JP"}:
+            raise ConfigError("CONFIG_SCHEMA_INVALID", "deployment_mode")
+        region = str(cfg.g.pod_region or "").upper()
+        if region not in {"EU", "US", "JP"}:
+            raise ConfigError("CONFIG_SCHEMA_INVALID", "pod_region")
+        if region == "JP" and not getattr(cfg.g, "enable_jp", False):
+            raise ConfigError("REGION_JP_DISABLED_BY_DEFAULT", "pod_region")
+        profile = str(cfg.g.capital_profile or "").upper()
+        if profile not in ALLOWED_CAPITAL_PROFILES:
+            raise ConfigError("CONFIG_SCHEMA_INVALID", "capital_profile")
+        for b in cfg.g.branch_priority:
+            if str(b).upper() not in ALLOWED_BRANCHES:
+                raise ConfigError("CONFIG_SCHEMA_INVALID", "branch_priority")
+        cfg.resolution_version = "v1"
         return cfg
+
+    def _note_config_error(self, reason_code: str, field: str) -> None:
+        try:
+            from modules import obs_metrics  # type: ignore
+            obs_metrics.safe_inc(
+                obs_metrics.NONFATAL_ERRORS_TOTAL,
+                "nonfatal_errors_total",
+                "bot_config",
+                module="bot_config",
+                kind="config_error",
+            )
+        except Exception:
+            pass
+        logging.getLogger(__name__).warning("config error %s on %s", reason_code, field)
+
+    def resolve(
+            self,
+            *,
+            profile: str | None = None,
+            region: str | None = None,
+            strategy: str | None = None,
+            route: str | None = None,
+            quote: str | None = None,
+    ) -> Dict[str, Any]:
+        base = {
+            "min_notional_by_exchange_quote": dict(self.g.min_notional_by_exchange_quote),
+            "branch_budgets_quote": dict(self.rm.branch_budgets_quote),
+            "combo_cap_usd_by_profile": dict(self.rm.combo_cap_usd_by_profile),
+        }
+        now_ms = int(time.time() * 1000)
+        for ov in self.overrides or []:
+            try:
+                value = ov.get("value")
+                ttl_raw = ov.get("ttl_s")
+                ttl_s = float(ttl_raw) if ttl_raw is not None else None
+                reason = ov.get("reason")
+                ts_ms = ov.get("ts_ms")
+                path = ov.get("path")
+                if value is None or ttl_s is None or reason is None or ts_ms is None or not path:
+                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    continue
+                if ttl_s <= 0:
+                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    continue
+                try:
+                    ts_ms = int(ts_ms)
+                except Exception:
+                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    continue
+                if (now_ms - int(ts_ms)) > int(ttl_s * 1000):
+                    self._note_config_error("CONFIG_OVERRIDE_EXPIRED", str(path))
+                    continue
+                if profile and ov.get("profile") and str(ov.get("profile")).upper() != str(profile).upper():
+                    continue
+                if region and ov.get("region") and str(ov.get("region")).upper() != str(region).upper():
+                    continue
+                if strategy and ov.get("strategy") and str(ov.get("strategy")).upper() != str(strategy).upper():
+                    continue
+                if route and ov.get("route") and str(ov.get("route")).upper() != str(route).upper():
+                    continue
+                if quote and ov.get("quote") and str(ov.get("quote")).upper() != str(quote).upper():
+                    continue
+                target: Any = base
+                keys = str(path).split(".")
+                for k in keys[:-1]:
+                    if not isinstance(target, dict) or k not in target:
+                        self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                        target = None
+                        break
+                    target = target.get(k)
+                if target is None or not isinstance(target, dict):
+                    continue
+                leaf = keys[-1]
+                if leaf not in target:
+                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    continue
+                current = target.get(leaf)
+                if isinstance(current, (int, float)) and isinstance(value, (int, float)):
+                    if float(value) > float(current):
+                        self._note_config_error("NO_UPSCALE_VIOLATION", str(path))
+                        continue
+                target[leaf] = value
+            except Exception:
+                self._note_config_error("CONFIG_OVERRIDE_INVALID", str(ov.get("path")))
+        return base
+
+    def snapshot_dict(self) -> Dict[str, Any]:
+        def _scrub(value: Any) -> Any:
+            if isinstance(value, dict):
+                out: Dict[str, Any] = {}
+                for k, v in value.items():
+                    key = str(k)
+                    if any(t in key.lower() for t in ("secret", "token", "password", "pem", "priv", "key")):
+                        continue
+                    out[key] = _scrub(v)
+                return dict(sorted(out.items(), key=lambda kv: kv[0]))
+            if isinstance(value, (list, tuple)):
+                return [_scrub(v) for v in value]
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return str(value)
+
+        snapshot = {
+            "resolution_version": self.resolution_version,
+            "g": asdict(self.g),
+            "router": asdict(self.router),
+            "ws_public": asdict(self.ws_public),
+            "discovery": asdict(self.discovery),
+            "scanner": asdict(self.scanner),
+            "rm": asdict(self.rm),
+            "sim": asdict(self.sim),
+            "engine": asdict(self.engine),
+            "pws": asdict(self.pws),
+            "rebal": asdict(self.rebal),
+            "reconciler": asdict(self.reconciler),
+            "flow_safety": asdict(self.flow_safety),
+            "balances": asdict(self.balances),
+            "slip": asdict(self.slip),
+            "vol": asdict(self.vol),
+            "rl": asdict(self.rl),
+            "retry": asdict(self.retry),
+            "rpc": asdict(self.rpc),
+            "lhm": asdict(self.lhm),
+            "dashboard": asdict(self.dashboard),
+            "tests": asdict(self.tests),
+        }
+        return _scrub(snapshot)
+
+    def snapshot_hash(self) -> str:
+        data = json.dumps(self.snapshot_dict(), sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
     def _sanity_check_rm_caps(cfg: "BotConfig") -> None:
         """

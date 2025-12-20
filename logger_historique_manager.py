@@ -553,7 +553,13 @@ class LoggerHistoriqueManager:
             "mm_cancels",         # P6 (verbeux)
             "privatews_events",   # P7 (massif)
         ]
-        self._stream_critical = {"fills_normalized": True}
+        self._stream_critical = {
+            "fills_normalized": True,
+            "engine_submits": True,
+            "engine_acks": True,
+            "privatews_events": True,
+        }
+        self._drop_log_sample_rate = float(getattr(L, "LHM_DROP_LOG_SAMPLE_RATE", 0.1))
 
         # Files bornées par stream + suivi plateau (initialisé au start)
         self._plateau_since: dict[str, float] = {name: 0.0 for name in self._jsonl.keys()}
@@ -806,18 +812,18 @@ class LoggerHistoriqueManager:
         except Exception:
             pass
 
-    def _db_lane_try_metric_drop(self, reason: str) -> None:
+    def _db_lane_record_drop(self, lane: str, reason: str) -> None:
+        reason_code = self._normalize_reason_code(reason)
         try:
-            from modules.obs_metrics import LHM_DB_LANE_DROPS_TOTAL
-
-            LHM_DB_LANE_DROPS_TOTAL.labels(reason=str(reason)).inc()
+            from modules.obs_metrics import LOGGERH_DB_LANE_DROPPED_TOTAL
+            LOGGERH_DB_LANE_DROPPED_TOTAL.labels(lane=str(lane), reason=reason_code).inc()
             return
         except Exception:
             pass
 
         try:
-            from modules.obs_metrics import LOGGERH_DB_LANE_DROPS_TOTAL
-            LOGGERH_DB_LANE_DROPS_TOTAL.labels(op=str(reason)).inc()
+            from modules.obs_metrics import LOGGERH_DB_LANE_DROPPED_TOTAL
+            LOGGERH_DB_LANE_DROPPED_TOTAL.labels(lane=str(lane), reason=reason_code).inc()
         except Exception:
             pass
 
@@ -828,7 +834,7 @@ class LoggerHistoriqueManager:
                 self._db_lane_disabled_seen = True
             except Exception:
                 pass
-            self._db_lane_try_metric_drop("db_disabled")
+
             return
 
         q: asyncio.Queue = self._db_lane_q  # type: ignore
@@ -837,7 +843,7 @@ class LoggerHistoriqueManager:
         try:
             q.put_nowait(item)
         except asyncio.QueueFull:
-            self._db_lane_try_metric_drop("queue_full")
+            self._db_lane_record_drop(op, "LOGGERH_DB_LANE_QUEUE_FULL")
             try:
                 self._db_lane_disabled_seen = True
             except Exception:
@@ -863,7 +869,7 @@ class LoggerHistoriqueManager:
             q.put_nowait(item)
         except asyncio.QueueFull:
             if getattr(self, "_db_lane_drop_when_full", True):
-                self._db_lane_try_metric_drop(op)
+                self._db_lane_record_drop(op, "LOGGERH_DB_LANE_QUEUE_FULL")
                 return
             await q.put(item)
 
@@ -891,6 +897,7 @@ class LoggerHistoriqueManager:
             return await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
             logger.warning("DB lane call timeout: %s", op)
+            self._db_lane_record_drop(op, "LOGGERH_DB_LANE_QUEUE_FULL")
             return {"status": "ERROR", "op": str(op), "err": "timeout"}
         except Exception as exc:  # noqa: PERF203
             logger.exception("DB lane call failed: %s", op)
@@ -969,6 +976,14 @@ class LoggerHistoriqueManager:
                     LOGGERH_WRITE_MS.observe(dt_ms)
                 except Exception:
                     pass
+                if op == "trades" and isinstance(res, dict):
+                    ignored = int(res.get("ignored") or 0)
+                    if ignored > 0:
+                        self._on_log_dedup("trades")
+                        logger.info(
+                            "db dedup ignored",
+                            extra={"reason_code": "DB_UNIQUE_DUPLICATE_IGNORED", "ignored": ignored},
+                        )
 
             except Exception as e:
                 logger.exception("DB lane op failed: %s", op)
@@ -1093,7 +1108,7 @@ class LoggerHistoriqueManager:
             # timeout atteint → comptage des drops best-effort
         for name, (q, _rot) in streams.items():
             if q.qsize() > 0:
-                self._drop_stream_record(name, reason="drain_timeout")
+                self._drop_stream_record(name, reason="LOGGERH_JSONL_DRAIN_TIMEOUT")
         logger.warning("jsonl_barrier: drain timeout with pending items")
 
     async def _drain_stream_once(self, order: list[str]) -> bool:
@@ -1130,11 +1145,7 @@ class LoggerHistoriqueManager:
                             line = (json.dumps(fallback, ensure_ascii=False, separators=(",", ":"),
                                                default=str) + "\n").encode("utf-8")
                         except Exception:
-                            try:
-                                from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
-                                LHM_JSONL_DROPPED_TOTAL.labels(stream=name, reason="serialize_error").inc()
-                            except Exception:
-                                pass
+                            self._drop_stream_record(name, reason="LOGGERH_JSONL_SERIALIZE_ERROR", payload=item)
                             try:
                                 self._critical_drop_seen = True
                             except Exception:
@@ -1232,6 +1243,8 @@ class LoggerHistoriqueManager:
         candidates = (
             "ts_ms",
             "timestamp_ms",
+            "recv_ts_ms",
+            "exchange_ts_ms",
             "t_done_ms",
             "t_filled_ms",
             "t_ack_ms",
@@ -1379,9 +1392,14 @@ class LoggerHistoriqueManager:
                 try:
                     from modules.obs_metrics import DERIVED_NET_PROFIT_SIGN_TOTAL
                     DERIVED_NET_PROFIT_SIGN_TOTAL.labels(
-                        module="LHM",
-                        branch=str(e.get("trade_mode") or ""),
+                        reason="net_bps",
                     ).inc()
+                except Exception:
+                    pass
+                try:
+                    from modules.obs_metrics import PNL_DERIVED_FROM_BPS_TOTAL
+                    route = str(e.get("route") or "NA")
+                    PNL_DERIVED_FROM_BPS_TOTAL.labels(route=route).inc()
                 except Exception:
                     pass
                 return
@@ -1391,8 +1409,7 @@ class LoggerHistoriqueManager:
             try:
                 from modules.obs_metrics import MISSING_NET_PROFIT_TOTAL
                 MISSING_NET_PROFIT_TOTAL.labels(
-                    module="LHM",
-                    branch=str(e.get("trade_mode") or ""),
+                    stage="missing_net_profit",
                 ).inc()
             except Exception:
                 pass
@@ -1551,10 +1568,22 @@ class LoggerHistoriqueManager:
                 notional = float(notional_raw) if notional_raw is not None else None
                 if notional is None or notional <= 0:
                     if "executed_volume_usdc" not in missing:
-                        missing.append("executed_volume_usdc")
+                       missing.append("executed_volume_usdc")
             except Exception:
                 if "executed_volume_usdc" not in missing:
-                    missing.append("executed_volume_usdc")
+                  missing.append("executed_volume_usdc")
+            tm = e.get("trade_mode")
+            if tm is not None:
+                tm_norm = str(tm).upper()
+                if tm_norm not in {"TT", "TM", "MM", "REB"}:
+                    if "trade_mode" not in missing:
+                        missing.append("trade_mode")
+                    self._on_schema_violation("trade_mode")
+                    self._log_schema_event(
+                        stream="trades",
+                        reason_code="LOGGERH_SCHEMA_MISSING_FIELD",
+                        payload=e,
+                    )
 
             if missing:
                 # Flag explicite pour consommation downstream (PnL strict, dashboards qualité)
@@ -1584,7 +1613,7 @@ class LoggerHistoriqueManager:
         try:
             from modules.obs_metrics import schema_violation_total
 
-            schema_violation_total.labels(reason=str(reason)).inc()
+            schema_violation_total.labels(field=str(reason)).inc()
         except Exception:
             pass
 
@@ -1626,12 +1655,26 @@ class LoggerHistoriqueManager:
 
     def _make_event_id(self, envelope: dict) -> str:
         try:
+            payload = envelope.get("payload")
+            idempotence_key = envelope.get("idempotence_key")
+            if not idempotence_key and isinstance(payload, dict):
+                idempotence_key = payload.get("idempotence_key")
+            if idempotence_key:
+                base = {
+                    "stream": envelope.get("stream"),
+                    "log_type": envelope.get("log_type"),
+                    "event_type": envelope.get("event_type"),
+                    "idempotence_key": idempotence_key,
+                }
+                data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
+                return hashlib.sha1(data.encode("utf-8")).hexdigest()
+
             base = {
                 "stream": envelope.get("stream"),
                 "log_type": envelope.get("log_type"),
                 "event_type": envelope.get("event_type"),
                 "ts_ms": envelope.get("ts_ms"),
-                "payload": envelope.get("payload"),
+                "payload": payload,
             }
             data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
             return hashlib.sha1(data.encode("utf-8")).hexdigest()
@@ -1656,16 +1699,33 @@ class LoggerHistoriqueManager:
         inner = self._with_context_tags(normalized)
         ts_ms = self._ensure_ts_ms(inner)
         inner.setdefault("ts_ms", ts_ms)
+        account_alias = inner.get("account_alias")
+        recv_ts_ms = inner.get("recv_ts_ms")
+        exchange_ts_ms = inner.get("exchange_ts_ms")
+        idempotence_key = inner.get("idempotence_key")
+        region = inner.get("pod_region") or inner.get("region")
 
         envelope = {
             "schema_version": schema_version,
             "stream": stream,
+            "component": "loggerh",
             "log_type": str(log_type or inner.get("log_type") or stream),
             "event_type": str(event_type or inner.get("event_type") or log_type or stream),
             "ts_ms": ts_ms,
             "payload": inner,
             "ingested_ms": int(time.time() * 1000),
         }
+        if region is not None:
+            envelope["region"] = region
+        if account_alias is not None:
+            envelope["account_alias"] = account_alias
+        if recv_ts_ms is not None:
+            envelope["recv_ts_ms"] = recv_ts_ms
+        if exchange_ts_ms is not None:
+            envelope["exchange_ts_ms"] = exchange_ts_ms
+        if idempotence_key is not None:
+            envelope["idempotence_key"] = idempotence_key
+
         if invalid:
             envelope["_schema_invalid"] = True
             if reason:
@@ -1876,7 +1936,7 @@ class LoggerHistoriqueManager:
                 except Exception:
                     pass
 
-        self._drop_stream_record(stream, reason="queue_full")
+        self._drop_stream_record(stream, reason="LOGGERH_JSONL_QUEUE_FULL", payload=payload)
         if critical:
             try:
                 self._critical_drop_seen = True
@@ -1935,6 +1995,26 @@ class LoggerHistoriqueManager:
             # [M5-A3-1] Contrat minimal TRADES (best-effort, non bloquant)
             if log_type == "trades":
                 self._validate_trade_schema(e)
+                exchange = e.get("exchange") or e.get("ex")
+                trade_id = e.get("trade_id") or e.get("id")
+                if not exchange:
+                    self._on_schema_violation("exchange")
+                    self._drop_stream_record("events", reason="LOGGERH_SCHEMA_MISSING_FIELD", payload=e)
+                    try:
+                        self._critical_drop_seen = True
+                    except Exception:
+                        pass
+                    continue
+                if not trade_id:
+                    self._on_schema_violation("trade_id")
+                    self._drop_stream_record("events", reason="LOGGERH_SCHEMA_MISSING_ID", payload=e)
+                    try:
+                        self._critical_drop_seen = True
+                    except Exception:
+                        pass
+                    continue
+                e.setdefault("idempotence_key", f"{exchange}:{trade_id}")
+
 
             # Fallback signe (sans inventer de montant)
             self._fallback_net_profit_sign(e)
@@ -2073,6 +2153,36 @@ class LoggerHistoriqueManager:
             "errors": [],
             "pnl_reconciliation": None,
         }
+        try:
+            cfg = getattr(self, "cfg", None)
+            g_cfg = getattr(cfg, "g", None) if cfg is not None else None
+            enable_jp = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else bool(
+                getattr(cfg, "enable_jp", False)
+            )
+        except Exception:
+            enable_jp = False
+        if region == "JP" and not enable_jp:
+            self._on_schema_violation("region_unsupported_jp")
+            self._log_drop_event(
+                stream="eod",
+                reason_code="REGION_UNSUPPORTED_JP",
+                payload={"region": region},
+            )
+            meta.update(
+                {
+                    "status": "SKIPPED",
+                    "errors": [{"stage": "region_guard", "err": "unsupported_jp"}],
+                    "pnl_reconciliation": {
+                        "component": "pnl_reconciliation",
+                        "status": "SKIPPED",
+                        "reason": "unsupported_region",
+                        "local_day": day,
+                        "region": region,
+                    },
+                }
+            )
+            self._emit_eod_metrics(meta)
+            return meta
 
         marker_path = Path(self._out_dir) / "eod" / f"eod-{day}.done.json"
 
@@ -2120,6 +2230,8 @@ class LoggerHistoriqueManager:
             pnl_meta = {
                 "component": "pnl_reconciliation",
                 "status": "SKIPPED",
+                "state": "SKIPPED",
+                "reason_code": "PNL_RECO_SKIPPED_FLAG",
                 "reason": "skip_cex_flag",
                 "local_day": day,
                 "region": region,
@@ -2128,6 +2240,8 @@ class LoggerHistoriqueManager:
             pnl_meta = {
                 "component": "pnl_reconciliation",
                 "status": "SKIPPED",
+                "state": "SKIPPED",
+                "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
                 "reason": "missing_fetch_fn",
                 "local_day": day,
                 "region": region,
@@ -2144,12 +2258,12 @@ class LoggerHistoriqueManager:
                     timeout=timeout_pnl_reco_s,
                 )
                 if isinstance(pnl_meta, dict):
-                    state = pnl_meta.get("global_state")
+                    state = pnl_meta.get("state")
                     if state is None:
                         pnl_meta["status"] = "SKIPPED"
-                    elif int(state) >= 2:
+                    elif state == "ERROR":
                         pnl_meta["status"] = "ERROR"
-                    elif int(state) >= 1:
+                    elif state == "ERROR":
                         pnl_meta["status"] = "WARN"
                     else:
                         pnl_meta["status"] = "OK"
@@ -2159,6 +2273,8 @@ class LoggerHistoriqueManager:
                 pnl_meta = {
                     "component": "pnl_reconciliation",
                     "status": "PARTIAL",
+                    "state": "ERROR",
+                    "reason_code": "PNL_RECO_EXCEPTION",
                     "reason": "timeout",
                     "local_day": day,
                     "region": region,
@@ -2169,6 +2285,8 @@ class LoggerHistoriqueManager:
                 pnl_meta = {
                     "component": "pnl_reconciliation",
                     "status": "ERROR",
+                    "state": "ERROR",
+                    "reason_code": "PNL_RECO_EXCEPTION",
                     "reason": "exception",
                     "err": str(exc),
                     "local_day": day,
@@ -2733,11 +2851,13 @@ class LoggerHistoriqueManager:
             return {
                 "component": "pnl_reconciliation",
                 "enabled": False,
-                "reason": "disabled",
+                "state": "SKIPPED",
+                "reason_code": "PNL_RECO_SKIPPED_FLAG",
                 "local_day": local_day,
                 "region": pod_region,
                 "rows": [],
-                "global_state": None,
+                 "window_since_ms": None,
+                "window_until_ms": None,
             }
 
         # 1) Résolution région + jour local
@@ -2766,6 +2886,25 @@ class LoggerHistoriqueManager:
             else:
                 dt_now_loc = datetime.now()
             local_day_str = dt_now_loc.strftime("%Y-%m-%d")
+        tz_name = {
+            "EU": "Europe/Rome",
+            "US": "America/New_York",
+            "JP": "Asia/Tokyo",
+        }.get(region, "Europe/Rome")
+        try:
+            dt_start_loc = datetime.strptime(local_day_str, "%Y-%m-%d")
+            if ZoneInfo is not None:
+                dt_start_loc = dt_start_loc.replace(tzinfo=ZoneInfo(tz_name))
+            else:
+                dt_start_loc = dt_start_loc.replace(tzinfo=timezone.utc)
+            dt_end_loc = dt_start_loc + timedelta(days=1)
+            dt_start_utc = dt_start_loc.astimezone(timezone.utc)
+            dt_end_utc = dt_end_loc.astimezone(timezone.utc)
+            window_since_ms = int(dt_start_utc.timestamp() * 1000)
+            window_until_ms = int(dt_end_utc.timestamp() * 1000) - 1
+        except Exception:
+            window_since_ms = None
+            window_until_ms = None
 
         # Limite d'âge (lookback) best-effort
         max_lookback_days = int(getattr(self, "_pnl_reco_max_lookback_days", 0) or 0)
@@ -2786,12 +2925,14 @@ class LoggerHistoriqueManager:
                     return {
                         "component": "pnl_reconciliation",
                         "enabled": True,
-                        "skipped": True,
+                        "state": "SKIPPED",
+                        "reason_code": "PNL_RECO_SKIPPED_FLAG",
                         "reason": f"outside_lookback({delta_days}d)",
                         "local_day": local_day_str,
                         "region": region,
                         "rows": [],
-                        "global_state": None,
+                        "window_since_ms": window_since_ms,
+                        "window_until_ms": window_until_ms,
                     }
             except Exception:
                 # En cas de problème de parsing, on continue sans gate
@@ -2807,8 +2948,11 @@ class LoggerHistoriqueManager:
                 "local_day": local_day_str,
                 "region": region,
                 "rows": [],
-                "global_state": None,
+                "state": "ERROR",
+                "reason_code": "PNL_RECO_EXCEPTION",
                 "error": "logwriter_not_ready",
+                "window_since_ms": window_since_ms,
+                "window_until_ms": window_until_ms,
             }
 
         views_db: dict | None = None
@@ -2854,12 +2998,17 @@ class LoggerHistoriqueManager:
                 "local_day": local_day_str,
                 "region": region,
                 "rows": [],
-                "global_state": None,
+                "state": "ERROR",
+                "reason_code": "PNL_RECO_EXCEPTION",
                 "error": "db_pnl_unavailable",
+                "window_since_ms": window_since_ms,
+                "window_until_ms": window_until_ms,
             }
 
         # 3) Prépare la vue DB par (exchange, account_alias)
         rows_acc = views_db.get("pnl_by_account") or []
+        base_ccy = views_db.get("base_currency") or views_db.get("base_ccy")
+        quote_ccy = views_db.get("quote_ccy")
         db_map: dict[tuple[str, str], dict] = {}
         for row in rows_acc:
             try:
@@ -2875,6 +3024,8 @@ class LoggerHistoriqueManager:
                     "fees_quote": float(pnl.get("fees") or 0.0),
                     "turnover_quote": float(pnl.get("turnover_quote") or 0.0),
                     "trades": int(pnl.get("trades") or 0),
+                    "base_ccy": base_ccy,
+                    "quote_ccy": quote_ccy,
                     "quality": {
                         "pnl_missing": int(quality.get("pnl_missing") or 0),
                         "pnl_missing_share": float(quality.get("pnl_missing_share") or 0.0),
@@ -2892,21 +3043,24 @@ class LoggerHistoriqueManager:
             return {
                 "component": "pnl_reconciliation",
                 "enabled": True,
-                "skipped": True,
-                "reason": "no_fetch_pnl_cex_fn",
+                "state": "SKIPPED",
+                "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
                 "local_day": local_day_str,
                 "region": region,
                 "rows": [],
-                "global_state": None,
+                "window_since_ms": window_since_ms,
+                "window_until_ms": window_until_ms,
             }
 
         # 5) Boucle de comparaison DB ↔ CEX
         rows_out: list[dict] = []
-        global_state = 0  # max(0/1/2)
+        global_state = "OK"
+        state_rank = {"SKIPPED": 0, "OK": 1, "MISMATCH": 2, "ERROR": 3}
 
         for (ex, alias), db_info in db_map.items():
             error_kind: str | None = None
             pnl_cex: dict | None = None
+            error_stage: str | None = None
 
             # 5.a) Fetch PnL côté CEX
             try:
@@ -2919,35 +3073,40 @@ class LoggerHistoriqueManager:
                         "fees_quote": float(res.get("fees_quote") or 0.0),
                         "turnover_quote": float(res.get("turnover_quote") or 0.0),
                         "trades": int(res.get("trades") or 0),
+                        "base_ccy": res.get("base_ccy") or res.get("base_currency"),
+                        "quote_ccy": res.get("quote_ccy") or res.get("quote_currency"),
+                        "notional_quote_ccy": res.get("notional_quote_ccy"),
+                        "notional_quote_amt": res.get("notional_quote_amt"),
                     }
                 else:
                     error_kind = "cex_result_invalid"
+                    error_stage = "cex_result_invalid"
             except Exception:
                 logger.exception(
                     "run_pnl_reconciliation_for_day: fetch_pnl_cex_fn failed",
                     extra={"exchange": ex, "account_alias": alias},
                 )
                 error_kind = "cex_fetch_error"
+                error_stage = "fetch_cex"
 
             pnl_db = db_info
             quality_db = db_info.get("quality") or {}
 
             if pnl_cex is None:
-                # Impossible de comparer: on marque CRIT best-effort
-                state = 2
-                level = "CRIT"
-                reason = "cex_pnl_unavailable"
+                state = "ERROR"
+                reason_code = "PNL_RECO_EXCEPTION"
                 abs_diff = 0.0
+                ratio_diff = 0.0
                 trades_diff = 0
             else:
                 # 5.b) Classification mismatch
-                state, level, reason, abs_diff, trades_diff = self._classify_pnl_mismatch(
+                state, reason_code, abs_diff, ratio_diff, trades_diff = self._classify_pnl_mismatch(
                     pnl_db=pnl_db,
                     pnl_cex=pnl_cex,
-                    quality_db=quality_db,
                 )
 
-            global_state = max(global_state, int(state))
+            if state_rank.get(state, 0) > state_rank.get(global_state, 0):
+                global_state = state
 
             # 5.c) Metrics (sauf en dry_run)
             if not dry_run:
@@ -2955,10 +3114,10 @@ class LoggerHistoriqueManager:
                     region=region,
                     exchange=ex,
                     account_alias=alias,
-                    state=int(state),
-                    level=str(level),
+                    state=str(state),
+                    reason_code=str(reason_code),
                     abs_diff_quote=float(abs_diff),
-                    error_kind=error_kind,
+                    error_stage=error_stage,
                 )
 
             rows_out.append(
@@ -2972,6 +3131,8 @@ class LoggerHistoriqueManager:
                         "fees_quote": pnl_db.get("fees_quote", 0.0),
                         "turnover_quote": pnl_db.get("turnover_quote", 0.0),
                         "trades": pnl_db.get("trades", 0),
+                        "base_ccy": pnl_db.get("base_ccy"),
+                        "quote_ccy": pnl_db.get("quote_ccy"),
                     },
                     "pnl_cex": pnl_cex,
                     "delta": {
@@ -2981,9 +3142,14 @@ class LoggerHistoriqueManager:
                         ) if pnl_cex is not None else 0.0,
                         "trades_diff": int(trades_diff),
                     },
-                    "state": int(state),
-                    "level": str(level),
-                    "reason": str(reason),
+                    "state": str(state),
+                    "reason_code": str(reason_code),
+                    "abs_diff_quote": float(abs_diff),
+                    "ratio_diff": float(ratio_diff),
+                    "trades_internal_count": int(pnl_db.get("trades") or 0),
+                    "trades_cex_count": int(pnl_cex.get("trades") or 0) if pnl_cex else None,
+                    "window_since_ms": window_since_ms,
+                    "window_until_ms": window_until_ms,
                     "quality_db": dict(quality_db),
                     "error_kind": error_kind,
                 }
@@ -3002,7 +3168,10 @@ class LoggerHistoriqueManager:
             "enabled": True,
             "local_day": local_day_str,
             "region": region,
-            "global_state": int(global_state) if rows_out else None,
+            "state": global_state if rows_out else "SKIPPED",
+            "reason_code": None if rows_out else "PNL_RECO_SKIPPED_FLAG",
+            "window_since_ms": window_since_ms,
+            "window_until_ms": window_until_ms,
             "rows": rows_out,
         }
 
@@ -3011,19 +3180,18 @@ class LoggerHistoriqueManager:
         *,
         pnl_db: dict,
         pnl_cex: dict,
-        quality_db: dict | None = None,
-    ) -> tuple[int, str, str, float, int]:
+    ) -> tuple[int, str, float, float, int]:
         """
         Applique la tolérance PnL Reco pour classifier un écart DB ↔ CEX.
 
         Retourne:
-        - state : 0=OK, 1=WARN, 2=CRIT
-        - level : "OK" | "WARN" | "CRIT"
-        - reason : motif synthétique ("within_tolerance", "moderate_diff", ...)
+        - state : "OK" | "MISMATCH"
+        - reason_code : code canonique du mismatch
         - abs_diff_quote : |PnL_CEX - PnL_DB|
+        - ratio_diff : abs_diff / max(1, |PnL_CEX|)
         - trades_diff : trades_cex - trades_db
         """
-        # Tolérances config (avec fallback robuste)
+
         tol_abs = float(getattr(self, "_pnl_reco_tol_abs_quote", 25.0) or 0.0)
         tol_pct = float(getattr(self, "_pnl_reco_tol_pct", 0.01) or 0.0)
 
@@ -3038,37 +3206,14 @@ class LoggerHistoriqueManager:
         denom = max(1.0, abs(np_cex))
         ratio = abs_diff / denom
 
-        q = quality_db or {}
-        missing_share = float(q.get("pnl_missing_share") or 0.0)
-        derived_share = float(q.get("derived_share") or 0.0)
+        if trades_diff != 0:
+            return "MISMATCH", "PNL_RECO_MISMATCH_TRADES_COUNT", float(abs_diff), float(ratio), int(trades_diff)
+        if abs_diff > tol_abs or ratio > tol_pct:
+            return "MISMATCH", "PNL_RECO_MISMATCH_ABS_DIFF_QUOTE", float(abs_diff), float(ratio), int(trades_diff)
 
-        # Base: dans la tolérance → OK
-        if abs_diff <= tol_abs and ratio <= tol_pct:
-            state = 0
-            level = "OK"
-            reason = "within_tolerance"
-        else:
-            # Déviation modérée → WARN
-            if ratio <= tol_pct * 2.0 and abs_diff <= tol_abs * 3.0:
-                state = 1
-                level = "WARN"
-                reason = "moderate_diff"
-            else:
-                state = 2
-                level = "CRIT"
-                reason = "large_diff"
 
-            # Qualité DB faible : on le note dans le reason
-            if missing_share > 0.05 or derived_share > 0.05:
-                reason = f"{reason}_db_low_quality"
 
-        # Mismatch sur les volumes de trades : au minimum WARN
-        if trades_diff != 0 and state == 0:
-            state = 1
-            level = "WARN"
-            reason = "trades_count_mismatch"
-
-        return int(state), str(level), str(reason), float(abs_diff), int(trades_diff)
+        return "OK", "within_tolerance", float(abs_diff), float(ratio), int(trades_diff)
 
     def _emit_pnl_reco_metrics(
         self,
@@ -3076,25 +3221,26 @@ class LoggerHistoriqueManager:
         region: str,
         exchange: str,
         account_alias: str,
-        state: int,
-        level: str,
+        state: str,
+        reason_code: str,
         abs_diff_quote: float,
-        error_kind: str | None = None,
+        error_stage: str | None = None,
     ) -> None:
         """
         Pousse les métriques PnL Reco pour un (region,exchange,account_alias).
 
-        - state: 0/1/2
-        - level: "OK"/"WARN"/"CRIT"
+        - state: "OK"/"MISMATCH"/"ERROR"/"SKIPPED"
         - abs_diff_quote: |PnL_CEX - PnL_DB|
-        - error_kind: type d'erreur éventuelle ("cex_fetch_error", ...)
+        - state: "OK"/"MISMATCH"/"ERROR"/"SKIPPED"
         """
         try:
-            PNL_RECO_STATE.labels(
-                region=region,
-                exchange=exchange,
-                account_alias=account_alias,
-            ).set(float(state))
+            for candidate in ("OK", "MISMATCH", "ERROR", "SKIPPED"):
+                PNL_RECO_STATE.labels(
+                    region=region,
+                    exchange=exchange,
+                    account_alias=account_alias,
+                    state=candidate,
+                ).set(1.0 if candidate == state else 0.0)
         except Exception:
             logger.exception(
                 "emit_pnl_reco_metrics: failed to push PNL_RECO_STATE",
@@ -3113,29 +3259,32 @@ class LoggerHistoriqueManager:
                 extra={"region": region, "exchange": exchange, "account_alias": account_alias},
             )
 
-        # Compteur de mismatches WARN/CRIT
-        if level in ("WARN", "CRIT"):
+        # Compteur de mismatches
+        if state == "MISMATCH":
+            reason_norm = self._normalize_reason_code(reason_code)
             try:
                 PNL_RECO_MISMATCH_TOTAL.labels(
                     region=region,
                     exchange=exchange,
                     account_alias=account_alias,
-                    level=level,
+                    reason=str(reason_norm),
                 ).inc()
             except Exception:
                 logger.exception(
                     "emit_pnl_reco_metrics: failed to inc PNL_RECO_MISMATCH_TOTAL",
-                    extra={"region": region, "exchange": exchange, "account_alias": account_alias, "level": level},
+                    extra={"region": region, "exchange": exchange, "account_alias": account_alias, "reason": reason_code},
                 )
 
+
         # Compteur d'erreurs techniques éventuelles
-        if error_kind:
+        if error_stage:
             try:
+
                 PNL_RECO_ERRORS_TOTAL.labels(
                     region=region,
                     exchange=exchange,
                     account_alias=account_alias,
-                    kind=error_kind,
+                    stage=error_stage,
                 ).inc()
             except Exception:
                 logger.exception(
@@ -3144,7 +3293,7 @@ class LoggerHistoriqueManager:
                         "region": region,
                         "exchange": exchange,
                         "account_alias": account_alias,
-                        "kind": error_kind,
+                        "stage": error_stage,
                     },
                 )
 
@@ -3230,6 +3379,13 @@ class LoggerHistoriqueManager:
         except Exception:
             pass
 
+    def on_btl_drop(self, log_type: str, *, reason: str) -> None:
+        try:
+            from modules.obs_metrics import lhm_on_dropped
+            lhm_on_dropped("btl", reason, n=1)
+        except Exception:
+            pass
+
     def on_btl_flush_latency(self, log_type: str, *, ms: float) -> None:
         try:
             from modules.obs_metrics import LOGGERH_WRITE_MS
@@ -3240,6 +3396,13 @@ class LoggerHistoriqueManager:
     def on_btl_emitted(self, log_type: str, *, n: int) -> None:
         # Optionnel : ici on pourrait pousser un compteur “batches” si on veut
         pass
+
+    def on_btl_filter_exception(self, log_type: str) -> None:
+        try:
+            from modules.obs_metrics import SCHEMA_VIOLATION_TOTAL
+            SCHEMA_VIOLATION_TOTAL.labels(field="filter_exception").inc()
+        except Exception:
+            pass
 
     # -------- API santé PnL (M5-B4-3) ----------------------------
     def get_pnl_pipeline_flags(self) -> dict[str, bool]:
@@ -3827,28 +3990,162 @@ class LoggerHistoriqueManager:
         await self._append_jsonl("mm_hedges", self._with_context_tags(payload), id_key="hedge_id")
 
     # ---- helper commun
+    def _normalize_reason_code(self, reason: str | None) -> str:
+        try:
+            from contracts import payloads as contracts
+            normalized = contracts.normalize_reason_code(reason)
+            return normalized or "UNKNOWN"
+        except Exception:
+            return str(reason or "UNKNOWN")
+
+    def _log_drop_event(
+            self,
+            *,
+            stream: str,
+            reason_code: str,
+            payload: dict | None = None,
+            lane: str | None = None,
+    ) -> None:
+        try:
+            sample_key = {
+                "stream": stream,
+                "reason_code": reason_code,
+                "lane": lane,
+                "id": (payload or {}).get("id"),
+                "event_id": (payload or {}).get("event_id"),
+            }
+            if not self._stable_sample(sample_key, getattr(self, "_drop_log_sample_rate", 0.1)):
+                return
+        except Exception:
+            pass
+
+        exchange = None
+        account_alias = None
+        if isinstance(payload, dict):
+            exchange = payload.get("exchange") or payload.get("ex")
+            account_alias = payload.get("account_alias")
+
+        logger.warning(
+            "loggerh drop",
+            extra={
+                "event_type": "loggerh_drop",
+                "reason_code": reason_code,
+                "stream": stream,
+                "lane": lane,
+                "exchange": exchange,
+                "account_alias": account_alias,
+            },
+        )
+
+    def _log_schema_event(self, *, stream: str, reason_code: str, payload: dict | None = None) -> None:
+        try:
+            sample_key = {
+                "stream": stream,
+                "reason_code": reason_code,
+                "id": (payload or {}).get("id"),
+            }
+            if not self._stable_sample(sample_key, getattr(self, "_drop_log_sample_rate", 0.1)):
+                return
+        except Exception:
+            pass
+
+        logger.warning(
+            "loggerh schema violation",
+            extra={
+                "event_type": "loggerh_schema",
+                "reason_code": reason_code,
+                "stream": stream,
+            },
+        )
+
+    def _build_idempotence_key(self, stream: str, payload: dict, id_key: str) -> str | None:
+        exchange = payload.get("exchange") or payload.get("ex")
+        if exchange is not None:
+            exchange = str(exchange).strip().replace("-", "").replace("_", "").upper()
+        account_alias = payload.get("account_alias")
+        if stream in {"fills_normalized", "trades"}:
+            trade_id = payload.get("trade_id") or payload.get("id") or payload.get(id_key)
+            if exchange and trade_id:
+                return f"{exchange}:{trade_id}"
+            return None
+        if stream in {"engine_submits", "engine_acks"}:
+            client_id = payload.get(id_key) or payload.get("client_id")
+            if exchange and account_alias and client_id:
+                return f"{exchange}:{account_alias}:{client_id}"
+            return None
+        if stream == "privatews_events":
+            event_id = payload.get(id_key) or payload.get("event_id")
+            if exchange and event_id:
+                return f"{exchange}:{event_id}"
+            order_id = payload.get("order_id") or payload.get("exchange_order_id")
+            sequence = payload.get("sequence") or payload.get("seq")
+            if exchange and order_id and sequence is not None:
+                return f"{exchange}:{order_id}:{sequence}"
+            return None
+        return None
+
     async def _append_jsonl(self, stream: str, payload: Dict[str, Any], *, id_key: str) -> None:
         try:
-
-            ts_ns = int(time.time_ns())
             obj = self._with_context_tags(dict(payload or {}))
-            ev_id = str(obj.get(id_key) or obj.get("id") or obj.get("client_order_id") or ts_ns)
-            obj.setdefault("ts_ns", ts_ns)
-            obj.setdefault("type", stream)
-            obj.setdefault("id", ev_id)
+            is_critical = bool(self._stream_critical.get(stream, False))
+            exchange = obj.get("exchange") or obj.get("ex")
+            if exchange is not None:
+                exchange = str(exchange).strip().replace("-", "").replace("_", "").upper()
+            id_candidate = obj.get(id_key) or obj.get("id") or obj.get("client_order_id")
+            idempotence_key = self._build_idempotence_key(stream, obj, id_key)
 
-            await self._enqueue_jsonl(stream, obj, is_critical=self._stream_critical.get(stream, False))
+            if is_critical:
+                if not exchange:
+                    self._on_schema_violation("exchange")
+                    self._drop_stream_record(stream, reason="LOGGERH_SCHEMA_MISSING_FIELD", payload=obj)
+                    return
+                if not id_candidate or not idempotence_key:
+                    self._on_schema_violation(id_key)
+                    self._drop_stream_record(stream, reason="LOGGERH_SCHEMA_MISSING_ID", payload=obj)
+                    return
+
+            if id_candidate is None:
+                id_candidate = int(time.time_ns())
+
+            obj.setdefault("type", stream)
+            obj.setdefault("id", str(id_candidate))
+            if idempotence_key is not None:
+               obj["idempotence_key"] = idempotence_key
+            envelope = self._build_envelope(stream, obj, log_type=stream)
+            await self._enqueue_jsonl(stream, envelope, is_critical=is_critical)
+
         except Exception:
             logger.exception("_append_jsonl enqueue failed (%s)", stream)
 
-    def _drop_stream_record(self, stream: str, reason: str = "queue_full") -> None:
+
+    def _drop_stream_record(self, stream: str, reason: str = "queue_full", payload: dict | None = None) -> None:
         # métriques best-effort + low-cardinality (stream, reason)
+        reason_code = self._normalize_reason_code(reason)
         try:
             from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
-            LHM_JSONL_DROPPED_TOTAL.labels(stream=stream, reason=reason).inc()
+            LHM_JSONL_DROPPED_TOTAL.labels(stream=stream, reason=reason_code).inc()
         except Exception:
             pass
-        # pas de log spammy; laisse Prometheus raconter l'histoire
+        self._log_drop_event(stream=stream, reason_code=reason_code, payload=payload)
+        try:
+            critical = False
+            if stream in self._stream_critical:
+                critical = True
+            elif isinstance(payload, dict):
+                log_type = str(payload.get("log_type") or "").lower()
+                inner = payload.get("payload") if isinstance(payload.get("payload"), dict) else payload
+                kind = str(inner.get("event_type") or inner.get("kind") or "").lower()
+                critical = (
+                        log_type in ("trades", "balances", "balance_snapshots")
+                        or kind.startswith("rm.")
+                        or kind.startswith("engine.")
+                        or kind.startswith("balance.")
+                )
+            if critical:
+                self._critical_drop_seen = True
+        except Exception:
+            pass
+
 
     async def _drain_all_streams_once(self) -> None:
         """

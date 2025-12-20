@@ -45,6 +45,7 @@ from __future__ import annotations
 import enum
 import math
 import time
+import re
 import uuid
 import logging
 from typing import Any, Dict, List, Optional,Tuple
@@ -163,6 +164,16 @@ class Liquidity(str, enum.Enum):
     TAKER = "TAKER"
     UNKNOWN = "UNKNOWN"
 
+class PortfolioRiskMetricsFields(str, enum.Enum):
+    PNL = "pnl"
+    PNL_PCT = "pnl_pct"
+    NET_EXPOSURE = "net_exposure"
+    GROSS_EXPOSURE = "gross_exposure"
+    LEVERAGE = "leverage"
+    VAR_95 = "var_95"
+    VAR_99 = "var_99"
+
+
 SCHEMA_VERSION = "1.1.0"
 SCHEMA_VERSION_MAJOR = 1
 
@@ -207,7 +218,36 @@ def _norm_pair_key(sym: str) -> str:
 
 def _norm_exchange(sym: str) -> str:
     return (sym or "").strip().upper()
+def _asset_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(v) for v in value if v is not None]
+    return [str(value)]
 
+def _normalize_metric_key(key: Any) -> str:
+    text = str(key or "").strip().lower()
+    if not text:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", text).strip("_")
+
+PORTFOLIO_RISK_METRICS_ALIASES = {
+    "pnl": "pnl",
+    "profit_loss": "pnl",
+    "pnl_pct": "pnl_pct",
+    "pnl_percent": "pnl_pct",
+    "net_exposure": "net_exposure",
+    "gross_exposure": "gross_exposure",
+    "leverage": "leverage",
+    "var95": "var_95",
+    "var_95": "var_95",
+    "var99": "var_99",
+    "var_99": "var_99",
+}
+
+PORTFOLIO_RISK_METRICS_KEYS = {
+    _normalize_metric_key(v.value) for v in PortfolioRiskMetricsFields
+}.union({_normalize_metric_key(k) for k in PORTFOLIO_RISK_METRICS_ALIASES})
 
 def encode_flow_meta(flow_kind: str | None = None, risk_effect: str | None = None) -> Dict[str, str]:
     """Helper best-effort pour encoder un meta (flow_kind, risk_effect) canonique."""
@@ -999,6 +1039,60 @@ class BalanceSnapshotRM(_Cfg, BaseModel):
     balances: Dict[str, Any]
     meta: Dict[str, Any]
 
+class CMExposure(_Cfg, BaseModel):
+    asset: List[str] = Field(default_factory=list)
+    exposure: Optional[float] = None
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("asset", mode="before")
+    @classmethod
+    def _v_asset_list(cls, v: Any) -> List[str]:
+        return _asset_list(v)
+
+    def __init__(self, **data: Any):  # type: ignore[override]
+        super().__init__(**data)
+        if ConfigDict is None:
+            self.asset = _asset_list(getattr(self, "asset", None))
+
+class CMSnapshots(_Cfg, BaseModel):
+    asset: List[str] = Field(default_factory=list)
+    snapshots: List[CMExposure] = Field(default_factory=list)
+    ts: float = Field(default_factory=_now_s)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("asset", mode="before")
+    @classmethod
+    def _v_asset_list(cls, v: Any) -> List[str]:
+        return _asset_list(v)
+
+    def __init__(self, **data: Any):  # type: ignore[override]
+        super().__init__(**data)
+        if ConfigDict is None:
+            self.asset = _asset_list(getattr(self, "asset", None))
+
+class PortfolioSnapshot(_Cfg, BaseModel):
+    risk_metrics: Dict[str, Any] = Field(default_factory=dict)
+    exposure_dict: Dict[str, Any] = Field(default_factory=dict)
+    ts: float = Field(default_factory=_now_s)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_risk_metrics(cls, values: Dict[str, Any]):
+        if not isinstance(values, dict):
+            return values
+        risk_metrics = values.get("risk_metrics") or {}
+        if not isinstance(risk_metrics, dict):
+            return values
+        unknown = []
+        for key in risk_metrics.keys():
+            if _normalize_metric_key(key) not in PORTFOLIO_RISK_METRICS_KEYS:
+                unknown.append(key)
+        if unknown:
+            joined = ", ".join(str(k) for k in unknown)
+            raise ValueError(f"Unknown risk_metrics key(s): {joined}")
+        return values
+
 class FeesSnapshot(_Cfg, BaseModel):
     exchange: str
     symbol: Optional[str] = None
@@ -1413,6 +1507,35 @@ KNOWN_REASON_CODES = {
     "ENGINE_REJECT",
     "ENGINE_BACKPRESSURE_QUEUE_FULL",
     "ENGINE_BACKPRESSURE_HIGH_WM",
+"LOGGERH_BTL_QUEUE_FULL_DROP",
+    "LOGGERH_BTL_PUT_TIMEOUT_DROP",
+    "LOGGERH_BTL_FLUSH_EMIT_FAILED",
+    "LOGGERH_BTL_FILTER_EXCEPTION",
+    "LOGGERH_SCHEMA_MISSING_ID",
+    "LOGGERH_SCHEMA_MISSING_FIELD",
+    "LOGGERH_JSONL_QUEUE_FULL",
+    "LOGGERH_JSONL_SERIALIZE_ERROR",
+    "LOGGERH_JSONL_WRITE_ERROR",
+    "LOGGERH_JSONL_DRAIN_TIMEOUT",
+    "LOGGERH_DB_LANE_QUEUE_FULL",
+    "REGION_UNSUPPORTED_JP",
+    "PNL_RECO_SKIPPED_ADAPTER_MISSING",
+    "PNL_RECO_SKIPPED_FLAG",
+    "PNL_RECO_MISMATCH_ABS_DIFF_QUOTE",
+    "PNL_RECO_MISMATCH_TRADES_COUNT",
+    "PNL_RECO_EXCEPTION",
+    "DB_UNIQUE_DUPLICATE_IGNORED",
+    "DB_SCHEMA_MISSING_TS_MS",
+    "DB_ROTATE_FAILED",
+    "PNL_INCOMPLETE_MISSING_NET_PROFIT",
+    "PNL_DERIVED_FROM_BPS",
+    "PNL_FX_MISSING_FOR_NON_USDC",
+    "BOOT_DEP_MISSING",
+    "BOOT_DEP_START_FAIL",
+    "BOOT_READY_BLOCKED",
+    "BOOT_STOP_TIMEOUT",
+    "REGION_JP_DISABLED_BY_DEFAULT",
+    "BOOT_MODE_FALLBACK",
 }
 
 
@@ -1436,12 +1559,13 @@ def normalize_reason_code(reason: Optional[str]) -> Optional[str]:
 # -----------------------------------------------------------------------------
 __all__ = [
     "SCHEMA_VERSION", "SCHEMA_VERSION_MAJOR",
-    "Side", "Action", "Liquidity",
+    "Side", "Action", "Liquidity", "PortfolioRiskMetricsFields",
     "MarketEvent", "VolEvent", "SlipEvent", "HealthEvent",
     "Opportunity", "RiskDecision", "EngineAction",
     "SubmitLeg", "OrderIntent", "SubmitBundleRequest", "SubmitBundle", "CancelRequest",
     "OrderModel", "FillModel", "FillNormalized",
     "PrivateFillEvent", "WSAliasStatusSnapshot", "RecoAliasStatusSnapshot", "BalanceSnapshotRM",
+    "CMExposure", "CMSnapshots", "PortfolioSnapshot",
     "FeesSnapshot", "SlippageSnapshot", "VolatilitySnapshot",
     "DiscoveryResult", "SimResult",  "opportunity_from_scanner", "decision_submit_from_rm", "engine_action_from_decision",
     "submit_leg_from_intent", "engine_action_from_intent",

@@ -59,8 +59,10 @@ class _NoopMetricsProxy:
     def on_btl_queue_depth(self, *a, **k): pass
     def on_btl_highwater(self, *a, **k): pass
     def on_btl_drop_full(self, *a, **k): pass
+    def on_btl_drop(self, *a, **k): pass
     def on_btl_flush_latency(self, *a, **k): pass
     def on_btl_emitted(self, *a, **k): pass
+    def on_btl_filter_exception(self, *a, **k): pass
 
 logger = logging.getLogger("BaseTradeLogger")
 
@@ -111,16 +113,46 @@ class BaseTradeLogger:
 
     # ---------------------------- ingestion -----------------------------
     def ingest(self, entry):
+        if entry is None:
+            return
+        data = entry
+        if isinstance(entry, dict):
+            data = dict(entry)
+            recv_ts_ns = self._to_int(data.get("recv_ts_ns"))
+            recv_ts_ms = self._to_int(data.get("recv_ts_ms"))
+            if recv_ts_ns is None and recv_ts_ms is None:
+                recv_ts_ns = time.time_ns()
+                recv_ts_ms = recv_ts_ns // 1_000_000
+            elif recv_ts_ns is None and recv_ts_ms is not None:
+                recv_ts_ns = int(recv_ts_ms) * 1_000_000
+            elif recv_ts_ms is None and recv_ts_ns is not None:
+                recv_ts_ms = int(recv_ts_ns) // 1_000_000
+            if recv_ts_ms is not None:
+                data["recv_ts_ms"] = int(recv_ts_ms)
+            if recv_ts_ns is not None:
+                data["recv_ts_ns"] = int(recv_ts_ns)
+
         # fast-path: filtrage amont (on ne casse jamais)
         try:
-            if self.trade_filter and not self.trade_filter(entry):
+            if self.trade_filter and not self.trade_filter(data):
                 return
         except Exception:
-            # filtre défaillant => on loggue quand même
-            pass
+            if isinstance(data, dict):
+                data["filter_error"] = True
+            self._log_event(
+                logging.WARNING,
+                "BTL filter exception",
+                reason_code="LOGGERH_BTL_FILTER_EXCEPTION",
+                entry=data,
+                exc_info=True,
+            )
+            self._metrics_proxy.on_btl_filter_exception(self.log_type)
 
         try:
-            self._queue.put_nowait(entry)
+            if self.drop_when_full:
+                self._queue.put_nowait(data)
+            else:
+                self._queue.put(data, timeout=0.05)
             qd = self._queue.qsize()
             # proxy métriques centralisé LHM
             self._metrics_proxy.on_btl_queue_depth(self.log_type, depth=qd)
@@ -128,8 +160,18 @@ class BaseTradeLogger:
                 self._metrics_proxy.on_btl_highwater(self.log_type, depth=qd)
             self._last_enqueue_ts_ms = int(time.time() * 1000)
         except QueueFull:
-            # drop explicite — comportement conservé, métriques via LHM
-            self._metrics_proxy.on_btl_drop_full(self.log_type)
+            reason_code = (
+                "LOGGERH_BTL_QUEUE_FULL_DROP"
+                if self.drop_when_full
+                else "LOGGERH_BTL_PUT_TIMEOUT_DROP"
+            )
+            self._log_event(
+                logging.WARNING,
+                "BTL drop",
+                reason_code=reason_code,
+                entry=data,
+            )
+            self._metrics_proxy.on_btl_drop(self.log_type, reason=reason_code)
 
     def ingest_many(self, trades: List[Dict[str, Any]] | None) -> None:
         if not trades:
@@ -196,9 +238,9 @@ class BaseTradeLogger:
             except Exception:
                 logging.exception("BaseTradeLogger._emit_remaining failed at shutdown")
 
-    def _emit(self, batch: List[Dict[str, Any]]) -> None:
+    def _emit(self, batch: List[Dict[str, Any]]) -> bool:
         if not batch or not getattr(self, "_event_sink", None):
-            return
+            return True
         import time, logging
         t0 = time.perf_counter()
         try:
@@ -214,10 +256,12 @@ class BaseTradeLogger:
             # Hook métrique (centralisé côté LHM)
             self._metrics_proxy.on_btl_flush_latency(self.log_type, ms=dur_ms)
             self._metrics_proxy.on_btl_emitted(self.log_type, n=len(batch))
+            return True
         except Exception:
             logging.getLogger("BaseTradeLogger").exception("emit failed")
+            return False
 
-    def _emit_remaining(self) -> None:
+    def _emit_remaining(self) -> bool:
         items: List[Dict[str, Any]] = []
         while True:
             try:
@@ -225,8 +269,9 @@ class BaseTradeLogger:
             except QueueEmpty:
                 break
         if items:
-            self._emit(items)
-    # --------------------------- normalisation --------------------------
+            return self._emit(items)
+        return True
+            # --------------------------- normalisation --------------------------
     @staticmethod
     def _norm_pair(x: Optional[str]) -> Optional[str]:
         if not x:
@@ -321,6 +366,7 @@ class BaseTradeLogger:
         maker_order_id = trade.get("maker_order_id")
         taker_order_id = trade.get("taker_order_id")
         rebal_group_id = trade.get("rebal_group_id")
+        trace_id = trade.get("trace_id")
 
         # --------- timestamps (ms) ---------
         t_sent_ms = self._first(self._to_int(trade.get("t_sent_ms")),
@@ -329,6 +375,16 @@ class BaseTradeLogger:
         t_ack_ms = self._first(self._to_int(trade.get("t_ack_ms")), self._to_int(trade.get("ack_ms")))
         t_filled_ms = self._first(self._to_int(trade.get("t_filled_ms")), self._to_int(trade.get("fill_ms")))
         t_done_ms = self._first(self._to_int(trade.get("t_done_ms")), self._to_int(trade.get("done_ms")))
+        recv_ts_ms = self._to_int(trade.get("recv_ts_ms"))
+        recv_ts_ns = self._to_int(trade.get("recv_ts_ns"))
+        if recv_ts_ms is None and recv_ts_ns is not None:
+            recv_ts_ms = int(recv_ts_ns) // 1_000_000
+        if recv_ts_ns is None and recv_ts_ms is not None:
+            recv_ts_ns = int(recv_ts_ms) * 1_000_000
+        if recv_ts_ms is None and recv_ts_ns is None:
+            now_ns = time.time_ns()
+            recv_ts_ns = now_ns
+            recv_ts_ms = now_ns // 1_000_000
 
         engine_latency_ms = self._to_float(trade.get("engine_latency_ms"))
         ack_latency_ms, fill_latency_ms, end_to_end_ms = self._compute_latencies(
@@ -473,6 +529,7 @@ class BaseTradeLogger:
             "maker_order_id": maker_order_id,
             "taker_order_id": taker_order_id,
             "rebal_group_id": rebal_group_id,
+            "trace_id": trace_id,
 
             "latency": self._to_float(trade.get("latency")),
             "engine_latency_ms": engine_latency_ms,
@@ -483,6 +540,9 @@ class BaseTradeLogger:
             "t_ack_ms": t_ack_ms,
             "t_filled_ms": t_filled_ms,
             "t_done_ms": t_done_ms,
+            "recv_ts_ms": recv_ts_ms,
+            "recv_ts_ns": recv_ts_ns,
+
 
             "executed_volume_usdc": volume_usdc,
             "vwap_buy": vwap_buy,
@@ -503,6 +563,8 @@ class BaseTradeLogger:
 
             "raw_json": json.dumps(trade, separators=(",", ":"), ensure_ascii=False),
         }
+        if trade.get("filter_error") is not None:
+            entry["filter_error"] = bool(trade.get("filter_error"))
         return entry
 
     # ---------------------------- lifecycle ----------------------------
@@ -526,11 +588,62 @@ class BaseTradeLogger:
                 pass
         if flush:
             try:
-                self._emit_remaining()
+                ok = self._emit_remaining()
+                if not ok:
+                    self._log_event(
+                        logging.ERROR,
+                        "BTL flush emit failed",
+                        reason_code="LOGGERH_BTL_FLUSH_EMIT_FAILED",
+                        entry=None,
+                    )
+                    self._metrics_proxy.on_btl_drop(
+                        self.log_type,
+                        reason="LOGGERH_BTL_FLUSH_EMIT_FAILED",
+                    )
             except Exception:
                 pass
         await asyncio.sleep(0)
 
+    def _log_event(
+            self,
+            level: int,
+            message: str,
+            *,
+            reason_code: str,
+            entry: Dict[str, Any] | None,
+            exc_info: bool | BaseException | None = None,
+    ) -> None:
+        approx_depth = None
+        try:
+            approx_depth = int(self._queue.qsize())
+        except Exception:
+            approx_depth = None
+        queue_cap = getattr(self._queue, "maxsize", None)
+        event_type = None
+        trade_id = order_id = client_id = exchange = None
+        if isinstance(entry, dict):
+            event_type = entry.get("event_type")
+            trade_id = entry.get("trade_id") or entry.get("id") or entry.get("tid")
+            order_id = entry.get("order_id") or entry.get("exchange_order_id")
+            client_id = entry.get("client_id") or entry.get("cid")
+            exchange = entry.get("exchange") or entry.get("ex")
+
+        logger.log(
+            level,
+            message,
+            exc_info=exc_info,
+            extra={
+                "reason_code": reason_code,
+                "log_type": self.log_type,
+                "event_type": event_type,
+                "queue_cap": queue_cap,
+                "approx_depth": approx_depth,
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "client_id": client_id,
+                "exchange": exchange,
+            },
+        )
     # ------------------------------ status -----------------------------
     def get_queue_size(self) -> int:
         try:
