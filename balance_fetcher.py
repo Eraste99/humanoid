@@ -47,7 +47,9 @@ from contracts.payloads import (
     validate_balance_snapshot_rm_lite,
     validate_reco_alias_status_snapshot_lite,
     validate_ws_alias_status_snapshot_lite,
+    normalize_reason_code,
 )
+
 
 
 logger = logging.getLogger("MultiBalanceFetcher")
@@ -216,6 +218,7 @@ class MultiBalanceFetcher:
         self._bal_ttl_default_block = float(getattr(bf_cfg, "BALANCES_TTL_S_BLOCK", 120.0))
         self._bal_ttl_by_ex: Dict[str, Dict[str, float]] = {}
         self._balances_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._balances_freshness_status: Dict[str, Any] = {"status": "UNKNOWN", "ready": False, "reason_code": None}
         # Seuils observabilité WS/Reconciler pour dériver capital_at_risk
         self._ws_miss_rate_thr = float(getattr(bf_cfg, "BF_WS_RECO_MISS_RATE_THR_PER_MIN", 30.0))
         self._ws_resync_age_thr_s = float(getattr(bf_cfg, "BF_WS_RECO_RESYNC_AGE_THR_S", 6 * 3600.0))
@@ -473,6 +476,69 @@ class MultiBalanceFetcher:
             self._bal_ttl_default_block,
         )
 
+    def _compute_balances_freshness_status(self) -> Dict[str, Any]:
+        states = []
+        affected: List[str] = []
+        for (ex, al), rec in (self._balances_health or {}).items():
+            state = str((rec or {}).get("state") or "").upper()
+            if state:
+                states.append(state)
+                if state in {"DEGRADED", "BLOCK"}:
+                    affected.append(f"{ex}.{al}")
+
+        if not states:
+            worst_state = "UNKNOWN"
+        elif "BLOCK" in states:
+            worst_state = "BLOCK"
+        elif "DEGRADED" in states:
+            worst_state = "DEGRADED"
+        else:
+            worst_state = "NORMAL"
+
+        bf_cfg = getattr(self, "_bf_cfg", self.cfg)
+        ready_min = str(getattr(bf_cfg, "balances_ready_min_state", "NORMAL") or "NORMAL").upper()
+        severity = {"NORMAL": 0, "DEGRADED": 1, "BLOCK": 2}
+        min_rank = severity.get(ready_min, 0)
+        worst_rank = severity.get(worst_state, 99)
+        ready = worst_state != "UNKNOWN" and worst_rank <= min_rank
+
+        reason_code = None
+        if worst_state == "BLOCK":
+            reason_code = normalize_reason_code("RM_BALANCE_TTL_BLOCK") or "RM_BALANCE_TTL_BLOCK"
+        elif worst_state == "DEGRADED":
+            reason_code = normalize_reason_code("RM_BALANCE_TTL_DEGRADED") or "RM_BALANCE_TTL_DEGRADED"
+
+        return {
+            "status": worst_state,
+            "ready": bool(ready),
+            "reason_code": reason_code,
+            "affected": affected,
+            "as_of_ts": time.time(),
+        }
+
+    def get_balances_freshness_status(self) -> Dict[str, Any]:
+        try:
+            status = self._compute_balances_freshness_status()
+            prev = self._balances_freshness_status
+            if prev.get("status") != status.get("status"):
+                self._balances_freshness_status = status
+                sink = getattr(self, "_event_sink", None)
+                if callable(sink):
+                    try:
+                        sink({
+                            "type": "balances_freshness",
+                            "status": status.get("status"),
+                            "ready": bool(status.get("ready")),
+                            "reason_code": status.get("reason_code"),
+                            "affected": status.get("affected"),
+                            "ts": status.get("as_of_ts"),
+                        })
+                    except Exception:
+                        pass
+            return dict(self._balances_freshness_status)
+        except Exception:
+            return dict(self._balances_freshness_status)
+
     async def run_alerts(self) -> None:
         """
         Boucle d'alerting des tokens de frais bas.
@@ -497,7 +563,7 @@ class MultiBalanceFetcher:
                             except Exception:
                                 pass
 
-                           if level < thr:
+                        if level < thr:
                                 try:
                                     BF_FEE_TOKEN_LOW_TOTAL.labels(ex, al, tok).inc()
                                 except Exception:
@@ -1238,6 +1304,8 @@ class MultiBalanceFetcher:
                     "high_watermark": float(info.get("high_watermark", 0.0) or 0.0),
                 }
 
+        freshness_status = self.get_balances_freshness_status()
+
 
         return {
             "mode": view,
@@ -1247,6 +1315,7 @@ class MultiBalanceFetcher:
                 "fee_tokens": meta_fee,
                 "age_s": age_s if age_s != float("inf") else None,
                 "balances_health": meta_bal_health,
+                "balances_freshness": freshness_status,
             },
         }
     def get_available_quote_simple(
@@ -1638,6 +1707,7 @@ class MultiBalanceFetcher:
             "fee_tokens": meta_fee,
             "ws_accounts": meta_ws_accounts,
             "balances_health": meta_bal_health,
+            "balances_freshness": self.get_balances_freshness_status(),
             "view": view,
             "cached_only": bool(cached_only),
             "as_of_ts": time.monotonic(),
@@ -1708,6 +1778,7 @@ class MultiBalanceFetcher:
                 # Vues synthèse P0
                 "pockets_by_quote": pockets,
                 "fee_token_levels": fee_tok,
+                "balances_freshness": self.get_balances_freshness_status(),
             }
 
     # Alias public (nommage canonique) — facilite le branchement depuis le Hub

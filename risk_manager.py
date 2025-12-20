@@ -35,6 +35,7 @@ from __future__ import annotations
     """
 import asyncio, time, inspect
 import time, uuid, random
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
@@ -44,6 +45,8 @@ import logging
 from collections import defaultdict
 from modules.obs_metrics import TIME_SKEW_MS
 from contracts.payloads import make_submit_bundle, submit_leg_from_intent, normalize_leg_dict, normalize_reason_code
+from modules.retry_policy import BackoffPolicy, awith_retry
+
 
 from dataclasses import dataclass, asdict
 import json
@@ -942,6 +945,57 @@ def _cfg_list_upper(cfg, name: str, default: list) -> list:
     except Exception:
         return [str(x).upper() for x in default]
 
+class TransferController:
+    def __init__(self, *, policy: Optional[BackoffPolicy] = None) -> None:
+        self._policy = policy or BackoffPolicy()
+        self._states: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _canonical_transfer_id(payload: Dict[str, Any]) -> str:
+        base = {
+            "exchange": str(payload.get("exchange") or ""),
+            "from_alias": str(payload.get("from_alias") or payload.get("from") or ""),
+            "to_alias": str(payload.get("to_alias") or payload.get("to") or ""),
+            "from_wallet": str(payload.get("from_wallet") or ""),
+            "to_wallet": str(payload.get("to_wallet") or ""),
+            "ccy": str(payload.get("ccy") or payload.get("currency") or ""),
+            "amount": float(payload.get("amount") or payload.get("amount_quote") or payload.get("amount_usdc") or 0.0),
+            "type": str(payload.get("type") or payload.get("kind") or "transfer"),
+        }
+        data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha1(data.encode("utf-8")).hexdigest()
+
+    async def submit(self, *, payload: Dict[str, Any], submit_fn: Callable[[], Any], venue: str) -> Dict[str, Any]:
+        transfer_id = payload.get("transfer_id") or self._canonical_transfer_id(payload)
+        payload["transfer_id"] = transfer_id
+        state = self._states.get(transfer_id, {})
+        if state.get("state") in {"SUBMITTED", "SETTLED"}:
+            return {"status": state.get("state"), "transfer_id": transfer_id, "replayed": True}
+
+        outcome = await awith_retry(submit_fn, venue=venue, policy=self._policy)
+        if outcome.ok:
+            self._states[transfer_id] = {
+                "state": "SUBMITTED",
+                "attempts": outcome.attempts,
+                "last_ts": time.time(),
+            }
+            return {"status": "SUBMITTED", "transfer_id": transfer_id, "attempts": outcome.attempts}
+
+        self._states[transfer_id] = {
+            "state": "FAILED",
+            "attempts": outcome.attempts,
+            "last_ts": time.time(),
+            "error": str(outcome.last_exception) if outcome.last_exception else "unknown",
+        }
+        return {"status": "FAILED", "transfer_id": transfer_id, "attempts": outcome.attempts}
+
+    def mark_settled(self, transfer_id: Optional[str]) -> None:
+        if not transfer_id:
+            return
+        self._states[transfer_id] = {
+            "state": "SETTLED",
+            "last_ts": time.time(),
+        }
 
 
 class RiskManager:
@@ -1421,6 +1475,10 @@ class RiskManager:
         self.engine = execution_engine
         self._scanner_consumer = scanner_consumer
         self.transfer_clients: Dict[str, Any] = {str(k).upper(): v for k, v in (transfer_clients or {}).items()}
+        retry_cfg = getattr(getattr(self.cfg, "rm", None), "transfer_retry_policy", None)
+        retry_cfg = retry_cfg or getattr(self.cfg, "transfer_retry_policy", None)
+        self._transfer_controller = TransferController(policy=BackoffPolicy.from_cfg(retry_cfg))
+        self._decision_id_cache: Dict[str, Dict[str, str]] = {}
 
         # Routes autorisées tri-CEX (configurable)
         self.allowed_routes: Set[Tuple[str, str]] = set(getattr(
@@ -4094,6 +4152,11 @@ class RiskManager:
             logging.warning("RM : engine indisponible, drop bundle")
             _record_decision(False, RM_ENGINE_NOT_READY)
             return False
+        if getattr(self, "trading_ready_event", None) and not self.trading_ready_event.is_set():
+            reason = normalize_reason_code("TRADING_NOT_READY") or "TRADING_NOT_READY"
+            logging.warning("RM : trading not ready, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
+            _record_decision(False, reason)
+            return False
 
         # Rafraîchit le mode consolidé et ses overlays avant d'exposer au moteur
         try:
@@ -4547,6 +4610,15 @@ class RiskManager:
                 self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
             _record_decision(False, reason or "ENGINE_REJECT")
             return False
+        if isinstance(accepted, dict):
+            state = str(accepted.get("state") or "").upper()
+            reason = str(accepted.get("reason_code") or "")
+            if state and state != "ENGINE_ACCEPTED":
+                _record_decision(False, reason or "ENGINE_REJECT")
+                return False
+            _record_decision(True, "")
+            return True
+
         if not accepted and self._shadow:
             self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
         _record_decision(bool(accepted), "ENGINE_REJECT" if not accepted else "")
@@ -6647,7 +6719,123 @@ class RiskManager:
 
     def _hash_decision_id(self, pair: str, buy: str, sell: str, ts_ns: int) -> str:
         base = f"{pair}|{buy}|{sell}|{ts_ns // 1_000_000}"  # tranche à la ms
-        return str(abs(hash(base)))
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+    def _build_idempotency_key(
+            self,
+            *,
+            decision_id: str,
+            bundle_id: str,
+            opp_id: Optional[str],
+            notional: Dict[str, Any],
+            legs: List[Dict[str, Any]],
+    ) -> str:
+        leg_fingerprint = [
+            {
+                "exchange": leg.get("exchange"),
+                "symbol": leg.get("symbol"),
+                "side": leg.get("side"),
+                "qty": leg.get("qty"),
+                "price": leg.get("price") or leg.get("px_limit"),
+            }
+            for leg in (legs or [])
+        ]
+        base = {
+            "decision_id": decision_id,
+            "bundle_id": bundle_id,
+            "opp_id": opp_id,
+            "notional": notional or {},
+            "legs": leg_fingerprint,
+        }
+        data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha1(data.encode("utf-8")).hexdigest()
+
+    def _ensure_canonical_ids(
+            self,
+            *,
+            opp: Dict[str, Any],
+            pair: str,
+            buy_ex: str,
+            sell_ex: str,
+            notional: Dict[str, Any],
+            legs: List[Dict[str, Any]],
+            frag_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, str]:
+        opp_id = (
+                opp.get("opp_id")
+                or opp.get("opportunity_id")
+                or (opp.get("meta") or {}).get("opportunity_id")
+        )
+        cache_key = str(opp_id or "")
+        cached = self._decision_id_cache.get(cache_key) if cache_key else None
+
+        meta_root = opp.setdefault("meta", {}) if isinstance(opp, dict) else {}
+        decision_id = (
+                opp.get("decision_id")
+                or meta_root.get("decision_id")
+                or (cached or {}).get("decision_id")
+        )
+        if decision_id is None:
+            decision_ts_ms = int(
+                opp.get("decision_ts_ms")
+                or (float(opp.get("t_detect") or opp.get("timestamp") or time.time()) * 1000.0)
+            )
+            decision_id = self._hash_decision_id(pair, buy_ex or "", sell_ex or "", int(decision_ts_ms * 1_000_000))
+
+        trace_id = (
+                opp.get("trace_id")
+                or meta_root.get("trace_id")
+                or (cached or {}).get("trace_id")
+                or decision_id
+        )
+        bundle_base = (
+                opp.get("bundle_id")
+                or meta_root.get("bundle_id")
+                or (cached or {}).get("bundle_id")
+                or decision_id
+        )
+        bundle_id = str(bundle_base)
+        frag_idx = (frag_meta or {}).get("idx") if isinstance(frag_meta, dict) else None
+        frag_total = (frag_meta or {}).get("total") if isinstance(frag_meta, dict) else None
+        if frag_idx is not None and frag_total and int(frag_total) > 1:
+            bundle_id = f"{bundle_id}:{int(frag_idx)}"
+
+        idempotency_key = (
+                opp.get("idempotency_key")
+                or meta_root.get("idempotency_key")
+                or (cached or {}).get("idempotency_key")
+        )
+        if not idempotency_key:
+            idempotency_key = self._build_idempotency_key(
+                decision_id=str(decision_id),
+                bundle_id=str(bundle_id),
+                opp_id=str(opp_id) if opp_id is not None else None,
+                notional=notional or {},
+                legs=legs or [],
+            )
+
+        meta_root.setdefault("decision_id", str(decision_id))
+        meta_root.setdefault("trace_id", str(trace_id))
+        meta_root.setdefault("bundle_id", str(bundle_id))
+        meta_root.setdefault("idempotency_key", str(idempotency_key))
+        if opp_id:
+            meta_root.setdefault("opportunity_id", opp_id)
+        opp["meta"] = meta_root
+
+        if cache_key and cache_key not in self._decision_id_cache:
+            self._decision_id_cache[cache_key] = {
+                "decision_id": str(decision_id),
+                "trace_id": str(trace_id),
+                "bundle_id": str(bundle_id),
+                "idempotency_key": str(idempotency_key),
+            }
+
+        return {
+            "decision_id": str(decision_id),
+            "trace_id": str(trace_id),
+            "bundle_id": str(bundle_id),
+            "idempotency_key": str(idempotency_key),
+        }
 
     def _current_prudence(self, pair: str) -> str:
         """
@@ -7365,6 +7553,12 @@ class RiskManager:
         Ne modifie pas la logique de décision interne : on garde exactement le pipeline existant.
         """
         # Readiness (comme avant)
+        if getattr(self, "trading_ready_event", None) and not self.trading_ready_event.is_set():
+            reason = normalize_reason_code("TRADING_NOT_READY") or "TRADING_NOT_READY"
+            try:
+                self._emit_decision_record("skipped", reason, opp, {})
+            finally:
+                return
         self._ensure_ready()
 
         # Pré-filtre
@@ -10261,6 +10455,11 @@ class RiskManager:
         payload = ev.get("payload") or {}
         if not isinstance(payload, dict):
             payload = {}
+        try:
+            transfer_id = payload.get("transfer_id") or ev.get("transfer_id")
+            self._transfer_controller.mark_settled(transfer_id)
+        except Exception:
+            pass
 
         try:
             ccy = str(payload.get("ccy") or "USDC").upper()
@@ -10400,10 +10599,32 @@ class RiskManager:
             logger.warning("[RiskManager] client %s missing transfer_wallet(..)", ex)
             return
         try:
-            res = fn(ex=ex, alias=alias, from_wallet=from_wallet, to_wallet=to_wallet, ccy=ccy, amount=amount)
-            if inspect.isawaitable(res):
-                await res
-            await self._alert("RiskManager", f"✅ Internal WALLET transfer {ex}[{alias}] {from_wallet}→{to_wallet} {amount} {ccy}")
+            async def _submit():
+                res = fn(ex=ex, alias=alias, from_wallet=from_wallet, to_wallet=to_wallet, ccy=ccy, amount=amount)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+
+            payload = {
+                "type": "internal_wallet_transfer",
+                "exchange": ex,
+                "alias": alias,
+                "from_wallet": from_wallet,
+                "to_wallet": to_wallet,
+                "ccy": ccy,
+                "amount": amount,
+                "transfer_id": op.get("transfer_id"),
+            }
+            outcome = await self._transfer_controller.submit(
+                payload=payload,
+                submit_fn=_submit,
+                venue=f"{ex}:wallet_transfer",
+            )
+            if outcome.get("status") == "SUBMITTED":
+                await self._alert(
+                    "RiskManager",
+                    f"✅ Internal WALLET transfer {ex}[{alias}] {from_wallet}→{to_wallet} {amount} {ccy}",
+                )
         except Exception:
             logger.exception("[RiskManager] internal wallet transfer failed")
 
@@ -10426,19 +10647,40 @@ class RiskManager:
             logger.warning("[RiskManager] client %s missing transfer_subaccount(..)", ex)
             return
         try:
-            res = fn(ex=ex, from_alias=from_alias, to_alias=to_alias, ccy=ccy, amount=amount)
-            if inspect.isawaitable(res):
-                await res
-            await self._alert("RiskManager", f"✅ Internal SUBACCOUNT transfer {ex} {from_alias}→{to_alias} {amount} {ccy}")
-            if getattr_bool(self.cfg, "dry_run", False):
-                self.adjust_virtual_balance(ex, from_alias, ccy, -amount)
-                self.adjust_virtual_balance(ex, to_alias, ccy, +amount)
+            async def _submit():
+                res = fn(ex=ex, from_alias=from_alias, to_alias=to_alias, ccy=ccy, amount=amount)
+                if inspect.isawaitable(res):
+                    return await res
+                return res
+
+            payload = {
+                "type": "internal_subaccount_transfer",
+                "exchange": ex,
+                "from_alias": from_alias,
+                "to_alias": to_alias,
+                "ccy": ccy,
+                "amount": amount,
+                "transfer_id": op.get("transfer_id"),
+            }
+            outcome = await self._transfer_controller.submit(
+                payload=payload,
+                submit_fn=_submit,
+                venue=f"{ex}:subaccount_transfer",
+            )
+            if outcome.get("status") == "SUBMITTED":
+                await self._alert(
+                    "RiskManager",
+                    f"✅ Internal SUBACCOUNT transfer {ex} {from_alias}→{to_alias} {amount} {ccy}",
+                )
+                if getattr_bool(self.cfg, "dry_run", False):
+                    self.adjust_virtual_balance(ex, from_alias, ccy, -amount)
+                    self.adjust_virtual_balance(ex, to_alias, ccy, +amount)
         except Exception:
             logger.exception("[RiskManager] internal subaccount transfer failed")
 
     def _make_internal_transfer(self, ex: str, from_alias: str, to_alias: str, amount_usdc: float) -> Dict[str, Any]:
         now_ms = int(time.time() * 1000)
-        return {
+        payload = {
             "type": "internal_transfer",
             "ts_ms": now_ms,
             "exchange": str(ex).upper(),
@@ -10447,6 +10689,8 @@ class RiskManager:
             "amount_usdc": float(amount_usdc),
             "meta": {"source": "RebalancingManager", "kind": "REB_TRANSFER"},
         }
+        payload["transfer_id"] = TransferController._canonical_transfer_id(payload)
+        return payload
 
     def _make_cross_cex_opportunity(self, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         x = plan.get("cross_cex")
@@ -13871,6 +14115,21 @@ class RiskManager:
                     meta_leg["kind"] = leg_kind_default
             leg["meta"] = meta_leg
 
+        ids = self._ensure_canonical_ids(
+            opp=opp,
+            pair=pk,
+            buy_ex=str(buy_ex or ""),
+            sell_ex=str(sell_ex or ""),
+            notional=notional or {},
+            legs=legs,
+            frag_meta=frag_meta,
+        )
+        decision_ts_ns = (
+                opp.get("decision_ts_ns")
+                or (int(opp.get("decision_ts_ms") or 0) * 1_000_000)
+                or int(time.time_ns())
+        )
+
         bundle = make_submit_bundle(
             legs=legs,
             route=route,
@@ -13886,6 +14145,11 @@ class RiskManager:
             split=split_meta,
             shadow=False,
             client_id=client_id,
+            trace_id=ids.get("trace_id"),
+            decision_id=ids.get("decision_id"),
+            bundle_id=ids.get("bundle_id"),
+            idempotency_key=ids.get("idempotency_key"),
+            ts_ns=decision_ts_ns,
         )
         base_for_meta = self._pair_base(pk)
         ex_for_state = ex_for_mm if strategy_u == "MM" else (buy_ex or sell_ex)
@@ -13922,26 +14186,18 @@ class RiskManager:
                     or opp.get("opp_id")
                     or (opp.get("meta") or {}).get("opportunity_id")
             )
-            decision_id = (
-                    opp.get("decision_id")
-                    or (opp.get("meta") or {}).get("decision_id")
-            )
-            if decision_id is None:
-                decision_ts_ms = int(
-                    opp.get("decision_ts_ms")
-                    or (float(opp.get("t_detect") or opp.get("timestamp") or time.time()) * 1000.0)
-                )
-                decision_id = self._hash_decision_id(pk, buy_ex or "", sell_ex or "", int(decision_ts_ms * 1_000_000))
-            trace_id = (
-                    opp.get("trace_id")
-                    or (opp.get("meta") or {}).get("trace_id")
-                    or opportunity_id
-                    or decision_id
-            )
             if opportunity_id:
                 meta_root.setdefault("opportunity_id", opportunity_id)
-            meta_root.setdefault("decision_id", decision_id)
-            meta_root.setdefault("trace_id", trace_id)
+            meta_root.setdefault("decision_id", ids.get("decision_id"))
+            meta_root.setdefault("trace_id", ids.get("trace_id"))
+            meta_root.setdefault("bundle_id", ids.get("bundle_id"))
+            meta_root.setdefault("idempotency_key", ids.get("idempotency_key"))
+            fx_rate_used = (
+                    opp.get("fx_rate_used")
+                    or (opp.get("meta") or {}).get("fx_rate_used")
+            )
+            if fx_rate_used is not None:
+                meta_root.setdefault("fx_rate_used", fx_rate_used)
             bundle["meta"] = meta_root
 
         if strategy_u == "MM" and isinstance(bundle, dict):

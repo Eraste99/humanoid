@@ -669,6 +669,28 @@ class LogWriter:
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_latency_route ON latency(route);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_latency_ts ON latency(t_scanner_ms);")
+        # ---------------- trade_fsm_events (append-only) ----------------
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trade_fsm_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT,
+              ts_ms INTEGER,
+              event_type TEXT,
+              stream TEXT,
+              trace_id TEXT,
+              bundle_id TEXT,
+              decision_id TEXT,
+              idempotency_key TEXT,
+              raw_json TEXT
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_ts ON trade_fsm_events(ts_ms);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_trace ON trade_fsm_events(trace_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_bundle ON trade_fsm_events(bundle_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_decision ON trade_fsm_events(decision_id);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_idem ON trade_fsm_events(idempotency_key);")
 
         conn.commit()
         # [PATCH-SCHEMA] Tags SPLIT / profil / pacer + qualité PnL (idempotent)

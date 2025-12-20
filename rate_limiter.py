@@ -6,6 +6,7 @@ from typing import Optional, Callable, Awaitable, Any
 import asyncio
 import threading
 import time
+from contracts.errors import RateLimitTimeoutError
 from typing import Any, Awaitable, Callable, Optional, Dict, Tuple
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
@@ -105,8 +106,13 @@ class TokenBucket:
                     if remain <= 0 or wait > remain:
                         eta = self.next_available_in(n)
                         self._notify_ratelimit('async_timeout')
-                        raise asyncio.TimeoutError(
-                            f'{self.name}.acquire timeout (need={n}, eta~{eta:.3f}s, tokens~{self.next_tokens():.2f})')
+                        raise RateLimitTimeoutError(
+                            f'{self.name}.acquire timeout (need={n}, eta~{eta:.3f}s, tokens~{self.next_tokens():.2f})',
+                            bucket=self.name,
+                            need=n,
+                            eta_s=eta,
+                            tokens=self.next_tokens(),
+                        )
                 await asyncio.sleep(wait)
         finally:
             if self.fair and registered:

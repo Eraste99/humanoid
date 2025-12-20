@@ -854,6 +854,10 @@ class LoggerHistoriqueManager:
     async def _db_lane_submit_one(self, op: str, payload: Any) -> None:
         if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
             # fallback direct
+            try:
+                self._db_lane_disabled_seen = True
+            except Exception:
+                pass
             if op == "latency_one":
                 await asyncio.to_thread(self._writer.insert_latency, payload)
             elif op == "alert_one":
@@ -878,6 +882,10 @@ class LoggerHistoriqueManager:
     async def _db_lane_call(self, op: str, payload: Any, *, timeout_s: float = 30.0) -> Any:
         if not getattr(self, "_db_lane_enabled", False) or getattr(self, "_db_lane_q", None) is None:
             # fallback direct (best-effort)
+            try:
+                self._db_lane_disabled_seen = True
+            except Exception:
+                pass
             try:
                 if op == "finalize_day":
                     return await asyncio.to_thread(self._writer.finalize_day, **(payload or {}))
@@ -1152,7 +1160,51 @@ class LoggerHistoriqueManager:
                                 pass
                             continue
                     # Écriture via l’API du rotateur (thread-safe)
+                    offset_bytes = rot.current_bytes
+                    path = rot.current_path
                     await asyncio.to_thread(rot.write_line, line)
+
+                    if name in {"rm_decisions", "engine_submits", "engine_acks", "privatews_events"}:
+                        try:
+                            payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else item
+                            ts_ms = item.get("ts_ms") or payload_obj.get("ts_ms") or payload_obj.get("timestamp_ms")
+                            if ts_ms is None:
+                                ts_ms = self._ensure_ts_ms(payload_obj if isinstance(payload_obj, dict) else item)
+                            ts_ns = int(ts_ms) * 1_000_000 if ts_ms is not None else time.time_ns()
+                            event_type = (
+                                    item.get("event_type")
+                                    or payload_obj.get("event_type")
+                                    or payload_obj.get("kind")
+                                    or name
+                            )
+                            ev_id = (
+                                    item.get("event_id")
+                                    or payload_obj.get("event_id")
+                                    or item.get("id")
+                                    or payload_obj.get("id")
+                            )
+                            trace_id = payload_obj.get("trace_id") or item.get("trace_id")
+                            bundle_id = payload_obj.get("bundle_id") or item.get("bundle_id")
+                            decision_id = payload_obj.get("decision_id") or item.get("decision_id")
+                            idempotency_key = (
+                                    payload_obj.get("idempotency_key")
+                                    or payload_obj.get("idempotence_key")
+                                    or item.get("idempotency_key")
+                                    or item.get("idempotence_key")
+                            )
+                            self._insert_index_event(
+                                ts_ns=int(ts_ns),
+                                typ=str(event_type),
+                                ev_id=None if ev_id is None else str(ev_id),
+                                path=path,
+                                offset_bytes=offset_bytes,
+                                trace_id=None if trace_id is None else str(trace_id),
+                                bundle_id=None if bundle_id is None else str(bundle_id),
+                                decision_id=None if decision_id is None else str(decision_id),
+                                idempotency_key=None if idempotency_key is None else str(idempotency_key),
+                            )
+                        except Exception:
+                            logger.exception("index insert failed for %s", name)
 
                     wrote_any = True
                     n += 1
@@ -1171,23 +1223,16 @@ class LoggerHistoriqueManager:
                     # Drop contrôlé si l’écriture échoue (I/O JSONL)
 
                     try:
+                        self._drop_stream_record(name, reason="LOGGERH_JSONL_WRITE_ERROR", payload=item)
 
-                        lhm_on_dropped(name, "write_error")
-                    except Exception:
-                        pass
-                    try:
-                        self._critical_drop_seen = True
                     except Exception:
                         pass
 
                     # Erreur de stockage → pipeline PnL potentiellement non audit-grade
 
                     try:
-
                         self._storage_error_seen = True
-
                     except Exception:
-
                         pass
 
             # Rotation par âge testée à chaque tick (et comptabilisée)
@@ -1919,30 +1964,27 @@ class LoggerHistoriqueManager:
         try:
             q.put_nowait(payload)
             # métriques best-effort (success path)
-            try:
-                lhm_set_queue_size(stream, q.qsize())
-                set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
-            except Exception:
-                pass
-                return
-            except asyncio.QueueFull:
-                pass
-
+        except asyncio.QueueFull:
             if critical and not getattr(self, "_drop_when_full", True):
                 try:
-
                     await asyncio.wait_for(q.put(payload), timeout=0.05)
                     return
                 except Exception:
                     pass
+            self._drop_stream_record(stream, reason="LOGGERH_JSONL_QUEUE_FULL", payload=payload)
+            if critical:
+                try:
+                    self._critical_drop_seen = True
+                except Exception:
+                    pass
+            return
 
-        self._drop_stream_record(stream, reason="LOGGERH_JSONL_QUEUE_FULL", payload=payload)
-        if critical:
-            try:
-                self._critical_drop_seen = True
-            except Exception:
-                pass
-
+        # métriques best-effort (success path)
+        try:
+            lhm_set_queue_size(stream, q.qsize())
+            set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
+        except Exception:
+            pass
 
 
     async def _on_event_sink(self, log_type: str, entries: list[dict]) -> None:
@@ -3311,6 +3353,8 @@ class LoggerHistoriqueManager:
         - offset_bytes INTEGER  → offset approx. dans le fichier (bytes écrits avant la ligne)
         - trace_id     TEXT     → trace_id stable si dispo
         - bundle_id    TEXT     → bundle_id stable si dispo
+        - decision_id  TEXT     → decision_id RM si dispo
+        - idempotency_key TEXT  → idempotency key si dispo
 
         Remarque: pour les outils récents, privilégier (trace_id,bundle_id,offset_bytes,path).
         """
@@ -3329,7 +3373,10 @@ class LoggerHistoriqueManager:
                     "path TEXT, "
                     "offset_bytes INTEGER, "
                     "trace_id TEXT, "
-                    "bundle_id TEXT)"
+                    "bundle_id TEXT, "
+                    "decision_id TEXT, "
+                    "idempotency_key TEXT)"
+
                 )
                 # colonnes additionnelles pour compat schémas plus anciens
                 try:
@@ -3339,6 +3386,8 @@ class LoggerHistoriqueManager:
                             ("offset_bytes", "INTEGER"),
                             ("trace_id", "TEXT"),
                             ("bundle_id", "TEXT"),
+                            ("decision_id", "TEXT"),
+                            ("idempotency_key", "TEXT"),
                     ):
                         if name not in existing:
                             cur.execute(f"ALTER TABLE idx ADD COLUMN {name} {decl};")
@@ -3351,6 +3400,8 @@ class LoggerHistoriqueManager:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_type_id ON idx(type,id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_trace_id ON idx(trace_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_bundle_id ON idx(bundle_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_decision_id ON idx(decision_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_key ON idx(idempotency_key)")
                 conn.commit()
             self._index_ready = True
         except Exception:
@@ -3433,6 +3484,8 @@ class LoggerHistoriqueManager:
             offset_bytes: int | None = None,
             trace_id: str | None = None,
             bundle_id: str | None = None,
+            decision_id: str | None = None,
+            idempotency_key: str | None = None,
     ) -> None:
         """
         Insère une ligne d'index JSONL minimal (M5-B2-3) dans la table `idx`.
@@ -3445,6 +3498,8 @@ class LoggerHistoriqueManager:
         - offset_bytes: offset approx. dans le fichier (bytes écrits avant la ligne).
         - trace_id:     identifiant de trace stable si disponible.
         - bundle_id:    identifiant de bundle stable si disponible.
+        - decision_id:  identifiant de décision RM si disponible.
+        - idempotency_key: idempotency key si disponible.
 
         Outils externes peuvent ensuite:
         - rejouer une journée en filtrant par ts_ns/path,
@@ -3457,8 +3512,8 @@ class LoggerHistoriqueManager:
             with sqlite3.connect(dbp, timeout=10) as conn:
                 cur = conn.cursor()
                 cur.execute(
-                    "INSERT INTO idx (ts_ns,type,id,path,offset_bytes,trace_id,bundle_id) "
-                    "VALUES (?,?,?,?,?,?,?)",
+                    "INSERT INTO idx (ts_ns,type,id,path,offset_bytes,trace_id,bundle_id,decision_id,idempotency_key) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
                     (
                         int(ts_ns),
                         str(typ),
@@ -3467,6 +3522,8 @@ class LoggerHistoriqueManager:
                         None if offset_bytes is None else int(offset_bytes),
                         None if trace_id is None else str(trace_id),
                         None if bundle_id is None else str(bundle_id),
+                        None if decision_id is None else str(decision_id),
+                        None if idempotency_key is None else str(idempotency_key),
                     ),
                 )
                 conn.commit()
@@ -3962,18 +4019,22 @@ class LoggerHistoriqueManager:
     # ---------------- JSONL pipelines (publiques) ----------------
     async def record_rm_decision(self, payload: Dict[str, Any]) -> None:
         await self._append_jsonl("rm_decisions", payload, id_key="opp_id")
+        await self._emit_trade_fsm_event("rm_decisions", payload, event_type="DECISION_LOGGED")
 
     async def record_engine_submit(self, payload: Dict[str, Any]) -> None:
         await self._append_jsonl("engine_submits", payload, id_key="client_id")
+        await self._emit_trade_fsm_event("engine_submits", payload, event_type="ENGINE_SUBMIT")
 
     async def record_engine_ack(self, payload: Dict[str, Any]) -> None:
         await self._append_jsonl("engine_acks", payload, id_key="client_id")
+        await self._emit_trade_fsm_event("engine_acks", payload, event_type="ENGINE_ACK")
 
     async def record_fill_normalized(self, payload: Dict[str, Any]) -> None:
         await self._append_jsonl("fills_normalized", payload, id_key="trade_id")
 
     async def record_privatews_event(self, payload: Dict[str, Any]) -> None:
         await self._append_jsonl("privatews_events", payload, id_key="event_id")
+        await self._emit_trade_fsm_event("privatews_events", payload, event_type="PWS_EVENT")
 
     # [PATCH-API-MM] Événements MM avec sampling déterministe
     async def record_mm_quote(self, payload: Dict[str, Any]) -> None:
@@ -3997,6 +4058,29 @@ class LoggerHistoriqueManager:
             return normalized or "UNKNOWN"
         except Exception:
             return str(reason or "UNKNOWN")
+
+    async def _emit_trade_fsm_event(self, stream: str, payload: Dict[str, Any], *, event_type: str) -> None:
+        try:
+            payload_obj = dict(payload or {})
+            try:
+                ts_ms = payload_obj.get("ts_ms") or self._ensure_ts_ms(payload_obj)
+            except Exception:
+                ts_ms = int(time.time() * 1000)
+            entry = {
+                "ts_ms": int(ts_ms) if ts_ms is not None else None,
+                "event_type": str(event_type),
+                "stream": str(stream),
+                "trace_id": payload_obj.get("trace_id"),
+                "bundle_id": payload_obj.get("bundle_id"),
+                "decision_id": payload_obj.get("decision_id"),
+                "idempotency_key": (
+                        payload_obj.get("idempotency_key") or payload_obj.get("idempotence_key")
+                ),
+                "raw_json": json.dumps(payload_obj, ensure_ascii=False, default=str),
+            }
+            await self._db_lane_submit_bulk("generic:trade_fsm_events", [entry])
+        except Exception:
+            logger.exception("_emit_trade_fsm_event failed")
 
     def _log_drop_event(
             self,
@@ -4122,8 +4206,8 @@ class LoggerHistoriqueManager:
         # métriques best-effort + low-cardinality (stream, reason)
         reason_code = self._normalize_reason_code(reason)
         try:
-            from modules.obs_metrics import LHM_JSONL_DROPPED_TOTAL
-            LHM_JSONL_DROPPED_TOTAL.labels(stream=stream, reason=reason_code).inc()
+            from modules.obs_metrics import lhm_on_dropped
+            lhm_on_dropped(stream, reason_code, n=1)
         except Exception:
             pass
         self._log_drop_event(stream=stream, reason_code=reason_code, payload=payload)

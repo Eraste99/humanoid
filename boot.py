@@ -38,6 +38,7 @@ from modules.private_ws_reconciler import PrivateWSReconciler
 from modules.execution_engine import ExecutionEngine
 from modules.rpc_gateway import RPCServer
 from modules.balance_fetcher import MultiBalanceFetcher
+from contracts.payloads import normalize_reason_code
 from modules.utils.rate_limiter import RateLimiter
 from modules import obs_metrics
 from modules.retry_policy import BackoffPolicy
@@ -1205,6 +1206,13 @@ class Boot:
                 except Exception:
                     self.log.exception("[Boot] rm.bind_private_ws_hub failed")
 
+        engine = getattr(self.ctx, "engine", None)
+        if engine and hasattr(engine, "set_private_ws_reconciler"):
+            try:
+                engine.set_private_ws_reconciler(self.ctx.reconciler)
+            except Exception:
+                self.log.exception("[Boot] engine.set_private_ws_reconciler failed")
+
         # 4) Tâche de santé privée (Hub→RM)
         self._propagate_private_ws_health()
         self._ensure_private_health_task()
@@ -1651,7 +1659,19 @@ class Boot:
 
         # TTL balances
         if bool(fs.get("balance_fetcher", False)):
-            if not self.ready_balances.is_set():
+            balances_ready = self.ready_balances.is_set()
+            mbf = getattr(self.ctx, "balances", None)
+            if mbf and hasattr(mbf, "get_balances_freshness_status"):
+                try:
+                    freshness = mbf.get_balances_freshness_status() or {}
+                    if not freshness.get("ready", True):
+                        balances_ready = False
+                        reason_code = normalize_reason_code(freshness.get("reason_code") or "RM_BALANCE_TTL_BLOCK")
+                        if reason_code and reason_code not in reasons:
+                            reasons.append(reason_code)
+                except Exception:
+                    balances_ready = False
+            if not balances_ready and "balances_stale" not in reasons:
                 reasons.append("balances_stale")
 
         # RM readiness (loops vs trading)

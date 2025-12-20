@@ -946,6 +946,11 @@ class SubmitBundleRequest(_Cfg, BaseModel):
     split: Optional[SplitControls] = None
     shadow: Optional[bool] = False
     client_id: Optional[str] = None
+    trace_id: Optional[str] = None
+    decision_id: Optional[str] = None
+    bundle_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    ts_ns: Optional[int] = None
 
 SubmitBundle = SubmitBundleRequest  # alias public
 
@@ -954,7 +959,18 @@ class CancelRequest(_Cfg, BaseModel):
     exchange: Optional[str] = None
     route_id: Optional[str] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: Optional[str] = None
 
+
+class BundleAck(_Cfg, BaseModel):
+    trace_id: Optional[str] = None
+    decision_id: Optional[str] = None
+    bundle_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    state: str
+    reason_code: Optional[str] = None
+    per_order: Dict[str, Any] = Field(default_factory=dict)
+    deadlines: Dict[str, Any] = Field(default_factory=dict)
 class OrderModel(_Cfg, BaseModel):
     order_id: str
     side: Side
@@ -1386,17 +1402,41 @@ def validate_reco_alias_status_snapshot_lite(payload: Dict[str, Any]) -> RecoAli
 def validate_balance_snapshot_rm_lite(payload: Dict[str, Any]) -> BalanceSnapshotRM:
     return _validate_lite(BalanceSnapshotRM, payload, "BalanceSnapshotRM")
 
-def validate_submit_bundle_lite(payload: Dict[str, Any]) -> SubmitBundleRequest:
-    return _validate_lite(SubmitBundleRequest, payload, "SubmitBundleRequest")
+def validate_idempotency_key_lite(payload: Dict[str, Any], *, prod: bool = False) -> Optional[str]:
+    if not prod:
+        return None
+    if not isinstance(payload, dict):
+        return normalize_reason_code("RPC_MISSING_IDEMPOTENCY_KEY") or "RPC_MISSING_IDEMPOTENCY_KEY"
+    if payload.get("idempotency_key") or payload.get("idempotence_key"):
+        return None
+    return normalize_reason_code("RPC_MISSING_IDEMPOTENCY_KEY") or "RPC_MISSING_IDEMPOTENCY_KEY"
 
-def validate_cancel_lite(payload: Dict[str, Any]) -> CancelRequest:
-    return _validate_lite(CancelRequest, payload, "CancelRequest")
+def _mark_idempotency_missing(payload: Dict[str, Any], *, prod: bool) -> Dict[str, Any]:
+    reason_code = validate_idempotency_key_lite(payload, prod=prod)
+    if not reason_code:
+        return payload
+    obj = dict(payload or {})
+    obj.setdefault("_schema_invalid", True)
+    obj.setdefault("_schema_reason", reason_code)
+    obj.setdefault("reason_code", reason_code)
+    return obj
+
+def validate_submit_bundle_lite(payload: Dict[str, Any], *, prod: bool = False) -> SubmitBundleRequest:
+    checked = _mark_idempotency_missing(payload, prod=prod)
+    return _validate_lite(SubmitBundleRequest, checked, "SubmitBundleRequest")
+
+def validate_cancel_lite(payload: Dict[str, Any], *, prod: bool = False) -> CancelRequest:
+    checked = _mark_idempotency_missing(payload, prod=prod)
+    return _validate_lite(CancelRequest, checked, "CancelRequest")
 
 def validate_fill_normalized_lite(payload: Dict[str, Any]) -> FillNormalized:
     return _validate_lite(FillNormalized, payload, "FillNormalized")
 
 def validate_order_intent_lite(payload: Dict[str, Any]) -> OrderIntent:
     return _validate_lite(OrderIntent, payload, "OrderIntent")
+
+def validate_bundle_ack_lite(payload: Dict[str, Any]) -> BundleAck:
+    return _validate_lite(BundleAck, payload, "BundleAck")
 
 # -----------------------------------------------------------------------------
 # make_submit_bundle — >>> PATCH #2 route optionnel
@@ -1414,7 +1454,12 @@ def make_submit_bundle(*,
                        tm_controls: Optional[Dict[str, Any]] = None,
                        split: Optional[Dict[str, Any]] = None,
                        shadow: Optional[bool] = False,
-                       client_id: Optional[str] = None) -> Dict[str, Any]:
+                       client_id: Optional[str] = None,
+                       trace_id: Optional[str] = None,
+                       decision_id: Optional[str] = None,
+                       bundle_id: Optional[str] = None,
+                       idempotency_key: Optional[str] = None,
+                       ts_ns: Optional[int] = None) -> Dict[str, Any]:
     """
     Construit un bundle exécutable standard (dict).
     - `legs` : liste de legs dict (peuvent contenir "order": {...} ou être plats).
@@ -1432,11 +1477,16 @@ def make_submit_bundle(*,
             legs_normalized.append(l)
             orders.append(l)
     r = route or {}
+    bundle_id_final = bundle_id or str(uuid.uuid4())
     return {
-        "bundle_id": str(uuid.uuid4()),
+        "bundle_id": bundle_id_final,
         "client_id": client_id or "default",
         "mode": mode,                    # "TT" | "TM" | "MM" | "REB-as-TM"
         "tif": tif,
+        "trace_id": trace_id,
+        "decision_id": decision_id,
+        "idempotency_key": idempotency_key,
+        "ts_ns": ts_ns,
         "route": {                       # champ existant, clés tolérantes
             "buy_ex":  r.get("buy_ex"),
             "sell_ex": r.get("sell_ex"),
@@ -1476,6 +1526,10 @@ def make_submit_bundle(*,
             "caps":   caps,
             "tm_controls": tm_controls,
             "split":  split,
+            "trace_id": trace_id,
+            "decision_id": decision_id,
+            "bundle_id": bundle_id_final,
+            "idempotency_key": idempotency_key,
         },
     }
 
@@ -1497,6 +1551,7 @@ def make_rm_shutdown_event(*,
 
 
 KNOWN_REASON_CODES = {
+    "RM_BALANCE_TTL_DEGRADED",
     "RM_ENGINE_NOT_READY",
     "RM_BALANCE_TTL_BLOCK",
     "RM_STALE_VOL",
@@ -1536,6 +1591,8 @@ KNOWN_REASON_CODES = {
     "BOOT_STOP_TIMEOUT",
     "REGION_JP_DISABLED_BY_DEFAULT",
     "BOOT_MODE_FALLBACK",
+    "RPC_MISSING_IDEMPOTENCY_KEY",
+    "TRADING_NOT_READY",
 }
 
 
@@ -1562,7 +1619,7 @@ __all__ = [
     "Side", "Action", "Liquidity", "PortfolioRiskMetricsFields",
     "MarketEvent", "VolEvent", "SlipEvent", "HealthEvent",
     "Opportunity", "RiskDecision", "EngineAction",
-    "SubmitLeg", "OrderIntent", "SubmitBundleRequest", "SubmitBundle", "CancelRequest",
+    "SubmitLeg", "OrderIntent", "SubmitBundleRequest", "SubmitBundle", "CancelRequest", "BundleAck",
     "OrderModel", "FillModel", "FillNormalized",
     "PrivateFillEvent", "WSAliasStatusSnapshot", "RecoAliasStatusSnapshot", "BalanceSnapshotRM",
     "CMExposure", "CMSnapshots", "PortfolioSnapshot",
@@ -1573,9 +1630,9 @@ __all__ = [
     "validate_engine_action_lite", "validate_order_lite", "validate_fill_lite",
     "try_validate_lite",
     "normalize_private_fill_event", "validate_private_fill_event_lite",
-    "validate_submit_bundle_lite", "validate_cancel_lite",
+    "validate_submit_bundle_lite", "validate_cancel_lite", "validate_bundle_ack_lite",
     "validate_fill_normalized_lite", "validate_order_intent_lite", "make_submit_bundle",
-    "make_rm_shutdown_event", "normalize_reason_code",
+    "make_rm_shutdown_event", "normalize_reason_code", "validate_idempotency_key_lite",
     "validate_ws_alias_status_snapshot_lite", "validate_reco_alias_status_snapshot_lite",
     "validate_balance_snapshot_rm_lite", "normalize_leg_dict",
     # >>> PATCH #3 — helpers publics

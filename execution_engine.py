@@ -736,6 +736,8 @@ if "ENGINE_PACER_UNAVAILABLE_TOTAL" not in globals():
     ENGINE_PACER_UNAVAILABLE_TOTAL = _NoopMetric()
 if "ENGINE_RL_TIMEOUT_TOTAL" not in globals():
     ENGINE_RL_TIMEOUT_TOTAL = _NoopMetric()
+if "ENGINE_DEDUP_HITS_TOTAL" not in globals():
+    ENGINE_DEDUP_HITS_TOTAL = _NoopMetric()
 
 # Helper/stub functions used by the engine
 if "inc_engine_trade" not in globals():
@@ -774,6 +776,7 @@ try:
         ENGINE_RETRIES_TOTAL,
         ENGINE_SUBMIT_QUEUE_DEPTH,
         INFLIGHT_GAUGE,
+        ENGINE_DEDUP_HITS_TOTAL,
         REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
         MM_FILLS_BOTH,
         MM_SINGLE_FILL_HEDGED,
@@ -1338,6 +1341,7 @@ class ExecutionEngine:
 
 
         self.risk_manager = risk_manager
+        self.reconciler = None
 
         # --- Garde DRY_RUN/PROD cohérente ---
         if self.cfg.g.mode == "DRY_RUN" and self.cfg.g.feature_switches.get("engine_real", False):
@@ -1364,6 +1368,9 @@ class ExecutionEngine:
             except Exception:
                 self.venue_keys[canon] = mapping or {}
         self._order_keys_hint: Dict[str, Tuple[str, Optional[str], Optional[str]]] = {}
+        self._submit_sent: Dict[str, Dict[str, Any]] = {}
+        self._client_bundle_map: Dict[str, Dict[str, Any]] = {}
+        self._submit_ack_sla_s = float(getattr(self.config, "submit_ack_sla_s", 3.0))
         self.ready_event = ready_event or asyncio.Event()
         self._auto_ready_on_start: bool = bool(getattr(self.config, "ready_autoset_on_start", False))
         self._ready = False
@@ -1837,6 +1844,9 @@ class ExecutionEngine:
             log.warning("[ExecutionEngine] Aucun PrivateWSHub attaché (mode test/dry-run)")
             self._update_trade_ready()
             return
+
+    def set_private_ws_reconciler(self, reconciler) -> None:
+        self.reconciler = reconciler
 
         status = {}
         try:
@@ -2964,7 +2974,7 @@ class ExecutionEngine:
         self._update_submit_queue_gauge()
         return {"accepted": True}
 
-    async def _execute_bundle(self, bundle: Dict[str, Any]) -> bool:
+    async def _execute_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
         """
         Hook async utilisé par RMCompat._submit_bundle.
 
@@ -2977,14 +2987,12 @@ class ExecutionEngine:
         - la même déduplication CID + enqueue non bloquant dans `order_queue`.
 
         Retour:
-            bool: True si le bundle a été accepté dans la file Engine.
-                  En cas de rejet technique, EngineSubmitError est propagée
-                  exactement comme pour le RM.
+            dict: BundleAck structuré (accepted/rejected + metadata).
         """
         # On réutilise la logique existante de l’interface RM synchrone.
         return self.execute_bundle(bundle)
 
-    def execute_bundle(self, bundle: Dict[str, Any]) -> bool:
+    def execute_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
         """Interface synchrone utilisée par le RiskManager.
 
         Objectifs Volet B (Macro 1):
@@ -2995,10 +3003,19 @@ class ExecutionEngine:
           * mêmes signaux de backpressure (QUEUE_FULL / CAP_BRANCH / HIGH_WM, MM_HIGH_WM),
         - ne jamais bloquer le RM (pas de sleep / await ici).
 
-        Retourne True si le bundle a été accepté par la file Engine.
-        En cas de rejet technique, lève EngineSubmitError avec un `reason`
-        cohérent avec le chemin async `submit`.
+        Retourne un BundleAck structuré.
         """
+        meta = bundle.get("meta") or {}
+        ack_base = {
+            "trace_id": meta.get("trace_id") or bundle.get("trace_id"),
+            "decision_id": meta.get("decision_id") or bundle.get("decision_id"),
+            "bundle_id": meta.get("bundle_id") or bundle.get("bundle_id"),
+            "idempotency_key": meta.get("idempotency_key") or bundle.get("idempotency_key"),
+            "state": "ENGINE_REJECTED",
+            "reason_code": None,
+            "per_order": {},
+            "deadlines": {},
+        }
         # 0) Readiness: on mappe NotReadyError -> EngineSubmitError homogène pour le RM
         try:
             self._ensure_ready()
@@ -3008,17 +3025,13 @@ class ExecutionEngine:
                 self._engine_reject_metric(RM_ENGINE_NOT_READY, branch=None, profile=None)
             except Exception:
                 pass
-            err = EngineSubmitError(RM_ENGINE_NOT_READY)
-            try:
-                err.reason = RM_ENGINE_NOT_READY
-            except Exception:
-                pass
-            raise err from e
+            ack_base["reason_code"] = RM_ENGINE_NOT_READY
+            return ack_base
 
         # 1) Enrichissement trace (semblable à execute / submit)
         now_ms = int(time.time() * 1000)
         trace = bundle.setdefault("trace", {})
-        trace.setdefault("trace_id", str(uuid.uuid4()))
+        trace.setdefault("trace_id", ack_base.get("trace_id") or str(uuid.uuid4()))
         trace.setdefault("t_engine_submit_ms", now_ms)
 
         # 2) Branch / profile + caps locaux pour métriques & backpressure
@@ -3050,7 +3063,14 @@ class ExecutionEngine:
                     )
                 except Exception:
                     pass
-                return True
+                try:
+                    ENGINE_DEDUP_HITS_TOTAL.labels(source="idempotency_key").inc()
+                except Exception:
+                    pass
+                ack_base["state"] = "ENGINE_ACCEPTED"
+                ack_base["deadlines"]["ack_deadline_ts"] = time.time() + float(self._submit_ack_sla_s or 0.0)
+                return ack_base
+
         except Exception:
             # Défensif: si la déduplication casse, on ne bloque jamais le RM.
             cid = None
@@ -3169,19 +3189,22 @@ class ExecutionEngine:
                 self._engine_backpressure_metric("QUEUE_FULL", branch=branch, profile=profile)
             except Exception:
                 pass
-            self._raise_engine_submit_error(
-                ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile
-            )
+            ack_base["reason_code"] = ENGINE_BACKPRESSURE_QUEUE_FULL
+            return ack_base
 
         # 3-b) Hard backpressure: caps_local par branche (optionnel)
         if bundle_concurrency is not None:
-            self._branch_concurrency_guard(
-                branch=branch,
-                profile=profile,
-                bundle_concurrency=bundle_concurrency,
-                headroom_min=headroom_min,
-                origin="execute_bundle",
-            )
+            try:
+                self._branch_concurrency_guard(
+                    branch=branch,
+                    profile=profile,
+                    bundle_concurrency=bundle_concurrency,
+                    headroom_min=headroom_min,
+                    origin="execute_bundle",
+                )
+            except EngineSubmitError as exc:
+                ack_base["reason_code"] = str(getattr(exc, "reason", None) or str(exc))
+                return ack_base
 
         # 3-c) Soft backpressure: high watermark
         # Priorité business TT/TM > MM : en cas de high watermark, on coupe d'abord la
@@ -3203,9 +3226,8 @@ class ExecutionEngine:
                 self._engine_backpressure_metric("MM_HIGH_WM", branch=branch, profile=profile)
             except Exception:
                 pass
-            self._raise_engine_submit_error(
-                ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile
-            )
+            ack_base["reason_code"] = ENGINE_BACKPRESSURE_HIGH_WM
+            return ack_base
 
         if queue_max and high_wm and depth >= high_wm and overflow_policy in ("defer", "reject"):
             # Ici on ne "déferre" pas (pas de sleep synchrone) : on choisit
@@ -3227,9 +3249,8 @@ class ExecutionEngine:
                 self._engine_backpressure_metric("HIGH_WM", branch=branch, profile=profile)
             except Exception:
                 pass
-            self._raise_engine_submit_error(
-                ENGINE_BACKPRESSURE_HIGH_WM, branch=branch, profile=profile
-            )
+            ack_base["reason_code"] = ENGINE_BACKPRESSURE_HIGH_WM
+            return ack_base
 
         # 4) Construction du job & enqueue non bloquant
         job = dict(bundle)
@@ -3254,9 +3275,8 @@ class ExecutionEngine:
                 pass
                 # Map sur le namespace Engine
             self._decrement_active_bundle(branch, profile)
-            self._raise_engine_submit_error(
-                ENGINE_BACKPRESSURE_QUEUE_FULL, branch=branch, profile=profile
-            )
+            ack_base["reason_code"] = ENGINE_BACKPRESSURE_QUEUE_FULL
+            return ack_base
         except Exception:
             self._decrement_active_bundle(branch, profile)
             raise
@@ -3275,7 +3295,18 @@ class ExecutionEngine:
         except Exception:
             pass
 
-        return True
+        ack_base["state"] = "ENGINE_ACCEPTED"
+        ack_base["deadlines"]["ack_deadline_ts"] = time.time() + float(self._submit_ack_sla_s or 0.0)
+        if ack_base.get("idempotency_key"):
+            self._submit_sent[str(ack_base["idempotency_key"])] = {
+                "bundle_id": ack_base.get("bundle_id"),
+                "decision_id": ack_base.get("decision_id"),
+                "trace_id": ack_base.get("trace_id"),
+                "ts_ms": now_ms,
+                "deadline_ts": ack_base["deadlines"]["ack_deadline_ts"],
+                "client_ids": set(),
+            }
+        return ack_base
 
 
     async def place_two_makers_with_hedge(self, bundle: dict):
@@ -4302,6 +4333,12 @@ class ExecutionEngine:
         que les retry du RM restent idempotents, mais on garde le reste du
         payload (route, meta, legs...) pour que le CID reflète bien la logique.
         """
+        idk = bundle.get("idempotency_key")
+        if not idk:
+            meta = bundle.get("meta") or {}
+            idk = meta.get("idempotency_key")
+        if idk:
+            return str(idk)
 
         # On travaille sur une copie "canonique" best-effort
         try:
@@ -4451,6 +4488,24 @@ class ExecutionEngine:
             raise
 
     # --------------------------- lifecycle ---------------------------
+    def _mark_submit_ack(self, client_id: str, status: str) -> None:
+        entry = self._client_bundle_map.get(client_id)
+        if not entry:
+            return
+        idk = entry.get("idempotency_key")
+        if not idk:
+            return
+        bundle_entry = self._submit_sent.get(str(idk))
+        if not bundle_entry:
+            return
+        try:
+            bundle_entry.setdefault("acks", {})[client_id] = status
+            bundle_entry.setdefault("client_ids", set()).discard(client_id)
+            if not bundle_entry.get("client_ids"):
+                self._submit_sent.pop(str(idk), None)
+        except Exception:
+            pass
+
     async def stop(self):
         if not self.running:
             return
@@ -4729,6 +4784,9 @@ class ExecutionEngine:
                 fsm.on_reject(event.get("reason", ""))
             elif st == "CANCELED":
                 fsm.on_cancel()
+
+        if st in {"ACK", "REJECTED", "FILLED", "CANCELED"}:
+            self._mark_submit_ack(clid, st)
 
         # --- TM hedge driver (partial/filled) ---
         plan = self._tm_hedges.get(clid)
@@ -6255,6 +6313,17 @@ class ExecutionEngine:
                 except Exception:
                     report_nonfatal("ExecutionEngine", "cancel_on_ack_timeout_failed", None, phase="watchdog")
                     logging.exception("Unhandled exception")
+                try:
+                    rec = getattr(self, "reconciler", None)
+                    if rec and hasattr(rec, "correlate_and_maybe_resync"):
+                        ex_u, alias_hint, _ = self._order_keys_hint.get(client_id, (exchange, None, None))
+                        alias = str(alias_hint or "").upper()
+                        if alias:
+                            asyncio.create_task(
+                                rec.correlate_and_maybe_resync(ex_u, alias, client_id, id_kind="client_id")
+                            )
+                except Exception:
+                    report_nonfatal("ExecutionEngine", "reconcile_on_ack_timeout_failed", None, phase="watchdog")
         except Exception:
             report_nonfatal("ExecutionEngine", "watchdog_error", None, phase="watchdog")
             logger.debug("[Watchdog] erreur", exc_info=False)
@@ -7343,9 +7412,10 @@ class ExecutionEngine:
             except Exception:
                 return False
 
-        def _cid(*, kind: str, bundle_id: str, slice_id: str, leg: str) -> str:
-            base = f"{bundle_id}:{slice_id}:{leg}:{kind}"
-            return base.replace(":", "")[:32]
+        def _cid(*, kind: str, bundle_id: str, slice_id: str, leg: str, idempotency_key: str | None) -> str:
+            base_id = idempotency_key or bundle_id
+            base = f"{base_id}:{slice_id}:{leg}:{kind}"
+            return hashlib.sha1(base.encode("utf-8")).hexdigest()[:32]
 
         async def _dual_submit(buy_order, sell_order, *, max_skew_ms: int) -> Tuple[bool, bool]:
             t_buy = asyncio.create_task(self._exec_single(buy_order))
@@ -7454,6 +7524,8 @@ class ExecutionEngine:
             except Exception:
                 flags = {}
 
+            idk = (meta.get("idempotency_key") or bundle.get("idempotency_key") or meta.get("idempotence_key"))
+
             meta_common = {
                 "best_ts": int(time.time() * 1000),
                 "tif_override": ("IOC" if flags.get("ioc_only", False) else (
@@ -7461,6 +7533,7 @@ class ExecutionEngine:
                 "fastpath_ok": fastpath_ok,
                 "skip_inventory": True,
                 "bundle_id": bundle_id,
+                "idempotency_key": idk,
                 "slice_id": slice_tag,
                 "strategy": "TT",
                 "slice_group": glabel,
@@ -7470,9 +7543,8 @@ class ExecutionEngine:
             }
 
             # IDs déterministes
-            buy_cid = _cid(kind="LMT", bundle_id=bundle_id, slice_id=slice_tag, leg="BUY")
-            sell_cid = _cid(kind="LMT", bundle_id=bundle_id, slice_id=slice_tag, leg="SELL")
-
+            buy_cid = _cid(kind="LMT", bundle_id=bundle_id, slice_id=slice_tag, leg="BUY", idempotency_key=idk)
+            sell_cid = _cid(kind="LMT", bundle_id=bundle_id, slice_id=slice_tag, leg="SELL", idempotency_key=idk)
             order_buy = {
                 "type": "single",
                 "exchange": buy_leg["exchange"],
@@ -7882,10 +7954,10 @@ class ExecutionEngine:
         open_makers: List[Tuple[str, str]] = []
 
         # Helpers spécifiques TM
-        def _cid(*, kind: str, bundle_id: str, slice_id: str, leg: str) -> str:
-            base = f"{bundle_id}:{slice_id}:{leg}:{kind}"
-            return base.replace(":", "")[:32]
-
+        def _cid(*, kind: str, bundle_id: str, slice_id: str, leg: str, idempotency_key: str | None) -> str:
+            base_id = idempotency_key or bundle_id
+            base = f"{base_id}:{slice_id}:{leg}:{kind}"
+            return hashlib.sha1(base.encode("utf-8")).hexdigest()[:32]
 
         # bind (once here; we keep the binding later as well for safety)
 
@@ -9136,7 +9208,17 @@ class ExecutionEngine:
         side = str(order.get("side") or "").upper()
         price = float(order.get("price", 0))
         vol_usdc = float(order.get("volume_usdc", 0))
-        client_id = order.get("client_id") or f"S{int(time.time() * 1000)}"
+        client_id = order.get("client_id")
+        if not client_id:
+            meta = order.get("meta") or {}
+            idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+            slice_id = meta.get("slice_id") or meta.get("slice")
+            leg = str(meta.get("leg_id") or side or "")
+            if idk and slice_id:
+                base = f"{idk}:{slice_id}:{leg}"
+                client_id = hashlib.sha1(base.encode("utf-8")).hexdigest()[:32]
+            else:
+                client_id = f"S{int(time.time() * 1000)}"
 
 
 
@@ -9151,6 +9233,23 @@ class ExecutionEngine:
             self._client_symbol_map[client_id] = (self._norm_ex(ex), str(symbol).replace("-", "").upper())
         except Exception:
             logging.exception("Unhandled exception in _client_symbol_map set")
+        try:
+            meta = order.get("meta") or {}
+            idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+            bundle_id = meta.get("bundle_id")
+            alias_hint = meta.get("account_alias") or meta.get("alias")
+            if idk:
+                self._client_bundle_map[client_id] = {
+                    "idempotency_key": str(idk),
+                    "bundle_id": bundle_id,
+                    "exchange": self._norm_ex(ex),
+                    "alias": str(alias_hint).upper() if alias_hint else None,
+                }
+                entry = self._submit_sent.get(str(idk))
+                if entry:
+                    entry.setdefault("client_ids", set()).add(client_id)
+        except Exception:
+            logging.exception("Unhandled exception in _client_bundle_map set")
 
         meta = (order.get("meta") or {})
         is_maker = bool(meta.get("maker", False))
