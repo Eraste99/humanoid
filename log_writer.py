@@ -2032,6 +2032,125 @@ class LogWriter:
                 )
                 conn.commit()
 
+    # ------------------------------------------------------------------
+    # Trade FSM (append-only) helpers
+    # ------------------------------------------------------------------
+
+    def insert_trade_fsm_event(self, event: Dict[str, Any]) -> None:
+        payload = dict(event or {})
+
+        def _coerce_ts_ms(raw: Any) -> int:
+            if raw is None:
+                raw = payload.get("timestamp_ms")
+            if raw is None:
+                raw = payload.get("ts")
+            try:
+                if isinstance(raw, (int, float)):
+                    return int(raw) if raw > 10_000_000_000 else int(float(raw) * 1000.0)
+                if isinstance(raw, str):
+                    return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp() * 1000)
+            except Exception:
+                pass
+            return int(time.time() * 1000)
+
+        def _do() -> int:
+            with self._lock:
+                self._rotate_if_needed()
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute("PRAGMA table_info(trade_fsm_events);")
+                    cols = {row[1] for row in cur.fetchall()}
+
+                    ts_ms = payload.get("ts_ms")
+                    if ts_ms is None:
+                        ts_ms = _coerce_ts_ms(payload.get("ts_ms"))
+                    row = {
+                        "ts_ms": int(ts_ms) if ts_ms is not None else None,
+                        "ts": payload.get("ts") or datetime.utcnow().isoformat(),
+                        "event_type": payload.get("event_type"),
+                        "stream": payload.get("stream"),
+                        "trace_id": payload.get("trace_id"),
+                        "bundle_id": payload.get("bundle_id"),
+                        "decision_id": payload.get("decision_id"),
+                        "idempotency_key": payload.get("idempotency_key"),
+                        "raw_json": payload.get("raw_json") or json.dumps(payload, ensure_ascii=False, default=str),
+                    }
+                    row = {k: v for k, v in row.items() if k in cols}
+                    if not row:
+                        return 0
+                    col_union = sorted(row.keys())
+                    qmarks = ", ".join(["?"] * len(col_union))
+                    sql = f"INSERT INTO trade_fsm_events ({', '.join(col_union)}) VALUES ({qmarks})"
+                    cur.execute(sql, tuple(row.get(c) for c in col_union))
+                    conn.commit()
+                    return 1
+
+        self._run_db("trade_fsm_events", _do)
+
+    def query_open_trade_bundles(
+            self,
+            *,
+            since_ts_ms: Optional[int] = None,
+            limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        since_ts_ms = int(since_ts_ms) if since_ts_ms is not None else None
+        limit = int(max(1, limit))
+
+        def _do() -> List[Dict[str, Any]]:
+            with self._lock:
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    params: List[Any] = []
+                    where_clause = "WHERE bundle_id IS NOT NULL"
+                    if since_ts_ms is not None:
+                        where_clause += " AND ts_ms >= ?"
+                        params.append(since_ts_ms)
+
+                    sql = f"""
+                        WITH latest AS (
+                          SELECT bundle_id,
+                                 MAX(ts_ms) AS last_ts_ms
+                          FROM trade_fsm_events
+                          {where_clause}
+                          GROUP BY bundle_id
+                        ),
+                        last_rows AS (
+                          SELECT e.bundle_id,
+                                 e.ts_ms,
+                                 e.event_type,
+                                 e.trace_id,
+                                 e.decision_id,
+                                 e.idempotency_key
+                          FROM trade_fsm_events e
+                          JOIN latest l
+                            ON e.bundle_id = l.bundle_id
+                           AND e.ts_ms = l.last_ts_ms
+                        )
+                        SELECT bundle_id, ts_ms, event_type, trace_id, decision_id, idempotency_key
+                        FROM last_rows
+                        WHERE event_type IN ('ENGINE_SUBMIT', 'ENGINE_ACK')
+                        ORDER BY ts_ms ASC
+                        LIMIT ?
+                    """
+                    params.append(limit)
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                    return [
+                        {
+                            "bundle_id": r[0],
+                            "ts_ms": r[1],
+                            "event_type": r[2],
+                            "trace_id": r[3],
+                            "decision_id": r[4],
+                            "idempotency_key": r[5],
+                        }
+                        for r in rows
+                    ]
+
+        res = self._run_db("trade_fsm_events_query", _do)
+        return res if isinstance(res, list) else []
+
+
     def insert_latencies_bulk(self, events: Iterable[Dict[str, Any]]) -> int:
         events = list(events or [])
         with self._lock:

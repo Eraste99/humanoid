@@ -111,6 +111,7 @@ class PrivateWSReconciler:
     Hooks P0 (optionnels) que l'orchestrateur peut poser :
       - self._lookup(exchange, alias, client_id) -> Any|None
       - self._resync_order(exchange, alias, client_id) -> awaitable[bool]
+      - self._resync_bundle(exchange, alias, bundle_id, idempotency_key=...) -> awaitable[bool]
       - self._resync_alias(exchange, alias) -> awaitable[bool]
     """
     # NOTE: On maintient la signature __init__ hybride pour compatibilité.
@@ -159,6 +160,7 @@ class PrivateWSReconciler:
         # Hooks P0 posés ultérieurement par l'orchestrateur
         self._lookup: Optional[Callable[[str, str, str], Any]] = None
         self._resync_order: Optional[Callable[[str, str, str], Awaitable[bool]]] = None
+        self._resync_bundle: Optional[Callable[..., Awaitable[bool]]] = None
         self._resync_alias: Optional[Callable[[str, str], Awaitable[bool]]] = None
 
         # Dédup bornée (client_id/fill-key)
@@ -643,6 +645,71 @@ class PrivateWSReconciler:
                 self._observe_resync_latency(exchange, alias, scope, t0)
             if ok:
                 self._alias_miss_counter[key] = 0  # reset indulgent
+
+    async def resync_bundle(
+            self,
+            exchange: str,
+            alias: str,
+            bundle_id: Optional[str],
+            *,
+            idempotency_key: Optional[str] = None,
+    ) -> bool:
+        """
+        Resync groupé par bundle_id (P0).
+        Fallbacks:
+          - _resync_bundle (si fourni),
+          - _resync_order avec id_kind="bundle",
+          - _resync_alias (dernier recours).
+        """
+        if not bundle_id:
+            return False
+        scope = "bundle"
+        ok = False
+        t0 = time.time()
+        try:
+            if callable(self._resync_bundle):
+                params = {
+                    "exchange": exchange,
+                    "alias": alias,
+                    "bundle_id": bundle_id,
+                }
+                if idempotency_key and "idempotency_key" in inspect.signature(self._resync_bundle).parameters:
+                    params["idempotency_key"] = idempotency_key
+                ok = bool(await self._resync_bundle(**params))
+            elif callable(self._resync_order):
+                params = {
+                    "exchange": exchange,
+                    "alias": alias,
+                    "order_id": bundle_id,
+                }
+                if "id_kind" in inspect.signature(self._resync_order).parameters:
+                    params["id_kind"] = "bundle"
+                if idempotency_key and "idempotency_key" in inspect.signature(self._resync_order).parameters:
+                    params["idempotency_key"] = idempotency_key
+                ok = bool(await self._resync_order(**params))
+            elif callable(self._resync_alias):
+                ok = bool(await self._resync_alias(exchange, alias))
+            else:
+                self._notify_hook_missing("resync_bundle", exchange, alias)
+                self._on_resync_failure(exchange, alias, scope, "hook_missing")
+                return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._on_resync_failure(exchange, alias, scope, "exception", error=exc)
+            return False
+        finally:
+            try:
+                self._record_resync_metric(exchange, alias, scope)
+            except Exception:
+                pass
+            try:
+                self._observe_resync_latency(exchange, alias, scope, t0)
+            except Exception:
+                pass
+        if not ok:
+            self._on_resync_failure(exchange, alias, scope, "returned_false")
+        return ok
 
     # ----------------------------- Loop --------------------------------------
 

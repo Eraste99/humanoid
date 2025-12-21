@@ -98,7 +98,7 @@ import random
 import time
 import asyncio as _asyncio
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
-
+from contracts.payloads import normalize_reason_code
 # --- Prometheus metrics (fallback no-op si registre absent) -------------------
 try:
     from modules.obs_metrics import (
@@ -1326,7 +1326,11 @@ class PrivateWSHub:
         if not hasattr(self, "_queues"):
             from collections import defaultdict, deque
             qmax = int(getattr(self.cfg, "PWS_QUEUE_MAXLEN", 1000))
-            self._queues = defaultdict(lambda: deque(maxlen=qmax))
+            self._queue_max = qmax
+            self._queues = defaultdict(deque)
+
+        if not hasattr(self, "_queue_max"):
+            self._queue_max = int(getattr(self.cfg, "PWS_QUEUE_MAXLEN", 1000))
 
         # Heartbeats
         if not hasattr(self, "_last_hb"):
@@ -1338,6 +1342,8 @@ class PrivateWSHub:
         self._pong_timeout_s = float(getattr(pws, "PWS_PONG_TIMEOUT_S", 3.0))
         self._backoff_base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 200))
         self._backoff_max_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 5000))
+        self._queue_backpressure_ms = int(getattr(pws, "PWS_QUEUE_BACKPRESSURE_MS", 50))
+        self._critical_drop_seen = bool(getattr(self, "_critical_drop_seen", False))
 
 
         # Pools WS par région (optionnel, valeur non bloquante si métrique absente)
@@ -1503,12 +1509,45 @@ class PrivateWSHub:
 
         pri = self._priority_map.get(cat, 3)
         q = self._queues[key]
+        cap = int(getattr(self, "_queue_max", 0) or 0)
 
         try:
             if pri <= 1:
+                if cap > 0 and len(q) >= cap:
+                    timeout_s = max(0.0, float(self._queue_backpressure_ms) / 1000.0)
+                    deadline = _t.time() + timeout_s
+                    while len(q) >= cap and _t.time() < deadline:
+                        try:
+                            self._pws_drain_one(key)
+                        except Exception:
+                            break
+                        if len(q) >= cap:
+                            _t.sleep(0.001)
+                if cap > 0 and len(q) >= cap:
+                    reason_code = normalize_reason_code(
+                        "PWS_QUEUE_BACKPRESSURE_TIMEOUT") or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+                    try:
+                        PWS_DROPPED_TOTAL.labels(exu, alu, reason_code).inc()
+                    except Exception:
+                        pass
+                    try:
+                        from modules.obs_metrics import inc_blocked
+                        inc_blocked("private_ws_hub", reason_code, None)
+                    except Exception:
+                        pass
+                    self._critical_drop_seen = True
+                    self._notify_alert(
+                        severity="CRITICAL",
+                        reason=reason_code,
+                        exchange=exu,
+                        alias=alu,
+                        kind=cat,
+                        message="PrivateWS queue saturated for critical ACK/FILL",
+                    )
+                    return
                 q.appendleft(ev)  # fills/acks en tête
             else:
-                if len(q) == q.maxlen and pri >= 2:
+                if cap > 0 and len(q) >= cap and pri >= 2:
                     try:
                         PWS_DROPPED_TOTAL.labels(exu, alu, f"queue_full_{cat}").inc()
                     except Exception:
@@ -2677,6 +2716,7 @@ class PrivateWSHub:
         return {
             "module": "PrivateWSHub",
             "healthy": self._started,
+            "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
             "wiring": wiring,
             "submodules": {
                 "binance": {al: c.get_status() for al, c in self.binance_by_alias.items()},

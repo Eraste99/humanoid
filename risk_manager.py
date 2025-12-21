@@ -10441,9 +10441,6 @@ class RiskManager:
         except Exception:
             return
 
-        # On ne traite que les transferts effectivement exécutés côté CEX.
-        if status not in ("OK", "SUCCESS"):
-            return
 
         if etype not in ("transfer", "pws_transfer"):
             return
@@ -10457,9 +10454,19 @@ class RiskManager:
             payload = {}
         try:
             transfer_id = payload.get("transfer_id") or ev.get("transfer_id")
-            self._transfer_controller.mark_settled(transfer_id)
+            if status in ("OK", "SUCCESS"):
+                self._transfer_controller.mark_settled(transfer_id)
+                if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
+                    self.rebalancing.mark_transfer_status(transfer_id, "SETTLED")
+            elif status in ("ERROR", "FAILED", "REJECTED"):
+                if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
+                    self.rebalancing.mark_transfer_status(transfer_id, status)
         except Exception:
             pass
+        
+        # On ne traite que les transferts effectivement exécutés côté CEX.
+        if status not in ("OK", "SUCCESS"):
+            return
 
         try:
             ccy = str(payload.get("ccy") or "USDC").upper()

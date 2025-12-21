@@ -239,6 +239,7 @@ class RebalancingManager:
         self._last_rebal_cap_status: Optional[str] = None
         self._reb_active_slots: deque = deque(maxlen=512)
         self._rebalancing_assets: Dict[Tuple[str, str], float] = {}
+        self._inflight_transfers: Dict[str, Dict[str, Any]] = {}
 
         # Snapshots ingérés par le RM
         # OB: latest_orderbooks[EX][SYMBOL] = {"bid":..., "ask":..., "ts": ...}
@@ -287,7 +288,7 @@ class RebalancingManager:
 
     @property
     def inflight_rebal_current(self) -> int:
-        return len(self._reb_active_slots)
+        return self._current_inflight_count()
 
 
     def set_cost_function(self, fn: Optional[Callable[[Dict[str, Any]], float]]) -> None:
@@ -314,6 +315,65 @@ class RebalancingManager:
             maxlen=self._reb_active_slots.maxlen,
         )
         self._prune_rebal_assets(now)
+
+    def _current_inflight_count(self) -> int:
+        if self._inflight_transfers:
+            return len(self._inflight_transfers)
+        return len(self._reb_active_slots)
+
+    def _canonical_transfer_id(self, payload: Dict[str, Any]) -> Optional[str]:
+        tc = getattr(self.rm, "_transfer_controller", None)
+        if tc and hasattr(tc, "_canonical_transfer_id"):
+            try:
+                return tc._canonical_transfer_id(payload)
+            except Exception:
+                return None
+        return None
+
+    def _ensure_transfer_id(self, op: Dict[str, Any], transfer_type: str) -> Optional[str]:
+        if not op:
+            return None
+        existing = op.get("transfer_id")
+        if existing:
+            return str(existing)
+        payload = {
+            "exchange": op.get("exchange"),
+            "from_alias": op.get("from_alias") or (op.get("from") or {}).get("alias"),
+            "to_alias": op.get("to_alias") or (op.get("to") or {}).get("alias"),
+            "from_wallet": op.get("from_wallet"),
+            "to_wallet": op.get("to_wallet"),
+            "ccy": op.get("ccy"),
+            "amount": op.get("amount"),
+            "type": transfer_type,
+        }
+        transfer_id = self._canonical_transfer_id(payload)
+        if transfer_id:
+            op["transfer_id"] = transfer_id
+        return transfer_id
+
+    def _register_inflight_transfers(self, operations: List[Dict[str, Any]], now: float) -> None:
+        if not operations:
+            return
+        for op in operations:
+            if not isinstance(op, dict):
+                continue
+            if op.get("from_wallet") or op.get("to_wallet"):
+                transfer_id = self._ensure_transfer_id(op, "internal_wallet_transfer")
+            elif op.get("from_alias") or op.get("to_alias") or op.get("from") or op.get("to"):
+                transfer_id = self._ensure_transfer_id(op, "internal_subaccount_transfer")
+            else:
+                transfer_id = None
+            if transfer_id:
+                self._inflight_transfers.setdefault(transfer_id, {"state": "SUBMITTED", "ts": now})
+
+    def mark_transfer_status(self, transfer_id: Optional[str], status: Optional[str]) -> None:
+        if not transfer_id:
+            return
+        st = str(status or "").upper()
+        if st in {"SETTLED", "FAILED", "ERROR", "CANCELLED", "REJECTED"}:
+            self._inflight_transfers.pop(str(transfer_id), None)
+            return
+        self._inflight_transfers[str(transfer_id)] = {"state": st or "SUBMITTED", "ts": _now()}
 
     def _prune_rebal_assets(self, now: float) -> None:
         ttl = float(self._reb_slot_ttl_s or 0.0)
@@ -849,7 +909,8 @@ class RebalancingManager:
         now = _now()
         self._emit_ts = type(self._emit_ts)([t for t in self._emit_ts if (now - t) < 60.0], maxlen=self._emit_ts.maxlen)
         self._prune_rebal_slots(now)
-        available_slots = max(0, int(self.rebal_inflight_cap) - len(self._reb_active_slots))
+        inflight_current = self._current_inflight_count()
+        available_slots = max(0, int(self.rebal_inflight_cap) - inflight_current)
         budget_rate = max(0, int(self.rebal_max_ops_per_min) - len(self._emit_ts))
         budget = min(len(ordered), budget_rate, available_slots)
         blocked_by_caps = 0
@@ -868,6 +929,7 @@ class RebalancingManager:
             self.rebal_plan_clipped_by_caps += 1
         self._emit_ts.extend([now] * len(selected))
         self._reb_active_slots.extend([now] * len(selected))
+        self._register_inflight_transfers(selected, now)
         self._register_rebalancing_assets(selected, now)
 
         plan_notional = self._estimate_plan_notional(selected)
@@ -1057,6 +1119,7 @@ class RebalancingManager:
         for w in plan.get("wallet_transfers") or []:
             base = dict(w or {})
             # On force le type attendu par le RM
+            self._ensure_transfer_id(base, "internal_wallet_transfer")
             ops.append({**base, "type": "internal_wallet_transfer"})
 
         # Transferts intra-CEX entre alias (TT/TM/MM...)
@@ -1081,6 +1144,7 @@ class RebalancingManager:
                 base["to_alias"] = to_alias
 
             # Type aligné sur l'API du RM
+            self._ensure_transfer_id(base, "internal_subaccount_transfer")
             ops.append({**base, "type": "internal_subaccount_transfer"})
 
         # Top-ups crypto indicatifs
@@ -1141,6 +1205,7 @@ class RebalancingManager:
             "rebal_caps": {
                 "inflight_cap": self.rebal_inflight_cap,
                 "inflight_current": self.inflight_rebal_current,
+                "inflight_transfers": len(self._inflight_transfers),
                 "ops_emitted_last_min": self.rebal_ops_emitted_last_min,
                 "ops_blocked_by_caps": self.rebal_ops_blocked_by_caps,
                 "plan_clipped_by_caps": self.rebal_plan_clipped_by_caps,

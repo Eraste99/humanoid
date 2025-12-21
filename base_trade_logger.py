@@ -50,6 +50,7 @@ from typing import Callable, Dict, Any, Optional, List, Tuple
 import asyncio, time, collections, hashlib, json
 import queue
 import time  # (déjà présent si tu l'utilises)
+from contracts.payloads import normalize_reason_code
 from queue import Queue, Empty as QueueEmpty, Full as QueueFull
 
 
@@ -147,9 +148,11 @@ class BaseTradeLogger:
                 exc_info=True,
             )
             self._metrics_proxy.on_btl_filter_exception(self.log_type)
-
+        is_critical = self._is_critical_entry(data)
         try:
-            if self.drop_when_full:
+            if is_critical:
+                self._queue.put(data, timeout=0.05)
+            elif self.drop_when_full:
                 self._queue.put_nowait(data)
             else:
                 self._queue.put(data, timeout=0.05)
@@ -162,16 +165,20 @@ class BaseTradeLogger:
         except QueueFull:
             reason_code = (
                 "LOGGERH_BTL_QUEUE_FULL_DROP"
-                if self.drop_when_full
+                if (self.drop_when_full and not is_critical)
                 else "LOGGERH_BTL_PUT_TIMEOUT_DROP"
             )
             self._log_event(
                 logging.WARNING,
                 "BTL drop",
-                reason_code=reason_code,
+                reason_code=normalize_reason_code(reason_code) or reason_code,
                 entry=data,
             )
-            self._metrics_proxy.on_btl_drop(self.log_type, reason=reason_code)
+            self._metrics_proxy.on_btl_drop(
+                self.log_type,
+                reason=normalize_reason_code(reason_code) or reason_code,
+                critical=is_critical,
+            )
 
     def ingest_many(self, trades: List[Dict[str, Any]] | None) -> None:
         if not trades:
@@ -633,7 +640,7 @@ class BaseTradeLogger:
             message,
             exc_info=exc_info,
             extra={
-                "reason_code": reason_code,
+                "reason_code": normalize_reason_code(reason_code) or reason_code,
                 "log_type": self.log_type,
                 "event_type": event_type,
                 "queue_cap": queue_cap,
@@ -644,6 +651,24 @@ class BaseTradeLogger:
                 "exchange": exchange,
             },
         )
+
+    def _is_critical_entry(self, entry: Any) -> bool:
+        try:
+            if self.log_type in {"trades", "balances", "balance_snapshots"}:
+                return True
+            if not isinstance(entry, dict):
+                return False
+            if entry.get("is_critical") or entry.get("critical"):
+                return True
+            kind = str(entry.get("event_type") or entry.get("kind") or "").lower()
+            if kind.startswith(("rm.", "engine.", "balance.")):
+                return True
+            if kind.startswith("transfer"):
+                return True
+        except Exception:
+            return False
+        return False
+
     # ------------------------------ status -----------------------------
     def get_queue_size(self) -> int:
         try:

@@ -3430,12 +3430,17 @@ class LoggerHistoriqueManager:
         except Exception:
             pass
 
-    def on_btl_drop(self, log_type: str, *, reason: str) -> None:
+    def on_btl_drop(self, log_type: str, *, reason: str, critical: bool = False) -> None:
         try:
             from modules.obs_metrics import lhm_on_dropped
             lhm_on_dropped("btl", reason, n=1)
         except Exception:
             pass
+        if critical:
+            try:
+                self._critical_drop_seen = True
+            except Exception:
+                pass
 
     def on_btl_flush_latency(self, log_type: str, *, ms: float) -> None:
         try:
@@ -3467,9 +3472,20 @@ class LoggerHistoriqueManager:
         Cette API reste volontairement minimale : elle pourra être consommée
         plus tard par le Watchdog, le RM ou un outil externe.
         """
+        critical_drop_seen = bool(getattr(self, "_critical_drop_seen", False))
+        storage_error_seen = bool(getattr(self, "_storage_error_seen", False))
+        try:
+            from modules.obs_metrics import set_lhm_pipeline_flags
+            set_lhm_pipeline_flags(
+                critical_drop_seen=critical_drop_seen,
+                storage_error_seen=storage_error_seen,
+            )
+        except Exception:
+            pass
+
         return {
-            "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
-            "storage_error_seen": bool(getattr(self, "_storage_error_seen", False)),
+            "critical_drop_seen": critical_drop_seen,
+            "storage_error_seen": storage_error_seen,
             "db_lane_disabled": bool(getattr(self, "_db_lane_disabled_seen", False)),
         }
 

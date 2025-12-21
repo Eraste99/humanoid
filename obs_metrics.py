@@ -1610,6 +1610,37 @@ LHM_SLO_DROPPED_TRADES_BUDGET = _metric(
     'Budget of dropped JSONL trade records per observation window',
 )
 
+LHM_CRITICAL_DROP_SEEN = _metric(
+    Gauge,
+    'lhm_critical_drop_seen',
+    'LHM critical drop seen flag (1=yes)',
+)
+
+LHM_STORAGE_ERROR_SEEN = _metric(
+    Gauge,
+    'lhm_storage_error_seen',
+    'LHM storage error seen flag (1=yes)',
+)
+
+TRADE_FSM_OPEN_BUNDLES = _metric(
+    Gauge,
+    'trade_fsm_open_bundles',
+    'Open trade FSM bundles pending reconcile',
+)
+
+RECONCILE_BACKLOG = _metric(
+    Gauge,
+    'reconcile_backlog',
+    'Reconcile backlog (open bundles/events)',
+    labelnames=('scope',),
+)
+
+BUNDLE_TRUTH_DIVERGENCE_TOTAL = _metric(
+    Counter,
+    'bundle_truth_divergence_total',
+    'Bundle truth divergence events',
+    labelnames=('reason',),
+)
 
 def lhm_set_pipeline_lag(seconds: float) -> None:
     """
@@ -1688,6 +1719,31 @@ def loggerh_set_last_flush_now() -> None:
 def loggerh_set_last_rotation_now() -> None:
     try:
         LOGGERH_LAST_ROTATION_TS_SECONDS.set(time.time())
+    except Exception:
+        pass
+
+def set_lhm_pipeline_flags(*, critical_drop_seen: bool, storage_error_seen: bool) -> None:
+    try:
+        LHM_CRITICAL_DROP_SEEN.set(1.0 if critical_drop_seen else 0.0)
+        LHM_STORAGE_ERROR_SEEN.set(1.0 if storage_error_seen else 0.0)
+    except Exception:
+        pass
+
+def set_trade_fsm_open_bundles(count: int) -> None:
+    try:
+        TRADE_FSM_OPEN_BUNDLES.set(max(0, int(count)))
+    except Exception:
+        pass
+
+def set_reconcile_backlog(scope: str, count: int) -> None:
+    try:
+        RECONCILE_BACKLOG.labels(str(scope)).set(max(0, int(count)))
+    except Exception:
+        pass
+
+def note_bundle_truth_divergence(reason: str, n: int = 1) -> None:
+    try:
+        BUNDLE_TRUTH_DIVERGENCE_TOTAL.labels(str(reason)).inc(max(1, int(n)))
     except Exception:
         pass
 
@@ -2885,6 +2941,15 @@ __all__ += [
     'LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET',
     'LHM_SLO_DROPPED_TRADES_BUDGET',
     'lhm_set_pipeline_lag',
+    'LHM_CRITICAL_DROP_SEEN',
+    'LHM_STORAGE_ERROR_SEEN',
+    'TRADE_FSM_OPEN_BUNDLES',
+    'RECONCILE_BACKLOG',
+    'BUNDLE_TRUTH_DIVERGENCE_TOTAL',
+    'set_lhm_pipeline_flags',
+    'set_trade_fsm_open_bundles',
+    'set_reconcile_backlog',
+    'note_bundle_truth_divergence',
     "VOL_PRICE_VOL_MICRO",
     "VOL_SPREAD_VOL_MICRO",
     "VOL_PRICE_PCTL",
