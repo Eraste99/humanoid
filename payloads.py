@@ -1598,6 +1598,21 @@ KNOWN_REASON_CODES = {
     "TRUTH_PERSISTENCE_FAILED",
     "ENGINE_DEDUP_BROKEN",
     "IDEMPOTENCY_MISSING",
+    "REB_LOCK",
+    "ENGINE_REBAL_LOCKED",
+    "BUNDLE_ILLEGAL",
+    "REB_LOCK_CHECK_FAILED",
+    "MM_PREEMPTED",
+    "PREEMPT_TT",
+    "PREEMPT_TM",
+    "PREEMPT_REB",
+    "PREEMPT_HEDGE",
+    "TT_CONTRACT_INVALID",
+    "TM_CONTRACT_INVALID",
+    "TM_DISABLED",
+    "MM_OFF_NOT_READY",
+    "REB_CONTRACT_INVALID",
+    "REB_DISABLED",
 }
 
 
@@ -1615,6 +1630,122 @@ def normalize_reason_code(reason: Optional[str]) -> Optional[str]:
     if canon in KNOWN_REASON_CODES:
         return canon
     return canon
+
+def tt_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    missing: List[str] = []
+
+    def _missing(field: str, value: Any) -> None:
+        if value in (None, ""):
+            missing.append(field)
+
+    _missing("trace_id", meta.get("trace_id") or payload.get("trace_id"))
+    _missing("decision_id", meta.get("decision_id") or payload.get("decision_id"))
+    _missing("bundle_id", meta.get("bundle_id") or payload.get("bundle_id"))
+    _missing("idempotency_key", meta.get("idempotency_key") or payload.get("idempotency_key"))
+
+    notional = payload.get("notional_quote") or {}
+    if not isinstance(notional, dict):
+        missing.append("notional_quote")
+    else:
+        try:
+            amount = float(notional.get("amount"))
+        except Exception:
+            amount = None
+        if amount is None or amount <= 0.0:
+            missing.append("notional_quote.amount")
+        if not notional.get("ccy"):
+            missing.append("notional_quote.ccy")
+
+    strategy_tag = meta.get("strategy_tag") or meta.get("strategy") or meta.get("branch")
+    if str(strategy_tag or "").upper() != "TT":
+        missing.append("strategy_tag")
+
+    kind = meta.get("kind")
+    _missing("kind", kind)
+    return missing
+
+
+def tm_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    missing: List[str] = []
+
+    def _missing(field: str, value: Any) -> None:
+        if value in (None, ""):
+            missing.append(field)
+
+    _missing("trace_id", meta.get("trace_id") or payload.get("trace_id"))
+    _missing("decision_id", meta.get("decision_id") or payload.get("decision_id"))
+    _missing("bundle_id", meta.get("bundle_id") or payload.get("bundle_id"))
+    _missing("idempotency_key", meta.get("idempotency_key") or payload.get("idempotency_key"))
+
+    notional = payload.get("notional_quote") or {}
+    if not isinstance(notional, dict):
+        missing.append("notional_quote")
+    else:
+        try:
+            amount = float(notional.get("amount"))
+        except Exception:
+            amount = None
+        if amount is None or amount <= 0.0:
+            missing.append("notional_quote.amount")
+        if not notional.get("ccy"):
+            missing.append("notional_quote.ccy")
+
+    strategy_tag = meta.get("strategy_tag") or meta.get("strategy") or meta.get("branch")
+    if str(strategy_tag or "").upper() != "TM":
+        missing.append("strategy_tag")
+
+    kind = meta.get("kind")
+    _missing("kind", kind)
+
+    route_id = meta.get("route_id")
+    _missing("route_id", route_id)
+    return missing
+
+
+def reb_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
+    meta = payload.get("meta") if isinstance(payload, dict) else {}
+    meta = meta if isinstance(meta, dict) else {}
+    missing: List[str] = []
+
+    def _missing(field: str, value: Any) -> None:
+        if value in (None, ""):
+            missing.append(field)
+
+    _missing("trace_id", meta.get("trace_id") or payload.get("trace_id"))
+    _missing("decision_id", meta.get("decision_id") or payload.get("decision_id"))
+    _missing("bundle_id", meta.get("bundle_id") or payload.get("bundle_id"))
+    _missing("idempotency_key", meta.get("idempotency_key") or payload.get("idempotency_key"))
+
+    notional = payload.get("notional_quote") or {}
+    if not isinstance(notional, dict):
+        missing.append("notional_quote")
+    else:
+        try:
+            amount = float(notional.get("amount"))
+        except Exception:
+            amount = None
+        if amount is None or amount <= 0.0:
+            missing.append("notional_quote.amount")
+        if not notional.get("ccy"):
+            missing.append("notional_quote.ccy")
+
+    strategy_tag = meta.get("strategy_tag") or meta.get("strategy") or meta.get("branch")
+    if str(strategy_tag or "").upper() != "REB":
+        missing.append("strategy_tag")
+
+    combo_signature = meta.get("combo_signature")
+    _missing("combo_signature", combo_signature)
+
+    kind = meta.get("kind")
+    _missing("kind", kind)
+
+    route_id = meta.get("route_id")
+    _missing("route_id", route_id)
+    return missing
 
 # -----------------------------------------------------------------------------
 # Exports publics
@@ -1639,6 +1770,7 @@ __all__ = [
     "validate_fill_normalized_lite", "validate_order_intent_lite", "make_submit_bundle",
     "make_rm_shutdown_event", "normalize_reason_code", "validate_idempotency_key_lite",
     "validate_ws_alias_status_snapshot_lite", "validate_reco_alias_status_snapshot_lite",
+    "tt_contract_missing_fields", "tm_contract_missing_fields", "reb_contract_missing_fields",
     "validate_balance_snapshot_rm_lite", "normalize_leg_dict",
     # >>> PATCH #3 — helpers publics
     "norm_symbol", "pair_key","encode_flow_meta",

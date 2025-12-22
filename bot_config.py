@@ -486,6 +486,12 @@ class RiskManagerCfg:
     audit_config_on_start: bool = True
     strict_config: bool = False
     ff_fail_closed_caps: bool = False
+    ff_enforce_preemption: bool = False
+    ff_hedge_fast_lane: bool = False
+    ff_tm_enabled: bool = False
+    ff_mm_enabled: bool = False
+    ff_mm_opportunistic_gating_enforced: bool = False
+    ff_reb_enabled: bool = False
 
     # Policy "Capital Ladder" — source canonique pour les profils NANO→LARGE.
     # Chaque profil porte :
@@ -763,6 +769,12 @@ class EngineCfg:
     ff_enforce_client_oid_deterministic: bool = False
     ff_fail_closed_idempotence: bool = False
     idempotence_on: bool = True
+    ff_hedge_fast_lane: bool = False
+    ff_enforce_preemption: bool = False
+    ff_tm_enabled: bool = False
+    ff_mm_enabled: bool = False
+    ff_mm_opportunistic_gating_enforced: bool = False
+    ff_reb_enabled: bool = False
 
     tm_exposure_ttl_ms: int = 1500
     tm_exposure_ttl_hedge_ratio: float = 0.5
@@ -1720,6 +1732,30 @@ class BotConfig:
             "FF_TRADING_STATE_UNIFIED",
             cfg.rm.ff_trading_state_unified,
         )
+        cfg.rm.ff_enforce_preemption = _Env.get_bool(
+            "FF_ENFORCE_PREEMPTION",
+            cfg.rm.ff_enforce_preemption,
+        )
+        cfg.rm.ff_hedge_fast_lane = _Env.get_bool(
+            "FF_HEDGE_FAST_LANE",
+            cfg.rm.ff_hedge_fast_lane,
+        )
+        cfg.rm.ff_tm_enabled = _Env.get_bool(
+            "FF_TM_ENABLED",
+            cfg.rm.ff_tm_enabled,
+        )
+        cfg.rm.ff_mm_enabled = _Env.get_bool(
+            "FF_MM_ENABLED",
+            cfg.rm.ff_mm_enabled,
+        )
+        cfg.rm.ff_mm_opportunistic_gating_enforced = _Env.get_bool(
+            "FF_MM_OPPORTUNISTIC_GATING_ENFORCED",
+            cfg.rm.ff_mm_opportunistic_gating_enforced,
+        )
+        cfg.rm.ff_reb_enabled = _Env.get_bool(
+            "FF_REB_ENABLED",
+            cfg.rm.ff_reb_enabled,
+        )
 
         # Branches RM (incluant REB) — alignées sur le chantier M6-B
         cfg.rm.branch_priority = _Env.get_list(
@@ -1919,6 +1955,30 @@ class BotConfig:
         cfg.engine.ff_fail_closed_idempotence = _Env.get_bool(
             "ENGINE_FAIL_CLOSED_IDEMPOTENCE",
             cfg.engine.ff_fail_closed_idempotence,
+        )
+        cfg.engine.ff_hedge_fast_lane = _Env.get_bool(
+            "ENGINE_FF_HEDGE_FAST_LANE",
+            cfg.engine.ff_hedge_fast_lane,
+        )
+        cfg.engine.ff_enforce_preemption = _Env.get_bool(
+            "ENGINE_FF_ENFORCE_PREEMPTION",
+            cfg.engine.ff_enforce_preemption,
+        )
+        cfg.engine.ff_tm_enabled = _Env.get_bool(
+            "ENGINE_FF_TM_ENABLED",
+            cfg.engine.ff_tm_enabled,
+        )
+        cfg.engine.ff_mm_enabled = _Env.get_bool(
+            "ENGINE_FF_MM_ENABLED",
+            cfg.engine.ff_mm_enabled,
+        )
+        cfg.engine.ff_mm_opportunistic_gating_enforced = _Env.get_bool(
+            "ENGINE_FF_MM_OPPORTUNISTIC_GATING_ENFORCED",
+            cfg.engine.ff_mm_opportunistic_gating_enforced,
+        )
+        cfg.engine.ff_reb_enabled = _Env.get_bool(
+            "ENGINE_FF_REB_ENABLED",
+            cfg.engine.ff_reb_enabled,
         )
         cfg.engine.depth_min_quote_tt = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_TT", cfg.engine.depth_min_quote_tt)
         cfg.engine.depth_min_quote_tm = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_TM", cfg.engine.depth_min_quote_tm)
@@ -2653,6 +2713,18 @@ class BotConfig:
             "MM_ALIAS_NAME": "rm.mm_alias_name",
             "preempt_mm_for_tt_tm": "rm.preempt_mm_for_tt_tm",
             "PREEMPT_MM_FOR_TT_TM": "rm.preempt_mm_for_tt_tm",
+            "ff_enforce_preemption": "rm.ff_enforce_preemption",
+            "FF_ENFORCE_PREEMPTION": "rm.ff_enforce_preemption",
+            "ff_hedge_fast_lane": "rm.ff_hedge_fast_lane",
+            "FF_HEDGE_FAST_LANE": "rm.ff_hedge_fast_lane",
+            "ff_tm_enabled": "rm.ff_tm_enabled",
+            "FF_TM_ENABLED": "rm.ff_tm_enabled",
+            "ff_mm_enabled": "rm.ff_mm_enabled",
+            "FF_MM_ENABLED": "rm.ff_mm_enabled",
+            "ff_mm_opportunistic_gating_enforced": "rm.ff_mm_opportunistic_gating_enforced",
+            "FF_MM_OPPORTUNISTIC_GATING_ENFORCED": "rm.ff_mm_opportunistic_gating_enforced",
+            "ff_reb_enabled": "rm.ff_reb_enabled",
+            "FF_REB_ENABLED": "rm.ff_reb_enabled",
             "per_strategy_notional_cap": "rm.per_strategy_notional_cap",
             "PER_STRATEGY_NOTIONAL_CAP": "rm.per_strategy_notional_cap",
             "rebal_allow_loss_bps": "rm.rebal_allow_loss_bps",

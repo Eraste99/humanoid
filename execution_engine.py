@@ -38,6 +38,7 @@ import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
 from contracts import payloads as fraglib
+from contracts.payloads import normalize_reason_code
 
 from modules.engine_pacer import EnginePacer  # ensure import top-level
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
@@ -2626,11 +2627,63 @@ class ExecutionEngine:
         new_state = str(state or "READY").upper()
         self.trading_state = new_state
         self.trading_state_reason = reason
+        if new_state in ("DEGRADED", "BLOCKED") and bool(
+                getattr(self.config, "ff_mm_opportunistic_gating_enforced", False)
+        ):
+            try:
+                exchanges = {
+                    ex for (ex, _alias, _pair) in (getattr(self, "_mm_active_by_pair", {}) or {}).keys()
+                }
+                for ex in exchanges:
+                    self._spawn(
+                        self.cancel_mm_quotes_on_exchange(
+                            exchange=str(ex),
+                            reason=normalize_reason_code("MM_OFF_NOT_READY") or "MM_OFF_NOT_READY",
+                        ),
+                        name="mm-cancel-degraded",
+                    )
+            except Exception:
+                pass
 
     def _fmt_pair(self, s: str) -> str:
+
         return str(s or "").replace("-", "").upper()
 
     def _bundle_combo_signature(self, payload: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+        meta = payload.get("meta") or {}
+        combo_sig = meta.get("combo_signature")
+        if isinstance(combo_sig, (tuple, list)) and len(combo_sig) == 3:
+            return (
+                self._fmt_pair(combo_sig[0]),
+                self._norm_ex(combo_sig[1]),
+                self._norm_ex(combo_sig[2]),
+            )
+        if isinstance(combo_sig, str):
+            parts = combo_sig.strip().split("|")
+            if len(parts) >= 2 and "->" in parts[-1]:
+                buy_ex, sell_ex = parts[-1].split("->", 1)
+                pair = parts[0]
+                return (
+                    self._fmt_pair(pair),
+                    self._norm_ex(buy_ex),
+                    self._norm_ex(sell_ex),
+                )
+
+        route = payload.get("route") or {}
+        pair = (
+                meta.get("pair")
+                or route.get("pair")
+                or payload.get("pair_key")
+                or payload.get("pair")
+        )
+        buy_ex = meta.get("buy_ex") or route.get("buy_ex")
+        sell_ex = meta.get("sell_ex") or route.get("sell_ex")
+        if pair and buy_ex and sell_ex:
+            return (
+                self._fmt_pair(pair),
+                self._norm_ex(buy_ex),
+                self._norm_ex(sell_ex),
+            )
         legs = payload.get("legs") or (payload.get("payload") or {}).get("legs", []) or []
         if len(legs) < 2:
             return None
@@ -2803,8 +2856,9 @@ class ExecutionEngine:
         ex = (exchange or "").upper()
 
         kind = (meta.get("kind") or "").upper()
+
         branch = (meta.get("branch") or "").upper()
-        is_hedge = (kind in ("HEDGE", "TAKER")) or (branch == "TT")
+        is_hedge = self._is_fast_lane_meta(meta) or kind == "TAKER" or branch == "TT"
 
         # RL CEX (si présent)
         rl = None
@@ -3061,7 +3115,17 @@ class ExecutionEngine:
 
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
+        is_fast_lane = self._is_fast_lane_meta(meta)
         branch, profile = self._require_branch_profile(meta)
+        strategy_tag = str(meta.get("strategy_tag") or meta.get("strategy") or meta.get("branch") or "").upper()
+        if branch == "TT" or strategy_tag == "TT":
+            self._enforce_tt_contract(bundle)
+        if branch == "TM" or strategy_tag == "TM":
+            self._enforce_tm_contract(bundle)
+        if branch == "REB" or strategy_tag == "REB":
+            self._enforce_reb_contract(bundle)
+        self._enforce_mm_enabled(branch, strategy_tag, bundle)
+        self._enforce_reb_enabled(branch, strategy_tag, bundle)
         idk = meta.get("idempotency_key") or meta.get("idempotence_key")
         if self.ff_enforce_client_oid_deterministic and not idk:
             ack_base["reason_code"] = "IDEMPOTENCY_MISSING"
@@ -4062,10 +4126,18 @@ class ExecutionEngine:
             if branch not in ("HEDGE", "PANIC_HEDGE", "INTERNAL"):
                 reason = self.trading_state_reason or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
                 self._raise_engine_submit_error(reason, branch=branch, profile=profile, payload=bundle)
+
         elif trading_state == "DEGRADED":
             if branch not in ("TT", "HEDGE", "PANIC_HEDGE", "INTERNAL"):
                 reason = self.trading_state_reason or "TRADING_NOT_READY"
                 self._raise_engine_submit_error(reason, branch=branch, profile=profile, payload=bundle)
+        if (branch == "TM" or strategy_tag == "TM") and not getattr(self.config, "ff_tm_enabled", False):
+            self._raise_engine_submit_error(
+                normalize_reason_code("TM_DISABLED") or "TM_DISABLED",
+                branch=branch,
+                profile=profile,
+                payload=bundle,
+            )
         # 1-ter) Garde technique alias / capital_mode (Ticket 4-ENG-1 / 4-ENG-2)
         capital_mode = str(meta.get("capital_mode") or "OK").upper()
         overlays = meta.get("overlays") or {}
@@ -4173,7 +4245,15 @@ class ExecutionEngine:
 
 
         # 2) Backpressure technique: queue globale et éventuelle concurrence par branche
-
+        if bool(getattr(self.config, "ff_enforce_preemption", False)):
+            preempt_by = "HEDGE" if is_fast_lane else branch
+            if preempt_by in ("TT", "TM", "REB", "HEDGE"):
+                combo = self._bundle_combo_signature(bundle)
+                if combo:
+                    try:
+                        await self._preempt_mm_for_pair([combo[1], combo[2]], combo[0], preempt_by)
+                    except Exception:
+                        logging.exception("Unhandled exception while preempting MM before submit")
         queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
         queue_max = getattr(self.order_queue, "maxsize", 0) or queue_max_cfg or 0
         depth = int(self.order_queue.qsize())
@@ -4277,15 +4357,25 @@ class ExecutionEngine:
             # vérifier engine_queue_* et engine_backpressure_total{type} puis rm_engine_reject_total côté RM.
 
             # 2-a) Hard backpressure: queue pleine
+
         if queue_max and depth >= queue_max:
+            if bool(getattr(self.config, "ff_hedge_fast_lane", False)) and is_fast_lane:
+                reclaimed = self._fast_lane_reclaim_queue(needed=1)
+                if reclaimed:
+                    depth = int(self.order_queue.qsize())
+                else:
+                    reclaimed = 0
+            else:
+                reclaimed = 0
+            if depth >= queue_max and reclaimed == 0:
                 # Raison explicite pour RM + métriques
-            try:
-                logger.warning(
-                "[ExecutionEngine] BACKPRESSURE_QUEUE_FULL branch=%s profile=%s depth=%s max=%s",
-                branch, profile, depth, queue_max,
-                )
-            except Exception:
-                pass
+                try:
+                    logger.warning(
+                    "[ExecutionEngine] BACKPRESSURE_QUEUE_FULL branch=%s profile=%s depth=%s max=%s",
+                    branch, profile, depth, queue_max,
+                    )
+                except Exception:
+                    pass
                 try:
                     ENGINE_QUEUEPOS_BLOCKED_TOTAL.labels(exchange="ALL").inc()
                 except Exception:
@@ -4821,6 +4911,155 @@ class ExecutionEngine:
         except Exception:
             return
 
+    def _tt_contract_missing_fields(self, bundle: Dict[str, Any]) -> List[str]:
+        try:
+            return fraglib.tt_contract_missing_fields(bundle)
+        except Exception:
+            return ["tt_contract_check_failed"]
+
+    def _enforce_tt_contract(self, bundle: Dict[str, Any]) -> None:
+        missing = self._tt_contract_missing_fields(bundle)
+        if missing:
+            meta = bundle.get("meta") if isinstance(bundle, dict) else {}
+            branch = str((meta or {}).get("branch") or "").upper()
+            profile = str((meta or {}).get("capital_profile") or "").upper()
+            reason = normalize_reason_code("TT_CONTRACT_INVALID") or "TT_CONTRACT_INVALID"
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: TT contract invalid (missing=%s)",
+                    ",".join(missing),
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(reason, branch=branch or "TT", profile=profile or "UNKNOWN")
+
+    def _tm_contract_missing_fields(self, bundle: Dict[str, Any]) -> List[str]:
+        try:
+            return fraglib.tm_contract_missing_fields(bundle)
+        except Exception:
+            return ["tm_contract_check_failed"]
+
+    def _enforce_tm_contract(self, bundle: Dict[str, Any]) -> None:
+        missing = self._tm_contract_missing_fields(bundle)
+        if missing:
+            meta = bundle.get("meta") if isinstance(bundle, dict) else {}
+            branch = str((meta or {}).get("branch") or "").upper()
+            profile = str((meta or {}).get("capital_profile") or "").upper()
+            reason = normalize_reason_code("TM_CONTRACT_INVALID") or "TM_CONTRACT_INVALID"
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: TM contract invalid (missing=%s)",
+                    ",".join(missing),
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(reason, branch=branch or "TM", profile=profile or "UNKNOWN")
+
+    def _enforce_mm_enabled(self, branch: str, strategy_tag: str, bundle: Dict[str, Any]) -> None:
+        if branch != "MM" and strategy_tag != "MM":
+            return
+        if bool(getattr(self.config, "ff_mm_enabled", False)):
+            return
+        reason = normalize_reason_code("MM_OFF_NOT_READY") or "MM_OFF_NOT_READY"
+        meta = bundle.get("meta") if isinstance(bundle, dict) else {}
+        branch_u = str((meta or {}).get("branch") or branch or "MM").upper()
+        profile = str((meta or {}).get("capital_profile") or "UNKNOWN").upper()
+        self._raise_engine_submit_error(reason, branch=branch_u, profile=profile, payload=bundle)
+
+    def _reb_contract_missing_fields(self, bundle: Dict[str, Any]) -> List[str]:
+        try:
+            return fraglib.reb_contract_missing_fields(bundle)
+        except Exception:
+            return ["reb_contract_check_failed"]
+
+    def _enforce_reb_contract(self, bundle: Dict[str, Any]) -> None:
+        missing = self._reb_contract_missing_fields(bundle)
+        if missing:
+            meta = bundle.get("meta") if isinstance(bundle, dict) else {}
+            branch = str((meta or {}).get("branch") or "").upper()
+            profile = str((meta or {}).get("capital_profile") or "").upper()
+            reason = normalize_reason_code("REB_CONTRACT_INVALID") or "REB_CONTRACT_INVALID"
+            try:
+                logger.warning(
+                    "[ExecutionEngine] submit: REB contract invalid (missing=%s)",
+                    ",".join(missing),
+                )
+            except Exception:
+                pass
+            self._raise_engine_submit_error(reason, branch=branch or "REB", profile=profile or "UNKNOWN")
+
+    def _enforce_reb_enabled(self, branch: str, strategy_tag: str, bundle: Dict[str, Any]) -> None:
+        if branch != "REB" and strategy_tag != "REB":
+            return
+        if bool(getattr(self.config, "ff_reb_enabled", False)):
+            return
+        reason = normalize_reason_code("REB_DISABLED") or "REB_DISABLED"
+        meta = bundle.get("meta") if isinstance(bundle, dict) else {}
+        branch_u = str((meta or {}).get("branch") or branch or "REB").upper()
+        profile = str((meta or {}).get("capital_profile") or "UNKNOWN").upper()
+        self._raise_engine_submit_error(reason, branch=branch_u, profile=profile, payload=bundle)
+
+    def _is_fast_lane_meta(self, meta: Dict[str, Any]) -> bool:
+        kind = str(meta.get("kind") or "").upper()
+        flow_kind = str(meta.get("flow_kind") or "").lower()
+        risk_effect = str(meta.get("risk_effect") or "").lower()
+        hedge_tag = meta.get("hedge_tag") or meta.get("tag")
+        return (
+                kind in ("HEDGE", "PANIC_HEDGE")
+                or flow_kind in ("hedge", "unwind")
+                or risk_effect in ("risk_reducing", "unwind")
+                or bool(hedge_tag)
+        )
+
+    def _is_low_priority_meta(self, meta: Dict[str, Any]) -> bool:
+        kind = str(meta.get("kind") or "").upper()
+        flow_kind = str(meta.get("flow_kind") or "").lower()
+        branch = str(meta.get("branch") or "").upper()
+        return (
+                branch == "MM"
+                or kind in ("MAKER", "MAKER_MM", "MAKER_TM", "CANCEL")
+                or flow_kind in ("maker", "cancel")
+        )
+
+    def _fast_lane_reclaim_queue(self, *, needed: int = 1) -> int:
+        try:
+            q = getattr(self.order_queue, "_queue", None)
+            if q is None or needed <= 0:
+                return 0
+            items = list(q)
+            removed = 0
+            for idx in range(len(items) - 1, -1, -1):
+                job = items[idx]
+                if not isinstance(job, dict):
+                    continue
+                meta = job.get("meta") or {}
+                if self._is_low_priority_meta(meta):
+                    removed_job = items.pop(idx)
+                    removed += 1
+                    try:
+                        self._release_active_bundle(removed_job)
+                    except Exception:
+                        pass
+                    if removed >= needed:
+                        break
+            if removed:
+                q.clear()
+                q.extend(items)
+            return removed
+        except Exception:
+            return 0
+
+    def _canonical_preempt_reason(self, by: str) -> str:
+        by_u = str(by or "").upper()
+        mapping = {
+            "TT": "PREEMPT_TT",
+            "TM": "PREEMPT_TM",
+            "REB": "PREEMPT_REB",
+            "HEDGE": "PREEMPT_HEDGE",
+        }
+        reason = mapping.get(by_u, "MM_PREEMPTED")
+        return normalize_reason_code(reason) or reason
+
     async def _acquire_rl(self, bucket, exchange: str) -> bool:
         if bucket is None:
             return True
@@ -4939,6 +5178,10 @@ class ExecutionEngine:
                             "planned_usdc": usdc_amt,
                             # hedge = taker → router TT pour l’alias
                             "strategy": "TT",
+                            "kind": "HEDGE",
+                            "flow_kind": "hedge",
+                            "risk_effect": "risk_reducing",
+                            "hedge_tag": "TM_FILL_HEDGE",
                             "account_alias": hedge_alias
                                              or self.wallet_router.pick_by_quote(hedge_ex, "TT", q),
                         }
@@ -5994,6 +6237,10 @@ class ExecutionEngine:
                 "skip_inventory": True,
                 "strategy": "TT",
                 "bundle_id": bundle_id,
+                "kind": "HEDGE",
+                "flow_kind": "hedge",
+                "risk_effect": "risk_reducing",
+                "hedge_tag": "MM_PANIC_HEDGE",
                 "account_alias": self.wallet_router.pick_by_quote(ex, "TT", quote),
             },
         }
@@ -6047,9 +6294,13 @@ class ExecutionEngine:
                 "skip_inventory": True,
                 "strategy": "TT",
                 "account_alias": alias,
+                "kind": "HEDGE",
+                "flow_kind": "hedge",
+                "risk_effect": "risk_reducing",
             }
             if tag:
                 meta["tag"] = tag
+                meta["hedge_tag"] = tag
             if max_slippage_bps is not None:
                 try:
                     meta["max_slippage_bps"] = float(max_slippage_bps)
@@ -6213,12 +6464,13 @@ class ExecutionEngine:
 
     async def _preempt_mm_for_pair(self, exchanges: list[str], pair_key: str, by: str) -> None:
         """Cancel MM makers on the given pair/venues when a higher priority branch executes."""
+        reason = self._canonical_preempt_reason(by)
         for ex in exchanges:
             active = self._mm_active_for(ex, pair_key)
             if not active:
                 continue
             try:
-                await self._mm_cancel_open_makers(active, reason=f"preempt_{by.lower()}")
+                await self._mm_cancel_open_makers(active, reason=reason)
             except Exception:
                 logging.exception("Unhandled exception preempting MM makers")
 
@@ -7630,6 +7882,10 @@ class ExecutionEngine:
                     "fastpath_ok": True,
                     "skip_inventory": True,
                     "strategy": "TT",  # hedge TT pur, même si déclenché en mode panic
+                    "kind": "HEDGE",
+                    "flow_kind": "hedge",
+                    "risk_effect": "risk_reducing",
+                    "hedge_tag": "TT_PANIC_HEDGE",
                     **({"account_alias": account_alias} if account_alias else {}),
                 },
             }
@@ -8195,6 +8451,10 @@ class ExecutionEngine:
                     "fastpath_ok": True,
                     "skip_inventory": True,
                     "strategy": "TT",
+                    "kind": "HEDGE",
+                    "flow_kind": "hedge",
+                    "risk_effect": "risk_reducing",
+                    "hedge_tag": "TM_PANIC_HEDGE",
                     **({"account_alias": account_alias} if account_alias else {}),
                 },
             }
@@ -9423,6 +9683,9 @@ class ExecutionEngine:
             logging.exception("Unhandled exception in _client_bundle_map set")
 
         meta = (order.get("meta") or {})
+        if self._is_fast_lane_meta(meta) and not meta.get("kind"):
+            meta["kind"] = "HEDGE"
+        order["meta"] = meta
         is_maker = bool(meta.get("maker", False))
 
         pair_key = (meta.get("pair_key")

@@ -2777,3 +2777,11 @@ class PrivateWSHub:
             },
             "private_ws_health": health,
         }
+
+    def critical_drop_snapshot(self) -> Dict[str, Any]:
+        """Expose l'état drop critique pour la route TT (tests/observabilité)."""
+        return {
+            "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
+            "last_critical_drop_reason": getattr(self, "_last_critical_drop_reason", None),
+            "last_critical_drop_ts": float(getattr(self, "_last_critical_drop_ts", 0.0) or 0.0),
+        }

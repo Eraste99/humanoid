@@ -434,6 +434,15 @@ class PrivateWSReconciler:
         """À appeler par l'Engine/Hub lorsqu'un event WS est reçu pour ce venue."""
         self._last_ws_ns = time.perf_counter_ns()
 
+    def is_ws_stale(self) -> bool:
+        """Retourne True si le flux WS est considéré stale (SLO dépassé)."""
+        try:
+            stale_ms = float(getattr(self, "_stale_ms", 0.0) or 0.0)
+        except Exception:
+            stale_ms = 0.0
+        if stale_ms <= 0.0:
+            return False
+        return (time.perf_counter_ns() - self._last_ws_ns) / 1e6 > stale_ms
     def note_seen_client_id(self, client_id: Optional[str]) -> None:
         """Optionnel: marquer un client_id vu pour idempotence locale (WS événementiel)."""
         if not client_id:

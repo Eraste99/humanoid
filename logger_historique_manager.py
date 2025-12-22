@@ -3591,6 +3591,29 @@ class LoggerHistoriqueManager:
             "db_lane_disabled": bool(getattr(self, "_db_lane_disabled_seen", False)),
         }
 
+    def tt_contract_missing_fields(self, payload: dict) -> list[str]:
+        """Retourne les champs TT manquants pour un payload (bundle/decision/log)."""
+        try:
+            from contracts import payloads as contracts
+            return contracts.tt_contract_missing_fields(payload)
+        except Exception:
+            return ["tt_contract_check_failed"]
+
+    def tm_contract_missing_fields(self, payload: dict) -> list[str]:
+        """Retourne les champs TM manquants pour un payload (bundle/decision/log)."""
+        try:
+            from contracts import payloads as contracts
+            return contracts.tm_contract_missing_fields(payload)
+        except Exception:
+            return ["tm_contract_check_failed"]
+
+    def reb_contract_missing_fields(self, payload: dict) -> list[str]:
+        """Retourne les champs REB manquants pour un payload (bundle/decision/log)."""
+        try:
+            from contracts import payloads as contracts
+            return contracts.reb_contract_missing_fields(payload)
+        except Exception:
+            return ["reb_contract_check_failed"]
 
     def _insert_index_event(
             self,

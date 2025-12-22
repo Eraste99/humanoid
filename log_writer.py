@@ -180,6 +180,33 @@ class LogWriter:
             return "COINBASE"
         return s
 
+    @staticmethod
+    def tt_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
+        """Valide le contrat TT pour un payload loggable (best-effort)."""
+        try:
+            from contracts import payloads as contracts
+            return contracts.tt_contract_missing_fields(payload)
+        except Exception:
+            return ["tt_contract_check_failed"]
+
+    @staticmethod
+    def tm_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
+        """Valide le contrat TM pour un payload loggable (best-effort)."""
+        try:
+            from contracts import payloads as contracts
+            return contracts.tm_contract_missing_fields(payload)
+        except Exception:
+            return ["tm_contract_check_failed"]
+
+    @staticmethod
+    def reb_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
+        """Valide le contrat REB pour un payload loggable (best-effort)."""
+        try:
+            from contracts import payloads as contracts
+            return contracts.reb_contract_missing_fields(payload)
+        except Exception:
+            return ["reb_contract_check_failed"]
+
     # ---------------------- lifecycle -----------------------
     def __init__(
         self,

@@ -69,6 +69,13 @@ RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
 
 RM_ALIAS_COLLAT_CRITICAL = "RM_ALIAS_COLLAT_CRITICAL"
 RM_ALIAS_COLLAT_LOW = "RM_ALIAS_COLLAT_LOW"
+BUNDLE_ILLEGAL = "BUNDLE_ILLEGAL"
+REB_LOCK = "REB_LOCK"
+REB_LOCK_CHECK_FAILED = "REB_LOCK_CHECK_FAILED"
+TT_CONTRACT_INVALID = "TT_CONTRACT_INVALID"
+TM_CONTRACT_INVALID = "TM_CONTRACT_INVALID"
+REB_CONTRACT_INVALID = "REB_CONTRACT_INVALID"
+REB_DISABLED = "REB_DISABLED"
 # =========================
 # RM Reason taxonomy (closed set)
 # =========================
@@ -92,6 +99,9 @@ RM_REASON_PRIORITY = (
     "RM_REB_FACTORY_REJECT",
     "RM_OPP_BAD_INPUTS",
     "RM_REGION_UNSUPPORTED",
+    "TT_CONTRACT_INVALID",
+    "TM_CONTRACT_INVALID",
+    "REB_CONTRACT_INVALID"
     "RM_REGION_UNKNOWN",
 
     # B) Readiness
@@ -126,6 +136,8 @@ RM_REASON_PRIORITY = (
 
     # F) Locks
     "REB_LOCK",
+    "REB_LOCK_CHECK_FAILED",
+    "BUNDLE_ILLEGAL",
 
     # G) Caps / Budgets
     "RM_CAP_PROFILE_DISABLED",
@@ -1356,6 +1368,13 @@ class RiskManager:
 
         # Préemption & caps notionnels par stratégie/CEX (devise de cotation)
         self.preempt_mm_for_tt_tm = bool(getattr(self.bot_cfg, "preempt_mm_for_tt_tm", True))
+        self.ff_enforce_preemption = bool(getattr(self.bot_cfg, "ff_enforce_preemption", False))
+        self.ff_tm_enabled = bool(getattr(self.bot_cfg, "ff_tm_enabled", False))
+        self.ff_mm_enabled = bool(getattr(self.bot_cfg, "ff_mm_enabled", False))
+        self.ff_mm_opportunistic_gating_enforced = bool(
+            getattr(self.bot_cfg, "ff_mm_opportunistic_gating_enforced", False)
+        )
+        self.ff_reb_enabled = bool(getattr(self.bot_cfg, "ff_reb_enabled", False))
         self.mm_preempt_cooldown_s = float(getattr(self.bot_cfg, "mm_preempt_cooldown_s", 1.0))
         self._mm_last_preempt_ts: Dict[tuple[str, str, str], float] = {}
         self.per_strategy_notional_cap   = _cfg_dict(self.bot_cfg, "per_strategy_notional_cap", {})
@@ -3258,6 +3277,7 @@ class RiskManager:
             return 0
         self._mm_last_preempt_ts[key] = now
 
+
         executor = getattr(self, "executor", None) or getattr(self, "engine", None)
         if executor is None or not hasattr(executor, "cancel_mm_quotes_on_exchange"):
             logging.warning("[RiskManager] executor without MM cancel API, skip preempt")
@@ -3277,11 +3297,22 @@ class RiskManager:
 
         if count >= 0:
             try:
-                RM_MM_PREEMPTED_TOTAL.labels(by=str(reason or "UNKNOWN").upper()).inc(count)
+                reason_code = normalize_reason_code(reason or "MM_PREEMPTED") or "MM_PREEMPTED"
+                RM_MM_PREEMPTED_TOTAL.labels(by=reason_code).inc(count)
             except Exception:
                 pass
         return count
     # === RM: capital net & profil ===
+    def _mm_preempt_reason(self, by: str) -> str:
+        by_u = str(by or "").upper()
+        mapping = {
+            "TT": "PREEMPT_TT",
+            "TM": "PREEMPT_TM",
+            "REB": "PREEMPT_REB",
+            "HEDGE": "PREEMPT_HEDGE",
+        }
+        reason = mapping.get(by_u, "MM_PREEMPTED")
+        return normalize_reason_code(reason) or reason
 
     def compute_capital_net_per_subaccount(self, gross_equity: float, fee_reserve_total: float) -> float:
         """
@@ -3341,10 +3372,13 @@ class RiskManager:
         cap = float(((self.per_strategy_notional_cap or {}).get(strategy, {}) or {}).get(str(ex).upper(), float("inf")))
         if desired_notional <= cap:
             return max(0.0, desired_notional)
-        if strategy in ("TT", "TM") and self.preempt_mm_for_tt_tm:
+        if strategy in ("TT", "TM", "REB", "HEDGE") and (
+                self.preempt_mm_for_tt_tm or getattr(self, "ff_enforce_preemption", False)
+        ):
             try:
+                reason = self._mm_preempt_reason(strategy)
                 asyncio.create_task(
-                    self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
+                    self._cancel_open_mm_quotes_on_exchange(ex, reason=reason)
                 )
             except Exception:
                 logging.exception("Unhandled while scheduling MM preempt")
@@ -3609,10 +3643,13 @@ class RiskManager:
         )
         if desired_notional <= cap:
             return max(0.0, desired_notional)
-        if strategy in ("TT", "TM") and getattr(self, "preempt_mm_for_tt_tm", False):
+        if strategy in ("TT", "TM", "REB", "HEDGE") and (
+                getattr(self, "preempt_mm_for_tt_tm", False) or getattr(self, "ff_enforce_preemption", False)
+        ):
             try:
+                reason = self._mm_preempt_reason(strategy)
                 asyncio.create_task(
-                    self._cancel_open_mm_quotes_on_exchange(ex, reason="preempt_tt_tm")
+                    self._cancel_open_mm_quotes_on_exchange(ex, reason=reason)
                 )
             except Exception:
                 logging.exception("Unhandled while scheduling MM preempt")
@@ -4474,16 +4511,34 @@ class RiskManager:
                 return False
 
         # 2) Légalité & REB lock
-        if not self._is_bundle_legal(bundle):
+        legal, legal_reason = self._bundle_legality_decision(bundle)
+        if not legal:
             if self._shadow:
-                self._shadow.on_bundle_drop(bundle, "ILLEGAL")
-            _record_decision(False, "ILLEGAL")
+                self._shadow.on_bundle_drop(bundle, legal_reason)
+            _record_decision(False, legal_reason)
             return False
+        if legal_reason:
+            try:
+                logging.info(
+                    "RM: bundle legality warn-only (%s) trace_id=%s",
+                    legal_reason,
+                    trace_id,
+                )
+            except Exception:
+                pass
 
-        if self._is_rebal_lock_active(bundle):
+        lock_active, lock_reason = self._is_rebal_lock_active(bundle)
+        if lock_active:
+            meta = bundle.get("meta") or {}
+            if not isinstance(bundle.get("meta"), dict):
+                bundle["meta"] = meta
+            meta["rm_drop_reason"] = lock_reason
+            if lock_reason == REB_LOCK_CHECK_FAILED:
+                meta["capital_mode"] = "BLOCKED"
+            bundle["meta"] = meta
             if self._shadow:
-                self._shadow.on_bundle_drop(bundle, "REB_LOCK")
-            _record_decision(False, "REB_LOCK")
+                self._shadow.on_bundle_drop(bundle, lock_reason)
+            _record_decision(False, lock_reason)
             return False
 
         # 3) Caps notionnels par CEX / profil / branche (+ préemption MM)
@@ -4698,25 +4753,131 @@ class RiskManager:
 
 
     # ------------------------------------------------------------------
-    # Légalité bundle & REB lock (stubs P0)
+    # Légalité bundle & REB lock
     # ------------------------------------------------------------------
-    def _is_bundle_legal(self, bundle: Dict[str, Any]) -> bool:
-        """
-        Stub P0 : vérifie la « légalité » d'un bundle.
-        À ce stade, on ne met PAS de logique métier complexe ici pour ne pas
-        créer de faux négatifs : on laisse les autres gardes (branch/profile,
-        TTL balances, caps, guards de prix…) faire le gros du travail.
+    def _bundle_legality_decision(self, bundle: Dict[str, Any]) -> Tuple[bool, str]:
+        ok, reason = self._is_bundle_legal(bundle)
+        if ok:
+            return True, ""
+        reason_code = normalize_reason_code(reason or BUNDLE_ILLEGAL) or BUNDLE_ILLEGAL
+        enforce = bool(getattr(getattr(self.cfg, "rm", None), "ff_enforce_bundle_legality", False))
+        if enforce:
+            return False, reason_code
+        return True, reason_code
 
-        Implémentation actuelle : toujours True tant que la structure de
-        base est présente.
+    def _parse_combo_signature(self, raw: Any) -> Optional[Tuple[str, str, str]]:
+        if isinstance(raw, (tuple, list)) and len(raw) == 3:
+            pair_raw, buy_raw, sell_raw = raw
+            return (
+                self._norm_pair(str(pair_raw)) if hasattr(self, "_norm_pair") else str(pair_raw).replace("-", "").upper(),
+                str(buy_raw or "").upper(),
+                str(sell_raw or "").upper(),
+            )
+        if not isinstance(raw, str):
+            return None
+        cleaned = raw.strip()
+        if not cleaned:
+            return None
+        parts = cleaned.split("|")
+        if len(parts) < 2:
+            return None
+        pair_raw = parts[0]
+        route_part = parts[-1]
+        if "->" not in route_part:
+            return None
+        buy_raw, sell_raw = route_part.split("->", 1)
+        return (
+            self._norm_pair(str(pair_raw)) if hasattr(self, "_norm_pair") else str(pair_raw).replace("-", "").upper(),
+            str(buy_raw or "").upper(),
+            str(sell_raw or "").upper(),
+        )
+
+    def _bundle_combo_signature(self, bundle: Dict[str, Any]) -> Optional[Tuple[str, str, str]]:
+        if not isinstance(bundle, dict):
+            return None
+        meta = bundle.get("meta") or {}
+        route = bundle.get("route") or {}
+        combo_sig = meta.get("combo_signature")
+        parsed = self._parse_combo_signature(combo_sig)
+        if parsed:
+            return parsed
+        pair = (
+                meta.get("pair")
+                or meta.get("symbol")
+                or bundle.get("pair")
+                or bundle.get("symbol")
+                or route.get("pair")
+        )
+        buy_ex = (
+                meta.get("buy_ex")
+                or route.get("buy_ex")
+                or meta.get("to_exchange")
+                or route.get("to_exchange")
+        )
+        sell_ex = (
+                meta.get("sell_ex")
+                or route.get("sell_ex")
+                or meta.get("from_exchange")
+                or route.get("from_exchange")
+        )
+        if not (pair and buy_ex and sell_ex):
+            return None
+        pair_key = (
+            self._norm_pair(str(pair))
+            if hasattr(self, "_norm_pair")
+            else str(pair).replace("-", "").upper()
+        )
+        return (pair_key, str(buy_ex).upper(), str(sell_ex).upper())
+
+    def _format_combo_signature(self, combo: Tuple[str, str, str]) -> str:
+        pair, buy_ex, sell_ex = combo
+        return f"{pair}|{buy_ex}->{sell_ex}"
+
+    def _is_bundle_legal(self, bundle: Dict[str, Any]) -> Tuple[bool, str]:
+        """
+        Vérifie la « légalité » minimale d'un bundle.
         """
         if not isinstance(bundle, dict):
             return False
-        # Si tu veux être un peu plus strict sans risque, tu peux vérifier la présence
-        # de quelques clés minimales, mais pour l’instant on reste permissif.
-        return True
+        return False, BUNDLE_ILLEGAL
 
-    def _is_rebal_lock_active(self, bundle: Dict[str, Any]) -> bool:
+        meta = bundle.get("meta") or {}
+        branch = ""
+        try:
+            branch = self._branch_of(meta, bundle)
+        except Exception:
+            branch = str(meta.get("branch") or bundle.get("branch") or "").upper()
+
+        notional = bundle.get("notional_quote") or {}
+        amount = None
+        try:
+            amount = float(notional.get("amount"))
+        except Exception:
+            amount = None
+        if amount is None or amount <= 0.0:
+            return False, "RM_NOTIONAL_QUOTE_INVALID"
+
+        legs = bundle.get("legs") or bundle.get("orders") or []
+        if not isinstance(legs, list) or not legs:
+            return False, BUNDLE_ILLEGAL
+
+        combo = self._bundle_combo_signature(bundle)
+        if not combo:
+            return False, BUNDLE_ILLEGAL
+
+        if branch == "REB" and not self._parse_combo_signature(meta.get("combo_signature")):
+            return False, BUNDLE_ILLEGAL
+
+        allowed_routes = getattr(self, "allowed_routes", set()) or set()
+        if allowed_routes:
+            buy_ex, sell_ex = combo[1], combo[2]
+            if buy_ex and sell_ex and (buy_ex, sell_ex) not in allowed_routes:
+                return False, BUNDLE_ILLEGAL
+
+        return True, ""
+
+
+    def _is_rebal_lock_active(self, bundle: Dict[str, Any]) -> Tuple[bool, str]:
         """
         Lock combo REB partagé avec TT/TM/MM.
 
@@ -4734,10 +4895,9 @@ class RiskManager:
         """
         # 1) Sanity minimal sur la structure
         if not isinstance(bundle, dict):
-          return False
+            return False, ""
 
         meta = bundle.get("meta") or {}
-        route = bundle.get("route") or {}
 
         # 2) Branch du bundle (TT/TM/MM uniquement)
         try:
@@ -4748,53 +4908,34 @@ class RiskManager:
         # On ne gèle que les branches de trading “classiques”
         if branch not in ("TT", "TM", "MM"):
             # REB lui-même, HEDGE internes, etc. ne sont pas bloqués par ce hook.
-            return False
+            return False, ""
 
-        # 3) Extraction du combo (pair, buy_ex, sell_ex)
-        #    On reste best-effort : si on ne retrouve pas proprement la route,
-        #    on ne bloque pas (risque = faible sur un cas incomplet).
-        pair = (
-                meta.get("pair")
-                or meta.get("symbol")
-                or bundle.get("pair")
-                or bundle.get("symbol")
-                or route.get("pair")
-                or ""
-        )
-        pair = (str(pair) or "").replace("-", "").upper()
-
-        buy_ex = (
-                meta.get("buy_ex")
-                or route.get("buy_ex")
-                or meta.get("to_exchange")
-                or route.get("to_exchange")
-                or ""
-        )
-        sell_ex = (
-                meta.get("sell_ex")
-                or route.get("sell_ex")
-                or meta.get("from_exchange")
-                or route.get("from_exchange")
-                or ""
-        )
-
-        buy_ex_u = str(buy_ex or "").upper()
-        sell_ex_u = str(sell_ex or "").upper()
-
-        if not (pair and buy_ex_u and sell_ex_u):
-            # Pas assez d’info pour reconstruire le combo ⇒ on laisse passer.
-            return False
+        combo = self._bundle_combo_signature(bundle)
+        if not combo:
+            if bool(getattr(getattr(self.cfg, "rm", None), "ff_fail_closed_reb_lock", False)):
+                return True, REB_LOCK_CHECK_FAILED
+            return False, ""
 
         # 4) Délégation à la fonction canonique de lock REB
         lock_fn = getattr(self, "is_rebalancing_locked", None)
         if not callable(lock_fn):
-            return False
+            if bool(getattr(getattr(self.cfg, "rm", None), "ff_fail_closed_reb_lock", False)):
+                return True, REB_LOCK_CHECK_FAILED
+            return False, ""
 
         try:
-            return bool(lock_fn(pair, buy_ex_u, sell_ex_u))
+            locked = lock_fn(combo[0], combo[1], combo[2])
+            if locked is None:
+                raise RuntimeError("reb_lock_check_none")
+            if bool(locked):
+                return True, REB_LOCK
+            return False, ""
+
         except Exception:
-            # En cas de problème de lock, on préfère ne pas bloquer le trafic.
-            return False
+            # En cas de problème de lock, on préfère bloquer si le flag est actif.
+            if bool(getattr(getattr(self.cfg, "rm", None), "ff_fail_closed_reb_lock", False)):
+                return True, REB_LOCK_CHECK_FAILED
+            return False, ""
 
     def _get_combo_key_from_bundle(self, bundle: Dict[str, Any]) -> Optional[str]:
         """
@@ -14254,6 +14395,37 @@ class RiskManager:
         rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
         strategy_u = str(strategy or "").upper()
 
+        if strategy_u == "MM":
+            if not bool(getattr(self, "ff_mm_enabled", False)):
+                if getattr(self, "log", None):
+                    self.log.info(
+                        "[RiskManager] _build_bundle: MM disabled by ff_mm_enabled",
+                    )
+                return None
+            trade_mode = str(getattr(self, "trade_mode", "NORMAL") or "NORMAL").upper()
+            if trade_mode != "NORMAL" and bool(getattr(self, "ff_mm_opportunistic_gating_enforced", False)):
+                if getattr(self, "log", None):
+                    self.log.info(
+                        "[RiskManager] _build_bundle: MM blocked by trade_mode=%s",
+                        trade_mode,
+                    )
+                return None
+        if strategy_u == "REB":
+            if not bool(getattr(self, "ff_reb_enabled", False)):
+                if getattr(self, "log", None):
+                    self.log.info(
+                        "[RiskManager] _build_bundle: REB disabled by ff_reb_enabled",
+                    )
+                return None
+            trade_mode = str(getattr(self, "trade_mode", "NORMAL") or "NORMAL").upper()
+            if trade_mode != "NORMAL":
+                if getattr(self, "log", None):
+                    self.log.info(
+                        "[RiskManager] _build_bundle: REB blocked by trade_mode=%s",
+                        trade_mode,
+                    )
+                return None
+
         # Validation stricte du contrat branch/profile (Macro 6-B-1)
         if strategy_u not in ALLOWED_BRANCHES:
             if getattr(self, "log", None):
@@ -14409,13 +14581,60 @@ class RiskManager:
             meta_root.setdefault("trace_id", ids.get("trace_id"))
             meta_root.setdefault("bundle_id", ids.get("bundle_id"))
             meta_root.setdefault("idempotency_key", ids.get("idempotency_key"))
+            meta_root.setdefault("strategy_tag", strategy_u)
+            if strategy_u in ("TM", "REB"):
+                meta_root.setdefault("route_id", ids.get("route_id") or route.get("route_id") or route.get("id"))
+            combo = self._bundle_combo_signature(bundle)
+            if combo:
+                meta_root.setdefault("combo_signature", self._format_combo_signature(combo))
             fx_rate_used = (
                     opp.get("fx_rate_used")
                     or (opp.get("meta") or {}).get("fx_rate_used")
             )
+            if strategy_u == "REB":
+                meta_root.setdefault("kind", "REB_OP")
             if fx_rate_used is not None:
                 meta_root.setdefault("fx_rate_used", fx_rate_used)
             bundle["meta"] = meta_root
+            if strategy_u == "TT" and isinstance(bundle, dict):
+                missing = fraglib.tt_contract_missing_fields(bundle)
+                if missing:
+                    if getattr(self, "log", None):
+                        self.log.error(
+                            "[RiskManager] _build_bundle: TT contract missing fields=%s trace_id=%s",
+                            ",".join(missing),
+                            ids.get("trace_id"),
+                        )
+                    meta_root = bundle.setdefault("meta", {}) or {}
+                    meta_root.setdefault("rm_drop_reason", "TT_CONTRACT_INVALID")
+                    bundle["meta"] = meta_root
+                    return None
+            if strategy_u == "TM" and isinstance(bundle, dict):
+                missing = fraglib.tm_contract_missing_fields(bundle)
+                if missing:
+                    if getattr(self, "log", None):
+                        self.log.error(
+                            "[RiskManager] _build_bundle: TM contract missing fields=%s trace_id=%s",
+                            ",".join(missing),
+                            ids.get("trace_id"),
+                        )
+                    meta_root = bundle.setdefault("meta", {}) or {}
+                    meta_root.setdefault("rm_drop_reason", "TM_CONTRACT_INVALID")
+                    bundle["meta"] = meta_root
+                    return None
+            if strategy_u == "REB" and isinstance(bundle, dict):
+                missing = fraglib.reb_contract_missing_fields(bundle)
+                if missing:
+                    if getattr(self, "log", None):
+                        self.log.error(
+                            "[RiskManager] _build_bundle: REB contract missing fields=%s trace_id=%s",
+                            ",".join(missing),
+                            ids.get("trace_id"),
+                        )
+                    meta_root = bundle.setdefault("meta", {}) or {}
+                    meta_root.setdefault("rm_drop_reason", "REB_CONTRACT_INVALID")
+                    bundle["meta"] = meta_root
+                    return None
         try:
             fsm_payload = {
                 "event_type": "DECISION",
