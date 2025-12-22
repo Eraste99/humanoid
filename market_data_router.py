@@ -26,7 +26,7 @@ API d’entrée/sortie inchangée côté snapshots ; clés out_queues explicites
 """
 
 
-import mapping
+
 import asyncio, contextlib, inspect, logging, math, time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta

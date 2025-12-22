@@ -440,6 +440,10 @@ class PrivateWSReconciler:
             return
         self._seen_keys.add((self.venue, "cid", str(client_id)))
 
+    def note_seen_idempotency_key(self, idempotency_key: Optional[str]) -> None:
+        if not idempotency_key:
+            return
+        self._seen_keys.add((self.venue, "idk", str(idempotency_key)))
     def _extract_client_id(self, row: dict) -> Optional[str]:
         if not isinstance(row, dict):
             return None
@@ -463,10 +467,12 @@ class PrivateWSReconciler:
         Clé de dédup d'un fill (robuste mais bornée) :
         - venue
         - client_id (ou 'no_cid')
+        - idempotency_key si dispo
         - trade_id/sequence/ts_ms bucket si dispo
         - (px, qty, side) arrondis (filet de sécurité)
         """
         cid = self._extract_client_id(row) or "no_cid"
+        idk = row.get("idempotency_key") or (row.get("meta") or {}).get("idempotency_key") or "no_idk"
         tid = row.get("trade_id") or row.get("tradeId") or row.get("sequence")
         t_ms = None
         for k in ("ts_ms", "ts", "timestamp", "time", "created_time", "completion_time"):
@@ -490,7 +496,7 @@ class PrivateWSReconciler:
         except Exception:
             px, qty = 0.0, 0.0
         side = str(row.get("side") or "").upper()
-        return (self.venue, cid, tid, bucket, round(px, 8), round(qty, 8), side)
+        return (self.venue, cid, idk, tid, bucket, round(px, 8), round(qty, 8), side)
 
     # ----------------------- Comptage & corrélation --------------------------
 

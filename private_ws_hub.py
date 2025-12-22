@@ -1344,6 +1344,11 @@ class PrivateWSHub:
         self._backoff_max_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 5000))
         self._queue_backpressure_ms = int(getattr(pws, "PWS_QUEUE_BACKPRESSURE_MS", 50))
         self._critical_drop_seen = bool(getattr(self, "_critical_drop_seen", False))
+        self._last_critical_drop_reason = getattr(self, "_last_critical_drop_reason", None)
+        self._last_critical_drop_ts = float(getattr(self, "_last_critical_drop_ts", 0.0) or 0.0)
+        self._ff_no_drop_critical_enforced = bool(
+            getattr(pws, "ff_pws_no_drop_critical_enforced", False)
+        )
 
 
         # Pools WS par région (optionnel, valeur non bloquante si métrique absente)
@@ -1514,15 +1519,18 @@ class PrivateWSHub:
         try:
             if pri <= 1:
                 if cap > 0 and len(q) >= cap:
-                    timeout_s = max(0.0, float(self._queue_backpressure_ms) / 1000.0)
-                    deadline = _t.time() + timeout_s
-                    while len(q) >= cap and _t.time() < deadline:
+                    try:
+                        attempts = max(1, int(self._queue_backpressure_ms // 5) or 1)
+                    except Exception:
+                        attempts = 1
+                    for _ in range(attempts):
+                        if len(q) < cap:
+                            break
                         try:
                             self._pws_drain_one(key)
                         except Exception:
                             break
-                        if len(q) >= cap:
-                            _t.sleep(0.001)
+
                 if cap > 0 and len(q) >= cap:
                     reason_code = normalize_reason_code(
                         "PWS_QUEUE_BACKPRESSURE_TIMEOUT") or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
@@ -1535,7 +1543,12 @@ class PrivateWSHub:
                         inc_blocked("private_ws_hub", reason_code, None)
                     except Exception:
                         pass
-                    self._critical_drop_seen = True
+                    self._record_critical_drop(
+                        exchange=exu,
+                        alias=alu,
+                        reason=reason_code,
+                        kind=cat,
+                    )
                     self._notify_alert(
                         severity="CRITICAL",
                         reason=reason_code,
@@ -1645,6 +1658,33 @@ class PrivateWSHub:
         except Exception:
             log.exception("[PrivateWSHub] %s callback failed", label)
 
+    def _emit_pws_health_event(self, *, exchange: str, alias: str, reason: str, kind: str) -> None:
+        ev = {
+            "type": "pws_health",
+            "status": "CRITICAL_DROP",
+            "exchange": exchange,
+            "alias": alias,
+            "reason": reason,
+            "kind": kind,
+            "ts_local": _now(),
+        }
+        rm_cb = getattr(self, "_rm_callback", None)
+        if rm_cb:
+            self._deliver_callback(rm_cb, ev, label="RM")
+        for cb in list(self._observers):
+            self._deliver_callback(cb, ev, label="Observer")
+
+    def _record_critical_drop(self, *, exchange: str, alias: str, reason: str, kind: str) -> None:
+        self._critical_drop_seen = True
+        self._last_critical_drop_reason = reason
+        self._last_critical_drop_ts = _now()
+        if self._ff_no_drop_critical_enforced:
+            self._emit_pws_health_event(
+                exchange=exchange,
+                alias=alias,
+                reason=reason,
+                kind=kind,
+            )
 
     def _pws_observe_latency(self, exchange: str, status: str, ev: dict) -> None:
         """Observe la latence entre ts_exchange et ts_local pour ACK/FILL/PARTIAL."""
@@ -2717,6 +2757,11 @@ class PrivateWSHub:
             "module": "PrivateWSHub",
             "healthy": self._started,
             "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
+            "pws_health": {
+                "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
+                "last_critical_drop_reason": getattr(self, "_last_critical_drop_reason", None),
+                "last_critical_drop_ts": float(getattr(self, "_last_critical_drop_ts", 0.0) or 0.0),
+            },
             "wiring": wiring,
             "submodules": {
                 "binance": {al: c.get_status() for al, c in self.binance_by_alias.items()},

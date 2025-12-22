@@ -406,6 +406,19 @@ class LoggerHistoriqueManager:
         self._drop_when_full = bool(getattr(L, "LHM_DROP_WHEN_FULL", True))
         self._high_watermark = float(getattr(L, "LHM_HIGH_WATERMARK_RATIO", 0.80))
         self._plateau_s      = int(getattr(L, "LHM_MAX_QUEUE_PLATEAU_S", 60))
+        self._fail_closed_logging = bool(getattr(L, "ff_fail_closed_logging", False))
+        self._truth_model_enabled = bool(getattr(L, "ff_truth_model_enabled", False))
+        self._truth_fail_closed = bool(getattr(L, "ff_truth_fail_closed", False))
+        critical_streams_cfg = getattr(L, "ff_logging_critical_streams", None)
+        self._logging_critical_streams = {
+            str(name or "").lower()
+            for name in (critical_streams_cfg or [])
+            if str(name or "").strip()
+        }
+        self._logging_fail_closed_cb = None
+        self._logging_fail_closed_emitted = False
+        self._last_critical_drop_reason: Optional[str] = None
+        self._truth_fail_closed_emitted = False
 
         # Sampling MM (cfg > défauts par profil capital)
         _def_q = {"NANO": 0.10, "MICRO": 0.20, "SMALL": 0.50, "MID": 0.75, "LARGE": 1.00}.get(self._capital_profile, 0.10)
@@ -482,6 +495,10 @@ class LoggerHistoriqueManager:
             trade_filter=trade_filter or (lambda _t: True),
             batch_size=int(getattr(L, "LHM_TRADE_BATCH_SIZE", trade_batch_size)),
             flush_interval=float(getattr(L, "LHM_TRADE_FLUSH_INTERVAL_S", trade_flush_interval)),
+            queue_maxsize=int(getattr(L, "LHM_Q_STREAM_MAX", 20000)),
+            drop_when_full=bool(getattr(L, "LHM_DROP_WHEN_FULL", True)),
+            high_watermark_ratio=float(getattr(L, "LHM_HIGH_WATERMARK_RATIO", 0.85)),
+            critical_streams=list(self._logging_critical_streams) or None,
         )
         self._trade_logger.set_event_sink(self._on_event_sink)
 
@@ -553,11 +570,19 @@ class LoggerHistoriqueManager:
             "mm_cancels",         # P6 (verbeux)
             "privatews_events",   # P7 (massif)
         ]
-        self._stream_critical = {
+        default_stream_critical = {
             "fills_normalized": True,
             "engine_submits": True,
             "engine_acks": True,
             "privatews_events": True,
+        }
+        self._stream_critical = {
+            name: (
+                str(name).lower() in self._logging_critical_streams
+                if self._logging_critical_streams
+                else default_stream_critical.get(name, False)
+            )
+            for name in self._jsonl.keys()
         }
         self._drop_log_sample_rate = float(getattr(L, "LHM_DROP_LOG_SAMPLE_RATE", 0.1))
 
@@ -665,6 +690,34 @@ class LoggerHistoriqueManager:
             LOGGERH_LAST_FLUSH_TS_SECONDS.set(int(time.time()))
         except Exception:
             pass
+        try:
+            self.refresh_open_trade_bundles()
+        except Exception:
+            logger.exception("start: refresh_open_trade_bundles failed")
+
+    def refresh_open_trade_bundles(self, *, since_ts_ms: Optional[int] = None, limit: int = 500) -> List[
+        Dict[str, Any]]:
+        try:
+            rows = self._writer.query_open_trade_bundles(since_ts_ms=since_ts_ms, limit=limit)
+        except Exception:
+            rows = []
+        self._open_trade_bundles = list(rows or [])
+        return self._open_trade_bundles
+
+    def check_and_mark_idempotency(self, *, idempotency_key: str, ttl_s: float) -> Optional[bool]:
+        if not idempotency_key:
+            return False
+        try:
+            return bool(
+                self._writer.check_and_mark_idempotency(
+                    idempotency_key=idempotency_key,
+                    ttl_s=ttl_s,
+                )
+            )
+        except Exception:
+            return None
+
+
 
     async def stop(self) -> None:
         """
@@ -817,7 +870,7 @@ class LoggerHistoriqueManager:
         try:
             from modules.obs_metrics import LOGGERH_DB_LANE_DROPPED_TOTAL
             LOGGERH_DB_LANE_DROPPED_TOTAL.labels(lane=str(lane), reason=reason_code).inc()
-            return
+
         except Exception:
             pass
 
@@ -826,6 +879,12 @@ class LoggerHistoriqueManager:
             LOGGERH_DB_LANE_DROPPED_TOTAL.labels(lane=str(lane), reason=reason_code).inc()
         except Exception:
             pass
+        try:
+            self._critical_drop_seen = True
+            self._last_critical_drop_reason = reason_code
+        except Exception:
+            pass
+        self._trigger_fail_closed_logging(reason_code)
 
     async def _db_lane_submit_bulk(self, op: str, batch: List[Dict[str, Any]]) -> None:
         enabled = getattr(self, "_db_lane_enabled", False) and getattr(self, "_db_lane_q", None) is not None
@@ -1975,7 +2034,9 @@ class LoggerHistoriqueManager:
             if critical:
                 try:
                     self._critical_drop_seen = True
+                    self._last_critical_drop_reason = "LOGGERH_JSONL_QUEUE_FULL"
                 except Exception:
+                    self._trigger_fail_closed_logging("LOGGERH_JSONL_QUEUE_FULL")
                     pass
             return
 
@@ -3439,6 +3500,47 @@ class LoggerHistoriqueManager:
         if critical:
             try:
                 self._critical_drop_seen = True
+                self._last_critical_drop_reason = reason
+            except Exception:
+                pass
+            self._trigger_fail_closed_logging(reason)
+
+    def set_fail_closed_callback(self, cb: Callable[[str], Any] | None) -> None:
+        self._logging_fail_closed_cb = cb
+
+    def _trigger_fail_closed_logging(self, reason: str) -> None:
+        if not self._fail_closed_logging:
+            return
+        if self._logging_fail_closed_emitted:
+            return
+        self._logging_fail_closed_emitted = True
+        try:
+            from modules.obs_metrics import inc_blocked
+            inc_blocked("loggerh", reason, None)
+        except Exception:
+            pass
+        cb = getattr(self, "_logging_fail_closed_cb", None)
+        if cb:
+            try:
+                cb(reason)
+            except Exception:
+                pass
+
+    def _trigger_truth_fail_closed(self, reason: str) -> None:
+        if not self._truth_fail_closed:
+            return
+        if self._truth_fail_closed_emitted:
+            return
+        self._truth_fail_closed_emitted = True
+        try:
+            from modules.obs_metrics import inc_blocked
+            inc_blocked("loggerh", reason, None)
+        except Exception:
+            pass
+        cb = getattr(self, "_logging_fail_closed_cb", None)
+        if cb:
+            try:
+                cb(reason)
             except Exception:
                 pass
 
@@ -4052,6 +4154,16 @@ class LoggerHistoriqueManager:
         await self._append_jsonl("privatews_events", payload, id_key="event_id")
         await self._emit_trade_fsm_event("privatews_events", payload, event_type="PWS_EVENT")
 
+
+    async def record_trade_fsm_event(
+        self,
+        payload: Dict[str, Any],
+        *,
+        event_type: str,
+        stream: str = "trade_fsm",
+    ) -> None:
+        await self._emit_trade_fsm_event(stream, payload, event_type=event_type)
+
     # [PATCH-API-MM] Événements MM avec sampling déterministe
     async def record_mm_quote(self, payload: Dict[str, Any]) -> None:
         if not self._stable_sample(payload, getattr(self, "_mm_sampling_quotes", 1.0)):
@@ -4067,6 +4179,58 @@ class LoggerHistoriqueManager:
         await self._append_jsonl("mm_hedges", self._with_context_tags(payload), id_key="hedge_id")
 
     # ---- helper commun
+    def _normalize_trade_fsm_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        obj = dict(payload or {})
+        meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+
+        obj.setdefault("trace_id", meta.get("trace_id"))
+        obj.setdefault("decision_id", meta.get("decision_id"))
+        obj.setdefault("bundle_id", meta.get("bundle_id"))
+        obj.setdefault("idempotency_key", meta.get("idempotency_key") or meta.get("idempotence_key"))
+
+        client_oid = (
+                obj.get("client_oid")
+                or obj.get("client_id")
+                or meta.get("client_oid")
+                or meta.get("client_id")
+        )
+        obj.setdefault("client_oid", client_oid or obj.get("idempotency_key"))
+
+        strategy_tag = (
+                obj.get("strategy_tag")
+                or obj.get("strategy")
+                or obj.get("branch")
+                or meta.get("strategy")
+                or meta.get("branch")
+        )
+        obj.setdefault("strategy_tag", strategy_tag)
+
+        kind = (
+                obj.get("kind")
+                or obj.get("_kind")
+                or meta.get("kind")
+                or obj.get("event_type")
+        )
+        obj.setdefault("kind", kind)
+        return obj
+
+    def _missing_trade_fsm_fields(self, payload: Dict[str, Any]) -> List[str]:
+        required = (
+            "trace_id",
+            "decision_id",
+            "bundle_id",
+            "idempotency_key",
+            "client_oid",
+            "strategy_tag",
+            "kind",
+        )
+        missing = []
+        for key in required:
+            value = payload.get(key)
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing.append(key)
+        return missing
+
     def _normalize_reason_code(self, reason: str | None) -> str:
         try:
             from contracts import payloads as contracts
@@ -4077,7 +4241,18 @@ class LoggerHistoriqueManager:
 
     async def _emit_trade_fsm_event(self, stream: str, payload: Dict[str, Any], *, event_type: str) -> None:
         try:
-            payload_obj = dict(payload or {})
+            if not self._truth_model_enabled:
+                return
+            payload_obj = self._normalize_trade_fsm_payload(dict(payload or {}))
+            missing = self._missing_trade_fsm_fields(payload_obj)
+            if missing:
+                reason = "TRUTH_PERSISTENCE_FAILED"
+                self._critical_drop_seen = True
+                self._last_critical_drop_reason = reason
+                self._trigger_truth_fail_closed(reason)
+                self._trigger_fail_closed_logging(reason)
+                self._log_drop_event(stream="trade_fsm_events", reason_code=reason, payload=payload_obj)
+                return
             try:
                 ts_ms = payload_obj.get("ts_ms") or self._ensure_ts_ms(payload_obj)
             except Exception:
@@ -4243,6 +4418,8 @@ class LoggerHistoriqueManager:
                 )
             if critical:
                 self._critical_drop_seen = True
+                self._last_critical_drop_reason = reason_code
+                self._trigger_fail_closed_logging(reason_code)
         except Exception:
             pass
 
@@ -4723,6 +4900,16 @@ class LoggerHistoriqueManager:
             st["pnl_pipeline_flags"] = self.get_pnl_pipeline_flags()
         except Exception:
             st["pnl_pipeline_flags"] = {}
+        try:
+            critical_drop_seen = bool(getattr(self, "_critical_drop_seen", False))
+            storage_error_seen = bool(getattr(self, "_storage_error_seen", False))
+            st["lhm_health"] = {
+                "critical_drop_seen": critical_drop_seen,
+                "last_critical_drop_reason": getattr(self, "_last_critical_drop_reason", None),
+                "logging_persistence_ok": not (critical_drop_seen or storage_error_seen),
+            }
+        except Exception:
+            st["lhm_health"] = {}
 
         # expose en plus les listes actives par mode si l’API existe
         try:

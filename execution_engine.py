@@ -19,7 +19,7 @@ Patches intégrés (sélection sécurité/perf):
 
 """
 
-import asyncio, time, collections, hashlib, json
+import asyncio, time, collections, hashlib, json,inspect
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
@@ -1371,12 +1371,22 @@ class ExecutionEngine:
         self._submit_sent: Dict[str, Dict[str, Any]] = {}
         self._client_bundle_map: Dict[str, Dict[str, Any]] = {}
         self._submit_ack_sla_s = float(getattr(self.config, "submit_ack_sla_s", 3.0))
+        self.idempotency_ttl_s = float(getattr(self.config, "idempotency_ttl_s", 60.0) or 60.0)
+        self.ff_enforce_client_oid_deterministic = bool(
+            getattr(self.config, "ff_enforce_client_oid_deterministic", False)
+        )
+        self.ff_fail_closed_idempotence = bool(
+            getattr(self.config, "ff_fail_closed_idempotence", False)
+        )
         self.ready_event = ready_event or asyncio.Event()
         self._auto_ready_on_start: bool = bool(getattr(self.config, "ready_autoset_on_start", False))
         self._ready = False
         self._ready_reasons: List[str] = []
         self._ready_details: Dict[str, Any] = {}
         self._readiness_task: Optional[asyncio.Task] = None
+        self.trading_state: str = "READY"
+        self.trading_state_reason: Optional[str] = None
+        self.history_fsm = None
 
         # --- File d’ordres bornée & workers ---
         # --- Profil capital & capacités Engine (Ticket 10) ---
@@ -2612,6 +2622,11 @@ class ExecutionEngine:
             logger.warning("[Engine] Appel avant readiness — action refusée")
             raise NotReadyError("ExecutionEngine not ready")
 
+    def set_trading_state(self, state: str, *, reason: str | None = None) -> None:
+        new_state = str(state or "READY").upper()
+        self.trading_state = new_state
+        self.trading_state_reason = reason
+
     def _fmt_pair(self, s: str) -> str:
         return str(s or "").replace("-", "").upper()
 
@@ -2647,6 +2662,14 @@ class ExecutionEngine:
     # --------------------------- wiring ---------------------------
     def set_history_logger(self, sink: Callable[[Dict[str, Any]], Any]):
         self.history_sink = sink
+        self.history_sink = sink
+        if sink is not None and not callable(sink):
+            if hasattr(sink, "sink") and callable(getattr(sink, "sink")):
+                self.history_sink = sink.sink
+            if hasattr(sink, "record_trade_fsm_event"):
+                self.history_fsm = sink
+        elif sink is not None and hasattr(sink, "record_trade_fsm_event"):
+            self.history_fsm = sink
 
     def register_listener(
         self, listener_callback: Callable, trade_type: Optional[str] = None, priority: int = 0
@@ -3035,9 +3058,33 @@ class ExecutionEngine:
         trace.setdefault("t_engine_submit_ms", now_ms)
 
         # 2) Branch / profile + caps locaux pour métriques & backpressure
+
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
         branch, profile = self._require_branch_profile(meta)
+        idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+        if self.ff_enforce_client_oid_deterministic and not idk:
+            ack_base["reason_code"] = "IDEMPOTENCY_MISSING"
+            return ack_base
+        dedup_mgr = getattr(self, "history_fsm", None)
+        if idk and dedup_mgr and hasattr(dedup_mgr, "check_and_mark_idempotency"):
+            try:
+                dedup_ok = dedup_mgr.check_and_mark_idempotency(
+                    idempotency_key=str(idk),
+                    ttl_s=self.idempotency_ttl_s,
+                )
+            except Exception:
+                dedup_ok = None
+            if dedup_ok is False:
+                try:
+                    ENGINE_DEDUP_HITS_TOTAL.labels(source="idempotency_store").inc()
+                except Exception:
+                    pass
+                ack_base["state"] = "ENGINE_DUPLICATE"
+                return ack_base
+            if dedup_ok is None and self.ff_fail_closed_idempotence:
+                ack_base["reason_code"] = "ENGINE_DEDUP_BROKEN"
+                return ack_base
 
         # Caps locaux: même contrat que le chemin async `submit`
         caps_local = bundle.get("caps") or {}
@@ -3302,6 +3349,9 @@ class ExecutionEngine:
                 "bundle_id": ack_base.get("bundle_id"),
                 "decision_id": ack_base.get("decision_id"),
                 "trace_id": ack_base.get("trace_id"),
+                "branch": branch,
+                "kind": meta.get("kind"),
+                "meta": meta,
                 "ts_ms": now_ms,
                 "deadline_ts": ack_base["deadlines"]["ack_deadline_ts"],
                 "client_ids": set(),
@@ -3971,6 +4021,51 @@ class ExecutionEngine:
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
         branch, profile = self._require_branch_profile(meta)
+        idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+        if self.ff_enforce_client_oid_deterministic and not idk:
+            self._raise_engine_submit_error("IDEMPOTENCY_MISSING", branch=branch, profile=profile, payload=bundle)
+        dedup_mgr = getattr(self, "history_fsm", None)
+        if idk and dedup_mgr and hasattr(dedup_mgr, "check_and_mark_idempotency"):
+            try:
+                dedup_ok = dedup_mgr.check_and_mark_idempotency(
+                    idempotency_key=str(idk),
+                    ttl_s=self.idempotency_ttl_s,
+                )
+            except Exception:
+                dedup_ok = None
+            if dedup_ok is False:
+                try:
+                    ENGINE_DEDUP_HITS_TOTAL.labels(source="idempotency_store").inc()
+                except Exception:
+                    pass
+                logger.info("[Engine] dedup persistent hit (idempotency_key=%s)", idk)
+                return
+            if dedup_ok is None and self.ff_fail_closed_idempotence:
+                self._raise_engine_submit_error("ENGINE_DEDUP_BROKEN", branch=branch, profile=profile, payload=bundle)
+        try:
+            fsm_payload = {
+                "event_type": "ENQUEUE",
+                "trace_id": meta.get("trace_id"),
+                "decision_id": meta.get("decision_id"),
+                "bundle_id": meta.get("bundle_id"),
+                "idempotency_key": meta.get("idempotency_key") or meta.get("idempotence_key"),
+                "client_oid": meta.get("client_id") or meta.get("idempotency_key"),
+                "strategy_tag": meta.get("strategy") or meta.get("branch") or branch,
+                "kind": meta.get("kind"),
+                "meta": meta,
+            }
+            _emit_trade_fsm_event(self, fsm_payload, event_type="ENQUEUE")
+        except Exception:
+            pass
+        trading_state = str(getattr(self, "trading_state", "READY")).upper()
+        if trading_state == "BLOCKED":
+            if branch not in ("HEDGE", "PANIC_HEDGE", "INTERNAL"):
+                reason = self.trading_state_reason or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+                self._raise_engine_submit_error(reason, branch=branch, profile=profile, payload=bundle)
+        elif trading_state == "DEGRADED":
+            if branch not in ("TT", "HEDGE", "PANIC_HEDGE", "INTERNAL"):
+                reason = self.trading_state_reason or "TRADING_NOT_READY"
+                self._raise_engine_submit_error(reason, branch=branch, profile=profile, payload=bundle)
         # 1-ter) Garde technique alias / capital_mode (Ticket 4-ENG-1 / 4-ENG-2)
         capital_mode = str(meta.get("capital_mode") or "OK").upper()
         overlays = meta.get("overlays") or {}
@@ -4498,6 +4593,22 @@ class ExecutionEngine:
         bundle_entry = self._submit_sent.get(str(idk))
         if not bundle_entry:
             return
+        try:
+            fsm_payload = {
+                "event_type": "ACK",
+                "trace_id": bundle_entry.get("trace_id"),
+                "decision_id": bundle_entry.get("decision_id"),
+                "bundle_id": bundle_entry.get("bundle_id"),
+                "idempotency_key": idk,
+                "client_oid": client_id,
+                "strategy_tag": bundle_entry.get("branch"),
+                "kind": bundle_entry.get("kind"),
+                "meta": bundle_entry.get("meta") or {},
+                "status": status,
+            }
+            _emit_trade_fsm_event(self, fsm_payload, event_type="ACK")
+        except Exception:
+            pass
         try:
             bundle_entry.setdefault("acks", {})[client_id] = status
             bundle_entry.setdefault("client_ids", set()).discard(client_id)
@@ -5559,6 +5670,24 @@ class ExecutionEngine:
 
     def _submit_or_raise(self, order: dict) -> dict:
         try:
+            try:
+                meta = order.get("meta") or {}
+                fsm_payload = {
+                    "event_type": "SUBMIT",
+                    "trace_id": meta.get("trace_id"),
+                    "decision_id": meta.get("decision_id"),
+                    "bundle_id": meta.get("bundle_id"),
+                    "idempotency_key": meta.get("idempotency_key") or meta.get("idempotence_key"),
+                    "client_oid": order.get("client_id") or meta.get("client_id"),
+                    "strategy_tag": meta.get("strategy") or meta.get("branch"),
+                    "kind": meta.get("kind"),
+                    "meta": meta,
+                    "exchange": order.get("exchange"),
+                    "symbol": order.get("symbol"),
+                }
+                _emit_trade_fsm_event(self, fsm_payload, event_type="SUBMIT")
+            except Exception:
+                pass
             return self._exchange_submit(order)  # tua chiamata SDK/signed REST
         except (TimeoutError, ConnectionError) as e:
             try:
@@ -5570,6 +5699,24 @@ class ExecutionEngine:
                 err.reason = ENGINE_SUBMIT_TIMEOUT
             except Exception:
                 pass
+            try:
+                meta = order.get("meta") or {}
+                fsm_payload = {
+                    "event_type": "ERROR",
+                    "trace_id": meta.get("trace_id"),
+                    "decision_id": meta.get("decision_id"),
+                    "bundle_id": meta.get("bundle_id"),
+                    "idempotency_key": meta.get("idempotency_key") or meta.get("idempotence_key"),
+                    "client_oid": order.get("client_id") or meta.get("client_id"),
+                    "strategy_tag": meta.get("strategy") or meta.get("branch"),
+                    "kind": meta.get("kind"),
+                    "meta": meta,
+                    "reason": ENGINE_SUBMIT_TIMEOUT,
+                }
+                _emit_trade_fsm_event(self, fsm_payload, event_type="ERROR")
+            except Exception:
+                pass
+
             raise err from e
         except Exception as e:
             msg = str(e).lower()
@@ -5583,6 +5730,23 @@ class ExecutionEngine:
             err = EngineSubmitError(reason)
             try:
                 err.reason = reason
+            except Exception:
+                pass
+            try:
+                meta = order.get("meta") or {}
+                fsm_payload = {
+                    "event_type": "ERROR",
+                    "trace_id": meta.get("trace_id"),
+                    "decision_id": meta.get("decision_id"),
+                    "bundle_id": meta.get("bundle_id"),
+                    "idempotency_key": meta.get("idempotency_key") or meta.get("idempotence_key"),
+                    "client_oid": order.get("client_id") or meta.get("client_id"),
+                    "strategy_tag": meta.get("strategy") or meta.get("branch"),
+                    "kind": meta.get("kind"),
+                    "meta": meta,
+                    "reason": reason,
+                }
+                _emit_trade_fsm_event(self, fsm_payload, event_type="ERROR")
             except Exception:
                 pass
             raise err from e
@@ -9214,9 +9378,16 @@ class ExecutionEngine:
             idk = meta.get("idempotency_key") or meta.get("idempotence_key")
             slice_id = meta.get("slice_id") or meta.get("slice")
             leg = str(meta.get("leg_id") or side or "")
-            if idk and slice_id:
+            if idk and slice_id and leg:
                 base = f"{idk}:{slice_id}:{leg}"
                 client_id = hashlib.sha1(base.encode("utf-8")).hexdigest()[:32]
+            elif self.ff_enforce_client_oid_deterministic:
+                err = EngineSubmitError("IDEMPOTENCY_MISSING")
+                try:
+                    err.reason = "IDEMPOTENCY_MISSING"
+                except Exception:
+                    pass
+                raise err
             else:
                 client_id = f"S{int(time.time() * 1000)}"
 
@@ -9650,6 +9821,17 @@ async def _hist(self: "ExecutionEngine", kind: str, data: dict) -> None:
     except Exception:
         logging.exception("ExecutionEngine._hist: error")
 
+def _emit_trade_fsm_event(self: "ExecutionEngine", payload: Dict[str, Any], *, event_type: str) -> None:
+    mgr = getattr(self, "history_fsm", None)
+    if not mgr or not hasattr(mgr, "record_trade_fsm_event"):
+        return
+    try:
+        result = mgr.record_trade_fsm_event(payload, event_type=event_type, stream="trade_fsm")
+        if inspect.isawaitable(result):
+            asyncio.create_task(result)
+    except Exception:
+        logging.exception("ExecutionEngine._emit_trade_fsm_event failed", exc_info=False)
+
 # ---------------------------------------------------------------------------
 # Rejet "propre" (stats + navette observabilité + historisation)
 # ---------------------------------------------------------------------------
@@ -9738,6 +9920,23 @@ def _reject(self, pair: str, order_or_payload: Dict[str, Any], reason: str) -> N
         except Exception:
             # Hist ne doit jamais casser les rejets
             logger.exception("[Engine] _hist reject failed", exc_info=False)
+
+        try:
+            fsm_payload = {
+                "event_type": "ERROR",
+                "trace_id": evt.get("trace_id"),
+                "decision_id": evt.get("decision_id"),
+                "bundle_id": evt.get("bundle_id"),
+                "idempotency_key": meta.get("idempotency_key") or meta.get("idempotence_key"),
+                "client_oid": meta.get("client_id") or evt.get("client_order_id") or evt.get("cid"),
+                "strategy_tag": strategy,
+                "kind": meta.get("kind"),
+                "meta": meta,
+                "reason": reason,
+            }
+            _emit_trade_fsm_event(self, fsm_payload, event_type="ERROR")
+        except Exception:
+            pass
 
         # --- Métrique spécifique Engine (déjà existante) ---
         try:

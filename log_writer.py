@@ -686,6 +686,18 @@ class LogWriter:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS idempotency_store (
+              idempotency_key TEXT PRIMARY KEY,
+              ts_ms INTEGER,
+              expires_ts_ms INTEGER,
+              status TEXT
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_ts ON idempotency_store(ts_ms);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_idempotency_expires ON idempotency_store(expires_ts_ms);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_ts ON trade_fsm_events(ts_ms);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_trace ON trade_fsm_events(trace_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_bundle ON trade_fsm_events(bundle_id);")
@@ -2150,6 +2162,47 @@ class LogWriter:
         res = self._run_db("trade_fsm_events_query", _do)
         return res if isinstance(res, list) else []
 
+    def check_and_mark_idempotency(
+            self,
+            *,
+            idempotency_key: str,
+            ttl_s: float,
+            status: str = "submitted",
+    ) -> bool:
+        if not idempotency_key:
+            return False
+        ttl_ms = int(max(0.0, float(ttl_s)) * 1000.0)
+        now_ms = int(time.time() * 1000)
+        expires_ms = now_ms + ttl_ms if ttl_ms > 0 else now_ms
+
+        def _do() -> bool:
+            with self._lock:
+                self._rotate_if_needed()
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "DELETE FROM idempotency_store WHERE expires_ts_ms IS NOT NULL AND expires_ts_ms < ?",
+                        (now_ms,),
+                    )
+                    cur.execute(
+                        "SELECT idempotency_key FROM idempotency_store WHERE idempotency_key = ?",
+                        (idempotency_key,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        return False
+                    cur.execute(
+                        """
+                        INSERT INTO idempotency_store (idempotency_key, ts_ms, expires_ts_ms, status)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (idempotency_key, now_ms, expires_ms, status),
+                    )
+                    conn.commit()
+                    return True
+
+        res = self._run_db("idempotency_store", _do)
+        return bool(res)
 
     def insert_latencies_bulk(self, events: Iterable[Dict[str, Any]]) -> int:
         events = list(events or [])

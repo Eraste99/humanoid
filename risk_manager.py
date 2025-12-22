@@ -86,6 +86,7 @@ RM_REASON_PRIORITY = (
     # A) Hard-safety / invariants (bloquants)
     "RM_CAPS_INVALID",
     "RM_COST_COMPUTE_ERROR",
+    "RM_CAPS_BROKEN",
     "RM_SFC_UNAVAILABLE",
     "RM_BUNDLE_EMPTY_PARAMS",
     "RM_REB_FACTORY_REJECT",
@@ -288,6 +289,7 @@ RM_ENGINE_NACK_REJECT = "RM_ENGINE_NACK_REJECT"
 
 # Famille RM_CAP_* : rejets caps métier (profil/branche/combo/disable)
 RM_CAPS_INVALID = "RM_CAPS_INVALID"
+RM_CAPS_BROKEN = "RM_CAPS_BROKEN"
 RM_CAPS_ZERO = "RM_CAPS_ZERO"
 RM_CAP_PROFILE_DISABLED = "RM_CAP_PROFILE_DISABLED"
 RM_CAP_BRANCH_DISABLED = "RM_CAP_BRANCH_DISABLED"
@@ -1132,6 +1134,19 @@ class RiskManager:
         self._rm_cfg_obj = getattr(self.cfg, "rm", None)
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.history_logger = history_logger
+        self._history_fsm = None
+        self._lhm_manager = None
+        if history_logger is not None and not callable(history_logger):
+            if hasattr(history_logger, "sink") and callable(getattr(history_logger, "sink")):
+                self.history_logger = history_logger.sink
+            if hasattr(history_logger, "record_trade_fsm_event"):
+                self._history_fsm = history_logger
+            if hasattr(history_logger, "get_status") or hasattr(history_logger, "get_pnl_pipeline_flags"):
+                self._lhm_manager = history_logger
+        elif history_logger is not None and hasattr(history_logger, "record_trade_fsm_event"):
+            self._history_fsm = history_logger
+            if hasattr(history_logger, "get_status") or hasattr(history_logger, "get_pnl_pipeline_flags"):
+                self._lhm_manager = history_logger
         # Hooks optionnels : observabilité (obs_inc) et mute de routes.
         # Le Boot / orchestrateur peut les remplir via set_obs_inc_callback /
         # set_mute_route_callback ou en assignant directement _obs_inc_cb/_mute_route_cb.
@@ -1383,6 +1398,11 @@ class RiskManager:
         self.private_ws_hub = None
         self.private_ws_healthy: bool = True
         self._private_ws_status: Dict[str, Any] = {}
+        self._pws_critical_drop_seen: bool = False
+        self._pws_critical_drop_reason: Optional[str] = None
+        self._pws_blocked_emitted: bool = False
+        self.trading_state: str = "READY"
+        self.trading_state_reason: Optional[str] = None
         # Flags de wiring (Hub / Reconciler) mis à jour par bind_* et _wire_*
         self.private_ws_wiring_ok: bool = False
         self.reconciler_wiring_ok: bool = False
@@ -3427,17 +3447,22 @@ class RiskManager:
             if pacer_factor < 0.0:
                 pacer_factor = 0.0
 
-                # Formula: inflight_cap × pacer_factor(branch) × alias_cap_factor (tous ≤ 1.0)
+            # Formula: inflight_cap × pacer_factor(branch) × alias_cap_factor (tous ≤ 1.0)
+            bundle_concurrency = 0
+            try:
+                bundle_concurrency = max(
+                    0,
+                    int(round(float(inflight_cap_eff) * pacer_factor * alias_cap_factor)),
+                )
+            except Exception:
                 try:
-                    bundle_concurrency = max(
-                        0,
-                        int(round(float(inflight_cap_eff) * pacer_factor * alias_cap_factor)),
-                    )
-                except Exception:
+
                     bundle_concurrency = max(
                         0,
                         int(float(inflight_cap_eff or 0) * alias_cap_factor),
                     )
+                except Exception:
+                    bundle_concurrency = 0
 
 
             caps_local["bundle_concurrency"] = bundle_concurrency
@@ -4152,6 +4177,14 @@ class RiskManager:
             logging.warning("RM : engine indisponible, drop bundle")
             _record_decision(False, RM_ENGINE_NOT_READY)
             return False
+        if str(getattr(self, "trading_state", "READY")).upper() != "READY":
+            reason = normalize_reason_code(
+                getattr(self, "trading_state_reason", None) or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+            ) or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+            logging.warning("RM : trading blocked (%s), drop bundle (trace_id=%s)", reason,
+                            bundle.get("trace_id") or "NA")
+            _record_decision(False, reason)
+            return False
         if getattr(self, "trading_ready_event", None) and not self.trading_ready_event.is_set():
             reason = normalize_reason_code("TRADING_NOT_READY") or "TRADING_NOT_READY"
             logging.warning("RM : trading not ready, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
@@ -4454,7 +4487,46 @@ class RiskManager:
             return False
 
         # 3) Caps notionnels par CEX / profil / branche (+ préemption MM)
-        caps_local = self._get_caps_for_bundle(bundle, branch, profile, quote, meta)
+        try:
+            caps_local = self._get_caps_for_bundle(bundle, branch, profile, quote, meta)
+        except Exception:
+            reason_caps = RM_CAPS_BROKEN
+            pair = (
+                    meta.get("pair")
+                    or meta.get("symbol")
+                    or bundle.get("pair")
+                    or bundle.get("symbol")
+                    or None
+            )
+            logging.exception(
+                "[RM] caps calculation failed; trace_id=%s branch=%s profile=%s pair=%s",
+                trace_id,
+                branch,
+                profile,
+                pair or "NA",
+            )
+            try:
+                inc_blocked("rm", reason_caps, pair)
+            except Exception:
+                pass
+            if not isinstance(bundle.get("meta"), dict):
+                bundle["meta"] = meta
+            meta["rm_drop_reason"] = reason_caps
+            if bool(getattr(getattr(self.cfg, "rm", None), "ff_fail_closed_caps", False)):
+                meta["capital_mode"] = "BLOCKED"
+                bundle["meta"] = meta
+                if self._shadow:
+                    self._shadow.on_bundle_drop(bundle, reason_caps)
+                _record_decision(False, reason_caps)
+                return False
+            meta["capital_mode"] = "CONSTRAINED"
+            bundle["meta"] = meta
+            caps_local = {
+                "inflight_cap": None,
+                "bundle_concurrency": 1,
+                "headroom_min": int(getattr(self, "inflight_headroom_min", 1) or 0),
+                "alias_cap_factor": 1.0,
+            }
 
         ok, caps_local, trade_mode = self._apply_caps_and_preempt(
             bundle=bundle,
@@ -5422,9 +5494,94 @@ class RiskManager:
         prev = getattr(self, "private_ws_healthy", None)
         self.private_ws_healthy = healthy
         self._private_ws_status = dict(status or {})
+        self._update_pws_critical_drop_from_status(status)
         if prev is None or bool(prev) != bool(healthy):
             event = "private_ws_recovered" if healthy else "private_ws_degraded"
             self._emit_private_plane_event(event, healthy=bool(healthy))
+
+    def _set_trading_state(self, state: str, *, reason: Optional[str] = None) -> None:
+        new_state = str(state or "READY").upper()
+        prev_state = str(getattr(self, "trading_state", "READY") or "READY").upper()
+        if new_state == prev_state and (not reason or reason == getattr(self, "trading_state_reason", None)):
+            return
+        self.trading_state = new_state
+        self.trading_state_reason = reason
+        try:
+            if getattr(self, "trading_ready_event", None):
+                if new_state == "READY":
+                    self.trading_ready_event.set()
+                else:
+                    self.trading_ready_event.clear()
+        except Exception:
+            pass
+        eng = getattr(self, "engine", None)
+        if eng and hasattr(eng, "set_trading_state"):
+            try:
+                eng.set_trading_state(new_state, reason=reason)
+            except Exception:
+                pass
+
+    def set_logging_fail_closed(self, reason: str) -> None:
+        reason_code = normalize_reason_code(reason) or str(reason or "TRUTH_PERSISTENCE_FAILED")
+        self._set_trading_state("BLOCKED", reason=reason_code)
+
+    def get_trading_state(self) -> str:
+        return str(getattr(self, "trading_state", "READY") or "READY").upper()
+
+    def get_block_reason(self) -> Optional[str]:
+        return getattr(self, "trading_state_reason", None)
+
+    def _collect_logging_health(self) -> dict:
+        manager = getattr(self, "_lhm_manager", None)
+        if manager is None:
+            return {}
+        try:
+            if hasattr(manager, "get_status"):
+                status = manager.get_status() or {}
+                lhm_health = status.get("lhm_health") or {}
+                if isinstance(lhm_health, dict):
+                    return lhm_health
+        except Exception:
+            pass
+        try:
+            if hasattr(manager, "get_pnl_pipeline_flags"):
+                flags = manager.get_pnl_pipeline_flags() or {}
+                return {
+                    "critical_drop_seen": bool(flags.get("critical_drop_seen")),
+                    "last_critical_drop_reason": None,
+                    "logging_persistence_ok": not bool(flags.get("critical_drop_seen")),
+                }
+        except Exception:
+            pass
+        return {}
+
+    def _update_pws_critical_drop_from_status(self, status: Optional[Dict[str, Any]]) -> None:
+        cfg = getattr(self, "cfg", None)
+        pws_cfg = getattr(cfg, "pws", None)
+        enforce = bool(getattr(pws_cfg, "ff_pws_no_drop_critical_enforced", False))
+        if not status:
+            return
+        pws_health = status.get("pws_health") if isinstance(status, dict) else None
+        critical_drop_seen = None
+        last_reason = None
+        if isinstance(pws_health, dict):
+            critical_drop_seen = pws_health.get("critical_drop_seen")
+            last_reason = pws_health.get("last_critical_drop_reason")
+        if critical_drop_seen is None and isinstance(status, dict):
+            critical_drop_seen = status.get("critical_drop_seen")
+        if critical_drop_seen:
+            reason = normalize_reason_code(last_reason or "PWS_QUEUE_BACKPRESSURE_TIMEOUT") \
+                     or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+            self._pws_critical_drop_seen = True
+            self._pws_critical_drop_reason = reason
+            if enforce:
+                if not self._pws_blocked_emitted:
+                    try:
+                        inc_blocked("rm", reason, None)
+                    except Exception:
+                        pass
+                    self._pws_blocked_emitted = True
+                self._set_trading_state("BLOCKED", reason=reason)
 
     def set_engine(self, engine) -> None:
         """
@@ -7488,7 +7645,16 @@ class RiskManager:
             except Exception:
                 pass
 
-
+    def _emit_trade_fsm_event(self, event_type: str, payload: Dict[str, Any]) -> None:
+        mgr = getattr(self, "_history_fsm", None)
+        if not mgr or not hasattr(mgr, "record_trade_fsm_event"):
+            return
+        try:
+            result = mgr.record_trade_fsm_event(payload, event_type=event_type, stream="trade_fsm")
+            if inspect.isawaitable(result):
+                asyncio.create_task(result)
+        except Exception:
+            logger.exception("[RM] _emit_trade_fsm_event failed", exc_info=False)
     # ==== [ADD THIS METHOD INSIDE class RiskManager] =============================
     def _emit_final_decision(self, opp: dict, choice: dict, outcome: str = "submitted") -> None:
         """
@@ -10295,6 +10461,41 @@ class RiskManager:
             readiness_reasons.append("balances_stale")
         if not scanner_ready:
             readiness_reasons.append("scanner_hook_missing")
+        unified = bool(getattr(rm_cfg, "ff_trading_state_unified", False))
+        blocked_reason = None
+        degraded_reason = None
+        if unified:
+            pws_status = getattr(self, "_private_ws_status", {}) or {}
+            pws_health = pws_status.get("pws_health") if isinstance(pws_status, dict) else {}
+            pws_critical = bool(
+                (pws_health or {}).get("critical_drop_seen")
+                or getattr(self, "_pws_critical_drop_seen", False)
+            )
+            if pws_critical:
+                blocked_reason = normalize_reason_code(
+                    (pws_health or {}).get("last_critical_drop_reason")
+                    or getattr(self, "_pws_critical_drop_reason", None)
+                    or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+                ) or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+
+            lhm_health = self._collect_logging_health() or {}
+            lhm_critical = bool(lhm_health.get("critical_drop_seen"))
+            if not blocked_reason and lhm_critical:
+                blocked_reason = normalize_reason_code(
+                    lhm_health.get("last_critical_drop_reason")
+                    or "LOGGERH_JSONL_QUEUE_FULL"
+                ) or "LOGGERH_JSONL_QUEUE_FULL"
+
+            lhm_cfg = getattr(cfg, "lhm", None)
+            truth_fail_closed = bool(getattr(lhm_cfg, "ff_truth_fail_closed", False))
+            if not blocked_reason and truth_fail_closed and not bool(lhm_health.get("logging_persistence_ok", True)):
+                blocked_reason = normalize_reason_code("TRUTH_PERSISTENCE_FAILED") or "TRUTH_PERSISTENCE_FAILED"
+
+            if not blocked_reason and readiness_reasons:
+                degraded_reason = readiness_reasons[0]
+        else:
+            if str(getattr(self, "trading_state", "READY")).upper() != "READY":
+                readiness_reasons.append("pws_critical_drop")
 
         self._readiness.update({
             "engine": engine_ready,
@@ -10309,11 +10510,20 @@ class RiskManager:
         safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if balances_ready else 0.0, dep="balances")
         safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if scanner_ready else 0.0, dep="scanner")
 
-        ready = not readiness_reasons
-        if ready:
-            self.trading_ready_event.set()
+        if unified:
+            if blocked_reason:
+                self._set_trading_state("BLOCKED", reason=blocked_reason)
+            elif degraded_reason:
+                self._set_trading_state("DEGRADED", reason=degraded_reason)
+            else:
+                self._set_trading_state("READY", reason=None)
+            ready = self.get_trading_state() == "READY"
         else:
-            self.trading_ready_event.clear()
+            ready = not readiness_reasons
+            if ready:
+                self.trading_ready_event.set()
+            else:
+                self.trading_ready_event.clear()
 
         safe_set(RM_TRADING_READY, "rm_trading_ready", "rm", 1.0 if ready else 0.0)
 
@@ -10463,7 +10673,7 @@ class RiskManager:
                     self.rebalancing.mark_transfer_status(transfer_id, status)
         except Exception:
             pass
-        
+
         # On ne traite que les transferts effectivement exécutés côté CEX.
         if status not in ("OK", "SUCCESS"):
             return
@@ -14206,7 +14416,21 @@ class RiskManager:
             if fx_rate_used is not None:
                 meta_root.setdefault("fx_rate_used", fx_rate_used)
             bundle["meta"] = meta_root
-
+        try:
+            fsm_payload = {
+                "event_type": "DECISION",
+                "trace_id": ids.get("trace_id"),
+                "decision_id": ids.get("decision_id"),
+                "bundle_id": ids.get("bundle_id"),
+                "idempotency_key": ids.get("idempotency_key"),
+                "client_oid": ids.get("idempotency_key"),
+                "strategy_tag": str(strategy_u),
+                "kind": leg_kind_default,
+                "meta": bundle.get("meta") if isinstance(bundle, dict) else {},
+            }
+            self._emit_trade_fsm_event("DECISION", fsm_payload)
+        except Exception:
+            pass
         if strategy_u == "MM" and isinstance(bundle, dict):
             meta_mm = bundle.setdefault("meta", {}) or {}
             meta_mm.setdefault("branch", "MM")
@@ -14407,6 +14631,22 @@ class RiskManager:
             "legs":[{exchange, alias, side, symbol, volume_usdc, volume_quote?, quote?}, ...],
             "strategy":"TT"|"TM", "tm":{...}?, "metadata":{...} }
         """
+        try:
+            meta = order_bundle.get("meta") or {}
+            fsm_payload = {
+                "event_type": "ENQUEUE",
+                "trace_id": meta.get("trace_id") or order_bundle.get("trace_id"),
+                "decision_id": meta.get("decision_id") or order_bundle.get("decision_id"),
+                "bundle_id": meta.get("bundle_id") or order_bundle.get("bundle_id"),
+                "idempotency_key": meta.get("idempotency_key") or order_bundle.get("idempotency_key"),
+                "client_oid": meta.get("client_id") or meta.get("idempotency_key"),
+                "strategy_tag": meta.get("strategy") or meta.get("branch") or order_bundle.get("branch"),
+                "kind": meta.get("kind"),
+                "meta": meta,
+            }
+            self._emit_trade_fsm_event("ENQUEUE", fsm_payload)
+        except Exception:
+            pass
         engine = getattr(self, "engine", None)
         if engine is None:
             try:
@@ -14448,6 +14688,15 @@ class RiskManager:
             return
 
         ev = dict(evt or {})
+        if str(ev.get("type") or "").lower() == "pws_health":
+            status = {
+                "pws_health": {
+                    "critical_drop_seen": True,
+                    "last_critical_drop_reason": ev.get("reason"),
+                },
+            }
+            self._update_pws_critical_drop_from_status(status)
+            return
         status = str(ev.get("status") or ev.get("type") or "").upper()
         etype = str(ev.get("type") or "").lower()
         rec = getattr(self, "reconciler", None)
@@ -14456,7 +14705,13 @@ class RiskManager:
                 rec.mark_ws_activity()
             except Exception:
                 pass
-
+        if rec and hasattr(rec, "note_seen_idempotency_key"):
+            try:
+                meta = ev.get("meta") or {}
+                idk = meta.get("idempotency_key") or ev.get("idempotency_key")
+                rec.note_seen_idempotency_key(idk)
+            except Exception:
+                pass
         # Branche dédiée pour les transferts internes (PrivateWSHub).
         if etype in ("transfer", "pws_transfer"):
             try:
@@ -14483,7 +14738,23 @@ class RiskManager:
         alias = str(ev.get("alias") or "NA").upper()
         ev["exchange"] = exchange
         ev["alias"] = alias
-
+        try:
+            meta = ev.get("meta") or {}
+            fsm_payload = {
+                "event_type": "FILL" if status in ("FILL", "FILLED", "PARTIAL", "PARTIAL_FILL") else "CANCEL",
+                "trace_id": meta.get("trace_id") or ev.get("trace_id"),
+                "decision_id": meta.get("decision_id") or ev.get("decision_id"),
+                "bundle_id": meta.get("bundle_id") or ev.get("bundle_id"),
+                "idempotency_key": meta.get("idempotency_key") or ev.get("idempotency_key"),
+                "client_oid": ev.get("client_id") or meta.get("client_id") or meta.get("idempotency_key"),
+                "strategy_tag": meta.get("strategy") or meta.get("branch"),
+                "kind": meta.get("kind") or etype,
+                "meta": meta,
+                "status": status,
+            }
+            self._emit_trade_fsm_event(fsm_payload["event_type"], fsm_payload)
+        except Exception:
+            pass
         def _handle_error(reason: str, exc: Exception) -> None:
             logger.exception("[RiskManager] %s", reason)
             self._emit_private_plane_event(
@@ -14918,6 +15189,8 @@ class RiskManager:
             "reconciler_attached": getattr(self, "reconciler", None) is not None,
             "reconciler_wiring_ok": bool(getattr(self, "reconciler_wiring_ok", False)),
             "engine_attached": getattr(self, "engine", None) is not None,
+            "critical_drop_seen": bool(getattr(self, "_pws_critical_drop_seen", False)),
+            "last_critical_drop_reason": getattr(self, "_pws_critical_drop_reason", None),
         }
 
         rebal_status = getattr(self.rebalancing, "get_status", lambda: {})()
@@ -14927,6 +15200,8 @@ class RiskManager:
             "healthy": self._running,
             "rm_trading_ready": bool(getattr(self, "trading_ready_event", asyncio.Event()).is_set()),
             "rm_loops_ready": bool(getattr(self, "ready_event", asyncio.Event()).is_set()),
+            "trading_state": str(getattr(self, "trading_state", "READY")),
+            "trading_state_reason": getattr(self, "trading_state_reason", None),
             "readiness": dict(self._readiness),
             "last_update": self.last_update,
             "private_ws_healthy": bool(getattr(self, "private_ws_healthy", True)),

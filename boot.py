@@ -676,7 +676,7 @@ class Boot:
         # 6) (Optionnel) Brancher les sinks si présents
         try:
             if getattr(self.ctx, "engine", None) and hasattr(self.ctx.engine, "set_history_logger"):
-                self.ctx.engine.set_history_logger(self.ctx.lhm.sink)
+                self.ctx.engine.set_history_logger(self.ctx.lhm)
             if getattr(self.ctx, "scanner", None) and hasattr(self.ctx.scanner, "set_history_logger"):
                 self.ctx.scanner.set_history_logger(self.ctx.lhm.opportunity)
         except Exception as e:
@@ -990,7 +990,7 @@ class Boot:
             "balance_fetcher": balances,
             "simulator": simulator,
             "execution_engine": getattr(self.ctx, "engine", None),
-            "history_logger": getattr(getattr(self.ctx, "lhm", None), "sink", None),
+            "history_logger": getattr(self.ctx, "lhm", None),
         }
         rm_kwargs["exchanges"] = list(
             getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"]))
@@ -1008,6 +1008,12 @@ class Boot:
                 self.ctx.rm.set_obs_inc_callback(cb)
         except Exception:
             pass
+        try:
+            lhm = getattr(self.ctx, "lhm", None)
+            if lhm is not None and hasattr(lhm, "set_fail_closed_callback"):
+                lhm.set_fail_closed_callback(self.ctx.rm.set_logging_fail_closed)
+        except Exception:
+            self.log.exception("[Boot] set_fail_closed_callback failed")
         if hasattr(self.ctx.rm, "start"):
             await self.ctx.rm.start()
 

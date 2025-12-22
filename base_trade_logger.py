@@ -83,6 +83,7 @@ class BaseTradeLogger:
             queue_maxsize: int = 5000,
             drop_when_full: bool = True,
             high_watermark_ratio: float = 0.8,
+            critical_streams: Optional[List[str]] = None,
     ):
         self.log_type = str(log_type)
         self.trade_filter = trade_filter
@@ -90,6 +91,11 @@ class BaseTradeLogger:
         self.flush_interval = float(max(0.05, flush_interval))
         self.dry_run = bool(dry_run)
         self.drop_when_full = bool(drop_when_full)
+        self._critical_streams = {
+            str(name or "").lower()
+            for name in (critical_streams or [])
+            if str(name or "").strip()
+        }
 
         import queue  # stdlib
         self._queue = queue.Queue(maxsize=int(queue_maxsize))
@@ -656,11 +662,21 @@ class BaseTradeLogger:
         try:
             if self.log_type in {"trades", "balances", "balance_snapshots"}:
                 return True
+            if self._critical_streams:
+                if str(self.log_type).lower() in self._critical_streams:
+                    return True
             if not isinstance(entry, dict):
                 return False
             if entry.get("is_critical") or entry.get("critical"):
                 return True
             kind = str(entry.get("event_type") or entry.get("kind") or "").lower()
+            stream = str(entry.get("stream") or entry.get("log_type") or "").lower()
+            if self._critical_streams:
+                if stream in self._critical_streams or kind in self._critical_streams:
+                    return True
+                for name in self._critical_streams:
+                    if kind.startswith(f"{name}."):
+                        return True
             if kind.startswith(("rm.", "engine.", "balance.")):
                 return True
             if kind.startswith("transfer"):

@@ -422,6 +422,7 @@ class RiskManagerCfg:
     enable_mm: bool = False
     enable_reb: bool = True
     enable_maker_maker: bool = False
+    ff_trading_state_unified: bool = False
     branch_priority: List[str] = field(default_factory=lambda: ["tt","tm","reb","mm"])
     branch_budgets_quote: Dict[str, Dict[str,float]] = field(default_factory=lambda: {
         "USDC": {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
@@ -484,6 +485,7 @@ class RiskManagerCfg:
     # Config audit
     audit_config_on_start: bool = True
     strict_config: bool = False
+    ff_fail_closed_caps: bool = False
 
     # Policy "Capital Ladder" — source canonique pour les profils NANO→LARGE.
     # Chaque profil porte :
@@ -757,6 +759,9 @@ class EngineCfg:
 
     tt_max_skew_ms: int = 35
     order_timeout_s: int = 3
+    idempotency_ttl_s: float = 60.0
+    ff_enforce_client_oid_deterministic: bool = False
+    ff_fail_closed_idempotence: bool = False
     idempotence_on: bool = True
 
     tm_exposure_ttl_ms: int = 1500
@@ -805,6 +810,7 @@ class PrivateWSHubCfg:
     PWS_REGION_MAP: Dict[str,str] = field(default_factory=lambda: {"BINANCE":"EU","BYBIT":"EU","COINBASE":"US"})
     PWS_QUEUE_MAXLEN: int = 5000
     PWS_QUEUE_SATURATION_RATIO: float = 0.85
+    ff_pws_no_drop_critical_enforced: bool = False
     PWS_PING_INTERVAL_S: int = 20
     PWS_PONG_TIMEOUT_S: int = 10
     PWS_HEARTBEAT_MAX_GAP_S: int = 30
@@ -1025,6 +1031,20 @@ class LoggerCfg:
     LHM_DROP_WHEN_FULL: bool = True
     LHM_HIGH_WATERMARK_RATIO: float = 0.85
     LHM_MAX_QUEUE_PLATEAU_S: int = 3
+    ff_fail_closed_logging: bool = False
+    ff_logging_critical_streams: List[str] = field(default_factory=lambda: [
+        "trade_fsm",
+        "private_plane",
+        "fills",
+        "transfers",
+        "engine_acks",
+        "engine_submits",
+        "fills_normalized",
+        "privatews_events",
+        "trades",
+    ])
+    ff_truth_model_enabled: bool = False
+    ff_truth_fail_closed: bool = False
     LHM_MM_SAMPLING_QUOTES: float = 0.05
     LHM_MM_SAMPLING_CANCELS: float = 0.02
     LHM_JSONL_QUEUE_CAP: int = 5000
@@ -1696,6 +1716,11 @@ class BotConfig:
         cfg.rm.enable_mm = _Env.get_bool("ENABLE_MM", cfg.rm.enable_mm)
         cfg.rm.enable_reb = _Env.get_bool("ENABLE_REB", cfg.rm.enable_reb)
         cfg.rm.enable_maker_maker = _Env.get_bool("ENABLE_MAKER_MAKER", cfg.rm.enable_maker_maker)
+        cfg.rm.ff_trading_state_unified = _Env.get_bool(
+            "FF_TRADING_STATE_UNIFIED",
+            cfg.rm.ff_trading_state_unified,
+        )
+
         # Branches RM (incluant REB) — alignées sur le chantier M6-B
         cfg.rm.branch_priority = _Env.get_list(
             "RM_BRANCH_PRIORITY",
@@ -1883,6 +1908,18 @@ class BotConfig:
         cfg.engine.vol_soft_cap_bps = _Env.get_float("ENGINE_VOL_SOFT_CAP_BPS", cfg.engine.vol_soft_cap_bps)
         cfg.engine.vol_hard_cap_bps = _Env.get_float("ENGINE_VOL_HARD_CAP_BPS", cfg.engine.vol_hard_cap_bps)
         cfg.engine.freeze_tm_on_vol = _Env.get_bool("ENGINE_FREEZE_TM_ON_VOL", cfg.engine.freeze_tm_on_vol)
+        cfg.engine.idempotency_ttl_s = _Env.get_float(
+            "ENGINE_IDEMPOTENCY_TTL_S",
+            cfg.engine.idempotency_ttl_s,
+        )
+        cfg.engine.ff_enforce_client_oid_deterministic = _Env.get_bool(
+            "ENGINE_ENFORCE_CLIENT_OID_DETERMINISTIC",
+            cfg.engine.ff_enforce_client_oid_deterministic,
+        )
+        cfg.engine.ff_fail_closed_idempotence = _Env.get_bool(
+            "ENGINE_FAIL_CLOSED_IDEMPOTENCE",
+            cfg.engine.ff_fail_closed_idempotence,
+        )
         cfg.engine.depth_min_quote_tt = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_TT", cfg.engine.depth_min_quote_tt)
         cfg.engine.depth_min_quote_tm = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_TM", cfg.engine.depth_min_quote_tm)
         cfg.engine.depth_min_quote_mm = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_MM", cfg.engine.depth_min_quote_mm)
@@ -1913,6 +1950,10 @@ class BotConfig:
         cfg.pws.PWS_POOL_SIZE_EU = _Env.get_int("PWS_POOL_SIZE_EU", cfg.pws.PWS_POOL_SIZE_EU)
         cfg.pws.PWS_POOL_SIZE_US = _Env.get_int("PWS_POOL_SIZE_US", cfg.pws.PWS_POOL_SIZE_US)
         cfg.pws.PWS_QUEUE_MAXLEN = _Env.get_int("PWS_QUEUE_MAXLEN", cfg.pws.PWS_QUEUE_MAXLEN)
+        cfg.pws.ff_pws_no_drop_critical_enforced = _Env.get_bool(
+            "PWS_NO_DROP_CRITICAL_ENFORCED",
+            cfg.pws.ff_pws_no_drop_critical_enforced,
+        )
         cfg.pws.PWS_PACER_EU = _Env.get("PWS_PACER_EU", cfg.pws.PWS_PACER_EU)
         cfg.pws.PWS_PACER_US = _Env.get("PWS_PACER_US", cfg.pws.PWS_PACER_US)
         cfg.pws.PWS_ALERT_PERIOD_S = _Env.get_int("PWS_ALERT_PERIOD_S", cfg.pws.PWS_ALERT_PERIOD_S)
@@ -2051,6 +2092,19 @@ class BotConfig:
         cfg.lhm.LHM_DROP_WHEN_FULL = _Env.get_bool("LHM_DROP_WHEN_FULL", cfg.lhm.LHM_DROP_WHEN_FULL)
         cfg.lhm.LHM_HIGH_WATERMARK_RATIO = _Env.get_float("LHM_HIGH_WATERMARK_RATIO", cfg.lhm.LHM_HIGH_WATERMARK_RATIO)
         cfg.lhm.LHM_MAX_QUEUE_PLATEAU_S = _Env.get_int("LHM_MAX_QUEUE_PLATEAU_S", cfg.lhm.LHM_MAX_QUEUE_PLATEAU_S)
+        cfg.lhm.ff_fail_closed_logging = _Env.get_bool("FF_FAIL_CLOSED_LOGGING", cfg.lhm.ff_fail_closed_logging)
+        cfg.lhm.ff_logging_critical_streams = _Env.get_list(
+            "FF_LOGGING_CRITICAL_STREAMS",
+            cfg.lhm.ff_logging_critical_streams,
+        )
+        cfg.lhm.ff_truth_model_enabled = _Env.get_bool(
+            "FF_TRUTH_MODEL_ENABLED",
+            cfg.lhm.ff_truth_model_enabled,
+        )
+        cfg.lhm.ff_truth_fail_closed = _Env.get_bool(
+            "FF_TRUTH_FAIL_CLOSED",
+            cfg.lhm.ff_truth_fail_closed,
+        )
         cfg.lhm.LHM_MM_SAMPLING_QUOTES = _Env.get_float("LHM_MM_SAMPLING_QUOTES", cfg.lhm.LHM_MM_SAMPLING_QUOTES)
         cfg.lhm.LHM_MM_SAMPLING_CANCELS = _Env.get_float("LHM_MM_SAMPLING_CANCELS", cfg.lhm.LHM_MM_SAMPLING_CANCELS)
         cfg.lhm.LHM_JSONL_QUEUE_CAP = _Env.get_int("LHM_JSONL_QUEUE_CAP", cfg.lhm.LHM_JSONL_QUEUE_CAP)
