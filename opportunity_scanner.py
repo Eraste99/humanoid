@@ -338,7 +338,7 @@ class OpportunityScanner:
         # 1) Paramètres Router (re-logés)
         # -------------------------------
         r = self.cfg.router
-        self._shards = int(r.shards_per_exchange)
+
 
         # pair_queue_max : valeur initiale conservatrice, recalée ensuite via apply_runtime_config
         try:

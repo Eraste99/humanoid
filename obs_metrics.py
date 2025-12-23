@@ -2142,9 +2142,111 @@ class StatusHTTPServer:
 
     async def _handle_ready(self, request):
         st = _extract_status_from_boot(self._boot)
-        ok = bool(st.get('ready_all')) and (not bool(st.get('degraded')))
-        code = 200 if ok else 503
-        return web.json_response(st, status=code)
+
+        # Rollout: cfg.g.ready_strict si présent.
+        # Fallback safe: auto-strict en PROD si cfg.g.mode == "PROD", sinon legacy.
+        strict = False
+        try:
+            cfg = getattr(self._boot, "cfg", None)
+            g = getattr(cfg, "g", None)
+            if g is not None and hasattr(g, "ready_strict"):
+                strict = bool(getattr(g, "ready_strict"))
+            elif g is not None and str(getattr(g, "mode", "DRY_RUN")).upper() == "PROD":
+                strict = True
+        except Exception:
+            strict = False
+
+        st["ready_strict"] = bool(strict)
+
+        if strict:
+            # TRADING_READY strict: fail-safe (si champs manquent => 503)
+            ok = False
+            fail_reasons = []
+
+            # 1) Prefer explicit trading_ready if boot exposes it
+            if "trading_ready" in st:
+                ok = bool(st.get("trading_ready"))
+                if not ok:
+                    fail_reasons.append("trading_ready=false")
+            else:
+                eng_ok = bool(st.get("engine_ready"))
+                rm_ok = bool(st.get("rm_trading_ready"))
+                tstate = str(st.get("trading_state", "READY")).upper()
+
+                if not eng_ok:
+                    fail_reasons.append("engine_not_ready")
+                if not rm_ok:
+                    fail_reasons.append("rm_not_trading_ready")
+                if tstate != "READY":
+                    fail_reasons.append(f"trading_state={tstate}")
+
+                ok = bool(eng_ok and rm_ok and tstate == "READY")
+
+            # 2) Safety: if boot is degraded, trading is not ready
+            if bool(st.get("degraded")):
+                ok = False
+                fail_reasons.append("boot_degraded")
+
+            # 3) Micro-durcissement: private_ws wiring check ONLY if private_ws feature is enabled
+            private_ws_enabled = False
+            try:
+                cfg = getattr(self._boot, "cfg", None)
+                g = getattr(cfg, "g", None)
+                fs = getattr(g, "feature_switches", None) if g is not None else None
+                if isinstance(fs, dict):
+                    private_ws_enabled = bool(fs.get("private_ws", False))
+            except Exception:
+                private_ws_enabled = False
+
+            st["private_ws_enabled"] = bool(private_ws_enabled)
+
+            if private_ws_enabled:
+                pws = st.get("private_ws") or {}
+                rm_pws = (pws.get("rm") or {}) if isinstance(pws, dict) else {}
+                eng_pws = (pws.get("engine") or {}) if isinstance(pws, dict) else {}
+
+                # Fail-safe si status absent
+                if not isinstance(pws, dict) or (not rm_pws and not eng_pws):
+                    ok = False
+                    fail_reasons.append("pws_status_missing")
+                else:
+                    rm_hub_ok = bool(rm_pws.get("hub_wiring_ok", False))
+                    rm_rec_ok = bool(rm_pws.get("reconciler_wiring_ok", False))
+                    eng_hub_ok = bool(eng_pws.get("hub_wiring_ok", False))
+
+                    st["ready_private_ws_wiring_ok"] = bool(rm_hub_ok and rm_rec_ok and eng_hub_ok)
+
+                    if not rm_hub_ok:
+                        ok = False
+                        fail_reasons.append("pws_rm_hub_wiring_not_ok")
+                    if not rm_rec_ok:
+                        ok = False
+                        fail_reasons.append("pws_rm_reconciler_wiring_not_ok")
+                    if not eng_hub_ok:
+                        ok = False
+                        fail_reasons.append("pws_engine_hub_wiring_not_ok")
+
+            st["ready_semantics"] = "TRADING_READY"
+            st["ready_trading"] = bool(ok)
+            if not ok and fail_reasons:
+                # Reasons endpoint-only (ne pas confondre avec reason codes canoniques trading)
+                st["ready_fail_reasons"] = fail_reasons
+
+            return web.json_response(st, status=(200 if ok else 503))
+
+        # Legacy service-ready behavior
+        ok = bool(st.get("ready_all")) and (not bool(st.get("degraded")))
+        st["ready_semantics"] = "SERVICE_READY"
+        st["ready_service"] = bool(ok)
+        return web.json_response(st, status=(200 if ok else 503))
+
+    async def _handle_healthz(self, request):
+        # /healthz conserve l'ancien critère: service-ready (boot ready_all et non dégradé)
+        st = _extract_status_from_boot(self._boot)
+        ok = bool(st.get("ready_all")) and (not bool(st.get("degraded")))
+        st["ready_semantics"] = "SERVICE_READY"
+        st["ready_service"] = bool(ok)
+        return web.json_response(st, status=(200 if ok else 503))
 
     async def _handle_metrics(self, request):
         if not self.include_metrics or self.registry is None:
@@ -2163,7 +2265,12 @@ class StatusHTTPServer:
         if self._runner:
             return
         app = web.Application()
-        app.add_routes([web.get('/ready', self._handle_ready), web.get('/status', self._handle_status), web.get('/healthz', self._handle_ready)])
+        app.add_routes([
+            web.get('/ready', self._handle_ready),
+            web.get('/status', self._handle_status),
+            web.get('/healthz', self._handle_healthz),
+        ])
+
         if self.include_metrics:
             app.add_routes([web.get('/metrics', self._handle_metrics)])
         self._runner = web.AppRunner(app, access_log=None)

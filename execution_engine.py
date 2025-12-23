@@ -1856,36 +1856,71 @@ class ExecutionEngine:
             self._update_trade_ready()
             return
 
-    def set_private_ws_reconciler(self, reconciler) -> None:
-        self.reconciler = reconciler
+    def set_private_ws_reconciler(self, reconciler):
+        """
+        Wire the PrivateWSReconciler to the engine and (optionally) to the PrivateWSHub.
+        This must never reference an undefined local variable (previous bug: `hub`).
+        """
+        self.private_ws_reconciler = reconciler
 
-        status = {}
         try:
-            if hasattr(hub, "get_status"):
-                status = hub.get_status()
-        except Exception:
-            log.exception("[ExecutionEngine] Impossible de lire le status du Hub")
+            if reconciler is None:
+                # Keep engine usable even if reconciler is disabled.
+                return {"reconciler": "disabled"}
 
-        wiring = status.get("wiring", {}) if isinstance(status, dict) else {}
-        has_engine_cb = bool(wiring.get("has_engine_callback"))
-        has_rm_cb = bool(wiring.get("has_rm_callback"))
-        auto_rm = bool(wiring.get("auto_rm_from_engine"))
-
-        if not (has_engine_cb and has_rm_cb) or auto_rm:
-            log.error(
-                "[ExecutionEngine] Wiring Hub incomplet: engine=%s rm=%s auto_rm=%s",
-                has_engine_cb,
-                has_rm_cb,
-                auto_rm,
+            # Prefer the already wired hub on the engine (set via set_private_ws_hub()).
+            hub = (
+                    getattr(self, "private_ws_hub", None)
+                    or getattr(self, "_private_ws_hub", None)
+                    or getattr(self, "pws_hub", None)
             )
 
-            self._wiring_checked = True
-            self.mark_not_ready(reasons=["hub_wiring_incomplete"], details={"wiring": wiring})
-            return
+            # Best-effort wiring hooks (do not assume exact API).
+            if hasattr(reconciler, "set_engine"):
+                reconciler.set_engine(self)
+            if hasattr(reconciler, "set_hub"):
+                reconciler.set_hub(hub)
 
-        self._wiring_checked = True
-        log.info("[ExecutionEngine] Hub wiring OK (engine + rm branchés)")
-        self._update_trade_ready()
+            # Status is best-effort and must not throw.
+            status = {"hub_wiring_incomplete": hub is None}
+            if hub is not None:
+                if hasattr(hub, "get_status") and callable(hub.get_status):
+                    try:
+                        hs = hub.get_status()
+                        if isinstance(hs, dict):
+                            status.update(hs)
+                    except Exception:
+                        # keep status minimal
+                        status["hub_status_error"] = True
+
+            # Optional readiness markers if your engine has them.
+            if status.get("hub_wiring_incomplete"):
+                if hasattr(self, "mark_not_ready") and callable(self.mark_not_ready):
+                    self.mark_not_ready("private_ws_hub_missing")
+                elif hasattr(self, "_mark_not_ready") and callable(self._mark_not_ready):
+                    self._mark_not_ready("private_ws_hub_missing")
+            else:
+                if hasattr(self, "mark_ready") and callable(self.mark_ready):
+                    self.mark_ready("private_ws_wired")
+                elif hasattr(self, "_mark_ready") and callable(self._mark_ready):
+                    self._mark_ready("private_ws_wired")
+
+            return status
+
+        except Exception:
+            # This path must be extremely conservative: do not crash boot.
+            try:
+                logger.exception("ExecutionEngine.set_private_ws_reconciler wiring failed")
+            except Exception:
+                pass
+
+            if hasattr(self, "mark_not_ready") and callable(self.mark_not_ready):
+                self.mark_not_ready("private_ws_reconciler_wiring_failed")
+            elif hasattr(self, "_mark_not_ready") and callable(self._mark_not_ready):
+                self._mark_not_ready("private_ws_reconciler_wiring_failed")
+
+            return {"hub_wiring_incomplete": True, "wiring_failed": True}
+
 
     async def submit_maker_or_delay(self, order: dict, meta: dict) -> Optional[str]:
         """

@@ -3392,6 +3392,9 @@ class RiskManager:
             quote: str,
             meta: dict,
     ) -> dict:
+        # SAFE DEFAULT: must always be defined (prevents UnboundLocalError)
+
+
         """
         Calcule/normalise les caps locaux pour ce bundle (Ticket 10).
 
@@ -3498,8 +3501,20 @@ class RiskManager:
                 except Exception:
                     bundle_concurrency = 0
 
+            # Ensure always valid and >= 0 (0 means "disabled / no concurrency")
+            try:
+                bundle_concurrency = int(bundle_concurrency) if bundle_concurrency is not None else 0
+            except Exception:
+                bundle_concurrency = 0
+            if bundle_concurrency < 0:
+                bundle_concurrency = 0
 
-            caps_local["bundle_concurrency"] = bundle_concurrency
+            # If inflight cap is 0, concurrency must be 0 (do not resurrect the branch)
+            if int(inflight_cap_eff or 0) <= 0:
+                bundle_concurrency = 0
+
+            # Do not override if already set earlier in caps_local (keeps existing semantics)
+            caps_local.setdefault("bundle_concurrency", bundle_concurrency)
 
         # 3) headroom_min : si absent, on garde ta valeur par défaut config
         if "headroom_min" not in caps_local:

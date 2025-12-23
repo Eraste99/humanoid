@@ -406,6 +406,12 @@ class LoggerHistoriqueManager:
         self._drop_when_full = bool(getattr(L, "LHM_DROP_WHEN_FULL", True))
         self._high_watermark = float(getattr(L, "LHM_HIGH_WATERMARK_RATIO", 0.80))
         self._plateau_s      = int(getattr(L, "LHM_MAX_QUEUE_PLATEAU_S", 60))
+        self._opportunity_queue_max = int(
+            getattr(L, "LHM_OPPORTUNITY_QUEUE_MAX", min(self._q_stream_max, 5000))
+        )
+        self._opportunity_drop_when_full = bool(
+            getattr(L, "LHM_OPPORTUNITY_DROP_WHEN_FULL", True)
+        )
         self._fail_closed_logging = bool(getattr(L, "ff_fail_closed_logging", False))
         self._truth_model_enabled = bool(getattr(L, "ff_truth_model_enabled", False))
         self._truth_fail_closed = bool(getattr(L, "ff_truth_fail_closed", False))
@@ -513,6 +519,8 @@ class LoggerHistoriqueManager:
         self._db_lane_q: asyncio.Queue | None = None
         self._db_lane_task: asyncio.Task | None = None
         self._db_lane_executor: ThreadPoolExecutor | None = None
+        self._opportunity_queue: asyncio.Queue | None = None
+        self._opportunity_task: asyncio.Task | None = None
 
 
         # -------- Pipelines JSONL.gz ------------------------------
@@ -662,6 +670,13 @@ class LoggerHistoriqueManager:
         self._running = True
         self._flush_lock = getattr(self, "_flush_lock", asyncio.Lock())
         await self._start_db_lane()
+        if self._opportunity_queue is None:
+            self._opportunity_queue = asyncio.Queue(maxsize=self._opportunity_queue_max)
+        if not self._opportunity_task or self._opportunity_task.done():
+            self._opportunity_task = asyncio.create_task(
+                self._opportunity_worker(),
+                name="LHM-OpportunityWorker",
+            )
 
         # 1) BaseTradeLogger -> event_sink (nous)
         btl = getattr(self, "_trade_logger", None)
@@ -743,6 +758,12 @@ class LoggerHistoriqueManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await t
         self._rotation_task = None
+        t = getattr(self, "_opportunity_task", None)
+        if t and not t.done():
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
+        self._opportunity_task = None
 
         # 2) Arrêt du BTL (peut encore émettre ici → JSONL worker doit rester vivant)
         btl = getattr(self, "_trade_logger", None)
@@ -4074,7 +4095,38 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("rotation_loop error")
 
+    async def _opportunity_worker(self) -> None:
+        q = self._opportunity_queue
+        if q is None:
+            return
+        while getattr(self, "_running", False):
+            try:
+                payload = await q.get()
+                try:
+                    await self.record_opportunity(payload)
+                except Exception:
+                    logger.exception("opportunity worker failed")
+                finally:
+                    with contextlib.suppress(Exception):
+                        q.task_done()
+                    try:
+                        from modules.obs_metrics import lhm_set_queue_size
+                        lhm_set_queue_size("opportunities", int(q.qsize()))
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("opportunity worker crashed")
 
+    def _record_opportunity_drop(self, reason: str, payload: Optional[Dict[str, Any]] = None) -> None:
+        reason_code = self._normalize_reason_code(reason)
+        try:
+            from modules.obs_metrics import lhm_on_dropped
+            lhm_on_dropped("opportunities", reason_code, n=1)
+        except Exception:
+            pass
+        self._log_drop_event(stream="opportunities", reason_code=reason_code, payload=payload)
     # ---------------- write API ----------------
     def sink(self, payload: Dict[str, Any]) -> None:
         """
@@ -4088,6 +4140,35 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("LHM.sink failed")
 
+    def opportunity(self, payload: Dict[str, Any]) -> None:
+        """
+        Sink synchrone pour opportunités (Scanner).
+        Non-bloquant, borné, et sans création de tâches par event.
+        """
+        q = self._opportunity_queue
+        if q is None:
+            self._record_opportunity_drop("LOGGERH_JSONL_QUEUE_FULL", payload=payload)
+            return
+        if not getattr(self, "_running", False):
+            self._record_opportunity_drop("LOGGERH_JSONL_QUEUE_FULL", payload=payload)
+            return
+        try:
+            q.put_nowait(payload)
+            try:
+                from modules.obs_metrics import lhm_set_queue_size
+                lhm_set_queue_size("opportunities", int(q.qsize()))
+            except Exception:
+                pass
+        except asyncio.QueueFull:
+            if self._opportunity_drop_when_full:
+                self._record_opportunity_drop("LOGGERH_JSONL_QUEUE_FULL", payload=payload)
+            else:
+                try:
+                    q.put_nowait(payload)
+                except Exception:
+                    self._record_opportunity_drop("LOGGERH_JSONL_QUEUE_FULL", payload=payload)
+        except Exception:
+            logger.exception("LHM.opportunity sink failed")
 
     async def record_trade(self, payload: Dict[str, Any]) -> None:
         """Ingestion publique. BaseTradeLogger gère batch/IDs/latences/tri-CEX."""

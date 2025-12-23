@@ -145,6 +145,11 @@ class Boot:
         # Moniteur santé pipeline PnL (LHM/JSONL/DB)
         self._pnl_pipeline_task: Optional[asyncio.Task] = None
         self._pnl_unhealthy_since: Optional[float] = None
+        self._router_watchdog_task: Optional[asyncio.Task] = None
+        self._router_health_state: Dict[str, Any] = {}
+        self._router_health_pairs_seen: Dict[str, Dict[str, int]] = {}
+        self._router_health_stale_counts: Dict[str, int] = {}
+        self._router_health_warned: bool = False
         self._obs_inc_cb: Optional[Any] = None
         self._obs_counter_cache: Dict[Tuple[str, tuple[str, ...]], Any] = {}
         self._critical_deps = ["config", "obs", "rate_limiter", "pacer"]
@@ -368,6 +373,16 @@ class Boot:
             except Exception:
                 self._mark_degraded("BOOT_STOP_TIMEOUT", where="private_health_task")
         self._private_health_task = None
+        t = getattr(self, "_router_watchdog_task", None)
+        if t:
+            t.cancel()
+            try:
+                await asyncio.wait_for(t, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="router_watchdog_task")
+            except Exception:
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where="router_watchdog_task")
+        self._router_watchdog_task = None
 
         # Moniteur santé pipeline PnL (LHM/JSONL/DB)
         t = getattr(self, "_pnl_pipeline_task", None)
@@ -461,7 +476,10 @@ class Boot:
     def get_status(self) -> Dict[str, Any]:
         s = dict(self.state)
         s.update({
+            # Service-ready (historique)
             "ready": self.ready_all.is_set(),
+            "ready_all": self.ready_all.is_set(),
+
             "ws_ready": self.ready_ws.is_set(),
             "router_ready": self.ready_router.is_set(),
             "scanner_ready": self.ready_scanner.is_set(),
@@ -471,11 +489,13 @@ class Boot:
             "private_ready": self.ready_private.is_set(),
             "balances_ready": self.ready_balances.is_set(),
             "rpc_ready": self.ready_rpc.is_set(),
+
             "scanner_proxy_dropped": getattr(self._scanner_proxy, "dropped", 0),
             "active_pairs": list(self.ctx.active_pairs),
             "discovered": len(self.ctx.discovered_pairs),
             "module_state": dict(self._module_state),
         })
+
         rc = self._get_router_ready_pairs_count()
         if rc is not None:
             s["router_l2_ready_pairs"] = rc
@@ -485,12 +505,15 @@ class Boot:
         engine = getattr(self.ctx, "engine", None)
         rm_private: Dict[str, Any] = {}
         engine_private: Dict[str, Any] = {}
+        rm_status: Dict[str, Any] = {}
+        eng_status: Dict[str, Any] = {}
 
         try:
             if rm and hasattr(rm, "get_status"):
                 rm_status = rm.get_status() or {}
                 rm_private = rm_status.get("private_ws") or {}
         except Exception:
+            rm_status = {}
             rm_private = {}
 
         try:
@@ -498,6 +521,7 @@ class Boot:
                 eng_status = engine.get_status() or {}
                 engine_private = eng_status.get("private_ws") or {}
         except Exception:
+            eng_status = {}
             engine_private = {}
 
         s["private_ws"] = {
@@ -505,6 +529,32 @@ class Boot:
             "rm": rm_private,
             "engine": engine_private,
         }
+
+        # --- Trading readiness canonique (utilisé par /ready strict) ---
+        # On expose ce que le RM sait (si dispo), et on calcule un "trading_ready" strict minimal.
+        try:
+            s["rm_trading_ready"] = bool(rm_status.get("rm_trading_ready")) if isinstance(rm_status, dict) else None
+        except Exception:
+            s["rm_trading_ready"] = None
+
+        try:
+            s["trading_state"] = str(rm_status.get("trading_state", "READY")) if isinstance(rm_status,
+                                                                                            dict) else "READY"
+            s["trading_state_reason"] = rm_status.get("trading_state_reason") if isinstance(rm_status, dict) else None
+        except Exception:
+            s["trading_state"] = "READY"
+            s["trading_state_reason"] = None
+
+        # Trading-ready strict minimal: Engine ready + RM trading ready + trading_state == READY
+        # (Fail-safe: si on ne sait pas, on considère NOT READY)
+        try:
+            eng_ok = bool(s.get("engine_ready"))
+            rm_ok = bool(s.get("rm_trading_ready"))
+            tstate = str(s.get("trading_state", "READY")).upper()
+            s["trading_ready"] = bool(eng_ok and rm_ok and tstate == "READY")
+        except Exception:
+            s["trading_ready"] = False
+
         return s
 
     def set_status_callback(self, callback) -> None:
@@ -675,13 +725,29 @@ class Boot:
 
         # 6) (Optionnel) Brancher les sinks si présents
         try:
-            if getattr(self.ctx, "engine", None) and hasattr(self.ctx.engine, "set_history_logger"):
-                self.ctx.engine.set_history_logger(self.ctx.lhm)
-            if getattr(self.ctx, "scanner", None) and hasattr(self.ctx.scanner, "set_history_logger"):
-                self.ctx.scanner.set_history_logger(self.ctx.lhm.opportunity)
+            self._bind_lhm_sinks()
         except Exception as e:
             self.log.warning("[Boot][LHM] Branchements sinks partiels : %s", e)
 
+    def _bind_lhm_sinks(self) -> None:
+        lhm = getattr(self.ctx, "lhm", None)
+        if not lhm:
+            return
+        try:
+            engine = getattr(self.ctx, "engine", None)
+            if engine and hasattr(engine, "set_history_logger"):
+                engine.set_history_logger(lhm)
+        except Exception:
+            self.log.warning("[Boot][LHM] engine.set_history_logger failed")
+        try:
+            scanner = getattr(self.ctx, "scanner", None)
+            if scanner and hasattr(scanner, "set_history_logger"):
+                sink = getattr(lhm, "opportunity", None)
+                if callable(sink):
+                    scanner.set_history_logger(sink)
+                scanner.logger_historique_manager = lhm
+        except Exception:
+            self.log.warning("[Boot][LHM] scanner history sinks failed")
     async def _discover_pairs_and_compute_active(self) -> None:
         """Discovery optionnelle → pool (discovered_pairs) → sous‑ensemble actif (active_pairs).
         Fallback 100% config si discovery disabled/échec.
@@ -851,6 +917,7 @@ class Boot:
         self.ready_router.set()
         self._mark_stage("router_started")
         self.log.info("[Boot] Router démarré. combos=%s", combos)
+        self._ensure_router_health_watchdog()
 
     def _wire_volatility_monitor(self) -> None:
         """Attache les files bus vol et forward scanner/config pour la Volatility."""
@@ -1064,6 +1131,14 @@ class Boot:
     async def _start_scanner(self) -> None:
 
         self.ctx.scanner = OpportunityScanner(self.cfg, self.ctx.rm, self.ctx.router, history_logger=self.ctx.lhm)
+        dry_run = bool(getattr(getattr(self.cfg, "g", object()), "dry_run", False))
+        live = not dry_run
+        if live:
+            rm = getattr(self.ctx, "rm", None)
+            cb = getattr(rm, "on_scanner_opportunity", None) if rm else None
+            if callable(cb):
+                self.ctx.scanner.on_opportunity = cb
+        self._bind_lhm_sinks()
         with contextlib.suppress(Exception):
             lhm = getattr(self.ctx, "lhm", None)
             coh = None
@@ -1341,24 +1416,96 @@ class Boot:
         self._send_status("engine", "ready")
 
         # 2) RPC
-        if not getattr(self.ctx, "rpc", None):
-            self.ctx.rpc = RPCServer(getattr(self, "cfg", None))
+        rpc_cfg = getattr(self.cfg, "rpc", None)
+        rpc_enabled = bool(getattr(rpc_cfg, "enabled", False))
 
-        # Tenter de monter /status via RPC existant AVANT start
+        # Si RPC désactivé, on ne bloque pas le boot.
+        if not rpc_enabled:
+            self._send_status("rpc", "disabled")
+            self.ready_rpc.set()
+            self._mark_stage("rpc_disabled")
+            return
+
+        self._send_status("rpc", "starting")
+
+        # Handlers (pour la signature RPCServer(cfg, handlers, ...))
+        # => On évite d'importer un type spécifique (RPCHandlers) pour rester compatible.
+        from types import SimpleNamespace
+
+        async def _rpc_submit_bundle(payload: dict) -> dict:
+            # Prefer RM si tu exposes une entrée “guarded”.
+            rm = getattr(self.ctx, "rm", None)
+            if rm is not None and hasattr(rm, "submit_bundle_from_rpc"):
+                return await rm.submit_bundle_from_rpc(payload)
+
+            eng = self.ctx.engine
+            if hasattr(eng, "_execute_bundle"):
+                return await eng._execute_bundle(payload)
+            if hasattr(eng, "execute_bundle"):
+                return await eng.execute_bundle(payload)
+            raise RuntimeError("No submit_bundle entrypoint available")
+
+        async def _rpc_get_pnl(*, days: int = 7) -> dict:
+            lhm = getattr(self.ctx, "lhm", None)
+            if lhm is None or not hasattr(lhm, "get_pnl_multiview"):
+                return {"ok": False, "reason": "LHM_NOT_AVAILABLE"}
+            return await lhm.get_pnl_multiview(window_s=int(days) * 86400)
+
+        def _rpc_get_open_orders() -> dict:
+            eng = self.ctx.engine
+            orders = getattr(eng, "_orders", None)
+            try:
+                n = len(orders) if orders is not None else 0
+            except Exception:
+                n = None
+            return {"count": n}
+
+        async def _rpc_pause_trading(reason: str = "rpc_pause") -> dict:
+            rm = getattr(self.ctx, "rm", None)
+            if rm is None or not hasattr(rm, "pause_all_symbols"):
+                return {"ok": False, "reason": "RM_NOT_AVAILABLE"}
+            await rm.pause_all_symbols(reason=reason)
+            return {"ok": True}
+
+        async def _rpc_resume_trading(reason: str = "rpc_resume") -> dict:
+            rm = getattr(self.ctx, "rm", None)
+            if rm is None or not hasattr(rm, "resume_all_symbols"):
+                return {"ok": False, "reason": "RM_NOT_AVAILABLE"}
+            await rm.resume_all_symbols(reason=reason)
+            return {"ok": True}
+
+        handlers = SimpleNamespace(
+            submit_bundle=_rpc_submit_bundle,
+            get_status=self.get_status,
+            get_pnl=_rpc_get_pnl,
+            get_open_orders=_rpc_get_open_orders,
+            pause_trading=_rpc_pause_trading,
+            resume_trading=_rpc_resume_trading,
+        )
+
+        # Instanciation compatible avec les 2 versions de RPCServer
+        if not getattr(self.ctx, "rpc", None):
+            try:
+                # Nouvelle signature: RPCServer(cfg, handlers, ...)
+                self.ctx.rpc = RPCServer(self.cfg, handlers)
+            except TypeError:
+                # Ancienne signature: RPCServer(cfg)
+                self.ctx.rpc = RPCServer(self.cfg)
+
+        # Ancienne API: on enregistre les endpoints si les méthodes existent
         try:
             if hasattr(self.ctx.rpc, "register_status_endpoint"):
                 self.ctx.rpc.register_status_endpoint(self)  # passe le Boot
-            elif hasattr(self.ctx.rpc, "enable_status_endpoint"):
-                # compat alternative si tu avais un autre nom
-                self.ctx.rpc.enable_status_endpoint(self)
+            if hasattr(self.ctx.rpc, "register_health_endpoint"):
+                self.ctx.rpc.register_health_endpoint(self)
+            if hasattr(self.ctx.rpc, "register_engine_bundle_endpoint"):
+                self.ctx.rpc.register_engine_bundle_endpoint(self.ctx.engine)
         except Exception:
-            pass
+            logger.exception("RPC endpoint registration failed (continuing)")
 
-        # Lancer le RPC
-        if hasattr(self.ctx.rpc, "start"):
-            await self.ctx.rpc.start()
-        self._send_status("rpc", "ready")
+        await self.ctx.rpc.start()
         self.ready_rpc.set()
+        self._send_status("rpc", "ready")
         self._mark_stage("rpc_ready")
 
         # 3) Recâblage tardif RM ↔ Engine/Reconciler (idempotent)
@@ -1464,6 +1611,113 @@ class Boot:
         except Exception:
             self.log.exception("[Boot] propagate private WS health failed")
 
+    def _ensure_router_health_watchdog(self) -> None:
+        if self._router_watchdog_task or not self._running:
+            return
+        router = getattr(self.ctx, "router", None)
+        if not router:
+            return
+        try:
+            self._router_watchdog_task = asyncio.create_task(
+                self._router_health_watchdog_loop(),
+                name="boot-router-health",
+            )
+        except Exception:
+            self.log.exception("[Boot] unable to start router health watchdog")
+
+    async def _router_health_watchdog_loop(self) -> None:
+        router = getattr(self.ctx, "router", None)
+        if not router:
+            return
+        router_cfg = getattr(self.cfg, "router", object())
+        stale_ms = int(getattr(router_cfg, "health_stale_ms", 0) or 0)
+        if not stale_ms:
+            stale_ms = int(getattr(router_cfg, "stale_ms", 3000) or 3000)
+        coverage_ratio = getattr(router_cfg, "health_min_coverage_ratio", None)
+        if coverage_ratio is None:
+            coverage_ratio = 0.5
+            if not self._router_health_warned:
+                self._router_health_warned = True
+                self.log.warning(
+                    "[Boot] router health coverage ratio fallback=%.2f (set cfg.router.health_min_coverage_ratio)",
+                    float(coverage_ratio),
+                )
+        coverage_ratio = float(coverage_ratio)
+        poll_s = float(getattr(router_cfg, "health_watchdog_interval_s", 0.5))
+        expected_pairs = len(getattr(self.ctx, "active_pairs", []) or [])
+        if expected_pairs <= 0:
+            expected_pairs = int(getattr(getattr(self.cfg, "scanner", object()), "active_max_pairs", 0) or 0)
+        expected_pairs = int(expected_pairs or 0)
+        exchanges = list(getattr(router, "exchanges", []) or [])
+
+        while getattr(self, "_running", False):
+            try:
+                now_ms = int(time.time() * 1000)
+                for ex in exchanges:
+                    key = MarketDataRouter._cex_key(ex)
+                    qmap = router.out_queues.get(key, {}) if hasattr(router, "out_queues") else {}
+                    q = qmap.get("health") if isinstance(qmap, dict) else None
+                    if not q:
+                        continue
+                    while True:
+                        try:
+                            payload = q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        try:
+                            exu = str(payload.get("exchange") or ex).upper()
+                            pair = payload.get("pair_key")
+                            ts_ms = int(payload.get("recv_ts_ms") or payload.get("exchange_ts_ms") or now_ms)
+                            per_ex = self._router_health_pairs_seen.setdefault(exu, {})
+                            if pair:
+                                per_ex[str(pair)] = ts_ms
+                            state = self._router_health_state.setdefault(exu, {})
+                            state["last_ts_ms"] = ts_ms
+                            state["last_payload_excerpt"] = {
+                                "pair_key": pair,
+                                "seq": payload.get("seq"),
+                            }
+                        except Exception:
+                            self.log.debug("[Boot] router health payload parse failed", exc_info=True)
+                        finally:
+                            with contextlib.suppress(Exception):
+                                q.task_done()
+
+                now_ms = int(time.time() * 1000)
+                for ex in exchanges:
+                    exu = str(ex).upper()
+                    state = self._router_health_state.setdefault(exu, {})
+                    last_ts = int(state.get("last_ts_ms") or 0)
+                    age_ms = max(0, now_ms - last_ts) if last_ts else None
+                    state["age_ms"] = age_ms
+                    per_ex = self._router_health_pairs_seen.get(exu, {})
+                    pairs_recent = 0
+                    if per_ex:
+                        for ts in per_ex.values():
+                            if (now_ms - int(ts)) <= stale_ms:
+                                pairs_recent += 1
+                    state["pairs_seen_count"] = pairs_recent
+                    state["expected_pairs"] = expected_pairs
+                    cov_ratio = (pairs_recent / expected_pairs) if expected_pairs > 0 else 0.0
+                    state["coverage_ratio"] = cov_ratio
+                    coverage_ok = True if expected_pairs <= 0 else cov_ratio >= coverage_ratio
+                    state["coverage_ok"] = coverage_ok
+                    stale = (age_ms is None) or (age_ms > stale_ms)
+                    state["stale"] = stale
+                    stale_count = self._router_health_stale_counts.get(exu, 0)
+                    if stale or not coverage_ok:
+                        stale_count += 1
+                    else:
+                        stale_count = 0
+                    self._router_health_stale_counts[exu] = stale_count
+                    state["stale_cycles"] = stale_count
+                    state["stale_ms_threshold"] = stale_ms
+                self.state["router_health"] = dict(self._router_health_state)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                self.log.exception("[Boot] router health watchdog crashed")
+            await asyncio.sleep(poll_s)
     def _ensure_private_health_task(self) -> None:
         if self._private_health_task or not self._running:
             return
@@ -1702,7 +1956,34 @@ class Boot:
         # RPC obligatoire si activé
         if rpc_enabled and not self.ready_rpc.is_set():
             reasons.append("rpc_unavailable")
-
+        dry_run = bool(getattr(getattr(self.cfg, "g", object()), "dry_run", False))
+        live = not dry_run
+        scanner = getattr(self.ctx, "scanner", None)
+        lhm = getattr(self.ctx, "lhm", None)
+        if live:
+            if not scanner or not callable(getattr(scanner, "on_opportunity", None)):
+                reason_code = self._normalize_reason("SCANNER_RM_CALLBACK_MISSING")
+                if reason_code not in reasons:
+                    reasons.append(reason_code)
+            if lhm and scanner and not callable(getattr(scanner, "_hist_logger", None)):
+                reason_code = self._normalize_reason("SCANNER_HISTORY_SINK_MISSING")
+                if reason_code not in reasons:
+                    reasons.append(reason_code)
+            router_watchdog = getattr(self, "_router_watchdog_task", None)
+            if not router_watchdog or router_watchdog.done():
+                reason_code = self._normalize_reason("ROUTER_HEALTH_UNCONSUMED")
+                if reason_code not in reasons:
+                    reasons.append(reason_code)
+            else:
+                stale_cycles_target = int(
+                    getattr(getattr(self.cfg, "router", object()), "health_stale_cycles", 3) or 3
+                )
+                for _, st in (self._router_health_state or {}).items():
+                    if int(st.get("stale_cycles", 0) or 0) >= stale_cycles_target:
+                        reason_code = self._normalize_reason("PUBLIC_FEED_STALE")
+                        if reason_code not in reasons:
+                            reasons.append(reason_code)
+                        break
         # Ticket 6 – wiring privé obligatoire en live + private_ws ON
         if live and private_ws_enabled:
             rm = getattr(self.ctx, "rm", None)
@@ -1742,29 +2023,32 @@ class Boot:
             reasons.append("BOOT_MODE_FALLBACK")
 
         # Décision READY / DEGRADED
-        self.state["degraded"] = bool(reasons)
-        self.state["reasons"] = reasons
+
         if not reasons:
             self.ready_all.set()
             try:
                 obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.ready", 2.0)
             except Exception:
                 pass
-            else:
-                if "BOOT_READY_BLOCKED" not in reasons:
-                    reasons.append("BOOT_READY_BLOCKED")
-                try:
-                    obs_metrics.safe_inc(
-                        obs_metrics.BLOCKED_TOTAL,
-                        "blocked_total",
-                        "boot.ready_blocked",
-                        module="boot",
-                        reason=self._normalize_reason("BOOT_READY_BLOCKED"),
-                        pair="ready",
-                    )
-                except Exception:
-                    pass
-
+        else:
+            if self.ready_all.is_set():
+                self.ready_all.clear()
+            blocked_reason = self._normalize_reason("BOOT_READY_BLOCKED")
+            if blocked_reason not in reasons:
+                reasons.append(blocked_reason)
+            try:
+                obs_metrics.safe_inc(
+                    obs_metrics.BLOCKED_TOTAL,
+                    "blocked_total",
+                    "boot.ready_blocked",
+                    module="boot",
+                    reason=blocked_reason,
+                    pair="ready",
+                )
+            except Exception:
+                pass
+        self.state["degraded"] = bool(reasons)
+        self.state["reasons"] = reasons
         self._mark_stage("ready")
 
 
