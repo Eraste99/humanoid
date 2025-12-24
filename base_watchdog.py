@@ -1,9 +1,13 @@
 # modules/WatchDog/base_watchdog.py
 from __future__ import annotations
+
 import asyncio, logging, time, os
 from collections import defaultdict, deque
-from typing import Any, Awaitable, Callable, Deque, Dict, Optional
+from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, Optional
+from modules.obs_metrics import watchdog_fallback_used
+from contracts.payloads import normalize_reason_code
 EventSink = Callable[[Dict[str, Any]], Any]  # sync ou async
+
 
 class BaseWatchdogV2:
     """
@@ -55,8 +59,140 @@ class BaseWatchdogV2:
         self._last_event_ts: Dict[str, float] = {}
         self._event_cooldown_ts: Dict[str, float] = {}
         self._consec: Dict[str, int] = defaultdict(int)
+        self._last_snapshot: Dict[str, Any] = {}
 
-    # -------- lifecycle --------
+    @staticmethod
+    def now_ts_ms() -> int:
+        return int(time.time() * 1000)
+
+    @staticmethod
+    def _coerce_severity(severity: str) -> str:
+        sev = str(severity or "").upper()
+        return sev if sev in ("OK", "WARN", "CRIT") else "OK"
+
+    def safe_get(
+            self,
+            obj: Any,
+            path: str | Iterable[str],
+            default: Any = None,
+            *,
+            missing: Optional[list[str]] = None,
+    ) -> Any:
+        if obj is None:
+            if missing is not None:
+                missing.append(str(path))
+            return default
+        steps = [path] if isinstance(path, str) else list(path)
+        cur = obj
+        for key in steps:
+            try:
+                if isinstance(cur, dict):
+                    if key in cur:
+                        cur = cur[key]
+                    else:
+                        if missing is not None:
+                            missing.append(str(key))
+                        return default
+                else:
+                    if hasattr(cur, str(key)):
+                        cur = getattr(cur, str(key))
+                    else:
+                        if missing is not None:
+                            missing.append(str(key))
+                        return default
+            except Exception:
+                if missing is not None:
+                    missing.append(str(key))
+                return default
+        return default if cur is None else cur
+
+    async def safe_call(
+            self,
+            fn: Optional[Callable[..., Any]],
+            *args: Any,
+            default: Any = None,
+            errors: Optional[list[str]] = None,
+            error_label: Optional[str] = None,
+            **kwargs: Any,
+    ) -> Any:
+        if not callable(fn):
+            if errors is not None:
+                errors.append(error_label or "callable_missing")
+            return default
+        try:
+            res = fn(*args, **kwargs)
+            if asyncio.iscoroutine(res):
+                return await res
+            return res
+        except Exception as exc:
+            if errors is not None:
+                errors.append(error_label or f"call_failed:{exc}")
+            return default
+
+    @staticmethod
+    def safe_len(obj: Any, default: int = 0) -> int:
+        try:
+            return int(len(obj))  # type: ignore[arg-type]
+        except Exception:
+            return int(default)
+
+    @staticmethod
+    def safe_age_ms(last_ts: Optional[float | int], now_ms: Optional[int] = None) -> Optional[int]:
+        if last_ts is None:
+            return None
+        try:
+            last_val = float(last_ts)
+        except Exception:
+            return None
+        if now_ms is None:
+            now_ms = BaseWatchdogV2.now_ts_ms()
+        if last_val <= 0:
+            return None
+        if last_val < 1e12:
+            last_val *= 1000.0
+        return max(0, int(now_ms - last_val))
+
+    def normalize_reasons(self, reasons: Iterable[str]) -> list[str]:
+        out: list[str] = []
+        for reason in reasons:
+            norm = normalize_reason_code(reason)
+            if norm:
+                out.append(norm)
+        return out
+
+    def record_fallback(self, key: str) -> None:
+        try:
+            self.log.warning("[%s] ⚠️ fallback threshold used: %s", self.name, key)
+        except Exception:
+            pass
+        watchdog_fallback_used(self.name, key)
+
+    def emit_health_event(
+            self,
+            *,
+            severity: str,
+            reasons: Iterable[str],
+            details: Dict[str, Any],
+            component: Optional[str] = None,
+            observed_at_ms: Optional[int] = None,
+            **dims: Any,
+    ) -> None:
+        sev = self._coerce_severity(severity)
+        normalized = self.normalize_reasons(reasons)
+        observed_ms = int(observed_at_ms or self.now_ts_ms())
+        payload: Dict[str, Any] = {
+            "component": component or self.name,
+            "severity": sev,
+            "reasons": normalized,
+            "details": dict(details or {}),
+            "observed_at_ms": observed_ms,
+        }
+        payload.update({k: v for k, v in dims.items() if v is not None})
+        msg = f"health_snapshot:{sev}:{','.join(normalized) if normalized else 'ok'}"
+        self.emit_event(type="health_snapshot", level=("INFO" if sev == "OK" else sev), message=msg, **payload)
+        self._last_snapshot = payload
+
+        # -------- lifecycle --------
     async def start(self) -> None:
         if self._running:
             return
@@ -228,4 +364,5 @@ class BaseWatchdogV2:
                 "last_check_ts": self.last_check_ts,
                 "notify_only": self.notify_only,
             },
+            "last_snapshot": dict(self._last_snapshot),
         }

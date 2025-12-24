@@ -37,7 +37,8 @@ import asyncio, time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from base_watchdog import BaseWatchdogV2
+from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 
 StateFn = Callable[[], Dict[str, Any] | Awaitable[Dict[str, Any]]]
 
@@ -102,126 +103,66 @@ class EngineWatchdogConfig:
     tuning: EngineModeTuning = field(default_factory=EngineModeTuning)
 
 
-class SimulatorExecutionWatchdog(BaseWatchdogV2):
-    """Watchdog Execution/Simulator passif (notify-only)."""
-
     def __init__(
-        self,
-        state_fn: StateFn,
-        *,
-        name: str = "SimulatorExecutionWatchdog",
-        config: Optional[EngineWatchdogConfig] = None,
-        notify_only: bool = True,
-        verbose: bool = True,
+            self,
+            state_fn: Optional[StateFn] = None,
+            *,
+            engine: Optional[Any] = None,
+            name: str = "SimulatorExecutionWatchdog",
+            config: Optional[EngineWatchdogConfig] = None,
+            notify_only: bool = True,
+            verbose: bool = True,
+            bot_config: Optional[BotConfig] = None,
     ) -> None:
-        cfg = config or EngineWatchdogConfig()
+        bot_cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            self.record_fallback("bot_config")
+        th = EngineThresholds(
+            submit_ack_warn_ms=bot_cfg.wd.engine_submit_ack_warn_ms,
+            submit_ack_crit_ms=bot_cfg.wd.engine_submit_ack_crit_ms,
+            ack_fill_warn_ms=bot_cfg.wd.engine_ack_fill_warn_ms,
+            ack_fill_crit_ms=bot_cfg.wd.engine_ack_fill_crit_ms,
+            timeouts_warn_per_min=bot_cfg.wd.engine_timeouts_warn_per_min,
+            timeouts_crit_per_min=bot_cfg.wd.engine_timeouts_crit_per_min,
+            retries_warn_per_min=bot_cfg.wd.engine_retries_warn_per_min,
+            retries_crit_per_min=bot_cfg.wd.engine_retries_crit_per_min,
+            panic_hedge_warn_per_min=bot_cfg.wd.engine_panic_hedge_warn_per_min,
+            panic_hedge_crit_per_min=bot_cfg.wd.engine_panic_hedge_crit_per_min,
+            queuepos_blocked_warn_per_min=bot_cfg.wd.engine_queuepos_blocked_warn_per_min,
+            queuepos_blocked_crit_per_min=bot_cfg.wd.engine_queuepos_blocked_crit_per_min,
+            escalate_after_cycles=bot_cfg.wd.engine_escalate_after_cycles,
+        )
+        cfg = config or EngineWatchdogConfig(check_interval=bot_cfg.wd.engine_interval_s, thresholds=th)
         super().__init__(
             name=name,
             check_interval=cfg.check_interval,
             restart_cooldown_s=30.0,
             max_restarts_per_min=3,
+            event_cooldown_s=bot_cfg.wd.cooldown_s,
             verbose=verbose,
             notify_only=notify_only,
         )
         self.cfg = cfg
         self.th = cfg.thresholds
         self.state_fn = state_fn
+        self.engine = engine
+        self.engine_blocked_ms = int(bot_cfg.wd.engine_blocked_ms)
+        self.engine_queue_max = int(bot_cfg.wd.engine_queue_max)
         self._bad_cycles: int = 0
+        self._last_inflight: Optional[int] = None
+        self._last_inflight_ts: float = 0.0
+
 
     async def _check_once(self) -> None:
-        s = await self._get_state()
-        now = float(s.get("now_ts", time.time()))
-        g = s.get("global", {}) or {}
-        exmap = s.get("exchanges", {}) or {}
-
-        any_warn = False
-        any_crit = False
-
-        # 1) Globaux
-        g_sa = float(g.get("submit_to_ack_p95_ms", 0.0))
-        g_af = float(g.get("ack_to_fill_p95_ms", 0.0))
-        g_to = float(g.get("timeouts_per_min", 0.0))
-        g_rt = float(g.get("retries_per_min", 0.0))
-        g_ph = float(g.get("panic_hedge_per_min", 0.0))
-        g_qb = float(g.get("queuepos_blocked_per_min", 0.0))
-
-        if g_sa >= self.th.submit_ack_crit_ms or g_af >= self.th.ack_fill_crit_ms:
-            self.emit_event(type="alert", level="CRIT", message="engine_latency_crit",
-                            submit_ack_p95_ms=int(g_sa), ack_fill_p95_ms=int(g_af),
-                            thresholds={"sa_crit": self.th.submit_ack_crit_ms, "af_crit": self.th.ack_fill_crit_ms},
-                            intent="request_full_restart")
-            any_crit = True
-        elif g_sa >= self.th.submit_ack_warn_ms or g_af >= self.th.ack_fill_warn_ms:
-            self.emit_event(type="health", level="WARN", message="engine_latency_warn",
-                            submit_ack_p95_ms=int(g_sa), ack_fill_p95_ms=int(g_af),
-                            thresholds={"sa_warn": self.th.submit_ack_warn_ms, "af_warn": self.th.ack_fill_warn_ms})
-            any_warn = True
-
-        for label, val, warn, crit, msg in [
-            ("timeouts_per_min", g_to, self.th.timeouts_warn_per_min, self.th.timeouts_crit_per_min, "timeouts"),
-            ("retries_per_min",  g_rt, self.th.retries_warn_per_min,  self.th.retries_crit_per_min,  "retries"),
-            ("panic_hedge_per_min", g_ph, self.th.panic_hedge_warn_per_min, self.th.panic_hedge_crit_per_min, "panic_hedge"),
-            ("queuepos_blocked_per_min", g_qb, self.th.queuepos_blocked_warn_per_min, self.th.queuepos_blocked_crit_per_min, "queuepos_blocked"),
-        ]:
-            if val >= crit:
-                self.emit_event(type="alert", level="CRIT", message=f"engine_{msg}_crit",
-                                **{label: val, "threshold": crit}, intent="request_full_restart")
-                any_crit = True
-            elif val >= warn:
-                self.emit_event(type="health", level="WARN", message=f"engine_{msg}_warn",
-                                **{label: val, "threshold": warn})
-                any_warn = True
-
-        # 2) Par exchange
-        for ex, info in exmap.items():
-            lat = self._ex_thresholds(ex)
-            ack = float((info or {}).get("ack_p95_ms", 0.0))
-            fil = float((info or {}).get("fill_p95_ms", 0.0))
-            to  = float((info or {}).get("timeouts_per_min", 0.0))
-            rt  = float((info or {}).get("retries_per_min", 0.0))
-            ph  = float((info or {}).get("panic_hedge_per_min", 0.0))
-            qb  = float((info or {}).get("queuepos_blocked_per_min", 0.0))
-
-            if ack >= lat.ack_crit_ms or fil >= lat.fill_crit_ms:
-                self.emit_event(type="alert", level="CRIT", message="engine_exchange_latency_crit",
-                                exchange=ex, ack_p95_ms=int(ack), fill_p95_ms=int(fil),
-                                thresholds={"ack_crit": lat.ack_crit_ms, "fill_crit": lat.fill_crit_ms},
-                                intent="request_full_restart")
-                any_crit = True
-            elif ack >= lat.ack_warn_ms or fil >= lat.fill_warn_ms:
-                self.emit_event(type="health", level="WARN", message="engine_exchange_latency_warn",
-                                exchange=ex, ack_p95_ms=int(ack), fill_p95_ms=int(fil),
-                                thresholds={"ack_warn": lat.ack_warn_ms, "fill_warn": lat.fill_warn_ms})
-                any_warn = True
-
-            for label, val, warn, crit, msg in [
-                ("timeouts_per_min", to, self.th.timeouts_warn_per_min, self.th.timeouts_crit_per_min, "timeouts"),
-                ("retries_per_min",  rt, self.th.retries_warn_per_min,  self.th.retries_crit_per_min,  "retries"),
-                ("panic_hedge_per_min", ph, self.th.panic_hedge_warn_per_min, self.th.panic_hedge_crit_per_min, "panic_hedge"),
-                ("queuepos_blocked_per_min", qb, self.th.queuepos_blocked_warn_per_min, self.th.queuepos_blocked_crit_per_min, "queuepos_blocked"),
-            ]:
-                if val >= crit:
-                    self.emit_event(type="alert", level="CRIT", message=f"engine_exchange_{msg}_crit",
-                                    exchange=ex, **{label: val, "threshold": crit}, intent="request_full_restart")
-                    any_crit = True
-                elif val >= warn:
-                    self.emit_event(type="health", level="WARN", message=f"engine_exchange_{msg}_warn",
-                                    exchange=ex, **{label: val, "threshold": warn})
-                    any_warn = True
-
-        # 3) Escalade persistance
-        if any_warn or any_crit:
-            self._bad_cycles += 1
-        else:
-            self._bad_cycles = 0
-
-        if self._bad_cycles >= max(1, self.th.escalate_after_cycles):
-            self.emit_event(type="alert", level="CRIT", message="engine_persistent_degradation",
-                            cycles=self._bad_cycles, intent="request_full_restart")
-
-        # tout vert
-        if self._bad_cycles == 0 and not any_warn and not any_crit:
-            self.emit_event(type="health", level="INFO", message="engine_ok")
+        snapshot = await self.collect_snapshot()
+        severity, reasons, details = self.evaluate(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="Engine",
+            observed_at_ms=snapshot.get("observed_at_ms"),
+        )
 
     # ---- helpers ----
     def _ex_thresholds(self, ex: str) -> ExchLatency:
@@ -237,6 +178,115 @@ class SimulatorExecutionWatchdog(BaseWatchdogV2):
         except Exception as e:
             self.emit_event(type="error", level="ERROR", message=f"state_fn failed: {e}")
             return {}
+
+    async def collect_snapshot(self) -> Dict[str, Any]:
+        observed_at_ms = self.now_ts_ms()
+        missing: list[str] = []
+        errors: list[str] = []
+        state: Dict[str, Any] = {}
+        if self.state_fn:
+            state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
+        if not state and self.engine is not None:
+            state = await self.safe_call(getattr(self.engine, "get_status", None), default={}, errors=errors,
+                                         error_label="engine.get_status")
+        if not state:
+            missing.append("get_status")
+        return {
+            "observed_at_ms": observed_at_ms,
+            "module_state": state or {},
+            "missing": missing,
+            "errors": errors,
+        }
+
+    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        state = snapshot.get("module_state", {}) or {}
+        reasons: list[str] = []
+        details: Dict[str, Any] = {}
+        missing = list(snapshot.get("missing") or [])
+        g = state.get("global", {}) or {}
+        exmap = state.get("exchanges", {}) or {}
+
+        any_warn = False
+        any_crit = False
+
+        if g:
+            g_sa = float(g.get("submit_to_ack_p95_ms", 0.0))
+            g_af = float(g.get("ack_to_fill_p95_ms", 0.0))
+            g_to = float(g.get("timeouts_per_min", 0.0))
+            g_rt = float(g.get("retries_per_min", 0.0))
+            g_ph = float(g.get("panic_hedge_per_min", 0.0))
+            g_qb = float(g.get("queuepos_blocked_per_min", 0.0))
+            if g_sa >= self.th.submit_ack_crit_ms or g_af >= self.th.ack_fill_crit_ms:
+                reasons.append("ENGINE_BLOCKED")
+                any_crit = True
+            elif g_sa >= self.th.submit_ack_warn_ms or g_af >= self.th.ack_fill_warn_ms:
+                any_warn = True
+            if g_to >= self.th.timeouts_crit_per_min or g_rt >= self.th.retries_crit_per_min:
+                reasons.append("ENGINE_BLOCKED")
+                any_crit = True
+            elif g_to >= self.th.timeouts_warn_per_min or g_rt >= self.th.retries_warn_per_min:
+                any_warn = True
+            if g_ph >= self.th.panic_hedge_crit_per_min or g_qb >= self.th.queuepos_blocked_crit_per_min:
+                reasons.append("ENGINE_BLOCKED")
+                any_crit = True
+            elif g_ph >= self.th.panic_hedge_warn_per_min or g_qb >= self.th.queuepos_blocked_warn_per_min:
+                any_warn = True
+
+        for ex, info in exmap.items():
+            lat = self._ex_thresholds(ex)
+            ack = float((info or {}).get("ack_p95_ms", 0.0))
+            fil = float((info or {}).get("fill_p95_ms", 0.0))
+            to = float((info or {}).get("timeouts_per_min", 0.0))
+            rt = float((info or {}).get("retries_per_min", 0.0))
+            ph = float((info or {}).get("panic_hedge_per_min", 0.0))
+            qb = float((info or {}).get("queuepos_blocked_per_min", 0.0))
+            if ack >= lat.ack_crit_ms or fil >= lat.fill_crit_ms:
+                reasons.append("ENGINE_BLOCKED")
+                any_crit = True
+            elif ack >= lat.ack_warn_ms or fil >= lat.fill_warn_ms:
+                any_warn = True
+            if to >= self.th.timeouts_crit_per_min or rt >= self.th.retries_crit_per_min:
+                reasons.append("ENGINE_BLOCKED")
+                any_crit = True
+            elif to >= self.th.timeouts_warn_per_min or rt >= self.th.retries_warn_per_min:
+                any_warn = True
+            if ph >= self.th.panic_hedge_crit_per_min or qb >= self.th.queuepos_blocked_crit_per_min:
+                reasons.append("ENGINE_BLOCKED")
+                any_crit = True
+            elif ph >= self.th.panic_hedge_warn_per_min or qb >= self.th.queuepos_blocked_warn_per_min:
+                any_warn = True
+
+        orders_inflight = self.safe_get(state, "orders_inflight", default=None, missing=missing)
+        if isinstance(orders_inflight, int):
+            if orders_inflight > self.engine_queue_max:
+                reasons.append("WD_QUEUE_BACKLOG")
+            now_ts = time.time()
+            if self._last_inflight is None or self._last_inflight != orders_inflight:
+                self._last_inflight = orders_inflight
+                self._last_inflight_ts = now_ts
+            elif orders_inflight > 0 and (now_ts - self._last_inflight_ts) * 1000 >= self.engine_blocked_ms:
+                reasons.append("ENGINE_BLOCKED")
+
+        if any_warn or any_crit:
+            self._bad_cycles += 1
+        else:
+            self._bad_cycles = 0
+
+        if self._bad_cycles >= max(1, self.th.escalate_after_cycles):
+            reasons.append("ENGINE_BLOCKED")
+            any_crit = True
+
+        if missing:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing
+
+        details["bad_cycles"] = self._bad_cycles
+        severity = "OK"
+        if any_crit or "ENGINE_BLOCKED" in reasons:
+            severity = "CRIT"
+        elif any_warn or reasons:
+            severity = "WARN"
+        return severity, reasons, details
 
     def get_status(self) -> Dict[str, Any]:
         s = super().get_status()

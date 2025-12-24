@@ -43,6 +43,8 @@ import os, time, hmac, hashlib, json, threading, queue, uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from modules.bot_config import BotConfig
+
 # AlertDispatcher global (M5-B3) — best-effort
 try:
     from modules.observability_pacer import ALERT_DISPATCHER
@@ -327,7 +329,13 @@ class CentralWatchdog:
     - Sinks: Telegram (optionnel) + sinks custom → cw.register_event_sink(cb)
     - Gouvernance: MANUEL/AUTO/HYBRID avec verrous/cooldown/idempotence
     """
-    def __init__(self, config: Optional[CWConfig] = None, service_name: str = "bot"):
+
+    def __init__(
+            self,
+            config: Optional[CWConfig] = None,
+            service_name: str = "bot",
+            bot_config: Optional[BotConfig] = None,
+    ):
         self.cfg = config or CWConfig()
         self.service_name = service_name
         self._sinks: List[EventSink] = []
@@ -367,6 +375,17 @@ class CentralWatchdog:
         self._lock = threading.Lock()
         # Santé pipeline PnL (LHM/JSONL/DB)
         self._pnl_unhealthy_since: Optional[float] = None
+        self._health_snapshots: Dict[str, Dict[str, Any]] = {}
+        self._reason_state: Dict[str, Dict[str, Any]] = {}
+        cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            try:
+                setattr(self, "_wd_fallback_used", True)
+            except Exception:
+                pass
+        self._wd_cooldown_s = float(cfg.wd.cooldown_s)
+        self._wd_persistence_s = float(cfg.wd.persistence_s)
+        self._wd_interval_s = float(cfg.wd.interval_s)
 
 
     # ----- intégrations optionnelles via ENV -----
@@ -516,8 +535,15 @@ class CentralWatchdog:
         t = e.get("type", "")
         lvl = _coerce_level(e.get("level", "INFO"))
         self._append_history(e)
+        suppress_emit = False
+        if self._is_child_health_event(e):
+            suppress_emit = self._record_child_health(e)
 
         # Dédup + rate-limit (toujours)
+        if suppress_emit:
+            self._dropped_count += 1
+            self._update_critical_path(e)
+            return
         if not self._dedup.allow(e):
             self._dropped_count += 1
             return
@@ -647,6 +673,83 @@ class CentralWatchdog:
             if not self._last_crit_since:
                 self._last_crit_since = now_ts()
 
+    def _is_child_health_event(self, e: Event) -> bool:
+        data = e.get("data", {}) or {}
+        return bool(data.get("reasons")) or str(e.get("type", "")).endswith("health_snapshot")
+
+    def _record_child_health(self, e: Event) -> bool:
+        data = e.get("data", {}) or {}
+        reasons = data.get("reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
+        severity = str(data.get("severity") or e.get("level") or "INFO").upper()
+        watchdog = str(e.get("watchdog") or "child")
+        component = str(data.get("component") or watchdog)
+        exchange = data.get("exchange")
+        pair = data.get("pair")
+        stream = data.get("stream")
+        shard = data.get("shard")
+        now_ms = int((e.get("ts") or now_ts()) * 1000)
+        observed_at_ms = int(data.get("observed_at_ms") or now_ms)
+
+        with self._lock:
+            self._health_snapshots[watchdog] = {
+                "component": component,
+                "severity": severity,
+                "reasons": list(reasons),
+                "details": data.get("details", {}),
+                "observed_at_ms": observed_at_ms,
+            }
+        suppress_emit = False
+        for reason in reasons:
+            key_parts = [watchdog, reason]
+            for val in (exchange, pair, stream, shard):
+                if val is not None:
+                    key_parts.append(str(val))
+            key = "|".join(key_parts)
+            with self._lock:
+                entry = self._reason_state.get(key)
+                if entry is None:
+                    entry = {
+                        "watchdog": watchdog,
+                        "component": component,
+                        "reason": reason,
+                        "severity": severity,
+                        "exchange": exchange,
+                        "pair": pair,
+                        "stream": stream,
+                        "shard": shard,
+                        "first_seen_ms": observed_at_ms,
+                        "last_seen_ms": observed_at_ms,
+                        "occurrences": 0,
+                        "cooldown_until_ms": 0,
+                    }
+                entry["occurrences"] = int(entry.get("occurrences", 0)) + 1
+                entry["last_seen_ms"] = observed_at_ms
+                entry["severity"] = severity
+                if observed_at_ms - int(entry.get("first_seen_ms") or observed_at_ms) < 0:
+                    entry["first_seen_ms"] = observed_at_ms
+                cooldown_until = int(entry.get("cooldown_until_ms") or 0)
+                if observed_at_ms < cooldown_until:
+                    suppress_emit = True
+                else:
+                    entry["cooldown_until_ms"] = observed_at_ms + int(self._wd_cooldown_s * 1000)
+                self._reason_state[key] = entry
+
+        if severity == "CRIT" and self._crit_persistent_by_reason():
+            self._propose_full_restart(self._derive_reason(e))
+        return suppress_emit
+
+    def _crit_persistent_by_reason(self) -> bool:
+        now_ms = int(now_ts() * 1000)
+        with self._lock:
+            for entry in self._reason_state.values():
+                if str(entry.get("severity")).upper() != "CRIT":
+                    continue
+                first_seen = int(entry.get("first_seen_ms") or now_ms)
+                if (now_ms - first_seen) >= int(self._wd_persistence_s * 1000):
+                    return True
+        return False
     def _update_pnl_pipeline_health(self, e: Event) -> None:
         """
         Suit la santé du pipeline PnL (component="pnl_pipeline") en se basant sur
@@ -870,3 +973,28 @@ class CentralWatchdog:
             "children": children,
             "history_tail": self._history[-10:],  # petit tail pour debug
         }
+
+    def get_health_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            snapshots = dict(self._health_snapshots)
+            reason_state = dict(self._reason_state)
+        reasons_sorted = sorted(reason_state.keys())
+        reasons_payload = [reason_state[k] for k in reasons_sorted]
+        degraded = any(str(v.get("severity", "")).upper() != "OK" for v in snapshots.values())
+        return {
+            "ts_ms": int(now_ts() * 1000),
+            "interval_s": self._wd_interval_s,
+            "degraded": degraded,
+            "snapshots": snapshots,
+            "reasons": reasons_payload,
+        }
+
+    def get_degraded_reasons(self) -> List[str]:
+        with self._lock:
+            reason_state = list(self._reason_state.values())
+        out = {
+            str(entry.get("reason"))
+            for entry in reason_state
+            if str(entry.get("severity", "")).upper() in ("WARN", "CRIT")
+        }
+        return sorted(out)

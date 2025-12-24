@@ -24,11 +24,8 @@ import asyncio
 import logging
 import time
 from typing import Any, Dict, Optional, Tuple
-# ---- BaseWatchdog import résilient ----
-try:  # snake
-    from modules.watchdog.base_watchdog import BaseWatchdogV2  # type: ignore
-except Exception:  # camel fallback
-    from modules.watchdog.base_watchdog import BaseWatchdog  # type: ignore
+from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 
 log = logging.getLogger("BalanceFetcherWatchdogV2")
 
@@ -50,12 +47,20 @@ class BalanceFetcherWatchdogV2(BaseWatchdogV2):
         binance_resync_cooldown_s: float = 60.0,
         verbose: bool = True,
         name: str = "BalanceFetcherWatchdogV2",
+        bot_config: Optional[BotConfig] = None,
     ) -> None:
+        cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            self.record_fallback("bot_config")
+        check_interval = float(cfg.wd.balance_interval_s or check_interval)
+        inactive_s = float(cfg.wd.balance_stale_s or inactive_s)
+        error_threshold = int(cfg.wd.balance_error_threshold or error_threshold)
         super().__init__(
             name=name,
             check_interval=check_interval,
             restart_cooldown_s=restart_cooldown_s,
             max_restarts_per_min=max_restarts_per_min,
+            event_cooldown_s=cfg.wd.cooldown_s,
             verbose=verbose,
         )
         self.fetcher = fetcher
@@ -64,6 +69,8 @@ class BalanceFetcherWatchdogV2(BaseWatchdogV2):
         self.manage_sync_loop = bool(manage_sync_loop)
         self.sync_interval = float(sync_interval)
         self.binance_resync_cooldown_s = float(binance_resync_cooldown_s)
+        if self.manage_sync_loop:
+            self.record_fallback("manage_sync_loop_disabled")
 
         # runtime
         self._loop_task: Optional[asyncio.Task] = None
@@ -75,73 +82,24 @@ class BalanceFetcherWatchdogV2(BaseWatchdogV2):
 
     # -------------- lifecycle --------------
     async def start(self) -> None:
-        if self.manage_sync_loop and (not self._loop_task or self._loop_task.done()):
-            await self._ensure_loop()
         await super().start()
         self.emit_event(type="lifecycle", level="INFO", message="WD started")
 
     async def stop(self) -> None:
-        if self.manage_sync_loop and self._loop_task and not self._loop_task.done():
-            self._loop_task.cancel()
-            try:
-                await self._loop_task
-            except asyncio.CancelledError:
-                logging.exception("Unhandled exception")
-            finally:
-                self._loop_task = None
         await super().stop()
         self.emit_event(type="lifecycle", level="INFO", message="WD stopped")
 
     # -------------- checks --------------
     async def _check_once(self) -> None:
-        st = await self._safe_status()
-        if not st:
-            await self._restart_fetcher(reason="no_status")
-            return
-
-        self._last_status = st
-        now = time.time()
-
-        last_sync = float(st.get("last_sync_time", 0.0) or 0.0)
-        err_cnt = int(st.get("error_count", 0) or 0)
-        succ_cnt = int(st.get("successful_syncs", 0) or 0)
-        last_err = str(st.get("last_error") or "")
-
-        progressed = (succ_cnt > self._prev_success) if self._prev_success >= 0 else True
-        self._prev_success = succ_cnt
-
-        if last_sync > 0:
-            self._last_sync_seen = last_sync
-        inactive_for = now - (self._last_sync_seen or 0.0)
-
-        # auto‑soin: -1021 (Binance timestamp) → resync horloge (avec cooldown)
-        if "-1021" in last_err and (now - self._last_binance_resync) >= self.binance_resync_cooldown_s:
-            await self._maybe_resync_binance_time()
-
-        # inactivité prolongée → restart
-        if inactive_for >= self.inactive_s:
-            await self._restart_fetcher(reason=f"inactive_{int(inactive_for)}s")
-            return
-
-        # dérive d'erreurs → restart
-        delta_err = err_cnt - self._prev_errors
-        if delta_err >= self.error_threshold:
-            await self._restart_fetcher(reason=f"errors_rising(+{delta_err})")
-        self._prev_errors = err_cnt
-
-        # nudge léger si aucune progression depuis le dernier check
-        if not progressed:
-            try:
-                coro = self.fetcher.get_all_balances(force_refresh=True)
-                if asyncio.iscoroutine(coro):
-                    asyncio.create_task(coro)
-            except Exception:
-                logging.exception("Unhandled exception")
-
-        # si on doit gérer la boucle, s'assurer qu'elle tourne
-        if self.manage_sync_loop and (not self._loop_task or self._loop_task.done()):
-            await self._ensure_loop()
-
+        snapshot = await self.collect_snapshot()
+        severity, reasons, details = self.evaluate(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="BalanceFetcher",
+            observed_at_ms=snapshot.get("observed_at_ms"),
+        )
     # -------------- helpers --------------
     async def _safe_status(self) -> Dict[str, Any]:
         try:
@@ -155,67 +113,80 @@ class BalanceFetcherWatchdogV2(BaseWatchdogV2):
             self.emit_event(type="status_error", level="WARN", message=f"get_status() failed: {e}")
             return {}
 
+    async def collect_snapshot(self) -> Dict[str, Any]:
+        observed_at_ms = self.now_ts_ms()
+        missing: list[str] = []
+        errors: list[str] = []
+        status = await self.safe_call(
+            getattr(self.fetcher, "get_status", None),
+            default={},
+            errors=errors,
+            error_label="fetcher.get_status",
+        )
+        if not status:
+            missing.append("get_status")
+        self._last_status = status or {}
+        return {
+            "observed_at_ms": observed_at_ms,
+            "module_state": status or {},
+            "missing": missing,
+            "errors": errors,
+        }
+
+    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        status = snapshot.get("module_state", {}) or {}
+        missing = list(snapshot.get("missing") or [])
+        reasons: list[str] = []
+        details: Dict[str, Any] = {}
+
+        running = self.safe_get(status, "running", default=True, missing=missing)
+        if running is False:
+            reasons.append("WD_MODULE_DEAD")
+
+        last_sync = self.safe_get(status, "last_sync_time", default=None, missing=missing)
+        if hasattr(last_sync, "timestamp"):
+            last_sync = last_sync.timestamp()
+        if last_sync:
+            self._last_sync_seen = float(last_sync)
+        age_ms = self.safe_age_ms(self._last_sync_seen or None, snapshot.get("observed_at_ms"))
+        if age_ms is not None:
+            details["age_ms"] = age_ms
+            if age_ms >= int(self.inactive_s * 1000):
+                reasons.append("BALANCE_STALE")
+
+        err_cnt = int(self.safe_get(status, "error_count", default=0, missing=missing) or 0)
+        delta_err = err_cnt - self._prev_errors
+        if delta_err >= self.error_threshold:
+            reasons.append("WD_LOOP_STOPPED")
+        self._prev_errors = err_cnt
+
+        if missing:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing
+
+        severity = "OK"
+        if "BALANCE_STALE" in reasons or "WD_MODULE_DEAD" in reasons:
+            severity = "CRIT"
+        elif reasons:
+            severity = "WARN"
+        return severity, reasons, details
+
+
     async def _maybe_resync_binance_time(self) -> None:
-        try:
-            fn = getattr(self.fetcher, "_sync_binance_time_offset", None)
-            if not fn:
-                return
-            res = fn()
-            if asyncio.iscoroutine(res):
-                await res
-            self._last_binance_resync = time.time()
-            self.emit_event(type="self_heal", level="INFO", message="Resync Binance server time (-1021)")
-        except Exception as e:
-            if self.verbose:
-                log.warning("[BF WD] Binance time resync failed: %s", e)
+        self.record_fallback("resync_disabled")
+
 
     async def _ensure_loop(self) -> None:
-        try:
-            self._loop_task = asyncio.create_task(self._sync_loop())
-            if self.verbose:
-                log.info("[%s] internal sync loop started (%.2fs)", self.name, self.sync_interval)
-        except Exception as e:
-            self.emit_event(type="loop_error", level="ERROR", message=f"unable to start loop: {e}")
+        self.record_fallback("sync_loop_disabled")
+
 
     async def _sync_loop(self) -> None:
-        try:
-            while True:
-                try:
-                    coro = self.fetcher.get_all_balances(force_refresh=True)
-                    if asyncio.iscoroutine(coro):
-                        await coro
-                except Exception as e:
-                    if self.verbose:
-                        log.warning("[BF WD] sync tick failed: %s", e)
-                await asyncio.sleep(self.sync_interval)
-        except asyncio.CancelledError:
-            logging.exception("Unhandled exception")
+        self.record_fallback("sync_loop_disabled")
+        await asyncio.sleep(0)
+
     async def _restart_fetcher(self, *, reason: str) -> None:
-        async def _stop():
-            fn = getattr(self.fetcher, "stop", None)
-            if fn:
-                r = fn()
-                if asyncio.iscoroutine(r):
-                    await r
+        self.emit_event(type="alert", level="WARN", message="restart_requested_notify_only", reason=reason)
 
-        async def _start():
-            fn = getattr(self.fetcher, "start", None)
-            if fn:
-                r = fn()
-                if asyncio.iscoroutine(r):
-                    await r
-            if self.manage_sync_loop:
-                # redémarre aussi la boucle interne
-                if self._loop_task and not self._loop_task.done():
-                    self._loop_task.cancel()
-                    try:
-                        await self._loop_task
-                    except asyncio.CancelledError:
-                        logging.exception("Unhandled exception")
-                await self._ensure_loop()
-
-        await self._restart_component(reason=reason, stop_fn=_stop, start_fn=_start, post_delay_s=0.0)
-        self.emit_event(type="module_restarted", level="WARN", message="BalanceFetcher restarted", reason=reason)
 
     # -------------- status --------------
     def get_status(self) -> Dict[str, Any]:

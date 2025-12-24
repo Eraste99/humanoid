@@ -302,6 +302,137 @@ class WsPublicCfg:
     auto_resubscribe: bool = True
     max_retries: int = 0  # 0 = infini (avec backoff)
 
+# --- Watchdogs ---
+@dataclass
+class WatchdogCfg:
+    interval_s: float = 2.0
+    cooldown_s: float = 5.0
+    persistence_s: float = 120.0
+
+    router_interval_s: float = 2.0
+    router_health_stale_ms: int = 1300
+    router_health_min_coverage_ratio: float = 0.80
+    router_health_queue_max: int = 2000
+
+    ws_public_interval_s: float = 2.0
+    ws_public_stale_warn_ms: int = 900
+    ws_public_stale_crit_ms: int = 1200
+    ws_public_hb_gap_warn_s: int = 15
+    ws_public_hb_gap_crit_s: int = 30
+    ws_public_resub_warn_per_min: int = 3
+    ws_public_resub_crit_per_min: int = 6
+    ws_public_escalate_after_cycles: int = 3
+
+    private_ws_interval_s: float = 2.0
+    private_ws_hb_warn_s: int = 20
+    private_ws_hb_crit_s: int = 35
+    private_ws_ack_warn_ms: int = 150
+    private_ws_ack_crit_ms: int = 220
+    private_ws_fill_warn_ms: int = 200
+    private_ws_fill_crit_ms: int = 280
+    private_ws_queue_warn_ratio: float = 0.70
+    private_ws_queue_crit_ratio: float = 0.90
+    private_ws_rate429_warn: float = 0.001
+    private_ws_rate429_crit: float = 0.002
+    private_ws_dedup_warn: float = 0.20
+    private_ws_dedup_crit: float = 0.35
+    private_ws_escalate_after_cycles: int = 3
+    private_ws_stale_ms: int = 35000
+
+    engine_interval_s: float = 2.0
+    engine_submit_ack_warn_ms: int = 130
+    engine_submit_ack_crit_ms: int = 200
+    engine_ack_fill_warn_ms: int = 180
+    engine_ack_fill_crit_ms: int = 260
+    engine_timeouts_warn_per_min: float = 0.5
+    engine_timeouts_crit_per_min: float = 1.5
+    engine_retries_warn_per_min: float = 1.0
+    engine_retries_crit_per_min: float = 3.0
+    engine_panic_hedge_warn_per_min: float = 0.5
+    engine_panic_hedge_crit_per_min: float = 2.0
+    engine_queuepos_blocked_warn_per_min: float = 1.0
+    engine_queuepos_blocked_crit_per_min: float = 3.0
+    engine_escalate_after_cycles: int = 3
+    engine_queue_max: int = 200
+    engine_blocked_ms: int = 30000
+
+    balance_interval_s: float = 5.0
+    balance_stale_s: float = 60.0
+    balance_error_threshold: int = 5
+
+    logger_interval_s: float = 2.0
+    logger_trade_queue_warn: int = 200
+    logger_trade_queue_crit: int = 1000
+    logger_queue_stuck_checks: int = 5
+    logger_writer_stall_s: float = 10.0
+    logger_min_queue_for_writer_stall: int = 10
+    logger_rotation_stall_factor: float = 3.0
+    logger_rotation_hard_stall_factor: float = 6.0
+
+    slippage_interval_s: float = 2.0
+    slippage_age_warn_s: float = 2.0
+    slippage_age_crit_s: float = 3.0
+    slippage_p95_warn_bps: float = 15.0
+    slippage_p99_crit_bps: float = 30.0
+    slippage_escalate_after_cycles: int = 3
+
+    volatility_interval_s: float = 2.0
+    volatility_age_warn_s: float = 5.0
+    volatility_age_crit_s: float = 8.0
+    volatility_soft_cap_bps: float = 50.0
+    volatility_hard_cap_bps: float = 80.0
+    volatility_p95_warn_bps: float = 40.0
+    volatility_p99_crit_bps: float = 70.0
+    volatility_z_warn: float = 2.5
+    volatility_z_crit: float = 3.5
+    volatility_escalate_after_cycles: int = 3
+
+    opportunity_interval_s: float = 2.0
+    opportunity_effective_ratio_warn: float = 0.70
+    opportunity_effective_ratio_crit: float = 0.40
+    opportunity_decision_p95_warn_ms: int = 8
+    opportunity_decision_p95_crit_ms: int = 15
+    opportunity_emit_p95_warn_ms: int = 12
+    opportunity_emit_p95_crit_ms: int = 25
+    opportunity_backlog_warn_ratio: float = 0.80
+    opportunity_backlog_crit_ratio: float = 0.95
+    opportunity_dedup_warn_per_min: float = 5.0
+    opportunity_dedup_crit_per_min: float = 15.0
+    opportunity_rejection_ratio_warn: float = 0.60
+    opportunity_rejection_ratio_crit: float = 0.80
+    opportunity_slip_age_warn_s: float = 2.0
+    opportunity_slip_age_crit_s: float = 3.0
+    opportunity_vol_age_warn_s: float = 4.0
+    opportunity_vol_age_crit_s: float = 6.0
+    opportunity_fees_age_warn_s: float = 120.0
+    opportunity_fees_age_crit_s: float = 300.0
+    opportunity_scanner_err_warn_per_min: float = 0.5
+    opportunity_scanner_err_crit_per_min: float = 2.0
+    opportunity_escalate_after_cycles: int = 3
+
+    discovery_interval_s: float = 5.0
+    discovery_min_change_ratio: float = 0.05
+    discovery_confirm_ticks: int = 2
+    discovery_dwell_ticks: int = 2
+    discovery_max_refresh_gap_s: int = 600
+
+    rm_interval_s: float = 2.0
+    rm_tick_warn_ms: int = 10
+    rm_tick_crit_ms: int = 20
+    rm_hb_warn_s: int = 5
+    rm_hb_crit_s: int = 15
+    rm_slip_age_warn_s: float = 2.0
+    rm_slip_age_crit_s: float = 3.0
+    rm_vol_age_warn_s: float = 4.0
+    rm_vol_age_crit_s: float = 6.0
+    rm_shadow_bias_warn_bps: float = 3.0
+    rm_shadow_bias_crit_bps: float = 5.0
+    rm_queuepos_warn_per_min: float = 3.0
+    rm_queuepos_crit_per_min: float = 8.0
+    rm_severe_warn_s: int = 120
+    rm_severe_crit_s: int = 600
+    rm_escalate_after_cycles: int = 3
+
 # --- Discovery ---
 @dataclass
 class DiscoveryCfg:
@@ -1156,6 +1287,7 @@ class BotConfig:
     # Sections modules
     router: RouterCfg = field(default_factory=RouterCfg)
     ws_public: WsPublicCfg = field(default_factory=WsPublicCfg)
+    wd: WatchdogCfg = field(default_factory=WatchdogCfg)
     discovery: DiscoveryCfg = field(default_factory=DiscoveryCfg)
     scanner: ScannerCfg = field(default_factory=ScannerCfg)
     rm: RiskManagerCfg = field(default_factory=RiskManagerCfg)
@@ -1360,6 +1492,241 @@ class BotConfig:
         cfg.daily_strategy_budget_quote = cfg.rm.daily_strategy_budget_quote
 
         cfg.discovery.http_timeout_s = _Env.get_int("DISCOVERY_HTTP_TIMEOUT_S", cfg.discovery.http_timeout_s)
+        cfg.wd.interval_s = _Env.get_float("WD_INTERVAL_S", cfg.wd.interval_s)
+        cfg.wd.cooldown_s = _Env.get_float("WD_COOLDOWN_S", cfg.wd.cooldown_s)
+        cfg.wd.persistence_s = _Env.get_float("WD_PERSISTENCE_S", cfg.wd.persistence_s)
+
+        cfg.wd.router_interval_s = _Env.get_float("WD_ROUTER_INTERVAL_S", cfg.wd.router_interval_s)
+        cfg.wd.router_health_stale_ms = _Env.get_int("ROUTER_HEALTH_STALE_MS", cfg.wd.router_health_stale_ms)
+        cfg.wd.router_health_min_coverage_ratio = _Env.get_float(
+            "ROUTER_HEALTH_MIN_COVERAGE_RATIO", cfg.wd.router_health_min_coverage_ratio
+        )
+        cfg.wd.router_health_queue_max = _Env.get_int("ROUTER_HEALTH_QUEUE_MAX", cfg.wd.router_health_queue_max)
+
+        cfg.wd.ws_public_interval_s = _Env.get_float("WD_WS_PUBLIC_INTERVAL_S", cfg.wd.ws_public_interval_s)
+        cfg.wd.ws_public_stale_warn_ms = _Env.get_int("WD_WS_PUBLIC_STALE_WARN_MS", cfg.wd.ws_public_stale_warn_ms)
+        cfg.wd.ws_public_stale_crit_ms = _Env.get_int("WD_WS_PUBLIC_STALE_CRIT_MS", cfg.wd.ws_public_stale_crit_ms)
+        cfg.wd.ws_public_hb_gap_warn_s = _Env.get_int("WD_WS_PUBLIC_HB_GAP_WARN_S", cfg.wd.ws_public_hb_gap_warn_s)
+        cfg.wd.ws_public_hb_gap_crit_s = _Env.get_int("WD_WS_PUBLIC_HB_GAP_CRIT_S", cfg.wd.ws_public_hb_gap_crit_s)
+        cfg.wd.ws_public_resub_warn_per_min = _Env.get_int(
+            "WD_WS_PUBLIC_RESUB_WARN_PER_MIN", cfg.wd.ws_public_resub_warn_per_min
+        )
+        cfg.wd.ws_public_resub_crit_per_min = _Env.get_int(
+            "WD_WS_PUBLIC_RESUB_CRIT_PER_MIN", cfg.wd.ws_public_resub_crit_per_min
+        )
+        cfg.wd.ws_public_escalate_after_cycles = _Env.get_int(
+            "WD_WS_PUBLIC_ESCALATE_AFTER_CYCLES", cfg.wd.ws_public_escalate_after_cycles
+        )
+
+        cfg.wd.private_ws_interval_s = _Env.get_float("WD_PRIVATE_WS_INTERVAL_S", cfg.wd.private_ws_interval_s)
+        cfg.wd.private_ws_hb_warn_s = _Env.get_int("WD_PRIVATE_WS_HB_WARN_S", cfg.wd.private_ws_hb_warn_s)
+        cfg.wd.private_ws_hb_crit_s = _Env.get_int("WD_PRIVATE_WS_HB_CRIT_S", cfg.wd.private_ws_hb_crit_s)
+        cfg.wd.private_ws_ack_warn_ms = _Env.get_int("WD_PRIVATE_WS_ACK_WARN_MS", cfg.wd.private_ws_ack_warn_ms)
+        cfg.wd.private_ws_ack_crit_ms = _Env.get_int("WD_PRIVATE_WS_ACK_CRIT_MS", cfg.wd.private_ws_ack_crit_ms)
+        cfg.wd.private_ws_fill_warn_ms = _Env.get_int("WD_PRIVATE_WS_FILL_WARN_MS", cfg.wd.private_ws_fill_warn_ms)
+        cfg.wd.private_ws_fill_crit_ms = _Env.get_int("WD_PRIVATE_WS_FILL_CRIT_MS", cfg.wd.private_ws_fill_crit_ms)
+        cfg.wd.private_ws_queue_warn_ratio = _Env.get_float(
+            "WD_PRIVATE_WS_QUEUE_WARN_RATIO", cfg.wd.private_ws_queue_warn_ratio
+        )
+        cfg.wd.private_ws_queue_crit_ratio = _Env.get_float(
+            "WD_PRIVATE_WS_QUEUE_CRIT_RATIO", cfg.wd.private_ws_queue_crit_ratio
+        )
+        cfg.wd.private_ws_rate429_warn = _Env.get_float("WD_PRIVATE_WS_RATE429_WARN", cfg.wd.private_ws_rate429_warn)
+        cfg.wd.private_ws_rate429_crit = _Env.get_float("WD_PRIVATE_WS_RATE429_CRIT", cfg.wd.private_ws_rate429_crit)
+        cfg.wd.private_ws_dedup_warn = _Env.get_float("WD_PRIVATE_WS_DEDUP_WARN", cfg.wd.private_ws_dedup_warn)
+        cfg.wd.private_ws_dedup_crit = _Env.get_float("WD_PRIVATE_WS_DEDUP_CRIT", cfg.wd.private_ws_dedup_crit)
+        cfg.wd.private_ws_escalate_after_cycles = _Env.get_int(
+            "WD_PRIVATE_WS_ESCALATE_AFTER_CYCLES", cfg.wd.private_ws_escalate_after_cycles
+        )
+        cfg.wd.private_ws_stale_ms = _Env.get_int("PRIVATE_WS_STALE_MS", cfg.wd.private_ws_stale_ms)
+
+        cfg.wd.engine_interval_s = _Env.get_float("WD_ENGINE_INTERVAL_S", cfg.wd.engine_interval_s)
+        cfg.wd.engine_submit_ack_warn_ms = _Env.get_int(
+            "WD_ENGINE_SUBMIT_ACK_WARN_MS", cfg.wd.engine_submit_ack_warn_ms
+        )
+        cfg.wd.engine_submit_ack_crit_ms = _Env.get_int(
+            "WD_ENGINE_SUBMIT_ACK_CRIT_MS", cfg.wd.engine_submit_ack_crit_ms
+        )
+        cfg.wd.engine_ack_fill_warn_ms = _Env.get_int(
+            "WD_ENGINE_ACK_FILL_WARN_MS", cfg.wd.engine_ack_fill_warn_ms
+        )
+        cfg.wd.engine_ack_fill_crit_ms = _Env.get_int(
+            "WD_ENGINE_ACK_FILL_CRIT_MS", cfg.wd.engine_ack_fill_crit_ms
+        )
+        cfg.wd.engine_timeouts_warn_per_min = _Env.get_float(
+            "WD_ENGINE_TIMEOUTS_WARN_PER_MIN", cfg.wd.engine_timeouts_warn_per_min
+        )
+        cfg.wd.engine_timeouts_crit_per_min = _Env.get_float(
+            "WD_ENGINE_TIMEOUTS_CRIT_PER_MIN", cfg.wd.engine_timeouts_crit_per_min
+        )
+        cfg.wd.engine_retries_warn_per_min = _Env.get_float(
+            "WD_ENGINE_RETRIES_WARN_PER_MIN", cfg.wd.engine_retries_warn_per_min
+        )
+        cfg.wd.engine_retries_crit_per_min = _Env.get_float(
+            "WD_ENGINE_RETRIES_CRIT_PER_MIN", cfg.wd.engine_retries_crit_per_min
+        )
+        cfg.wd.engine_panic_hedge_warn_per_min = _Env.get_float(
+            "WD_ENGINE_PANIC_HEDGE_WARN_PER_MIN", cfg.wd.engine_panic_hedge_warn_per_min
+        )
+        cfg.wd.engine_panic_hedge_crit_per_min = _Env.get_float(
+            "WD_ENGINE_PANIC_HEDGE_CRIT_PER_MIN", cfg.wd.engine_panic_hedge_crit_per_min
+        )
+        cfg.wd.engine_queuepos_blocked_warn_per_min = _Env.get_float(
+            "WD_ENGINE_QUEUEPOS_BLOCKED_WARN_PER_MIN", cfg.wd.engine_queuepos_blocked_warn_per_min
+        )
+        cfg.wd.engine_queuepos_blocked_crit_per_min = _Env.get_float(
+            "WD_ENGINE_QUEUEPOS_BLOCKED_CRIT_PER_MIN", cfg.wd.engine_queuepos_blocked_crit_per_min
+        )
+        cfg.wd.engine_escalate_after_cycles = _Env.get_int(
+            "WD_ENGINE_ESCALATE_AFTER_CYCLES", cfg.wd.engine_escalate_after_cycles
+        )
+        cfg.wd.engine_queue_max = _Env.get_int("ENGINE_QUEUE_MAX", cfg.wd.engine_queue_max)
+        cfg.wd.engine_blocked_ms = _Env.get_int("ENGINE_BLOCKED_MS", cfg.wd.engine_blocked_ms)
+
+        cfg.wd.balance_interval_s = _Env.get_float("WD_BALANCE_INTERVAL_S", cfg.wd.balance_interval_s)
+        cfg.wd.balance_stale_s = _Env.get_float("BALANCE_STALE_S", cfg.wd.balance_stale_s)
+        cfg.wd.balance_error_threshold = _Env.get_int("WD_BALANCE_ERROR_THRESHOLD", cfg.wd.balance_error_threshold)
+
+        cfg.wd.logger_interval_s = _Env.get_float("WD_LOGGER_INTERVAL_S", cfg.wd.logger_interval_s)
+        cfg.wd.logger_trade_queue_warn = _Env.get_int("WD_LOGGER_TRADE_QUEUE_WARN", cfg.wd.logger_trade_queue_warn)
+        cfg.wd.logger_trade_queue_crit = _Env.get_int("WD_LOGGER_TRADE_QUEUE_CRIT", cfg.wd.logger_trade_queue_crit)
+        cfg.wd.logger_queue_stuck_checks = _Env.get_int(
+            "WD_LOGGER_QUEUE_STUCK_CHECKS", cfg.wd.logger_queue_stuck_checks
+        )
+        cfg.wd.logger_writer_stall_s = _Env.get_float("WD_LOGGER_WRITER_STALL_S", cfg.wd.logger_writer_stall_s)
+        cfg.wd.logger_min_queue_for_writer_stall = _Env.get_int(
+            "WD_LOGGER_MIN_QUEUE_FOR_WRITER_STALL", cfg.wd.logger_min_queue_for_writer_stall
+        )
+        cfg.wd.logger_rotation_stall_factor = _Env.get_float(
+            "WD_LOGGER_ROTATION_STALL_FACTOR", cfg.wd.logger_rotation_stall_factor
+        )
+        cfg.wd.logger_rotation_hard_stall_factor = _Env.get_float(
+            "WD_LOGGER_ROTATION_HARD_STALL_FACTOR", cfg.wd.logger_rotation_hard_stall_factor
+        )
+
+        cfg.wd.slippage_interval_s = _Env.get_float("WD_SLIPPAGE_INTERVAL_S", cfg.wd.slippage_interval_s)
+        cfg.wd.slippage_age_warn_s = _Env.get_float("WD_SLIPPAGE_AGE_WARN_S", cfg.wd.slippage_age_warn_s)
+        cfg.wd.slippage_age_crit_s = _Env.get_float("WD_SLIPPAGE_AGE_CRIT_S", cfg.wd.slippage_age_crit_s)
+        cfg.wd.slippage_p95_warn_bps = _Env.get_float("WD_SLIPPAGE_P95_WARN_BPS", cfg.wd.slippage_p95_warn_bps)
+        cfg.wd.slippage_p99_crit_bps = _Env.get_float("WD_SLIPPAGE_P99_CRIT_BPS", cfg.wd.slippage_p99_crit_bps)
+        cfg.wd.slippage_escalate_after_cycles = _Env.get_int(
+            "WD_SLIPPAGE_ESCALATE_AFTER_CYCLES", cfg.wd.slippage_escalate_after_cycles
+        )
+
+        cfg.wd.volatility_interval_s = _Env.get_float("WD_VOLATILITY_INTERVAL_S", cfg.wd.volatility_interval_s)
+        cfg.wd.volatility_age_warn_s = _Env.get_float("WD_VOLATILITY_AGE_WARN_S", cfg.wd.volatility_age_warn_s)
+        cfg.wd.volatility_age_crit_s = _Env.get_float("WD_VOLATILITY_AGE_CRIT_S", cfg.wd.volatility_age_crit_s)
+        cfg.wd.volatility_soft_cap_bps = _Env.get_float("WD_VOLATILITY_SOFT_CAP_BPS", cfg.wd.volatility_soft_cap_bps)
+        cfg.wd.volatility_hard_cap_bps = _Env.get_float("WD_VOLATILITY_HARD_CAP_BPS", cfg.wd.volatility_hard_cap_bps)
+        cfg.wd.volatility_p95_warn_bps = _Env.get_float("WD_VOLATILITY_P95_WARN_BPS", cfg.wd.volatility_p95_warn_bps)
+        cfg.wd.volatility_p99_crit_bps = _Env.get_float("WD_VOLATILITY_P99_CRIT_BPS", cfg.wd.volatility_p99_crit_bps)
+        cfg.wd.volatility_z_warn = _Env.get_float("WD_VOLATILITY_Z_WARN", cfg.wd.volatility_z_warn)
+        cfg.wd.volatility_z_crit = _Env.get_float("WD_VOLATILITY_Z_CRIT", cfg.wd.volatility_z_crit)
+        cfg.wd.volatility_escalate_after_cycles = _Env.get_int(
+            "WD_VOLATILITY_ESCALATE_AFTER_CYCLES", cfg.wd.volatility_escalate_after_cycles
+        )
+
+        cfg.wd.opportunity_interval_s = _Env.get_float("WD_OPPORTUNITY_INTERVAL_S", cfg.wd.opportunity_interval_s)
+        cfg.wd.opportunity_effective_ratio_warn = _Env.get_float(
+            "WD_OPPORTUNITY_EFFECTIVE_RATIO_WARN", cfg.wd.opportunity_effective_ratio_warn
+        )
+        cfg.wd.opportunity_effective_ratio_crit = _Env.get_float(
+            "WD_OPPORTUNITY_EFFECTIVE_RATIO_CRIT", cfg.wd.opportunity_effective_ratio_crit
+        )
+        cfg.wd.opportunity_decision_p95_warn_ms = _Env.get_int(
+            "WD_OPPORTUNITY_DECISION_P95_WARN_MS", cfg.wd.opportunity_decision_p95_warn_ms
+        )
+        cfg.wd.opportunity_decision_p95_crit_ms = _Env.get_int(
+            "WD_OPPORTUNITY_DECISION_P95_CRIT_MS", cfg.wd.opportunity_decision_p95_crit_ms
+        )
+        cfg.wd.opportunity_emit_p95_warn_ms = _Env.get_int(
+            "WD_OPPORTUNITY_EMIT_P95_WARN_MS", cfg.wd.opportunity_emit_p95_warn_ms
+        )
+        cfg.wd.opportunity_emit_p95_crit_ms = _Env.get_int(
+            "WD_OPPORTUNITY_EMIT_P95_CRIT_MS", cfg.wd.opportunity_emit_p95_crit_ms
+        )
+        cfg.wd.opportunity_backlog_warn_ratio = _Env.get_float(
+            "WD_OPPORTUNITY_BACKLOG_WARN_RATIO", cfg.wd.opportunity_backlog_warn_ratio
+        )
+        cfg.wd.opportunity_backlog_crit_ratio = _Env.get_float(
+            "WD_OPPORTUNITY_BACKLOG_CRIT_RATIO", cfg.wd.opportunity_backlog_crit_ratio
+        )
+        cfg.wd.opportunity_dedup_warn_per_min = _Env.get_float(
+            "WD_OPPORTUNITY_DEDUP_WARN_PER_MIN", cfg.wd.opportunity_dedup_warn_per_min
+        )
+        cfg.wd.opportunity_dedup_crit_per_min = _Env.get_float(
+            "WD_OPPORTUNITY_DEDUP_CRIT_PER_MIN", cfg.wd.opportunity_dedup_crit_per_min
+        )
+        cfg.wd.opportunity_rejection_ratio_warn = _Env.get_float(
+            "WD_OPPORTUNITY_REJECTION_RATIO_WARN", cfg.wd.opportunity_rejection_ratio_warn
+        )
+        cfg.wd.opportunity_rejection_ratio_crit = _Env.get_float(
+            "WD_OPPORTUNITY_REJECTION_RATIO_CRIT", cfg.wd.opportunity_rejection_ratio_crit
+        )
+        cfg.wd.opportunity_slip_age_warn_s = _Env.get_float(
+            "WD_OPPORTUNITY_SLIP_AGE_WARN_S", cfg.wd.opportunity_slip_age_warn_s
+        )
+        cfg.wd.opportunity_slip_age_crit_s = _Env.get_float(
+            "WD_OPPORTUNITY_SLIP_AGE_CRIT_S", cfg.wd.opportunity_slip_age_crit_s
+        )
+        cfg.wd.opportunity_vol_age_warn_s = _Env.get_float(
+            "WD_OPPORTUNITY_VOL_AGE_WARN_S", cfg.wd.opportunity_vol_age_warn_s
+        )
+        cfg.wd.opportunity_vol_age_crit_s = _Env.get_float(
+            "WD_OPPORTUNITY_VOL_AGE_CRIT_S", cfg.wd.opportunity_vol_age_crit_s
+        )
+        cfg.wd.opportunity_fees_age_warn_s = _Env.get_float(
+            "WD_OPPORTUNITY_FEES_AGE_WARN_S", cfg.wd.opportunity_fees_age_warn_s
+        )
+        cfg.wd.opportunity_fees_age_crit_s = _Env.get_float(
+            "WD_OPPORTUNITY_FEES_AGE_CRIT_S", cfg.wd.opportunity_fees_age_crit_s
+        )
+        cfg.wd.opportunity_scanner_err_warn_per_min = _Env.get_float(
+            "WD_OPPORTUNITY_SCANNER_ERR_WARN_PER_MIN", cfg.wd.opportunity_scanner_err_warn_per_min
+        )
+        cfg.wd.opportunity_scanner_err_crit_per_min = _Env.get_float(
+            "WD_OPPORTUNITY_SCANNER_ERR_CRIT_PER_MIN", cfg.wd.opportunity_scanner_err_crit_per_min
+        )
+        cfg.wd.opportunity_escalate_after_cycles = _Env.get_int(
+            "WD_OPPORTUNITY_ESCALATE_AFTER_CYCLES", cfg.wd.opportunity_escalate_after_cycles
+        )
+
+        cfg.wd.discovery_interval_s = _Env.get_float("WD_DISCOVERY_INTERVAL_S", cfg.wd.discovery_interval_s)
+        cfg.wd.discovery_min_change_ratio = _Env.get_float(
+            "WD_DISCOVERY_MIN_CHANGE_RATIO", cfg.wd.discovery_min_change_ratio
+        )
+        cfg.wd.discovery_confirm_ticks = _Env.get_int("WD_DISCOVERY_CONFIRM_TICKS", cfg.wd.discovery_confirm_ticks)
+        cfg.wd.discovery_dwell_ticks = _Env.get_int("WD_DISCOVERY_DWELL_TICKS", cfg.wd.discovery_dwell_ticks)
+        cfg.wd.discovery_max_refresh_gap_s = _Env.get_int(
+            "WD_DISCOVERY_MAX_REFRESH_GAP_S", cfg.wd.discovery_max_refresh_gap_s
+        )
+
+        cfg.wd.rm_interval_s = _Env.get_float("WD_RM_INTERVAL_S", cfg.wd.rm_interval_s)
+        cfg.wd.rm_tick_warn_ms = _Env.get_int("WD_RM_TICK_WARN_MS", cfg.wd.rm_tick_warn_ms)
+        cfg.wd.rm_tick_crit_ms = _Env.get_int("WD_RM_TICK_CRIT_MS", cfg.wd.rm_tick_crit_ms)
+        cfg.wd.rm_hb_warn_s = _Env.get_int("WD_RM_HB_WARN_S", cfg.wd.rm_hb_warn_s)
+        cfg.wd.rm_hb_crit_s = _Env.get_int("WD_RM_HB_CRIT_S", cfg.wd.rm_hb_crit_s)
+        cfg.wd.rm_slip_age_warn_s = _Env.get_float("WD_RM_SLIP_AGE_WARN_S", cfg.wd.rm_slip_age_warn_s)
+        cfg.wd.rm_slip_age_crit_s = _Env.get_float("WD_RM_SLIP_AGE_CRIT_S", cfg.wd.rm_slip_age_crit_s)
+        cfg.wd.rm_vol_age_warn_s = _Env.get_float("WD_RM_VOL_AGE_WARN_S", cfg.wd.rm_vol_age_warn_s)
+        cfg.wd.rm_vol_age_crit_s = _Env.get_float("WD_RM_VOL_AGE_CRIT_S", cfg.wd.rm_vol_age_crit_s)
+        cfg.wd.rm_shadow_bias_warn_bps = _Env.get_float(
+            "WD_RM_SHADOW_BIAS_WARN_BPS", cfg.wd.rm_shadow_bias_warn_bps
+        )
+        cfg.wd.rm_shadow_bias_crit_bps = _Env.get_float(
+            "WD_RM_SHADOW_BIAS_CRIT_BPS", cfg.wd.rm_shadow_bias_crit_bps
+        )
+        cfg.wd.rm_queuepos_warn_per_min = _Env.get_float(
+            "WD_RM_QUEUEPOS_WARN_PER_MIN", cfg.wd.rm_queuepos_warn_per_min
+        )
+        cfg.wd.rm_queuepos_crit_per_min = _Env.get_float(
+            "WD_RM_QUEUEPOS_CRIT_PER_MIN", cfg.wd.rm_queuepos_crit_per_min
+        )
+        cfg.wd.rm_severe_warn_s = _Env.get_int("WD_RM_SEVERE_WARN_S", cfg.wd.rm_severe_warn_s)
+        cfg.wd.rm_severe_crit_s = _Env.get_int("WD_RM_SEVERE_CRIT_S", cfg.wd.rm_severe_crit_s)
+        cfg.wd.rm_escalate_after_cycles = _Env.get_int(
+            "WD_RM_ESCALATE_AFTER_CYCLES", cfg.wd.rm_escalate_after_cycles
+        )
         cfg.discovery.retry_policy = _Env.get_dict("DISCOVERY_RETRY_POLICY", cfg.discovery.retry_policy)
         cfg.discovery.max_inflight_requests = _Env.get_int("DISCOVERY_MAX_INFLIGHT", cfg.discovery.max_inflight_requests)
         cfg.discovery.quotes_allowed = _Env.get_list("DISCOVERY_QUOTES_ALLOWED", cfg.discovery.quotes_allowed)

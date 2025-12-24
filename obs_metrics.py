@@ -10,7 +10,7 @@ from dataclasses import dataclass, asdict
 log = logging.getLogger('obs_metrics')
 _obs_shim_log = logging.getLogger('observability_shim')
 
-from prometheus_client import Counter, Gauge, Histogram, REGISTRY
+
 
 class _AlertCounter:
     def __init__(self):
@@ -705,7 +705,12 @@ SLIP_REASONS = {
 VOL_REASONS = {
     "vol_unknown_or_stale",
 }
-
+WATCHDOG_FALLBACK_USED_TOTAL = _metric(
+    Counter,
+    "watchdog_fallback_used_total",
+    "Watchdog fallback thresholds used",
+    ["watchdog", "key"],
+)
 OBS_REASON_REGISTRY = {
     "router": ROUTER_DROP_REASONS,
     "ws_public": WS_PUBLIC_DROP_REASONS,
@@ -713,6 +718,11 @@ OBS_REASON_REGISTRY = {
     "slip": SLIP_REASONS,
     "vol": VOL_REASONS,
 }
+def watchdog_fallback_used(watchdog: str, key: str) -> None:
+    try:
+        WATCHDOG_FALLBACK_USED_TOTAL.labels(_norm(watchdog), _norm(key)).inc()
+    except Exception:
+        pass
 SCANNER_GLOBAL_LOAD = _metric(Gauge, 'scanner_global_load', 'Scanner global load (0..1)')
 SCANNER_RATE_LIMITED_TOTAL = _metric(Counter, 'scanner_rate_limited_total', 'Scanner rate limited hits', ['kind', 'cohort'])
 SCANNER_EMITTED_TOTAL = _metric(Counter, 'scanner_emitted_total', 'Opportunities emitted')

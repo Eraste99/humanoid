@@ -32,7 +32,8 @@ import asyncio, time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from base_watchdog import BaseWatchdogV2
+from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 
 StateFn = Callable[[], Dict[str, Any] | Awaitable[Dict[str, Any]]]
 
@@ -54,24 +55,33 @@ class SlippageWatchdogConfig:
     per_pair_caps: Dict[str, Dict[str, float]] = field(default_factory=dict)       # {"BINANCE:BTCUSDC:BUY": {"p95_warn": 10, "p99_crit": 20}}
 
 
-class SlippageWatchdog(BaseWatchdogV2):
-    """Watchdog Slippage passif (notify-only)."""
-
     def __init__(
-        self,
-        state_fn: StateFn,
-        *,
-        name: str = "SlippageWatchdog",
-        config: Optional[SlippageWatchdogConfig] = None,
-        notify_only: bool = True,
-        verbose: bool = True,
+            self,
+            state_fn: Optional[StateFn] = None,
+            *,
+            name: str = "SlippageWatchdog",
+            config: Optional[SlippageWatchdogConfig] = None,
+            notify_only: bool = True,
+            verbose: bool = True,
+            bot_config: Optional[BotConfig] = None,
     ) -> None:
-        cfg = config or SlippageWatchdogConfig()
+        bot_cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            self.record_fallback("bot_config")
+        th = SlipThresholds(
+            age_warn_s=bot_cfg.wd.slippage_age_warn_s,
+            age_crit_s=bot_cfg.wd.slippage_age_crit_s,
+            p95_warn_bps=bot_cfg.wd.slippage_p95_warn_bps,
+            p99_crit_bps=bot_cfg.wd.slippage_p99_crit_bps,
+            escalate_after_cycles=bot_cfg.wd.slippage_escalate_after_cycles,
+        )
+        cfg = config or SlippageWatchdogConfig(check_interval=bot_cfg.wd.slippage_interval_s, thresholds=th)
         super().__init__(
             name=name,
             check_interval=cfg.check_interval,
             restart_cooldown_s=30.0,
             max_restarts_per_min=3,
+            event_cooldown_s=bot_cfg.wd.cooldown_s,
             verbose=verbose,
             notify_only=notify_only,
         )
@@ -80,82 +90,17 @@ class SlippageWatchdog(BaseWatchdogV2):
         self.state_fn = state_fn
         self._bad_cycles: int = 0
 
+
     async def _check_once(self) -> None:
-        s = await self._get_state()
-        g = s.get("global", {}) or {}
-        exmap = s.get("exchanges", {}) or {}
-        pairs = s.get("pairs", {}) or {}
-
-        any_warn = False
-        any_crit = False
-
-        # 1) Global
-        g_age = float(g.get("age_s", 0.0))
-        g_p95 = abs(float(g.get("p95_bps", 0.0)))
-        g_p99 = abs(float(g.get("p99_bps", 0.0)))
-        if g_age >= self.th.age_crit_s or g_p99 >= self.th.p99_crit_bps:
-            self.emit_event(type="alert", level="CRIT", message="slip_global_crit",
-                            age_s=g_age, p95_bps=g_p95, p99_bps=g_p99,
-                            thresholds={"age_crit": self.th.age_crit_s, "p99_crit": self.th.p99_crit_bps},
-                            intent="request_full_restart")
-            any_crit = True
-        elif g_age >= self.th.age_warn_s or g_p95 >= self.th.p95_warn_bps:
-            self.emit_event(type="health", level="WARN", message="slip_global_warn",
-                            age_s=g_age, p95_bps=g_p95, p99_bps=g_p99,
-                            thresholds={"age_warn": self.th.age_warn_s, "p95_warn": self.th.p95_warn_bps})
-            any_warn = True
-
-        # 2) Par exchange
-        for ex, m in exmap.items():
-            age = float((m or {}).get("age_s", 0.0))
-            p95 = abs(float((m or {}).get("p95_bps", 0.0)))
-            p99 = abs(float((m or {}).get("p99_bps", 0.0)))
-            w, c = self._caps_for_exchange(ex)
-
-            if age >= self.th.age_crit_s or p99 >= c:
-                self.emit_event(type="alert", level="CRIT", message="slip_exchange_crit",
-                                exchange=ex, age_s=age, p95_bps=p95, p99_bps=p99,
-                                thresholds={"age_crit": self.th.age_crit_s, "p99_crit": c},
-                                intent="request_full_restart")
-                any_crit = True
-            elif age >= self.th.age_warn_s or p95 >= w:
-                self.emit_event(type="health", level="WARN", message="slip_exchange_warn",
-                                exchange=ex, age_s=age, p95_bps=p95, p99_bps=p99,
-                                thresholds={"age_warn": self.th.age_warn_s, "p95_warn": w})
-                any_warn = True
-
-        # 3) Par pair/side
-        for key, m in pairs.items():
-            age = float((m or {}).get("age_s", 0.0))
-            p95 = abs(float((m or {}).get("p95_bps", 0.0)))
-            p99 = abs(float((m or {}).get("p99_bps", 0.0)))
-            w, c = self._caps_for_pair(key)
-
-            if age >= self.th.age_crit_s or p99 >= c:
-                self.emit_event(type="alert", level="CRIT", message="slip_pair_crit",
-                                pair=key, age_s=age, p95_bps=p95, p99_bps=p99,
-                                thresholds={"age_crit": self.th.age_crit_s, "p99_crit": c},
-                                intent="request_full_restart")
-                any_crit = True
-            elif age >= self.th.age_warn_s or p95 >= w:
-                self.emit_event(type="health", level="WARN", message="slip_pair_warn",
-                                pair=key, age_s=age, p95_bps=p95, p99_bps=p99,
-                                thresholds={"age_warn": self.th.age_warn_s, "p95_warn": w})
-                any_warn = True
-
-        # 4) Persistance
-        if any_warn or any_crit:
-            self._bad_cycles += 1
-        else:
-            self._bad_cycles = 0
-
-        if self._bad_cycles >= max(1, self.th.escalate_after_cycles):
-            self.emit_event(type="alert", level="CRIT", message="slip_persistent_degradation",
-                            cycles=self._bad_cycles, intent="request_full_restart")
-
-        if self._bad_cycles == 0 and not any_warn and not any_crit:
-            self.emit_event(type="health", level="INFO", message="slip_ok")
-
+        snapshot = await self.collect_snapshot()
+        severity, reasons, details = self.evaluate(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="Slippage",
+            observed_at_ms=snapshot.get("observed_at_ms"),
+        )
     # ---- helpers ----
     def _caps_for_exchange(self, ex: str) -> Tuple[float, float]:
         o = self.cfg.per_exchange_caps.get((ex or "").upper(), {})
@@ -175,6 +120,86 @@ class SlippageWatchdog(BaseWatchdogV2):
             self.emit_event(type="error", level="ERROR", message=f"state_fn failed: {e}")
             return {}
 
+    async def collect_snapshot(self) -> Dict[str, Any]:
+        observed_at_ms = self.now_ts_ms()
+        missing: list[str] = []
+        errors: list[str] = []
+        state: Dict[str, Any] = {}
+        if self.state_fn:
+            state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
+        if not state:
+            missing.append("state_fn")
+        return {
+            "observed_at_ms": observed_at_ms,
+            "module_state": state or {},
+            "missing": missing,
+            "errors": errors,
+        }
+
+    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        s = snapshot.get("module_state", {}) or {}
+        g = s.get("global", {}) or {}
+        exmap = s.get("exchanges", {}) or {}
+        pairs = s.get("pairs", {}) or {}
+        reasons: list[str] = []
+        details: Dict[str, Any] = {}
+        missing = list(snapshot.get("missing") or [])
+
+        any_warn = False
+        any_crit = False
+
+        g_age = float(g.get("age_s", 0.0))
+        g_p95 = abs(float(g.get("p95_bps", 0.0)))
+        g_p99 = abs(float(g.get("p99_bps", 0.0)))
+        if g_age >= self.th.age_crit_s or g_p99 >= self.th.p99_crit_bps:
+            reasons.append("WD_STALE")
+            any_crit = True
+        elif g_age >= self.th.age_warn_s or g_p95 >= self.th.p95_warn_bps:
+            any_warn = True
+
+        for ex, m in exmap.items():
+            age = float((m or {}).get("age_s", 0.0))
+            p95 = abs(float((m or {}).get("p95_bps", 0.0)))
+            p99 = abs(float((m or {}).get("p99_bps", 0.0)))
+            w, c = self._caps_for_exchange(ex)
+            if age >= self.th.age_crit_s or p99 >= c:
+                reasons.append("WD_STALE")
+                any_crit = True
+            elif age >= self.th.age_warn_s or p95 >= w:
+                any_warn = True
+
+        for key, m in pairs.items():
+            age = float((m or {}).get("age_s", 0.0))
+            p95 = abs(float((m or {}).get("p95_bps", 0.0)))
+            p99 = abs(float((m or {}).get("p99_bps", 0.0)))
+            w, c = self._caps_for_pair(key)
+            if age >= self.th.age_crit_s or p99 >= c:
+                reasons.append("WD_STALE")
+                any_crit = True
+            elif age >= self.th.age_warn_s or p95 >= w:
+                any_warn = True
+
+        if any_warn or any_crit:
+            self._bad_cycles += 1
+        else:
+            self._bad_cycles = 0
+
+        if self._bad_cycles >= max(1, self.th.escalate_after_cycles):
+            reasons.append("WD_STALE")
+            any_crit = True
+
+        if missing:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing
+
+        details["bad_cycles"] = self._bad_cycles
+        severity = "OK"
+        if any_crit or "WD_STALE" in reasons:
+            severity = "CRIT"
+        elif any_warn or reasons:
+            severity = "WARN"
+        return severity, reasons, details
+    
     def get_status(self) -> Dict[str, Any]:
         s = super().get_status()
         s.update({

@@ -3,8 +3,9 @@
 from __future__ import annotations
 import asyncio, logging, time
 from collections import deque
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional,Tuple
 from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 logger = logging.getLogger("LoggerWatchdogV2")
 
 
@@ -45,18 +46,30 @@ class LoggerWatchdogV2(BaseWatchdogV2):
 
         restart_cooldown_s: float = 15.0,
         max_restarts_per_min: int = 3,
-        name: str = "LoggerWatchdogV2",
-        verbose: bool = True,
+            name: str = "LoggerWatchdogV2",
+            verbose: bool = True,
+            bot_config: Optional[BotConfig] = None,
     ) -> None:
+        cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            self.record_fallback("bot_config")
+        check_interval = float(cfg.wd.logger_interval_s or check_interval)
+        trade_queue_warn = int(cfg.wd.logger_trade_queue_warn or trade_queue_warn)
+        trade_queue_crit = int(cfg.wd.logger_trade_queue_crit or trade_queue_crit)
+        queue_stuck_checks = int(cfg.wd.logger_queue_stuck_checks or queue_stuck_checks)
+        writer_stall_s = float(cfg.wd.logger_writer_stall_s or writer_stall_s)
+        min_queue_for_writer_stall = int(cfg.wd.logger_min_queue_for_writer_stall or min_queue_for_writer_stall)
+        rotation_stall_factor = float(cfg.wd.logger_rotation_stall_factor or rotation_stall_factor)
+        rotation_hard_stall_factor = float(cfg.wd.logger_rotation_hard_stall_factor or rotation_hard_stall_factor)
         super().__init__(
             name=name,
             check_interval=check_interval,
             restart_cooldown_s=restart_cooldown_s,
             max_restarts_per_min=max_restarts_per_min,
+            event_cooldown_s=cfg.wd.cooldown_s,
             verbose=verbose,
         )
         self.mgr = manager
-
         # thresholds
         self.trade_queue_warn = int(trade_queue_warn)
         self.trade_queue_crit = int(trade_queue_crit)
@@ -125,107 +138,25 @@ class LoggerWatchdogV2(BaseWatchdogV2):
         return st or {}
 
     async def _restart_manager(self, *, reason: str) -> None:
-        async def _do_restart():
-            if hasattr(self.mgr, "restart"):
-                res = self.mgr.restart()
-                if asyncio.iscoroutine(res):
-                    await res
-            else:
-                if hasattr(self.mgr, "stop"):
-                    r = self.mgr.stop()
-                    if asyncio.iscoroutine(r): await r
-                if hasattr(self.mgr, "start"):
-                    r = self.mgr.start()
-                    if asyncio.iscoroutine(r): await r
-
-        await self._restart_component(reason=reason, stop_fn=None, start_fn=_do_restart, post_delay_s=0.0)
         self.emit_event(
-            type="module_restarted",
+            type="alert",
             level="WARN",
-            message="LoggerHistoriqueManager redémarré",
+            message="restart_requested_notify_only",
             module="LoggerHistoriqueManager",
             reason=reason,
         )
-
     # ------------------------- core check -------------------------
 
     async def _check_once(self) -> None:
-        self._last_check_ts = time.time()
-        st = self._safe_status()
-        if not st:
-            await self._restart_manager(reason="status_unavailable")
-            return
-
-        writer = st.get("writer") or {}
-        tlog = st.get("trade_logger") or {}
-        tracker = st.get("tracker") or {}
-
-        # ------------- TradeLogger (queue) -------------
-        qsize = int(tlog.get("queue_size", 0) or 0)
-        self._q_hist.append(qsize)
-
-        if qsize >= self.trade_queue_crit:
-            self.emit_event(type="alert", level="CRIT", message=f"TradeLogger queue CRIT={qsize}")
-        elif qsize >= self.trade_queue_warn:
-            self.emit_event(type="alert", level="WARN", message=f"TradeLogger queue WARN={qsize}")
-
-        # queue “plate” (inchangée N checks d’affilée)
-        if qsize > 0 and len(self._q_hist) == self._q_hist.maxlen and len(set(self._q_hist)) == 1:
-            await self._restart_manager(reason=f"trade_queue_stuck(q={qsize})")
-            return
-
-        # ------------- LogWriter (liveness) -------------
-        log_count = writer.get("log_count")
-        now = time.time()
-        if isinstance(log_count, int):
-            if self._last_log_count is None:
-                self._last_log_count, self._last_logcount_ts = log_count, now
-            else:
-                if log_count != self._last_log_count:
-                    # progression OK
-                    self._last_log_count = log_count
-                    self._last_logcount_ts = now
-
-        # writer stall = pas de progression log_count alors que la queue grandit/reste élevée
-        if (
-            isinstance(log_count, int)
-            and qsize >= max(self.min_queue_for_writer_stall, 1)
-            and (now - self._last_logcount_ts) >= self.writer_stall_s
-        ):
-            await self._restart_manager(reason=f"stall_writer(q={qsize},no_progress={now - self._last_logcount_ts:.1f}s)")
-            return
-
-        # ------------- Tracker (rotation fraîche) -------------
-        rotate_every_s = float(st.get("rotate_every_s") or 0.0)
-        last_rotation = float(tracker.get("last_rotation") or 0.0)  # epoch s attendu par PairHistoryTracker
-
-        # mémorise la dernière valeur observée (utile si 0 au boot)
-        if last_rotation > 0:
-            if (self._last_rotation_seen is None) or (last_rotation != self._last_rotation_seen):
-                self._last_rotation_seen = last_rotation
-                self._last_rotation_ts = now
-
-        stall_window_soft = (rotate_every_s * self.rotation_stall_factor) if rotate_every_s > 0 else 180.0
-        stall_window_hard = (rotate_every_s * self.rotation_hard_stall_factor) if rotate_every_s > 0 else 360.0
-
-        # si l’âge depuis le dernier changement observé dépasse soft → nudge rotate; si > hard → restart
-        if self._last_rotation_ts > 0:
-            age = now - self._last_rotation_ts
-            if age >= stall_window_soft and age < stall_window_hard:
-                # nudge une seule fois toutes les 30s
-                if now - self._nudge_rotate_ts >= 30.0 and hasattr(self.mgr, "rotate_now"):
-                    try:
-                        self.mgr.rotate_now()
-                        self._nudge_rotate_ts = now
-                        self.emit_event(type="alert", level="WARN", message=f"tracker_rotation_stale(age={age:.0f}s) → rotate_now()")
-                    except Exception:
-                        # si le nudge échoue, on escalade tout de suite
-                        await self._restart_manager(reason=f"rotation_nudge_failed(age={age:.0f}s)")
-                        return
-            elif age >= stall_window_hard:
-                await self._restart_manager(reason=f"rotation_stale(age={age:.0f}s)")
-                return
-
+        snapshot = await self.collect_snapshot()
+        severity, reasons, details = self.evaluate(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="LoggerHistoriqueManager",
+            observed_at_ms=snapshot.get("observed_at_ms"),
+        )
     # ------------------------- external status -------------------------
 
     def get_status(self) -> Dict[str, Any]:
@@ -250,3 +181,81 @@ class LoggerWatchdogV2(BaseWatchdogV2):
             },
         })
         return base
+
+    async def collect_snapshot(self) -> Dict[str, Any]:
+        self._last_check_ts = time.time()
+        observed_at_ms = self.now_ts_ms()
+        missing: list[str] = []
+        errors: list[str] = []
+        status = await self.safe_call(getattr(self.mgr, "get_status", None), default={}, errors=errors,
+                                      error_label="mgr.get_status")
+        if not status:
+            missing.append("get_status")
+        return {
+            "observed_at_ms": observed_at_ms,
+            "module_state": status or {},
+            "missing": missing,
+            "errors": errors,
+        }
+
+    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        st = snapshot.get("module_state", {}) or {}
+        missing = list(snapshot.get("missing") or [])
+        reasons: list[str] = []
+        details: Dict[str, Any] = {}
+
+        writer = st.get("writer") or {}
+        tracker = st.get("tracker") or {}
+        qsize = self.safe_get(st, "trade_queue_size", default=0, missing=missing)
+        qsize = int(qsize or 0)
+        self._q_hist.append(qsize)
+
+        if qsize >= self.trade_queue_crit:
+            reasons.append("WD_QUEUE_BACKLOG")
+        elif qsize >= self.trade_queue_warn:
+            reasons.append("WD_QUEUE_BACKLOG")
+
+        if qsize > 0 and len(self._q_hist) == self._q_hist.maxlen and len(set(self._q_hist)) == 1:
+            reasons.append("WD_LOOP_STOPPED")
+
+        log_count = writer.get("log_count")
+        now = time.time()
+        if isinstance(log_count, int):
+            if self._last_log_count is None:
+                self._last_log_count, self._last_logcount_ts = log_count, now
+            elif log_count != self._last_log_count:
+                self._last_log_count = log_count
+                self._last_logcount_ts = now
+
+        if (
+                isinstance(log_count, int)
+                and qsize >= max(self.min_queue_for_writer_stall, 1)
+                and (now - self._last_logcount_ts) >= self.writer_stall_s
+        ):
+            reasons.append("WD_LOOP_STOPPED")
+
+        rotation_status = st.get("rotation_status") or {}
+        last_rotation_ts = rotation_status.get("last_rotation_ts")
+        if last_rotation_ts:
+            self._last_rotation_ts = float(last_rotation_ts)
+        if self._last_rotation_ts > 0:
+            age = now - self._last_rotation_ts
+            details["rotation_age_s"] = age
+            rotate_every_s = float(st.get("rotate_every_s") or 0.0)
+            stall_window_soft = (rotate_every_s * self.rotation_stall_factor) if rotate_every_s > 0 else 180.0
+            stall_window_hard = (rotate_every_s * self.rotation_hard_stall_factor) if rotate_every_s > 0 else 360.0
+            if age >= stall_window_hard:
+                reasons.append("WD_LOOP_STOPPED")
+            elif age >= stall_window_soft:
+                reasons.append("WD_STALE")
+
+        if missing:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing
+
+        severity = "OK"
+        if "WD_LOOP_STOPPED" in reasons:
+            severity = "CRIT"
+        elif reasons:
+            severity = "WARN"
+        return severity, reasons, details

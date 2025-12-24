@@ -33,7 +33,8 @@ import asyncio, time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from base_watchdog import BaseWatchdogV2
+from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 
 StateFn = Callable[[], Dict[str, Any] | Awaitable[Dict[str, Any]]]
 
@@ -90,105 +91,177 @@ class MarketDataRouterWatchdog(BaseWatchdogV2):
 
     def __init__(
         self,
-        state_fn: StateFn,
+        state_fn: Optional[StateFn] = None,
         *,
+        router: Optional[Any] = None,
+        bot_config: Optional[BotConfig] = None,
         name: str = "MarketDataRouterWatchdog",
         config: Optional[RouterWatchdogConfig] = None,
         notify_only: bool = True,
         verbose: bool = True,
     ) -> None:
         cfg = config or RouterWatchdogConfig()
-        applied = cfg.tuning.apply(cfg.thresholds)
+        bot_cfg = bot_config
+        if bot_cfg is None:
+            bot_cfg = BotConfig.from_env()
+            self.record_fallback("bot_config")
+        wd_cfg = bot_cfg.wd
         super().__init__(
             name=name,
-            check_interval=cfg.check_interval,
+            check_interval=wd_cfg.router_interval_s,
             restart_cooldown_s=30.0,
             max_restarts_per_min=3,
+            event_cooldown_s=wd_cfg.cooldown_s,
             verbose=verbose,
             notify_only=notify_only,
         )
         self.cfg = cfg
-        self.th = applied
         self.state_fn = state_fn
-        self._stale_cycles: int = 0
+        self.router = router
+        self.health_stale_ms = int(wd_cfg.router_health_stale_ms)
+        self.health_min_coverage_ratio = float(wd_cfg.router_health_min_coverage_ratio)
+        self.health_queue_max = int(wd_cfg.router_health_queue_max)
+        self._last_health_by_exchange: Dict[str, int] = {}
+        self._last_pairs_seen: Dict[str, set[str]] = {}
 
     async def _check_once(self) -> None:
-        state = await self._get_state()
-        now = float(state.get("now_ts", time.time()))
-        qmap = state.get("queues", {}) or {}
-        lat = state.get("latency", {}) or {}
-        stale = state.get("staleness", {}) or {}
-        shards = state.get("shards", {}) or {}
+        snapshot = await self.collect_snapshot()
+        severity, reasons, details = self.evaluate(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="Router",
+            observed_at_ms=snapshot.get("observed_at_ms"),
+        )
 
-        # 1) Latence Router→Scanner
-        r2s_p95 = float(lat.get("router_to_scanner_p95_ms", 0.0))
-        r2s_p99 = float(lat.get("router_to_scanner_p99_ms", 0.0))
-        if r2s_p95 > 0:
-            if r2s_p95 >= self.th.r2s_crit_ms:
-                self.emit_event(type="alert", level="CRIT", message="router_to_scanner_latency_crit",
-                                r2s_p95_ms=int(r2s_p95), r2s_p99_ms=int(r2s_p99),
-                                thresholds={"crit": self.th.r2s_crit_ms}, intent="request_full_restart")
-            elif r2s_p95 >= self.th.r2s_warn_ms:
-                self.emit_event(type="health", level="WARN", message="router_to_scanner_latency_warn",
-                                r2s_p95_ms=int(r2s_p95), r2s_p99_ms=int(r2s_p99),
-                                thresholds={"warn": self.th.r2s_warn_ms})
-        else:
-            self.emit_event(type="health", level="INFO", message="router_to_scanner_latency_unset")
+    async def collect_snapshot(self) -> Dict[str, Any]:
+        observed_at_ms = self.now_ts_ms()
+        missing: list[str] = []
+        errors: list[str] = []
+        state: Dict[str, Any] = {}
+        if self.state_fn:
+            state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
+        if not state and self.router is not None:
+            state = await self.safe_call(getattr(self.router, "get_status", None), default={}, errors=errors, error_label="router.get_status")
+        health = self._drain_health_queues(observed_at_ms, state or {}, missing)
+        return {
+            "observed_at_ms": observed_at_ms,
+            "module_state": state or {},
+            "health": health,
+            "missing": missing,
+            "errors": errors,
+        }
 
-        # 2) Occupation queues
-        for qname in ("combo", "vol", "slip", "health"):
-            q = qmap.get(qname) or {}
-            d, m = int(q.get("depth", 0)), int(q.get("max", 0) or 1)
-            ratio = d / float(m)
-            if ratio >= self.th.q_crit_ratio:
-                self.emit_event(type="alert", level="CRIT", message="queue_saturation_crit",
-                                queue=qname, depth=d, max=m, ratio=round(ratio, 3),
-                                thresholds={"crit_ratio": self.th.q_crit_ratio}, intent="request_full_restart")
-            elif ratio >= self.th.q_warn_ratio:
-                self.emit_event(type="health", level="WARN", message="queue_saturation_warn",
-                                queue=qname, depth=d, max=m, ratio=round(ratio, 3),
-                                thresholds={"warn_ratio": self.th.q_warn_ratio})
+    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        reasons: list[str] = []
+        details: Dict[str, Any] = {"health": snapshot.get("health", {})}
+        missing = list(snapshot.get("missing") or [])
+        if missing:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing
 
-            # Drops/coalescing si dispo
-            dropped = int(q.get("dropped_total", 0))
-            coalesced = int(q.get("coalesced_total", 0))
-            if dropped > 0:
-                self.emit_event(type="alert", level="WARN", message="queue_drops_detected",
-                                queue=qname, dropped_total=dropped, coalesced_total=coalesced)
+        now_ms = int(snapshot.get("observed_at_ms") or self.now_ts_ms())
+        health_map = snapshot.get("health", {}) or {}
+        for ex, info in health_map.items():
+            age_ms = self.safe_age_ms(info.get("last_event_ts_ms"), now_ms)
+            if age_ms is None:
+                reasons.append("MISSING_FIELD")
+                details.setdefault("missing_fields", []).append(f"{ex}:last_event_ts_ms")
+            else:
+                if age_ms >= self.health_stale_ms:
+                    reasons.append("PUBLIC_FEED_STALE")
+                info["age_ms"] = age_ms
+            if info.get("queue_size", 0) > self.health_queue_max:
+                reasons.append("HEALTH_QUEUE_BACKLOG")
 
-        # 3) Staleness L2
-        stale_ms = float(stale.get("stale_ms", 0.0))
-        base_delta = float(stale.get("base_delta_ms", 0.0))
-        skew = float(stale.get("skew_ms", 0.0))
-        if stale_ms >= self.th.stale_warn_ms:
-            self._stale_cycles += 1
-            lvl = "CRIT" if stale_ms >= self.th.stale_crit_ms else "WARN"
-            msg = "staleness_crit" if lvl == "CRIT" else "staleness_warn"
-            self.emit_event(type=("alert" if lvl == "CRIT" else "health"), level=lvl, message=msg,
-                            stale_ms=int(stale_ms), base_delta_ms=int(base_delta), skew_ms=int(skew),
-                            thresholds={"warn": self.th.stale_warn_ms, "crit": self.th.stale_crit_ms},
-                            **({"intent": "request_full_restart"} if lvl == "CRIT" else {}))
-        else:
-            self._stale_cycles = 0
+            expected = info.get("expected_pairs")
+            seen = info.get("pairs_seen_count")
+            if isinstance(expected, int) and expected > 0 and isinstance(seen, int):
+                ratio = float(seen) / float(expected)
+                info["coverage_ratio"] = round(ratio, 4)
+                if ratio < self.health_min_coverage_ratio:
+                    reasons.append("PUBLIC_FEED_COVERAGE_LOW")
 
-        # 4) Shards
-        for shard, sinfo in shards.items():
-            lag = float((sinfo or {}).get("lag_ms", 0.0))
-            if lag >= self.th.shard_lag_crit_ms:
-                self.emit_event(type="alert", level="CRIT", message="shard_lag_crit",
-                                shard=shard, lag_ms=int(lag),
-                                thresholds={"crit": self.th.shard_lag_crit_ms}, intent="request_full_restart")
-            elif lag >= self.th.shard_lag_warn_ms:
-                self.emit_event(type="health", level="WARN", message="shard_lag_warn",
-                                shard=shard, lag_ms=int(lag),
-                                thresholds={"warn": self.th.shard_lag_warn_ms})
+        severity = "OK"
+        if "PUBLIC_FEED_STALE" in reasons:
+            severity = "CRIT"
+        elif reasons:
+            severity = "WARN"
+        return severity, reasons, details
 
-        # 5) Escalade globale si staleness persiste
-        if self._stale_cycles >= max(1, self.th.escalate_after_cycles):
-            self.emit_event(type="alert", level="CRIT", message="router_global_staleness_persistent",
-                            cycles=self._stale_cycles, intent="request_full_restart")
+    def _expected_pairs(self, state: Dict[str, Any]) -> Optional[int]:
+        candidates = [
+            state.get("active_pairs"),
+            state.get("pairs"),
+            getattr(self.router, "active_pairs", None) if self.router is not None else None,
+            getattr(self.router, "pairs", None) if self.router is not None else None,
+            getattr(getattr(self.router, "bot_cfg", None), "g", None).pairs if self.router is not None and getattr(self.router, "bot_cfg", None) else None,
+        ]
+        for cand in candidates:
+            if isinstance(cand, (list, set, tuple)):
+                return int(len(cand))
+            if isinstance(cand, dict):
+                return int(len(cand))
+        return None
+
+    def _drain_health_queues(self, observed_at_ms: int, state: Dict[str, Any], missing: list[str]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        router = self.router
+        out_queues = self.safe_get(router, "out_queues", default=None, missing=missing)
+        if not isinstance(out_queues, dict):
+            return out
+        expected_pairs = self._expected_pairs(state)
+        for route_name, qmap in out_queues.items():
+            if not isinstance(route_name, str) or not route_name.startswith("cex:"):
+                continue
+            ex = route_name.split(":", 1)[1].upper()
+            q = (qmap or {}).get("health")
+            if q is None:
+                missing.append(f"{route_name}.health")
+                continue
+            queue_size = self.safe_get(q, "qsize", default=0)
+            try:
+                queue_size = int(q.qsize())
+            except Exception:
+                queue_size = int(queue_size or 0)
+            drained = 0
+            pairs_seen: set[str] = set(self._last_pairs_seen.get(ex, set()))
+            last_event_ts_ms = int(self._last_health_by_exchange.get(ex, 0))
+            while True:
+                try:
+                    ev = q.get_nowait()
+                except Exception:
+                    break
+                drained += 1
+                if isinstance(ev, dict):
+                    pair_key = ev.get("pair_key")
+                    if pair_key:
+                        pairs_seen.add(str(pair_key))
+                    ts = ev.get("recv_ts_ms") or ev.get("exchange_ts_ms")
+                    try:
+                        ts_val = int(ts)
+                    except Exception:
+                        ts_val = 0
+                    if ts_val > last_event_ts_ms:
+                        last_event_ts_ms = ts_val
+
+            self._last_pairs_seen[ex] = pairs_seen
+            if last_event_ts_ms:
+                self._last_health_by_exchange[ex] = last_event_ts_ms
+            out[ex] = {
+                "queue_size": queue_size,
+                "drained": drained,
+                "pairs_seen_count": len(pairs_seen),
+                "expected_pairs": expected_pairs,
+                "last_event_ts_ms": last_event_ts_ms or None,
+                "observed_at_ms": observed_at_ms,
+            }
+        return out
 
     async def _get_state(self) -> Dict[str, Any]:
+        if not self.state_fn:
+            return {}
         try:
             res = self.state_fn()
             if asyncio.iscoroutine(res):
@@ -198,17 +271,14 @@ class MarketDataRouterWatchdog(BaseWatchdogV2):
             self.emit_event(type="error", level="ERROR", message=f"state_fn failed: {e}")
             return {}
 
+
     def get_status(self) -> Dict[str, Any]:
         s = super().get_status()
         s.update({
             "module": "MarketDataRouterWatchdog",
             "metrics": {**s.get("metrics", {}),
-                         "stale_cycles": self._stale_cycles,
-                         "r2s_warn_ms": self.th.r2s_warn_ms,
-                         "r2s_crit_ms": self.th.r2s_crit_ms,
-                         "stale_warn_ms": self.th.stale_warn_ms,
-                         "stale_crit_ms": self.th.stale_crit_ms,
-                         "q_warn_ratio": self.th.q_warn_ratio,
-                         "q_crit_ratio": self.th.q_crit_ratio},
+                         "health_stale_ms": self.health_stale_ms,
+                         "health_min_coverage_ratio": self.health_min_coverage_ratio,
+                         "health_queue_max": self.health_queue_max},
         })
         return s

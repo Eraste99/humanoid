@@ -24,7 +24,8 @@ import asyncio, time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
-from base_watchdog import BaseWatchdogV2
+from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 
 DiscoverFn = Callable[[], Dict[str, Any] | Awaitable[Dict[str, Any]]]
 GetUniverseFn = Callable[[], Dict[str, Any] | Awaitable[Dict[str, Any]]]
@@ -60,13 +61,24 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
         config: Optional[PairsDiscoveryConfig] = None,
         notify_only: bool = True,
         verbose: bool = True,
+        bot_config: Optional[BotConfig] = None,
     ) -> None:
-        cfg = config or PairsDiscoveryConfig()
+        bot_cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            self.record_fallback("bot_config")
+        th = DiscoveryThresholds(
+            min_change_ratio=bot_cfg.wd.discovery_min_change_ratio,
+            confirm_ticks=bot_cfg.wd.discovery_confirm_ticks,
+            dwell_ticks=bot_cfg.wd.discovery_dwell_ticks,
+            max_refresh_gap_s=bot_cfg.wd.discovery_max_refresh_gap_s,
+        )
+        cfg = config or PairsDiscoveryConfig(check_interval=bot_cfg.wd.discovery_interval_s, thresholds=th)
         super().__init__(
             name=name,
             check_interval=cfg.check_interval,
             restart_cooldown_s=30.0,
             max_restarts_per_min=3,
+            event_cooldown_s=bot_cfg.wd.cooldown_s,
             verbose=verbose,
             notify_only=notify_only,
         )
@@ -87,6 +99,19 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
         if now < self._retry_after_until_ts:
             self.emit_event(type="health", level="INFO", message="discovery_backoff_active",
                             retry_after_remaining_s=round(self._retry_after_until_ts - now, 2))
+            snapshot = {
+                "observed_at_ms": self.now_ts_ms(),
+                "last_discovery_ts": self._last_discovery_ts,
+                "retry_after_until_ts": self._retry_after_until_ts,
+            }
+            severity, reasons, details = self._evaluate_snapshot(snapshot)
+            self.emit_health_event(
+                severity=severity,
+                reasons=reasons,
+                details=details,
+                component="PairsDiscovery",
+                observed_at_ms=snapshot["observed_at_ms"],
+            )
             return
 
         # Récupère l'univers courant pour calculer le diff
@@ -101,6 +126,19 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
             if (now - self._last_discovery_ts) > self.cfg.thresholds.max_refresh_gap_s:
                 self.emit_event(type="alert", level="WARN", message="discovery_gap",
                                 gap_s=int(now - self._last_discovery_ts), max_refresh_gap_s=self.cfg.thresholds.max_refresh_gap_s)
+            snapshot = {
+                "observed_at_ms": self.now_ts_ms(),
+                "last_discovery_ts": self._last_discovery_ts,
+                "retry_after_until_ts": self._retry_after_until_ts,
+            }
+            severity, reasons, details = self._evaluate_snapshot(snapshot)
+            self.emit_health_event(
+                severity=severity,
+                reasons=reasons,
+                details=details,
+                component="PairsDiscovery",
+                observed_at_ms=snapshot["observed_at_ms"],
+            )
             return
 
         self._last_discovery_ts = now
@@ -142,6 +180,19 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
             # pas de changement significatif
             self.emit_event(type="health", level="INFO", message="no_significant_change", ratio=round(ratio, 4))
 
+        snapshot = {
+            "observed_at_ms": self.now_ts_ms(),
+            "last_discovery_ts": self._last_discovery_ts,
+            "retry_after_until_ts": self._retry_after_until_ts,
+        }
+        severity, reasons, details = self._evaluate_snapshot(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="PairsDiscovery",
+            observed_at_ms=snapshot["observed_at_ms"],
+        )
     # -------------- helpers --------------
     async def _get_current(self) -> Dict[str, Any]:
         try:
@@ -197,3 +248,23 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
                          "min_change_ratio": self.cfg.thresholds.min_change_ratio},
         })
         return s
+
+    def _evaluate_snapshot(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        reasons: list[str] = []
+        details: Dict[str, Any] = {}
+        now = time.time()
+        last = float(snapshot.get("last_discovery_ts") or 0.0)
+        if last <= 0:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = ["last_discovery_ts"]
+        else:
+            gap = now - last
+            details["refresh_gap_s"] = gap
+            if gap >= self.cfg.thresholds.max_refresh_gap_s:
+                reasons.append("WD_STALE")
+        severity = "OK"
+        if "WD_STALE" in reasons:
+            severity = "WARN"
+        elif reasons:
+            severity = "WARN"
+        return severity, reasons, details
