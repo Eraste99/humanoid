@@ -25,6 +25,10 @@ import inspect
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
+
+from logger import logger
+
+from modules.dynamic_execution_simulator import DynamicExecutionSimulator
 from modules.risk_manager.risk_manager import RiskManager
 from modules.logger_historique.logger_historique_manager import LoggerHistoriqueManager
 from modules.pairs_discovery import discover_pairs_3cex
@@ -36,7 +40,7 @@ from modules.opportunity_scanner import OpportunityScanner
 from modules.private_ws_hub import PrivateWSHub
 from modules.private_ws_reconciler import PrivateWSReconciler
 from modules.execution_engine import ExecutionEngine
-from modules.rpc_gateway import RPCServer
+from modules.rpc_gateway import RPCServer, make_submitter_for_exchange
 from modules.balance_fetcher import MultiBalanceFetcher
 from contracts.payloads import normalize_reason_code
 from modules.utils.rate_limiter import RateLimiter
@@ -1046,6 +1050,13 @@ class Boot:
         slippage = getattr(self.ctx, "slippage", None)
         balances = getattr(self.ctx, "balances", None)
         simulator = getattr(self.ctx, "simulator", None)
+        if simulator is None:
+            try:
+                simulator = DynamicExecutionSimulator(getattr(self, "cfg", None))
+                simulator.start()
+                self.ctx.simulator = simulator
+            except Exception:
+                self.log.exception("[Boot] unable to start simulator")
 
         # Construction RM (tolérante aux noms d'args)
         rm_kwargs = {
@@ -1130,7 +1141,7 @@ class Boot:
 
     async def _start_scanner(self) -> None:
 
-        self.ctx.scanner = OpportunityScanner(self.cfg, self.ctx.rm, self.ctx.router, history_logger=self.ctx.lhm)
+        self.ctx.scanner = OpportunityScanner(self.cfg, self.ctx.rm, self.ctx.router, history_logger=self.ctx.lhm, simulator=getattr(self.ctx, "simulator", None))
         dry_run = bool(getattr(getattr(self.cfg, "g", object()), "dry_run", False))
         live = not dry_run
         if live:
@@ -1504,6 +1515,27 @@ class Boot:
             logger.exception("RPC endpoint registration failed (continuing)")
 
         await self.ctx.rpc.start()
+        # Build execution submitters (local loopback ou RPC réseau)
+        submitters = {}
+        gcfg = getattr(self.cfg, "g", self.cfg)
+        local_region = str(getattr(gcfg, "pod_region", "EU")).upper()
+        ex_region_map = getattr(gcfg, "exchange_region_map", {}) or {}
+        engine_pods = getattr(gcfg, "engine_pod_map", {}) or {}
+        for ex in getattr(gcfg, "enabled_exchanges", []):
+            try:
+                submitters[str(ex).upper()] = make_submitter_for_exchange(
+                    self.cfg,
+                    ex,
+                    local_region=local_region,
+                    exchange_region_map=ex_region_map,
+                    engine_pod_map=engine_pods,
+                    rpc_server=self.ctx.rpc,
+                )
+            except Exception as exc:
+                self._send_status("rpc", f"submitter_error:{exc}")
+                if bool(getattr(getattr(self.cfg, "rpc", object()), "ready_strict", True)):
+                    return
+        self.ctx.exec_submitters = submitters
         self.ready_rpc.set()
         self._send_status("rpc", "ready")
         self._mark_stage("rpc_ready")
@@ -1514,6 +1546,10 @@ class Boot:
             try:
                 if hasattr(rm, "set_engine"):
                     rm.set_engine(engine)
+                    if hasattr(self.ctx, "exec_submitters", None):
+                        setter = getattr(rm, "set_exec_submitters", None)
+                        if callable(setter):
+                            setter(self.ctx.exec_submitters)
                 reconciler = getattr(self.ctx, "reconciler", None)
                 if reconciler and hasattr(rm, "bind_reconciler"):
                     rm.bind_reconciler(reconciler)
@@ -1956,6 +1992,19 @@ class Boot:
         # RPC obligatoire si activé
         if rpc_enabled and not self.ready_rpc.is_set():
             reasons.append("rpc_unavailable")
+        if rpc_enabled:
+            gcfg = getattr(self.cfg, "g", self.cfg)
+            deployment_mode = str(getattr(gcfg, "deployment_mode", "SPLIT") or "SPLIT").upper()
+            if deployment_mode == "SPLIT" and bool(getattr(getattr(self.cfg, "rpc", object()), "ready_strict", True)):
+                loc_region = str(getattr(gcfg, "pod_region", "EU")).upper()
+                ex_region_map = getattr(gcfg, "exchange_region_map", {}) or {}
+                engine_pods = getattr(gcfg, "engine_pod_map", {}) or {}
+                for ex in getattr(gcfg, "enabled_exchanges", []):
+                    target_region = str(ex_region_map.get(str(ex).upper(), loc_region)).upper()
+                    if target_region != loc_region and str(target_region).upper() not in {k.upper() for k in
+                                                                                          engine_pods.keys()}:
+                        reasons.append("engine_pod_missing")
+                        break
         dry_run = bool(getattr(getattr(self.cfg, "g", object()), "dry_run", False))
         live = not dry_run
         scanner = getattr(self.ctx, "scanner", None)

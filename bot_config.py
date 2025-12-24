@@ -157,10 +157,17 @@ class ConfigError(Exception):
 @dataclass
 class Globals:
     deployment_mode: str = "SPLIT"              # "EU_ONLY" | "SPLIT"
-    pod_region: str = "EU"                      # "EU" | "US"
+    pod_region: str = "EU"  # "EU" | "US" | "JP"
     enable_jp: bool = False
+    exchange_region_map: Dict[str, str] = field(default_factory=lambda: {
+        "BINANCE": "JP",
+        "BYBIT": "JP",
+        "COINBASE": "US",
+    })
     engine_pod_map: Dict[str,str] = field(default_factory=lambda: {
-        "BINANCE":"EU", "BYBIT":"EU", "COINBASE":"US"
+        "EU": "http://127.0.0.1:8080",
+        "US": "http://127.0.0.1:8080",
+        "JP": "http://127.0.0.1:8080",
     })
     split_latency: Dict[str,int] = field(default_factory=lambda: {
         "skew_ms": 25,
@@ -308,6 +315,7 @@ class WatchdogCfg:
     interval_s: float = 2.0
     cooldown_s: float = 5.0
     persistence_s: float = 120.0
+    persistence_cycles: int = 3
 
     router_interval_s: float = 2.0
     router_health_stale_ms: int = 1300
@@ -840,6 +848,28 @@ class SimulatorCfg:
     maker_fill_ratio: float = 0.65
     maker_skew_bps: float = 1.0
     target_ladder_participation: float = 0.5
+    simulator_mode: str = "ON"
+    simulator_bypass_allowed_in_live: bool = False
+    sim_cache_ttl_ms: int = 300
+    sim_max_wait_ms_rm: int = 3
+    sim_prime_depth_levels: int = 25
+    sim_max_inflight_jobs: int = 32
+    sim_notional_buckets_base: str = "250,500,1000,2000,4000"
+    sim_buckets_per_profile: Dict[str, str] = field(default_factory=dict)
+    sim_buckets_adapt_with_vol: bool = True
+    sim_vol_size_factor_floor: float = 0.60
+    sim_vol_size_factor_ceil: float = 1.00
+    sim_prime_multibucket_k: int = 3
+    sim_book_fingerprint_mode: str = "TOP_AND_SUMMARY"
+    sim_book_fingerprint_levels: int = 5
+    sim_mm_hints_interval_ms: int = 500
+    sim_mm_hints_levels: int = 5
+    sim_outputs_required_by_branch: Dict[str, List[str]] = field(default_factory=lambda: {
+        "TT": ["fragmentation_plan"],
+        "TM": ["fragmentation_plan"],
+        "REB": ["fragmentation_plan"],
+        "MM": [],
+    })
 
 # --- Engine ---
 @dataclass
@@ -1147,7 +1177,10 @@ class RPCCfg:
     port: int = 8443
     region: str = "EU"
     timeout_s: float = 2.0
+    timeout_ms: int = 1500
     max_retries: int = 2
+    loopback_inproc: bool = True
+    ready_strict: bool = True
     mtls_enabled: bool = True
     ca_cert: Optional[str] = None
     server_cert: Optional[str] = None
@@ -1495,6 +1528,7 @@ class BotConfig:
         cfg.wd.interval_s = _Env.get_float("WD_INTERVAL_S", cfg.wd.interval_s)
         cfg.wd.cooldown_s = _Env.get_float("WD_COOLDOWN_S", cfg.wd.cooldown_s)
         cfg.wd.persistence_s = _Env.get_float("WD_PERSISTENCE_S", cfg.wd.persistence_s)
+        cfg.wd.persistence_cycles = _Env.get_int("WD_PERSISTENCE_CYCLES", cfg.wd.persistence_cycles)
 
         cfg.wd.router_interval_s = _Env.get_float("WD_ROUTER_INTERVAL_S", cfg.wd.router_interval_s)
         cfg.wd.router_health_stale_ms = _Env.get_int("ROUTER_HEALTH_STALE_MS", cfg.wd.router_health_stale_ms)
@@ -2279,6 +2313,47 @@ class BotConfig:
 
         cfg.sim.max_fragments = _Env.get_int("SIM_MAX_FRAGMENTS", cfg.sim.max_fragments)
         cfg.sim.min_fragment_usdc = _Env.get_float("SIM_MIN_FRAGMENT_USDC", cfg.sim.min_fragment_usdc)
+        cfg.sim.simulator_mode = str(_Env.get("SIMULATOR_MODE", cfg.sim.simulator_mode)).upper()
+        cfg.sim.simulator_bypass_allowed_in_live = _Env.get_bool(
+            "SIMULATOR_BYPASS_ALLOWED_IN_LIVE", cfg.sim.simulator_bypass_allowed_in_live
+        )
+        cfg.sim.sim_cache_ttl_ms = _Env.get_int("SIM_CACHE_TTL_MS", cfg.sim.sim_cache_ttl_ms)
+        cfg.sim.sim_max_wait_ms_rm = _Env.get_int("SIM_MAX_WAIT_MS_RM", cfg.sim.sim_max_wait_ms_rm)
+        cfg.sim.sim_prime_depth_levels = _Env.get_int("SIM_PRIME_DEPTH_LEVELS", cfg.sim.sim_prime_depth_levels)
+        cfg.sim.sim_max_inflight_jobs = _Env.get_int("SIM_MAX_INFLIGHT_JOBS", cfg.sim.sim_max_inflight_jobs)
+        cfg.sim.sim_notional_buckets_base = _Env.get(
+            "SIM_NOTIONAL_BUCKETS_BASE", cfg.sim.sim_notional_buckets_base
+        )
+        cfg.sim.sim_buckets_per_profile = _Env.get_dict(
+            "SIM_BUCKETS_PER_PROFILE", cfg.sim.sim_buckets_per_profile
+        )
+        cfg.sim.sim_buckets_adapt_with_vol = _Env.get_bool(
+            "SIM_BUCKETS_ADAPT_WITH_VOL", cfg.sim.sim_buckets_adapt_with_vol
+        )
+        cfg.sim.sim_vol_size_factor_floor = _Env.get_float(
+            "SIM_VOL_SIZE_FACTOR_FLOOR", cfg.sim.sim_vol_size_factor_floor
+        )
+        cfg.sim.sim_vol_size_factor_ceil = _Env.get_float(
+            "SIM_VOL_SIZE_FACTOR_CEIL", cfg.sim.sim_vol_size_factor_ceil
+        )
+        cfg.sim.sim_prime_multibucket_k = _Env.get_int(
+            "SIM_PRIME_MULTIBUCKET_K", cfg.sim.sim_prime_multibucket_k
+        )
+        cfg.sim.sim_book_fingerprint_mode = str(
+            _Env.get("SIM_BOOK_FINGERPRINT_MODE", cfg.sim.sim_book_fingerprint_mode)
+        ).upper()
+        cfg.sim.sim_book_fingerprint_levels = _Env.get_int(
+            "SIM_BOOK_FINGERPRINT_LEVELS", cfg.sim.sim_book_fingerprint_levels
+        )
+        cfg.sim.sim_mm_hints_interval_ms = _Env.get_int(
+            "SIM_MM_HINTS_INTERVAL_MS", cfg.sim.sim_mm_hints_interval_ms
+        )
+        cfg.sim.sim_mm_hints_levels = _Env.get_int(
+            "SIM_MM_HINTS_LEVELS", cfg.sim.sim_mm_hints_levels
+        )
+        cfg.sim.sim_outputs_required_by_branch = _Env.get_dict(
+            "SIM_OUTPUTS_REQUIRED_BY_BRANCH", cfg.sim.sim_outputs_required_by_branch
+        )
 
         # Ticket 10 — capacités techniques Engine (workers / inflight CEX par profil)
         cfg.engine.workers_by_profile = _Env.get_dict(
@@ -2495,7 +2570,10 @@ class BotConfig:
         cfg.rpc.region = _Env.get("RPC_REGION", cfg.rpc.region)
         cfg.rpc.timeout_s = _Env.get_float("RPC_TIMEOUT_S", cfg.rpc.timeout_s)
         cfg.rpc.max_retries = _Env.get_int("RPC_MAX_RETRIES", cfg.rpc.max_retries)
+        cfg.rpc.timeout_ms = _Env.get_int("RPC_TIMEOUT_MS", cfg.rpc.timeout_ms)
         cfg.rpc.mtls_enabled = _Env.get_bool("RPC_MTLS_ENABLED", cfg.rpc.mtls_enabled)
+        cfg.rpc.loopback_inproc = _Env.get_bool("RPC_LOOPBACK_INPROC", cfg.rpc.loopback_inproc)
+        cfg.rpc.ready_strict = _Env.get_bool("RPC_READY_STRICT", cfg.rpc.ready_strict)
         cfg.rpc.ca_cert = _Env.get("RPC_CA_CERT", cfg.rpc.ca_cert)
         cfg.rpc.server_cert = _Env.get("RPC_SERVER_CERT", cfg.rpc.server_cert)
         cfg.rpc.server_key = _Env.get("RPC_SERVER_KEY", cfg.rpc.server_key)
@@ -2510,6 +2588,18 @@ class BotConfig:
         cfg.rpc.rpc_cert_paths = _Env.get_dict("RPC_CERT_PATHS", cfg.rpc.rpc_cert_paths)
         cfg.rpc.rpc_max_payload_kb = _Env.get_int("RPC_MAX_PAYLOAD_KB", cfg.rpc.rpc_max_payload_kb)
 
+        # --- Regions / Split routing ---
+        g = getattr(cfg, "g", cfg)
+        g.pod_region = _Env.get("REGION", getattr(g, "pod_region", "EU"))
+        g.deployment_mode = _Env.get("DEPLOYMENT_MODE", getattr(g, "deployment_mode", "SPLIT"))
+        g.exchange_region_map = {
+            str(k).upper(): str(v).upper() for k, v in
+            (_Env.get_dict("EXCHANGE_REGION_MAP", getattr(g, "exchange_region_map", {})) or {}).items()
+        }
+        g.engine_pod_map = {
+            str(k).upper(): str(v) for k, v in
+            (_Env.get_dict("ENGINE_POD_MAP", getattr(g, "engine_pod_map", {})) or {}).items()
+        }
 
         # --- Logger / LHM (optionnel) ---
         cfg.lhm.out_dir = _Env.get("LHM_OUT_DIR", cfg.lhm.out_dir)

@@ -128,6 +128,7 @@ class RiskManagerWatchdog(BaseWatchdogV2):
             reasons=reasons,
             details=details,
             component="RiskManager",
+            module="RiskManager",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
 
@@ -150,7 +151,7 @@ class RiskManagerWatchdog(BaseWatchdogV2):
         if self.state_fn:
             state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
         if not state:
-            missing.append("state_fn")
+            missing.append("MISSING_FIELD:state_fn")
         return {
             "observed_at_ms": observed_at_ms,
             "module_state": state or {},
@@ -159,19 +160,26 @@ class RiskManagerWatchdog(BaseWatchdogV2):
         }
 
     def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        missing = list(snapshot.get("missing") or [])
         s = snapshot.get("module_state", {}) or {}
-        now = float(s.get("now_ts", time.time()))
-        loop = s.get("loop", {}) or {}
-        tick_p95 = float(loop.get("tick_ms_p95", 0.0))
-        hb_gap = float(loop.get("heartbeat_gap_s", 0.0))
-        mode = str(s.get("mode", "")).upper() or "UNKNOWN"
-        pacer = str(s.get("pacer", "")).upper() or "UNKNOWN"
-        gates = s.get("gates", {}) or {}
-        hints = s.get("hints", {}) or {}
+        now = self.safe_float(s, "now_ts", default=time.time(), missing=missing)
+        loop = self.safe_get(s, "loop", default={}, missing=missing)
+        gates = self.safe_get(s, "gates", default={}, missing=missing)
+        hints = self.safe_get(s, "hints", default={}, missing=missing)
+        if not isinstance(loop, dict):
+            loop = {}
+        if not isinstance(gates, dict):
+            gates = {}
+        if not isinstance(hints, dict):
+            hints = {}
+        tick_p95 = self.safe_float(loop, "tick_ms_p95", default=0.0, missing=missing)
+        hb_gap = self.safe_float(loop, "heartbeat_gap_s", default=0.0, missing=missing)
+        mode = str(self.safe_get(s, "mode", default="UNKNOWN", missing=missing)).upper() or "UNKNOWN"
+        pacer = str(self.safe_get(s, "pacer", default="UNKNOWN", missing=missing)).upper() or "UNKNOWN"
 
         reasons: list[str] = []
         details: Dict[str, Any] = {"mode": mode, "pacer": pacer}
-        missing = list(snapshot.get("missing") or [])
+
 
         any_warn = False
         any_crit = False
@@ -182,16 +190,17 @@ class RiskManagerWatchdog(BaseWatchdogV2):
         elif tick_p95 >= self.th.tick_warn_ms or hb_gap >= self.th.hb_warn_s:
             any_warn = True
 
-        slip_age = float(hints.get("slip_age_s", 0.0))
-        vol_age = float(hints.get("vol_age_s", 0.0))
-        shadow = float(hints.get("shadow_bias_bps_p50", 0.0))
+        slip_age = self.safe_float(hints, "slip_age_s", default=0.0, missing=missing)
+        vol_age = self.safe_float(hints, "vol_age_s", default=0.0, missing=missing)
+        shadow = self.safe_float(hints, "shadow_bias_bps_p50", default=0.0, missing=missing)
+
         if slip_age >= self.th.slip_age_crit_s or vol_age >= self.th.vol_age_crit_s or shadow >= self.th.shadow_bias_crit_bps:
             reasons.append("WD_STALE")
             any_crit = True
         elif slip_age >= self.th.slip_age_warn_s or vol_age >= self.th.vol_age_warn_s or shadow >= self.th.shadow_bias_warn_bps:
             any_warn = True
 
-        qpos = float(gates.get("queuepos_guard_hits_per_min", 0.0))
+        qpos = self.safe_float(gates, "queuepos_guard_hits_per_min", default=0.0, missing=missing)
         if qpos >= self.th.queuepos_crit_per_min:
             reasons.append("WD_QUEUE_BACKLOG")
             any_crit = True

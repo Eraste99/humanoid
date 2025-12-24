@@ -28,7 +28,8 @@ import asyncio, time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from base_watchdog import BaseWatchdogV2
+from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 
 StateFn = Callable[[], Dict[str, Any] | Awaitable[Dict[str, Any]]]
 
@@ -71,13 +72,29 @@ class VolatilityWatchdog(BaseWatchdogV2):
         config: Optional[VolatilityWatchdogConfig] = None,
         notify_only: bool = True,
         verbose: bool = True,
+        bot_config: Optional[BotConfig] = None,
     ) -> None:
-        cfg = config or VolatilityWatchdogConfig()
+        bot_cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            self.record_fallback("bot_config")
+        th = VolThresholds(
+            age_warn_s=bot_cfg.wd.volatility_age_warn_s,
+            age_crit_s=bot_cfg.wd.volatility_age_crit_s,
+            soft_cap_bps=bot_cfg.wd.volatility_soft_cap_bps,
+            hard_cap_bps=bot_cfg.wd.volatility_hard_cap_bps,
+            p95_warn_bps=bot_cfg.wd.volatility_p95_warn_bps,
+            p99_crit_bps=bot_cfg.wd.volatility_p99_crit_bps,
+            z_warn=bot_cfg.wd.volatility_z_warn,
+            z_crit=bot_cfg.wd.volatility_z_crit,
+            escalate_after_cycles=bot_cfg.wd.volatility_escalate_after_cycles,
+        )
+        cfg = config or VolatilityWatchdogConfig(check_interval=bot_cfg.wd.volatility_interval_s, thresholds=th)
         super().__init__(
             name=name,
             check_interval=cfg.check_interval,
             restart_cooldown_s=30.0,
             max_restarts_per_min=3,
+            event_cooldown_s=bot_cfg.wd.cooldown_s,
             verbose=verbose,
             notify_only=notify_only,
         )
@@ -87,94 +104,16 @@ class VolatilityWatchdog(BaseWatchdogV2):
         self._bad_cycles: int = 0
 
     async def _check_once(self) -> None:
-        s = await self._get_state()
-        g = s.get("global", {}) or {}
-        exmap = s.get("exchanges", {}) or {}
-        pairs = s.get("pairs", {}) or {}
-
-        any_warn = False
-        any_crit = False
-
-        # 1) Global
-        g_age = float(g.get("age_s", 0.0))
-        g_p95 = float(g.get("p95_bps", 0.0))
-        g_p99 = float(g.get("p99_bps", 0.0))
-        g_ema = float(g.get("ema_bps", 0.0))
-        g_cha = bool(g.get("chaos", False))
-
-        soft = self.th.soft_cap_bps
-        hard = self.th.hard_cap_bps
-
-        if g_age >= self.th.age_crit_s or g_p99 >= max(self.th.p99_crit_bps, hard):
-            self.emit_event(type="alert", level="CRIT", message="vol_global_crit",
-                            age_s=g_age, p95_bps=g_p95, p99_bps=g_p99, ema_bps=g_ema, chaos=g_cha,
-                            thresholds={"age_crit": self.th.age_crit_s, "p99_crit": self.th.p99_crit_bps, "hard": hard},
-                            intent="request_full_restart")
-            any_crit = True
-        elif g_age >= self.th.age_warn_s or g_p95 >= max(self.th.p95_warn_bps, soft) or g_cha:
-            self.emit_event(type="health", level="WARN", message="vol_global_warn",
-                            age_s=g_age, p95_bps=g_p95, p99_bps=g_p99, ema_bps=g_ema, chaos=g_cha,
-                            thresholds={"age_warn": self.th.age_warn_s, "p95_warn": self.th.p95_warn_bps, "soft": soft})
-            any_warn = True
-
-        # 2) Par exchange
-        for ex, m in exmap.items():
-            age = float((m or {}).get("age_s", 0.0))
-            p95 = float((m or {}).get("p95_bps", 0.0))
-            p99 = float((m or {}).get("p99_bps", 0.0))
-            ema = float((m or {}).get("ema_bps", 0.0))
-            chaos = bool((m or {}).get("chaos", False))
-            soft_e, hard_e = self._caps_for_exchange(ex, soft, hard)
-
-            if age >= self.th.age_crit_s or p99 >= max(self.th.p99_crit_bps, hard_e):
-                self.emit_event(type="alert", level="CRIT", message="vol_exchange_crit",
-                                exchange=ex, age_s=age, p95_bps=p95, p99_bps=p99, ema_bps=ema, chaos=chaos,
-                                thresholds={"age_crit": self.th.age_crit_s, "p99_crit": self.th.p99_crit_bps, "hard": hard_e},
-                                intent="request_full_restart")
-                any_crit = True
-            elif age >= self.th.age_warn_s or p95 >= max(self.th.p95_warn_bps, soft_e) or chaos:
-                self.emit_event(type="health", level="WARN", message="vol_exchange_warn",
-                                exchange=ex, age_s=age, p95_bps=p95, p99_bps=p99, ema_bps=ema, chaos=chaos,
-                                thresholds={"age_warn": self.th.age_warn_s, "p95_warn": self.th.p95_warn_bps, "soft": soft_e})
-                any_warn = True
-
-        # 3) Par pair
-        for pair, m in pairs.items():
-            age = float((m or {}).get("age_s", 0.0))
-            p95 = float((m or {}).get("p95_bps", 0.0))
-            p99 = float((m or {}).get("p99_bps", 0.0))
-            ema = float((m or {}).get("ema_bps", 0.0))
-            z   = float((m or {}).get("zscore", 0.0))
-            soft_p, hard_p = self._caps_for_pair(pair, soft, hard)
-
-            # Spike detection: zscore si dispo sinon p99>>ema
-            spike_warn = (z >= self.th.z_warn) or (ema > 0 and (p99 - ema) >= self.th.z_warn * (ema/10.0))
-            spike_crit = (z >= self.th.z_crit) or (ema > 0 and (p99 - ema) >= self.th.z_crit * (ema/10.0))
-
-            if age >= self.th.age_crit_s or p99 >= max(self.th.p99_crit_bps, hard_p) or spike_crit:
-                self.emit_event(type="alert", level="CRIT", message="vol_pair_crit",
-                                pair=pair, age_s=age, p95_bps=p95, p99_bps=p99, ema_bps=ema, zscore=z,
-                                thresholds={"age_crit": self.th.age_crit_s, "p99_crit": self.th.p99_crit_bps, "hard": hard_p, "z_crit": self.th.z_crit},
-                                intent="request_full_restart")
-                any_crit = True
-            elif age >= self.th.age_warn_s or p95 >= max(self.th.p95_warn_bps, soft_p) or spike_warn:
-                self.emit_event(type="health", level="WARN", message="vol_pair_warn",
-                                pair=pair, age_s=age, p95_bps=p95, p99_bps=p99, ema_bps=ema, zscore=z,
-                                thresholds={"age_warn": self.th.age_warn_s, "p95_warn": self.th.p95_warn_bps, "soft": soft_p, "z_warn": self.th.z_warn})
-                any_warn = True
-
-        # 4) Persistance
-        if any_warn or any_crit:
-            self._bad_cycles += 1
-        else:
-            self._bad_cycles = 0
-
-        if self._bad_cycles >= max(1, self.th.escalate_after_cycles):
-            self.emit_event(type="alert", level="CRIT", message="vol_persistent_degradation",
-                            cycles=self._bad_cycles, intent="request_full_restart")
-
-        if self._bad_cycles == 0 and not any_warn and not any_crit:
-            self.emit_event(type="health", level="INFO", message="vol_ok")
+        snapshot = await self.collect_snapshot()
+        severity, reasons, details = self.evaluate(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="Volatility",
+            module="VolatilityMonitor",
+            observed_at_ms=snapshot.get("observed_at_ms"),
+        )
 
     # ---- helpers ----
     def _caps_for_exchange(self, ex: str, soft: float, hard: float) -> tuple[float, float]:
@@ -194,6 +133,113 @@ class VolatilityWatchdog(BaseWatchdogV2):
         except Exception as e:
             self.emit_event(type="error", level="ERROR", message=f"state_fn failed: {e}")
             return {}
+
+    async def collect_snapshot(self) -> Dict[str, Any]:
+        observed_at_ms = self.now_ts_ms()
+        missing: list[str] = []
+        errors: list[str] = []
+        state: Dict[str, Any] = {}
+        if self.state_fn:
+            state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
+        if not state:
+            missing.append("MISSING_FIELD:state_fn")
+        return {
+            "observed_at_ms": observed_at_ms,
+            "module_state": state or {},
+            "missing": missing,
+            "errors": errors,
+        }
+
+    def evaluate(self, snapshot: Dict[str, Any]) -> tuple[str, list[str], Dict[str, Any]]:
+        s = snapshot.get("module_state", {}) or {}
+        missing = list(snapshot.get("missing") or [])
+        g = self.safe_get(s, "global", default={}, missing=missing)
+        exmap = self.safe_get(s, "exchanges", default={}, missing=missing)
+        pairs = self.safe_get(s, "pairs", default={}, missing=missing)
+        if not isinstance(g, dict):
+            g = {}
+        if not isinstance(exmap, dict):
+            exmap = {}
+        if not isinstance(pairs, dict):
+            pairs = {}
+
+        reasons: list[str] = []
+        details: Dict[str, Any] = {}
+        any_warn = False
+        any_crit = False
+
+        g_age = self.safe_float(g, "age_s", default=0.0, missing=missing)
+        g_p95 = self.safe_float(g, "p95_bps", default=0.0, missing=missing)
+        g_p99 = self.safe_float(g, "p99_bps", default=0.0, missing=missing)
+        g_ema = self.safe_float(g, "ema_bps", default=0.0, missing=missing)
+        g_cha = bool(self.safe_get(g, "chaos", default=False, missing=missing))
+
+        soft = self.th.soft_cap_bps
+        hard = self.th.hard_cap_bps
+
+        if g_age >= self.th.age_crit_s or g_p99 >= max(self.th.p99_crit_bps, hard):
+            reasons.append("WD_STALE")
+            any_crit = True
+        elif g_age >= self.th.age_warn_s or g_p95 >= max(self.th.p95_warn_bps, soft) or g_cha:
+            any_warn = True
+
+        for ex, m in exmap.items():
+            m = m or {}
+            age = self.safe_float(m, "age_s", default=0.0, missing=missing)
+            p95 = self.safe_float(m, "p95_bps", default=0.0, missing=missing)
+            p99 = self.safe_float(m, "p99_bps", default=0.0, missing=missing)
+            ema = self.safe_float(m, "ema_bps", default=0.0, missing=missing)
+            chaos = bool(self.safe_get(m, "chaos", default=False, missing=missing))
+            soft_e, hard_e = self._caps_for_exchange(ex, soft, hard)
+
+            if age >= self.th.age_crit_s or p99 >= max(self.th.p99_crit_bps, hard_e):
+                reasons.append("WD_STALE")
+                any_crit = True
+            elif age >= self.th.age_warn_s or p95 >= max(self.th.p95_warn_bps, soft_e) or chaos:
+                any_warn = True
+
+        for pair, m in pairs.items():
+            m = m or {}
+            age = self.safe_float(m, "age_s", default=0.0, missing=missing)
+            p95 = self.safe_float(m, "p95_bps", default=0.0, missing=missing)
+            p99 = self.safe_float(m, "p99_bps", default=0.0, missing=missing)
+            ema = self.safe_float(m, "ema_bps", default=0.0, missing=missing)
+            z = self.safe_float(m, "zscore", default=0.0, missing=missing)
+            soft_p, hard_p = self._caps_for_pair(pair, soft, hard)
+
+            spike_warn = (z >= self.th.z_warn) or (ema > 0 and (p99 - ema) >= self.th.z_warn * (ema / 10.0))
+            spike_crit = (z >= self.th.z_crit) or (ema > 0 and (p99 - ema) >= self.th.z_crit * (ema / 10.0))
+
+            if age >= self.th.age_crit_s or p99 >= max(self.th.p99_crit_bps, hard_p) or spike_crit:
+                reasons.append("WD_STALE")
+                any_crit = True
+            elif age >= self.th.age_warn_s or p95 >= max(self.th.p95_warn_bps, soft_p) or spike_warn:
+                any_warn = True
+
+        if any_warn or any_crit:
+            self._bad_cycles += 1
+        else:
+            self._bad_cycles = 0
+
+        if self._bad_cycles >= max(1, self.th.escalate_after_cycles):
+            reasons.append("WD_STALE")
+            any_crit = True
+
+        if missing:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing
+
+        details.update({
+            "bad_cycles": self._bad_cycles,
+            "global": {"age_s": g_age, "p95_bps": g_p95, "p99_bps": g_p99, "ema_bps": g_ema, "chaos": g_cha},
+        })
+
+        severity = "OK"
+        if any_crit or "WD_STALE" in reasons:
+            severity = "CRIT"
+        elif any_warn or reasons:
+            severity = "WARN"
+        return severity, reasons, details
 
     def get_status(self) -> Dict[str, Any]:
         s = super().get_status()

@@ -4,7 +4,12 @@ from __future__ import annotations
 import asyncio, logging, time, os
 from collections import defaultdict, deque
 from typing import Any, Awaitable, Callable, Deque, Dict, Iterable, Optional
-from modules.obs_metrics import watchdog_fallback_used
+from modules.obs_metrics import (
+    watchdog_fallback_used,
+    watchdog_degraded_total,
+    watchdog_restart_intent_total,
+    watchdog_snapshot_total,
+)
 from contracts.payloads import normalize_reason_code
 EventSink = Callable[[Dict[str, Any]], Any]  # sync ou async
 
@@ -80,7 +85,7 @@ class BaseWatchdogV2:
     ) -> Any:
         if obj is None:
             if missing is not None:
-                missing.append(str(path))
+                missing.append(f"MISSING_FIELD:{path}")
             return default
         steps = [path] if isinstance(path, str) else list(path)
         cur = obj
@@ -91,20 +96,69 @@ class BaseWatchdogV2:
                         cur = cur[key]
                     else:
                         if missing is not None:
-                            missing.append(str(key))
+                            missing.append(f"MISSING_FIELD:{key}")
                         return default
                 else:
                     if hasattr(cur, str(key)):
                         cur = getattr(cur, str(key))
                     else:
                         if missing is not None:
-                            missing.append(str(key))
+                            missing.append(f"MISSING_FIELD:{key}")
                         return default
             except Exception:
                 if missing is not None:
-                    missing.append(str(key))
+                    missing.append(f"MISSING_FIELD:{key}")
                 return default
         return default if cur is None else cur
+
+    def safe_int(
+            self,
+            obj: Any,
+            path: str | Iterable[str],
+            default: int = 0,
+            *,
+            missing: Optional[list[str]] = None,
+    ) -> int:
+        value = self.safe_get(obj, path, default=None, missing=missing)
+        try:
+            return int(value)
+        except Exception:
+            return int(default)
+
+    def safe_float(
+            self,
+            obj: Any,
+            path: str | Iterable[str],
+            default: float = 0.0,
+            *,
+            missing: Optional[list[str]] = None,
+    ) -> float:
+        value = self.safe_get(obj, path, default=None, missing=missing)
+        try:
+            return float(value)
+        except Exception:
+            return float(default)
+
+    def safe_ts_ms(
+            self,
+            obj: Any,
+            path: str | Iterable[str],
+            default: Optional[int] = None,
+            *,
+            missing: Optional[list[str]] = None,
+    ) -> Optional[int]:
+        value = self.safe_get(obj, path, default=None, missing=missing)
+        if value is None:
+            return default
+        try:
+            ts = float(value)
+        except Exception:
+            return default
+        if ts <= 0:
+            return default
+        if ts < 1e12:
+            ts *= 1000.0
+        return int(ts)
 
     async def safe_call(
             self,
@@ -152,10 +206,14 @@ class BaseWatchdogV2:
             last_val *= 1000.0
         return max(0, int(now_ms - last_val))
 
+    def normalize_reason(self, reason: Optional[str]) -> Optional[str]:
+        norm = normalize_reason_code(reason)
+        return norm if norm else None
+
     def normalize_reasons(self, reasons: Iterable[str]) -> list[str]:
         out: list[str] = []
         for reason in reasons:
-            norm = normalize_reason_code(reason)
+            norm = self.normalize_reason(reason)
             if norm:
                 out.append(norm)
         return out
@@ -167,6 +225,45 @@ class BaseWatchdogV2:
             pass
         watchdog_fallback_used(self.name, key)
 
+    def build_snapshot(
+            self,
+            healthy: bool,
+            severity: str,
+            reasons: Iterable[str],
+            details: Dict[str, Any],
+            *,
+            module: Optional[str] = None,
+            observed_at_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        sev = self._coerce_severity(severity)
+        observed_ms = int(observed_at_ms or self.now_ts_ms())
+        normalized_reasons = self.normalize_reasons(reasons)
+        details_out = dict(details or {})
+        missing_fields = details_out.get("missing_fields") or []
+        if isinstance(missing_fields, (list, tuple)) and missing_fields:
+            if "MISSING_FIELD" not in normalized_reasons:
+                normalized_reasons.append("MISSING_FIELD")
+            for key in sorted({str(k) for k in missing_fields}):
+                self.record_fallback(key)
+        elif "MISSING_FIELD" in normalized_reasons:
+            self.record_fallback("MISSING_FIELD")
+
+        snapshot = {
+            "watchdog": self.name,
+            "module": module or self.name,
+            "healthy": bool(healthy),
+            "severity": sev,
+            "reasons": normalized_reasons,
+            "observed_at_ms": observed_ms,
+            "details": details_out,
+        }
+        watchdog_snapshot_total(self.name, sev)
+        if sev in ("WARN", "CRIT"):
+            for reason in normalized_reasons:
+                watchdog_degraded_total(self.name, reason)
+        self._last_snapshot = dict(snapshot)
+        return snapshot
+
     def emit_health_event(
             self,
             *,
@@ -174,24 +271,28 @@ class BaseWatchdogV2:
             reasons: Iterable[str],
             details: Dict[str, Any],
             component: Optional[str] = None,
+            module: Optional[str] = None,
             observed_at_ms: Optional[int] = None,
             **dims: Any,
     ) -> None:
-        sev = self._coerce_severity(severity)
-        normalized = self.normalize_reasons(reasons)
-        observed_ms = int(observed_at_ms or self.now_ts_ms())
-        payload: Dict[str, Any] = {
-            "component": component or self.name,
-            "severity": sev,
-            "reasons": normalized,
-            "details": dict(details or {}),
-            "observed_at_ms": observed_ms,
-        }
+        snapshot = self.build_snapshot(
+            healthy=(self._coerce_severity(severity) == "OK"),
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            module=module,
+            observed_at_ms=observed_at_ms,
+        )
+        payload: Dict[str, Any] = dict(snapshot)
+        payload["component"] = component or module or self.name
         payload.update({k: v for k, v in dims.items() if v is not None})
-        msg = f"health_snapshot:{sev}:{','.join(normalized) if normalized else 'ok'}"
-        self.emit_event(type="health_snapshot", level=("INFO" if sev == "OK" else sev), message=msg, **payload)
-        self._last_snapshot = payload
-
+        msg = f"health_snapshot:{snapshot['severity']}:{','.join(snapshot['reasons']) if snapshot['reasons'] else 'ok'}"
+        self.emit_event(
+            type="health_snapshot",
+            level=("INFO" if snapshot["severity"] == "OK" else snapshot["severity"]),
+            message=msg,
+            **payload,
+        )
         # -------- lifecycle --------
     async def start(self) -> None:
         if self._running:
@@ -366,3 +467,16 @@ class BaseWatchdogV2:
             },
             "last_snapshot": dict(self._last_snapshot),
         }
+
+    def get_health_snapshot(self) -> Dict[str, Any]:
+        if self._last_snapshot:
+            return dict(self._last_snapshot)
+        details = {"running": bool(self._running)}
+        return self.build_snapshot(
+            healthy=bool(self._running),
+            severity="OK" if self._running else "CRIT",
+            reasons=[],
+            details=details,
+            module=self.name,
+            observed_at_ms=self.now_ts_ms(),
+        )

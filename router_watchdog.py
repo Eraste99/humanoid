@@ -132,6 +132,7 @@ class MarketDataRouterWatchdog(BaseWatchdogV2):
             reasons=reasons,
             details=details,
             component="Router",
+            module="MarketDataRouter",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
 
@@ -164,19 +165,21 @@ class MarketDataRouterWatchdog(BaseWatchdogV2):
         now_ms = int(snapshot.get("observed_at_ms") or self.now_ts_ms())
         health_map = snapshot.get("health", {}) or {}
         for ex, info in health_map.items():
-            age_ms = self.safe_age_ms(info.get("last_event_ts_ms"), now_ms)
+            last_event_ts_ms = self.safe_ts_ms(info, "last_event_ts_ms", default=None, missing=missing)
+            age_ms = self.safe_age_ms(last_event_ts_ms, now_ms)
             if age_ms is None:
                 reasons.append("MISSING_FIELD")
-                details.setdefault("missing_fields", []).append(f"{ex}:last_event_ts_ms")
+                details.setdefault("missing_fields", []).append(f"MISSING_FIELD:{ex}:last_event_ts_ms")
             else:
                 if age_ms >= self.health_stale_ms:
                     reasons.append("PUBLIC_FEED_STALE")
                 info["age_ms"] = age_ms
-            if info.get("queue_size", 0) > self.health_queue_max:
+            queue_size = self.safe_int(info, "queue_size", default=0, missing=missing)
+            if queue_size > self.health_queue_max:
                 reasons.append("HEALTH_QUEUE_BACKLOG")
 
-            expected = info.get("expected_pairs")
-            seen = info.get("pairs_seen_count")
+            expected = self.safe_get(info, "expected_pairs", default=None, missing=missing)
+            seen = self.safe_get(info, "pairs_seen_count", default=None, missing=missing)
             if isinstance(expected, int) and expected > 0 and isinstance(seen, int):
                 ratio = float(seen) / float(expected)
                 info["coverage_ratio"] = round(ratio, 4)
@@ -218,9 +221,9 @@ class MarketDataRouterWatchdog(BaseWatchdogV2):
             ex = route_name.split(":", 1)[1].upper()
             q = (qmap or {}).get("health")
             if q is None:
-                missing.append(f"{route_name}.health")
+                missing.append(f"MISSING_FIELD:{route_name}.health")
                 continue
-            queue_size = self.safe_get(q, "qsize", default=0)
+            queue_size = self.safe_get(q, "qsize", default=0, missing=missing)
             try:
                 queue_size = int(q.qsize())
             except Exception:

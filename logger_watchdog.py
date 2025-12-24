@@ -155,6 +155,7 @@ class LoggerWatchdogV2(BaseWatchdogV2):
             reasons=reasons,
             details=details,
             component="LoggerHistoriqueManager",
+            module="LoggerHistoriqueManager",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
     # ------------------------- external status -------------------------
@@ -190,7 +191,7 @@ class LoggerWatchdogV2(BaseWatchdogV2):
         status = await self.safe_call(getattr(self.mgr, "get_status", None), default={}, errors=errors,
                                       error_label="mgr.get_status")
         if not status:
-            missing.append("get_status")
+            missing.append("MISSING_FIELD:get_status")
         return {
             "observed_at_ms": observed_at_ms,
             "module_state": status or {},
@@ -204,8 +205,12 @@ class LoggerWatchdogV2(BaseWatchdogV2):
         reasons: list[str] = []
         details: Dict[str, Any] = {}
 
-        writer = st.get("writer") or {}
-        tracker = st.get("tracker") or {}
+        writer = self.safe_get(st, "writer", default={}, missing=missing)
+        tracker = self.safe_get(st, "tracker", default={}, missing=missing)
+        if not isinstance(writer, dict):
+            writer = {}
+        if not isinstance(tracker, dict):
+            tracker = {}
         qsize = self.safe_get(st, "trade_queue_size", default=0, missing=missing)
         qsize = int(qsize or 0)
         self._q_hist.append(qsize)
@@ -218,7 +223,7 @@ class LoggerWatchdogV2(BaseWatchdogV2):
         if qsize > 0 and len(self._q_hist) == self._q_hist.maxlen and len(set(self._q_hist)) == 1:
             reasons.append("WD_LOOP_STOPPED")
 
-        log_count = writer.get("log_count")
+        log_count = self.safe_get(writer, "log_count", default=None, missing=missing)
         now = time.time()
         if isinstance(log_count, int):
             if self._last_log_count is None:
@@ -234,14 +239,16 @@ class LoggerWatchdogV2(BaseWatchdogV2):
         ):
             reasons.append("WD_LOOP_STOPPED")
 
-        rotation_status = st.get("rotation_status") or {}
-        last_rotation_ts = rotation_status.get("last_rotation_ts")
+        rotation_status = self.safe_get(st, "rotation_status", default={}, missing=missing)
+        if not isinstance(rotation_status, dict):
+            rotation_status = {}
+        last_rotation_ts = self.safe_get(rotation_status, "last_rotation_ts", default=None, missing=missing)
         if last_rotation_ts:
             self._last_rotation_ts = float(last_rotation_ts)
         if self._last_rotation_ts > 0:
             age = now - self._last_rotation_ts
             details["rotation_age_s"] = age
-            rotate_every_s = float(st.get("rotate_every_s") or 0.0)
+            rotate_every_s = self.safe_float(st, "rotate_every_s", default=0.0, missing=missing)
             stall_window_soft = (rotate_every_s * self.rotation_stall_factor) if rotate_every_s > 0 else 180.0
             stall_window_hard = (rotate_every_s * self.rotation_hard_stall_factor) if rotate_every_s > 0 else 360.0
             if age >= stall_window_hard:

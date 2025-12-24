@@ -46,7 +46,8 @@ import asyncio, time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
-from base_watchdog import BaseWatchdogV2
+from modules.watchdog.base_watchdog import BaseWatchdogV2
+from modules.bot_config import BotConfig
 
 StateFn = Callable[[], Dict[str, Any] | Awaitable[Dict[str, Any]]]
 
@@ -110,14 +111,28 @@ class WebSocketExchangeWatchdog(BaseWatchdogV2):
         config: Optional[WebSocketWatchdogConfig] = None,
         notify_only: bool = True,
         verbose: bool = True,
+        bot_config: Optional[BotConfig] = None,
     ) -> None:
-        cfg = config or WebSocketWatchdogConfig()
+        bot_cfg = bot_config or BotConfig.from_env()
+        if bot_config is None:
+            self.record_fallback("bot_config")
+        th = WsThresholds(
+            stale_warn_ms=bot_cfg.wd.ws_public_stale_warn_ms,
+            stale_crit_ms=bot_cfg.wd.ws_public_stale_crit_ms,
+            hb_gap_warn_s=bot_cfg.wd.ws_public_hb_gap_warn_s,
+            hb_gap_crit_s=bot_cfg.wd.ws_public_hb_gap_crit_s,
+            resub_warn_per_min=bot_cfg.wd.ws_public_resub_warn_per_min,
+            resub_crit_per_min=bot_cfg.wd.ws_public_resub_crit_per_min,
+            escalate_after_cycles=bot_cfg.wd.ws_public_escalate_after_cycles,
+        )
+        cfg = config or WebSocketWatchdogConfig(check_interval=bot_cfg.wd.ws_public_interval_s, thresholds=th)
         applied = cfg.tuning.apply(cfg.thresholds)
         super().__init__(
             name=name,
             check_interval=cfg.check_interval,
             restart_cooldown_s=30.0,
             max_restarts_per_min=3,
+            event_cooldown_s=bot_cfg.wd.cooldown_s,
             verbose=verbose,
             notify_only=notify_only,
         )
@@ -128,96 +143,16 @@ class WebSocketExchangeWatchdog(BaseWatchdogV2):
 
     # -------------- core check --------------
     async def _check_once(self) -> None:
-        state = await self._get_state()
-        now = float(state.get("now_ts", time.time()))
-        ex_map: Dict[str, Any] = state.get("exchanges", {}) or {}
-
-        if not ex_map:
-            self.emit_event(type="health", level="WARN", message="ws_state_empty", reason="no_exchanges")
-            return
-
-        any_warn = False
-        any_crit = False
-        stale_any_exchange = False
-
-        for ex, info in ex_map.items():
-            streams = (info or {}).get("streams", {}) or {}
-            if not streams:
-                # Pas de streams : on avertit mais on n'escalade pas tout de suite
-                self.emit_event(type="health", level="WARN", message="no_streams", exchange=ex)
-                continue
-
-            # Seuils effectifs pour cet exchange
-            warn_ms, crit_ms = self._ms_thresholds_for_exchange(ex)
-
-            # Mesures
-            stale_pairs: Dict[str, float] = {}
-            max_age_ms = 0.0
-            for stream, meta in streams.items():
-                last_ts = float((meta or {}).get("last_msg_ts", 0.0))
-                if last_ts <= 0.0:
-                    continue
-                age_ms = max(0.0, (now - last_ts) * 1000.0)
-                max_age_ms = max(max_age_ms, age_ms)
-                if age_ms >= warn_ms:
-                    stale_pairs[stream] = age_ms
-
-            # Heartbeat & resub
-            hb_gap_s = float((info or {}).get("hb_gap_s", 0.0))
-            resub_rate = float((info or {}).get("resub_rate_per_min", 0.0))
-
-            # Évaluation par exchange
-            if stale_pairs or hb_gap_s >= self.th.hb_gap_warn_s or resub_rate >= self.th.resub_warn_per_min:
-                stale_any_exchange = stale_any_exchange or bool(stale_pairs)
-                level = "WARN"
-                reason = []
-                if stale_pairs:
-                    reason.append("stale_pairs")
-                if hb_gap_s >= self.th.hb_gap_warn_s:
-                    reason.append("hb_gap")
-                if resub_rate >= self.th.resub_warn_per_min:
-                    reason.append("resub_storm")
-                self.emit_event(
-                    type="health", level=level, message="ws_exchange_warn",
-                    exchange=ex, max_age_ms=int(max_age_ms),
-                    stale_pairs={k: int(v) for k, v in stale_pairs.items()},
-                    hb_gap_s=int(hb_gap_s), resub_per_min=int(resub_rate),
-                    thresholds={"warn_ms": warn_ms, "crit_ms": crit_ms,
-                                "hb_gap_warn_s": self.th.hb_gap_warn_s,
-                                "hb_gap_crit_s": self.th.hb_gap_crit_s,
-                                "resub_warn_per_min": self.th.resub_warn_per_min,
-                                "resub_crit_per_min": self.th.resub_crit_per_min},
-                    reasons=reason,
-                )
-                any_warn = True
-
-            # CRIT par exchange
-            if (max_age_ms >= crit_ms) or (hb_gap_s >= self.th.hb_gap_crit_s) or (resub_rate >= self.th.resub_crit_per_min):
-                self.emit_event(
-                    type="alert", level="CRIT", message="ws_exchange_crit",
-                    exchange=ex, max_age_ms=int(max_age_ms), hb_gap_s=int(hb_gap_s), resub_per_min=int(resub_rate),
-                    thresholds={"crit_ms": crit_ms, "hb_gap_crit_s": self.th.hb_gap_crit_s,
-                                "resub_crit_per_min": self.th.resub_crit_per_min},
-                    intent="request_full_restart",
-                )
-                any_crit = True
-
-        # Escalade globale si staleness persiste N cycles
-        if stale_any_exchange:
-            self._global_stale_cycles += 1
-        else:
-            self._global_stale_cycles = 0
-
-        if self._global_stale_cycles >= max(1, self.th.escalate_after_cycles):
-            self.emit_event(
-                type="alert", level="CRIT", message="ws_global_stale_persistent",
-                cycles=self._global_stale_cycles, intent="request_full_restart",
-            )
-            # On ne reset pas immédiatement pour laisser la coalescence anti-spam faire son travail
-
-        # Si tout est vert
-        if not any_warn and not any_crit and self._global_stale_cycles == 0:
-            self.emit_event(type="health", level="INFO", message="ws_ok")
+        snapshot = await self.collect_snapshot()
+        severity, reasons, details = self.evaluate(snapshot)
+        self.emit_health_event(
+            severity=severity,
+            reasons=reasons,
+            details=details,
+            component="WebSocketPublic",
+            module="WebSocketsClients",
+            observed_at_ms=snapshot.get("observed_at_ms"),
+        )
 
     # -------------- helpers --------------
     async def _get_state(self) -> Dict[str, Any]:
@@ -229,6 +164,100 @@ class WebSocketExchangeWatchdog(BaseWatchdogV2):
         except Exception as e:
             self.emit_event(type="error", level="ERROR", message=f"state_fn failed: {e}")
             return {}
+
+    async def collect_snapshot(self) -> Dict[str, Any]:
+        observed_at_ms = self.now_ts_ms()
+        missing: list[str] = []
+        errors: list[str] = []
+        state: Dict[str, Any] = {}
+        if self.state_fn:
+            state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
+        if not state:
+            missing.append("MISSING_FIELD:state_fn")
+        return {
+            "observed_at_ms": observed_at_ms,
+            "module_state": state or {},
+            "missing": missing,
+            "errors": errors,
+        }
+
+    def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        state = snapshot.get("module_state", {}) or {}
+        missing = list(snapshot.get("missing") or [])
+        reasons: list[str] = []
+        details: Dict[str, Any] = {}
+
+        now_ms = int(snapshot.get("observed_at_ms") or self.now_ts_ms())
+        ex_map = self.safe_get(state, "exchanges", default={}, missing=missing)
+        if not isinstance(ex_map, dict):
+            ex_map = {}
+        any_warn = False
+        any_crit = False
+        stale_any_exchange = False
+
+        if not ex_map:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing or ["MISSING_FIELD:exchanges"]
+
+        for ex, info in ex_map.items():
+            info = info or {}
+            streams = self.safe_get(info, "streams", default={}, missing=missing)
+            if not isinstance(streams, dict) or not streams:
+                any_warn = True
+                continue
+
+            warn_ms, crit_ms = self._ms_thresholds_for_exchange(ex)
+
+            max_age_ms = 0.0
+            for stream, meta in streams.items():
+                meta = meta or {}
+                last_ts_ms = self.safe_ts_ms(meta, "last_msg_ts", default=None, missing=missing)
+                if last_ts_ms is None:
+                    continue
+                age_ms = max(0.0, float(now_ms - last_ts_ms))
+                max_age_ms = max(max_age_ms, age_ms)
+                if age_ms >= warn_ms:
+                    stale_any_exchange = True
+                    any_warn = True
+                if age_ms >= crit_ms:
+                    reasons.append("PUBLIC_FEED_STALE")
+                    any_crit = True
+            hb_gap_s = self.safe_float(info, "hb_gap_s", default=0.0, missing=missing)
+            resub_rate = self.safe_float(info, "resub_rate_per_min", default=0.0, missing=missing)
+            details.setdefault("exchanges", {})[ex] = {
+                "max_age_ms": int(max_age_ms),
+                "hb_gap_s": hb_gap_s,
+                "resub_rate_per_min": resub_rate,
+            }
+
+            if hb_gap_s >= self.th.hb_gap_crit_s or resub_rate >= self.th.resub_crit_per_min:
+                reasons.append("PUBLIC_FEED_STALE")
+            elif hb_gap_s >= self.th.hb_gap_warn_s or resub_rate >= self.th.resub_warn_per_min:
+                any_warn = True
+
+        if stale_any_exchange:
+            self._global_stale_cycles += 1
+        else:
+            self._global_stale_cycles = 0
+
+        if self._global_stale_cycles >= max(1, self.th.escalate_after_cycles):
+            reasons.append("PUBLIC_FEED_STALE")
+            any_crit = True
+
+            # On ne reset pas immédiatement pour laisser la coalescence anti-spam faire son travail
+
+        if missing:
+            reasons.append("MISSING_FIELD")
+            details["missing_fields"] = missing
+
+        details["global_stale_cycles"] = self._global_stale_cycles
+
+        severity = "OK"
+        if any_crit or "PUBLIC_FEED_STALE" in reasons:
+            severity = "CRIT"
+        elif any_warn or reasons:
+            severity = "WARN"
+        return severity, reasons, details
 
     def _ms_thresholds_for_exchange(self, ex: str) -> Tuple[int, int]:
         ex = (ex or "").upper()

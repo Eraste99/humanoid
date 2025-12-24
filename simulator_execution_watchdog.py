@@ -161,6 +161,7 @@ class EngineWatchdogConfig:
             reasons=reasons,
             details=details,
             component="Engine",
+            module="ExecutionEngine",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
 
@@ -190,7 +191,7 @@ class EngineWatchdogConfig:
             state = await self.safe_call(getattr(self.engine, "get_status", None), default={}, errors=errors,
                                          error_label="engine.get_status")
         if not state:
-            missing.append("get_status")
+            missing.append("MISSING_FIELD:get_status")
         return {
             "observed_at_ms": observed_at_ms,
             "module_state": state or {},
@@ -203,19 +204,23 @@ class EngineWatchdogConfig:
         reasons: list[str] = []
         details: Dict[str, Any] = {}
         missing = list(snapshot.get("missing") or [])
-        g = state.get("global", {}) or {}
-        exmap = state.get("exchanges", {}) or {}
+        g = self.safe_get(state, "global", default={}, missing=missing)
+        exmap = self.safe_get(state, "exchanges", default={}, missing=missing)
+        if not isinstance(g, dict):
+            g = {}
+        if not isinstance(exmap, dict):
+            exmap = {}
 
         any_warn = False
         any_crit = False
 
         if g:
-            g_sa = float(g.get("submit_to_ack_p95_ms", 0.0))
-            g_af = float(g.get("ack_to_fill_p95_ms", 0.0))
-            g_to = float(g.get("timeouts_per_min", 0.0))
-            g_rt = float(g.get("retries_per_min", 0.0))
-            g_ph = float(g.get("panic_hedge_per_min", 0.0))
-            g_qb = float(g.get("queuepos_blocked_per_min", 0.0))
+            g_sa = self.safe_float(g, "submit_to_ack_p95_ms", default=0.0, missing=missing)
+            g_af = self.safe_float(g, "ack_to_fill_p95_ms", default=0.0, missing=missing)
+            g_to = self.safe_float(g, "timeouts_per_min", default=0.0, missing=missing)
+            g_rt = self.safe_float(g, "retries_per_min", default=0.0, missing=missing)
+            g_ph = self.safe_float(g, "panic_hedge_per_min", default=0.0, missing=missing)
+            g_qb = self.safe_float(g, "queuepos_blocked_per_min", default=0.0, missing=missing)
             if g_sa >= self.th.submit_ack_crit_ms or g_af >= self.th.ack_fill_crit_ms:
                 reasons.append("ENGINE_BLOCKED")
                 any_crit = True
@@ -234,12 +239,13 @@ class EngineWatchdogConfig:
 
         for ex, info in exmap.items():
             lat = self._ex_thresholds(ex)
-            ack = float((info or {}).get("ack_p95_ms", 0.0))
-            fil = float((info or {}).get("fill_p95_ms", 0.0))
-            to = float((info or {}).get("timeouts_per_min", 0.0))
-            rt = float((info or {}).get("retries_per_min", 0.0))
-            ph = float((info or {}).get("panic_hedge_per_min", 0.0))
-            qb = float((info or {}).get("queuepos_blocked_per_min", 0.0))
+            info = info or {}
+            ack = self.safe_float(info, "ack_p95_ms", default=0.0, missing=missing)
+            fil = self.safe_float(info, "fill_p95_ms", default=0.0, missing=missing)
+            to = self.safe_float(info, "timeouts_per_min", default=0.0, missing=missing)
+            rt = self.safe_float(info, "retries_per_min", default=0.0, missing=missing)
+            ph = self.safe_float(info, "panic_hedge_per_min", default=0.0, missing=missing)
+            qb = self.safe_float(info, "queuepos_blocked_per_min", default=0.0, missing=missing)
             if ack >= lat.ack_crit_ms or fil >= lat.fill_crit_ms:
                 reasons.append("ENGINE_BLOCKED")
                 any_crit = True

@@ -33,7 +33,39 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional, NamedTuple
 try:
     from aiohttp import web, ClientSession, ClientTimeout
 except Exception as e:  # pragma: no cover
-    raise RuntimeError("aiohttp manquant: ajoutez-le à requirements-core.txt") from e
+    class _DummyJSONResponse:
+        def __init__(self, payload=None, status=200):
+            self.payload = payload
+            self.status = status
+
+
+    class _DummyWeb:
+        def __getattr__(self, name):
+            if name == "middleware":
+                return lambda fn: fn
+            if name == "json_response":
+                return lambda payload=None, status=200: _DummyJSONResponse(payload, status)
+            if name == "Request":
+                return object
+            if name == "Application":
+                return object
+            if name == "AppRunner":
+                return object
+            if name == "TCPSite":
+                return object
+            raise RuntimeError("aiohttp unavailable")
+
+    class _DummySession:
+        def __init__(self, *a, **k):
+            raise RuntimeError("aiohttp unavailable")
+
+    class _DummyTimeout:
+        def __init__(self, *a, **k):
+            raise RuntimeError("aiohttp unavailable")
+
+    web, ClientSession, ClientTimeout = _DummyWeb(), _DummySession, _DummyTimeout
+    # Metrics disabled log once
+    print("[rpc_gateway] aiohttp unavailable, falling back to dummy stubs")
 
 from modules.bot_config import BotConfig
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
@@ -174,7 +206,13 @@ class RPCSettings:
         host = getattr(cfg, "rpc_host", default_host)
         port = getattr_int(cfg, "rpc_port", default_port)
         region = getattr(cfg, "region", default_region)  # label métrique
+        timeout_ms = getattr_int(cfg, "rpc_timeout_ms", 0) or None
         timeout_s = getattr_float(cfg, "rpc_timeout_s", 2.0)
+        if timeout_ms is not None:
+            try:
+                timeout_s = max(timeout_s, float(timeout_ms) / 1000.0)
+            except Exception:
+                pass
         max_retries = int(min(getattr(cfg, "rpc_max_retries", 2), 2))
         mtls_enabled = getattr_bool(cfg, "rpc_mtls_enabled", True)
         ca_cert = getattr(cfg, "rpc_ca_cert", None)
@@ -594,13 +632,13 @@ class RPCClient:
         client = RPCClient(cfg, region="US")
         await client.call("submit_bundle", body={...})
     """
-    def __init__(self, cfg: BotConfig, region: str):
+    def __init__(self, cfg: BotConfig, region: str, base_url: Optional[str] = None):
         self.cfg = cfg
         self.settings = RPCSettings.from_cfg(cfg, default_region=region)
         self._ssl_ctx = _make_client_ssl(self.settings)
         self._session: Optional[ClientSession] = None
         # endpoint distant (ex: cfg.engine_pod_map["US"])
-        self._base_url = getattr(cfg, "rpc_remote_base_url", "https://engine-us:8443")
+        self._base_url = base_url or getattr(cfg, "rpc_remote_base_url", "https://engine-us:8443")
 
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
@@ -695,3 +733,62 @@ class RPCClient:
         # expo backoff (100ms * 2^attempts) + jitter [0..100ms], borné à 600ms
         base = min(0.1 * (2 ** attempts), 0.6)
         return base + random.random() * 0.1
+
+# ---------- Execution Submitters (canonique) ----------
+
+
+class ExecutionSubmitter:
+    async def submit_bundle(self, payload: dict) -> dict:  # pragma: no cover - interface
+        raise NotImplementedError
+
+
+class InprocSubmitter(ExecutionSubmitter):
+    """Loopback ultra-rapide: appelle le handler canonique sans HTTP."""
+
+    def __init__(self, rpc_server: RPCServer):
+        self.rpc_server = rpc_server
+
+    async def submit_bundle(self, payload: dict) -> dict:
+        body = self.rpc_server._validate_submit_payload(payload)
+        return await self.rpc_server.submit_bundle(body)
+
+
+class RpcSubmitter(ExecutionSubmitter):
+    """Soumission via RPC réseau standard."""
+
+    def __init__(self, rpc_client: RPCClient):
+        self.rpc_client = rpc_client
+
+    async def submit_bundle(self, payload: dict) -> dict:
+        validated = validate_submit_bundle_lite(payload)
+        data = validated.model_dump() if hasattr(validated, "model_dump") else validated.dict(exclude_none=False)
+        idem = data.get("meta", {}).get("idempotency_key") or data.get("idempotency_key")
+        return await self.rpc_client.call("submit_bundle", body=data, idempotency_key=idem)
+
+
+def make_submitter_for_exchange(
+        cfg: BotConfig,
+        exchange: str,
+        *,
+        local_region: Optional[str] = None,
+        exchange_region_map: Optional[Dict[str, str]] = None,
+        engine_pod_map: Optional[Dict[str, str]] = None,
+        rpc_server: Optional[RPCServer] = None,
+        rpc_client_factory: Callable[[str, str], RPCClient] | None = None,
+) -> ExecutionSubmitter:
+    ex = str(exchange or "").upper()
+    region_map = {k.upper(): str(v).upper() for k, v in (exchange_region_map or {}).items()}
+    target_region = region_map.get(ex, str(local_region or "EU").upper())
+    loopback = bool(getattr(getattr(cfg, "rpc", object()), "loopback_inproc", True))
+    if target_region == str(local_region or "EU").upper() and loopback:
+        if rpc_server is None:
+            raise ValueError("RPC server required for inproc submitter")
+        return InprocSubmitter(rpc_server)
+
+    pod_map = {k.upper(): v for k, v in (engine_pod_map or {}).items()}
+    base_url = pod_map.get(target_region)
+    if not base_url:
+        raise ValueError(f"Missing engine_pod_map endpoint for region {target_region}")
+    factory = rpc_client_factory or (lambda region, url: RPCClient(cfg, region=region, base_url=url))
+    client = factory(target_region, base_url)
+    return RpcSubmitter(client)

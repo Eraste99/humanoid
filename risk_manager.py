@@ -4723,7 +4723,25 @@ class RiskManager:
 
         # 4) Passage au moteur
         try:
-            accepted = self.engine.execute_bundle(bundle)
+            accepted = None
+            submitter = None
+            try:
+                ex_key = str(route.get("buy_ex") or route.get("sell_ex") or meta.get("exchange") or "").upper()
+            except Exception:
+                ex_key = ""
+            if hasattr(self, "exec_submitters"):
+                submitter = (self.exec_submitters or {}).get(ex_key)
+            if submitter is not None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        accepted = loop.run_until_complete(submitter.submit_bundle(bundle))  # type: ignore
+                    else:
+                        accepted = loop.run_until_complete(submitter.submit_bundle(bundle))  # type: ignore
+                except Exception:
+                    accepted = None
+            if accepted is None:
+                accepted = self.engine.execute_bundle(bundle)
         except EngineSubmitError as exc:
             reason = str(getattr(exc, "reason", None) or str(exc))
             try:
@@ -5757,6 +5775,12 @@ class RiskManager:
         except Exception as exc:
             logger.exception("[RiskManager] set_engine failed")
             self._emit_private_plane_event("set_engine_failed", error=str(exc))
+
+    def set_exec_submitters(self, submitters: Dict[str, Any]) -> None:
+        try:
+            self.exec_submitters = {str(k).upper(): v for k, v in (submitters or {}).items()}
+        except Exception:
+            self.exec_submitters = {}
 
     def _wire_reconciler_engine_hooks(self) -> None:
         """
@@ -14283,24 +14307,37 @@ class RiskManager:
         # Fragmentation suggérée par le Simulateur (industry-grade)
 
         frag_meta = None
-        sim_cnt: Optional[int] = None
-        sim_avg: Optional[float] = None
         simulator = getattr(self, "simulator", None)
-        if simulator and hasattr(simulator, "suggest_slices"):
+        sim_cfg = getattr(getattr(self, "bot_cfg", None), "sim", None)
+        sim_mode = str(getattr(sim_cfg, "simulator_mode", "ON")).upper()
+        sim_wait_ms = int(getattr(sim_cfg, "sim_max_wait_ms_rm", 3) or 3)
+        sim_bypass_live = bool(getattr(sim_cfg, "simulator_bypass_allowed_in_live", False))
+        sim_plan = None
+        sim_plan_age_ms = None
+        sim_key = None
+        if simulator and hasattr(simulator, "make_plan_key_from_payload"):
             try:
-                plan = simulator.suggest_slices(
-                    pair=pair,
-                    notional_usdc=float(notional["amount"]),
-                    volatility_hint=getattr(self, "volatility_hint_for_pair", lambda p: None)(pair),
-                    min_fragment_usdc=getattr(self, "min_fragment_usdc", 200),
-                    frontload_weights=getattr(self, "frontload_weights", [0.50, 0.35, 0.15]),
-                    frontload_group_size=int(getattr(self, "frontload_group_size", 3) or 3),
-                )
-                sim_cnt = int(plan.get("count", 1)) if plan else None
-                sim_avg = float(plan.get("fragment_usdc", 0.0)) if plan else None
+                sim_key = simulator.make_plan_key_from_payload(opp, strategy)
+                if sim_key:
+                    sim_plan = simulator.peek_plan(sim_key)
+                    if sim_plan is None and hasattr(simulator, "wait_plan"):
+                        try:
+                            loop = asyncio.get_event_loop()
+                            if loop.is_running():
+                                fut = asyncio.run_coroutine_threadsafe(simulator.wait_plan(sim_key, sim_wait_ms), loop)
+                                sim_plan = fut.result(timeout=max(0.001, sim_wait_ms / 1000.0))
+                            else:
+                                sim_plan = loop.run_until_complete(simulator.wait_plan(sim_key, sim_wait_ms))
+                        except Exception:
+                            sim_plan = None
+                    if sim_plan:
+                        try:
+                            sim_plan_age_ms = simulator.plan_age_ms(sim_key)
+                        except Exception:
+                            sim_plan_age_ms = None
             except Exception:
-                sim_cnt = None
-                sim_avg = None
+
+                sim_plan = None
         quote_ccy = str((notional or {}).get("ccy") or "USDC").upper()
         min_frag_map = getattr(self, "min_fragment_quote", {}) or {}
         eff_min_frag = float(min_frag_map.get(quote_ccy, getattr(self, "min_fragment_usdc", 200.0)))
@@ -14311,26 +14348,20 @@ class RiskManager:
 
         frag_plan = None
         if strategy in {"TT", "TM", "REB"}:
-            desired = sim_cnt
-            avg_hint = sim_avg
-            if strategy == "TM" or strategy == "REB":
-                if total < (2 * eff_min_frag):
-                    desired = 1
-            try:
-                frag_plan = self.plan_fragments(
-                    pair_key=pk,
-                    buy_ex=buy_ex,
-                    sell_ex=sell_ex,
-                    total_usdc=total,
-                    strategy=strategy,
-                    regime=regime,
-                    desired_count=desired,
-                    avg_fragment_usdc=avg_hint,
-                    source="SIM" if sim_cnt or sim_avg else "STATIC",
-                )
-            except Exception:
-                frag_plan = None
-
+            frag_plan = sim_plan
+            if frag_plan is None:
+                if sim_mode == "ON":
+                    _record_reason("SIM_CACHE_MISS")
+                    try:
+                        inc_rm_reject(reason="SIM_CACHE_MISS", pair=pair)
+                    except Exception:
+                        pass
+                    return decision_ctx
+                if sim_mode == "BYPASS_SAFE":
+                    if self.live and not sim_bypass_live:
+                        _record_reason("SIM_CACHE_MISS")
+                        return decision_ctx
+                    decision_ctx["simulator_bypassed"] = True
         if frag_plan and (frag_plan.get("amounts") or []):
             amounts = frag_plan.get("amounts", [])
             groups = frag_plan.get("groups", []) or ["G1"]

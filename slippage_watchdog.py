@@ -99,6 +99,7 @@ class SlippageWatchdogConfig:
             reasons=reasons,
             details=details,
             component="Slippage",
+            module="SlippageHandler",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
     # ---- helpers ----
@@ -128,7 +129,7 @@ class SlippageWatchdogConfig:
         if self.state_fn:
             state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
         if not state:
-            missing.append("state_fn")
+            missing.append("MISSING_FIELD:state_fn")
         return {
             "observed_at_ms": observed_at_ms,
             "module_state": state or {},
@@ -137,20 +138,27 @@ class SlippageWatchdogConfig:
         }
 
     def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        missing = list(snapshot.get("missing") or [])
         s = snapshot.get("module_state", {}) or {}
-        g = s.get("global", {}) or {}
-        exmap = s.get("exchanges", {}) or {}
-        pairs = s.get("pairs", {}) or {}
+        g = self.safe_get(s, "global", default={}, missing=missing)
+        exmap = self.safe_get(s, "exchanges", default={}, missing=missing)
+        pairs = self.safe_get(s, "pairs", default={}, missing=missing)
+        if not isinstance(g, dict):
+            g = {}
+        if not isinstance(exmap, dict):
+            exmap = {}
+        if not isinstance(pairs, dict):
+            pairs = {}
         reasons: list[str] = []
         details: Dict[str, Any] = {}
-        missing = list(snapshot.get("missing") or [])
+
 
         any_warn = False
         any_crit = False
 
-        g_age = float(g.get("age_s", 0.0))
-        g_p95 = abs(float(g.get("p95_bps", 0.0)))
-        g_p99 = abs(float(g.get("p99_bps", 0.0)))
+        g_age = self.safe_float(g, "age_s", default=0.0, missing=missing)
+        g_p95 = abs(self.safe_float(g, "p95_bps", default=0.0, missing=missing))
+        g_p99 = abs(self.safe_float(g, "p99_bps", default=0.0, missing=missing))
         if g_age >= self.th.age_crit_s or g_p99 >= self.th.p99_crit_bps:
             reasons.append("WD_STALE")
             any_crit = True
@@ -158,9 +166,11 @@ class SlippageWatchdogConfig:
             any_warn = True
 
         for ex, m in exmap.items():
-            age = float((m or {}).get("age_s", 0.0))
-            p95 = abs(float((m or {}).get("p95_bps", 0.0)))
-            p99 = abs(float((m or {}).get("p99_bps", 0.0)))
+            m = m or {}
+            age = self.safe_float(m, "age_s", default=0.0, missing=missing)
+            p95 = abs(self.safe_float(m, "p95_bps", default=0.0, missing=missing))
+            p99 = abs(self.safe_float(m, "p99_bps", default=0.0, missing=missing))
+
             w, c = self._caps_for_exchange(ex)
             if age >= self.th.age_crit_s or p99 >= c:
                 reasons.append("WD_STALE")
@@ -169,9 +179,10 @@ class SlippageWatchdogConfig:
                 any_warn = True
 
         for key, m in pairs.items():
-            age = float((m or {}).get("age_s", 0.0))
-            p95 = abs(float((m or {}).get("p95_bps", 0.0)))
-            p99 = abs(float((m or {}).get("p99_bps", 0.0)))
+            m = m or {}
+            age = self.safe_float(m, "age_s", default=0.0, missing=missing)
+            p95 = abs(self.safe_float(m, "p95_bps", default=0.0, missing=missing))
+            p99 = abs(self.safe_float(m, "p99_bps", default=0.0, missing=missing))
             w, c = self._caps_for_pair(key)
             if age >= self.th.age_crit_s or p99 >= c:
                 reasons.append("WD_STALE")
@@ -199,7 +210,7 @@ class SlippageWatchdogConfig:
         elif any_warn or reasons:
             severity = "WARN"
         return severity, reasons, details
-    
+
     def get_status(self) -> Dict[str, Any]:
         s = super().get_status()
         s.update({

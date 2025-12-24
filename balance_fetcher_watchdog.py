@@ -98,6 +98,7 @@ class BalanceFetcherWatchdogV2(BaseWatchdogV2):
             reasons=reasons,
             details=details,
             component="BalanceFetcher",
+            module="BalanceFetcher",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
     # -------------- helpers --------------
@@ -124,7 +125,7 @@ class BalanceFetcherWatchdogV2(BaseWatchdogV2):
             error_label="fetcher.get_status",
         )
         if not status:
-            missing.append("get_status")
+            missing.append("MISSING_FIELD:get_status")
         self._last_status = status or {}
         return {
             "observed_at_ms": observed_at_ms,
@@ -154,7 +155,7 @@ class BalanceFetcherWatchdogV2(BaseWatchdogV2):
             if age_ms >= int(self.inactive_s * 1000):
                 reasons.append("BALANCE_STALE")
 
-        err_cnt = int(self.safe_get(status, "error_count", default=0, missing=missing) or 0)
+        err_cnt = self.safe_int(status, "error_count", default=0, missing=missing)
         delta_err = err_cnt - self._prev_errors
         if delta_err >= self.error_threshold:
             reasons.append("WD_LOOP_STOPPED")

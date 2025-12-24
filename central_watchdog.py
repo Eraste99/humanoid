@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from modules.bot_config import BotConfig
-
+from modules.obs_metrics import watchdog_restart_intent_total
 # AlertDispatcher global (M5-B3) — best-effort
 try:
     from modules.observability_pacer import ALERT_DISPATCHER
@@ -359,6 +359,7 @@ class CentralWatchdog:
         self._restarts_window: List[float] = []  # timestamps des derniers restarts
         self._pending_corr: Optional[str] = None
         self._pending_since: float = 0.0
+        self._last_restart_intent_ts: float = 0.0
 
         # état chemin critique
         self._block_since: Optional[float] = None
@@ -377,6 +378,9 @@ class CentralWatchdog:
         self._pnl_unhealthy_since: Optional[float] = None
         self._health_snapshots: Dict[str, Dict[str, Any]] = {}
         self._reason_state: Dict[str, Dict[str, Any]] = {}
+        self._children: List[Any] = []
+        self._snapshot_state: Dict[str, Dict[str, Any]] = {}
+        self._snapshot_dedup_drops: int = 0
         cfg = bot_config or BotConfig.from_env()
         if bot_config is None:
             try:
@@ -384,7 +388,7 @@ class CentralWatchdog:
             except Exception:
                 pass
         self._wd_cooldown_s = float(cfg.wd.cooldown_s)
-        self._wd_persistence_s = float(cfg.wd.persistence_s)
+        self._wd_persistence_cycles = int(getattr(cfg.wd, "persistence_cycles", 3) or 3)
         self._wd_interval_s = float(cfg.wd.interval_s)
 
 
@@ -430,6 +434,15 @@ class CentralWatchdog:
         # Purement informatif; l'abonnement réel se fait côté enfant: child.register_event_sink(cw.on_child_event)
         self._child_names.append(name)
 
+    def register_child(self, child: Any) -> None:
+        if child is None:
+            return
+        self._children.append(child)
+        try:
+            name = getattr(child, "name", None) or getattr(child, "__class__", type("x", (), {})).__name__
+        except Exception:
+            name = "child"
+        self.register_child_name(str(name))
     # ----- boucle interne -----
 
     def start(self) -> None:
@@ -506,10 +519,32 @@ class CentralWatchdog:
                 e[k] = kwargs[k]
         self._q.put(e)
 
+    def _poll_children(self) -> None:
+        if not self._children:
+            return
+        for child in list(self._children):
+            try:
+                snapshot_fn = getattr(child, "get_health_snapshot", None)
+                if not callable(snapshot_fn):
+                    continue
+                snap = snapshot_fn()
+                if isinstance(snap, dict):
+                    event: Event = {
+                        "ts": now_ts(),
+                        "watchdog": snap.get("watchdog") or getattr(child, "name", "child"),
+                        "type": "child::health_snapshot",
+                        "level": str(snap.get("severity") or "INFO").upper(),
+                        "message": "child_health_snapshot",
+                        "data": dict(snap),
+                    }
+                    self._q.put(event)
+            except Exception:
+                continue
     # ----- loop interne -----
 
     def _loop(self) -> None:
         last_reminder = 0.0
+        last_poll = 0.0
         while not self._stop.is_set():
             try:
                 e = self._q.get(timeout=0.2)
@@ -517,6 +552,10 @@ class CentralWatchdog:
                 e = None
             if e:
                 self._handle_event(e)
+            now = now_ts()
+            if (now - last_poll) >= max(0.2, self._wd_interval_s):
+                last_poll = now
+                self._poll_children()
             # rappels CRIT persistants
             if self._pending_corr and (now_ts() - last_reminder) >= self.cfg.reminder_every_s:
                 last_reminder = now_ts()
@@ -526,6 +565,7 @@ class CentralWatchdog:
             while True:
                 e = self._q.get_nowait()
                 self._handle_event(e)
+
         except queue.Empty:
             pass
 
@@ -565,9 +605,9 @@ class CentralWatchdog:
         # Politique gouvernance: détecter intents / CRIT persistants / chemin critique
         self._update_critical_path(e)
 
-        if e.get("intent") == "request_full_restart" or (lvl == "CRIT" and self._crit_persistent()):
+        if e.get("intent") == "request_full_restart":
             reason = self._derive_reason(e)
-            self._propose_full_restart(reason)
+            self._emit_restart_intent(reason)
 
         # Mise à jour status enfants (optionnel: si les enfants émettent un status event)
         if str(t).endswith("::status") and e.get("data", {}).get("component"):
@@ -677,6 +717,32 @@ class CentralWatchdog:
         data = e.get("data", {}) or {}
         return bool(data.get("reasons")) or str(e.get("type", "")).endswith("health_snapshot")
 
+    def _snapshot_hash(self, snapshot: Dict[str, Any]) -> str:
+        try:
+            payload = {
+                "watchdog": snapshot.get("watchdog"),
+                "module": snapshot.get("module"),
+                "severity": snapshot.get("severity"),
+                "reasons": snapshot.get("reasons"),
+                "details": snapshot.get("details"),
+            }
+            return json.dumps(payload, sort_keys=True, default=str)
+        except Exception:
+            return str(snapshot)
+
+    def _snapshot_dedup(self, watchdog: str, snapshot: Dict[str, Any]) -> bool:
+        now_ms = int(now_ts() * 1000)
+        snap_hash = self._snapshot_hash(snapshot)
+        with self._lock:
+            state = self._snapshot_state.get(watchdog, {})
+            last_hash = state.get("hash")
+            last_ts = int(state.get("ts_ms") or 0)
+            if snap_hash == last_hash and (now_ms - last_ts) < int(self._wd_cooldown_s * 1000):
+                self._snapshot_dedup_drops += 1
+                return True
+            self._snapshot_state[watchdog] = {"hash": snap_hash, "ts_ms": now_ms}
+        return False
+
     def _record_child_health(self, e: Event) -> bool:
         data = e.get("data", {}) or {}
         reasons = data.get("reasons") or []
@@ -691,6 +757,8 @@ class CentralWatchdog:
         shard = data.get("shard")
         now_ms = int((e.get("ts") or now_ts()) * 1000)
         observed_at_ms = int(data.get("observed_at_ms") or now_ms)
+        if self._snapshot_dedup(watchdog, data):
+            return True
 
         with self._lock:
             self._health_snapshots[watchdog] = {
@@ -723,10 +791,15 @@ class CentralWatchdog:
                         "last_seen_ms": observed_at_ms,
                         "occurrences": 0,
                         "cooldown_until_ms": 0,
+                        "crit_cycles": 0,
                     }
                 entry["occurrences"] = int(entry.get("occurrences", 0)) + 1
                 entry["last_seen_ms"] = observed_at_ms
                 entry["severity"] = severity
+                if severity == "CRIT":
+                    entry["crit_cycles"] = int(entry.get("crit_cycles", 0)) + 1
+                else:
+                    entry["crit_cycles"] = 0
                 if observed_at_ms - int(entry.get("first_seen_ms") or observed_at_ms) < 0:
                     entry["first_seen_ms"] = observed_at_ms
                 cooldown_until = int(entry.get("cooldown_until_ms") or 0)
@@ -737,17 +810,16 @@ class CentralWatchdog:
                 self._reason_state[key] = entry
 
         if severity == "CRIT" and self._crit_persistent_by_reason():
-            self._propose_full_restart(self._derive_reason(e))
+            self._emit_restart_intent(self._derive_reason(e))
         return suppress_emit
 
     def _crit_persistent_by_reason(self) -> bool:
-        now_ms = int(now_ts() * 1000)
+
         with self._lock:
             for entry in self._reason_state.values():
                 if str(entry.get("severity")).upper() != "CRIT":
                     continue
-                first_seen = int(entry.get("first_seen_ms") or now_ms)
-                if (now_ms - first_seen) >= int(self._wd_persistence_s * 1000):
+                if int(entry.get("crit_cycles", 0)) >= max(1, self._wd_persistence_cycles):
                     return True
         return False
     def _update_pnl_pipeline_health(self, e: Event) -> None:
@@ -830,14 +902,15 @@ class CentralWatchdog:
         msg = e.get("message", "degradation")
         return f"{comp}: {msg}"
 
-    def _propose_full_restart(self, reason: str) -> None:
-        # si déjà en attente, ne pas reproposer
-        if self._pending_corr:
+    def _emit_restart_intent(self, reason: str) -> None:
+        now = now_ts()
+        if (now - self._last_restart_intent_ts) < max(0.0, float(self._wd_cooldown_s)):
             return
+        self._last_restart_intent_ts = now
         corr = str(uuid.uuid4())
         self._pending_corr = corr
-        self._pending_since = now_ts()
-        # CW publie la demande (notify-only)
+        self._pending_since = now
+        watchdog_restart_intent_total(reason)
         self.emit_event(
             type="cw::policy",
             level="CRIT",
@@ -846,50 +919,15 @@ class CentralWatchdog:
             intent="request_full_restart",
             correlation_id=corr,
         )
-        # Mode de gouvernance
-        mode = self._mode
-        if mode == "AUTO":
-            self._auto_evaluate_and_maybe_approve(corr, reason)
-        elif mode == "HYBRID":
-            if not self._auto_evaluate_and_maybe_approve(corr, reason):
-                # reste en attente pour ACK manuel
-                pass
-        # sinon MANUAL → attend ACK via Telegram/externe
+
+    def _propose_full_restart(self, reason: str) -> None:
+        self._emit_restart_intent(reason)
 
     def _auto_evaluate_and_maybe_approve(self, corr: str, reason: str) -> bool:
-        # Portes AUTO
-        if not self._crit_persistent():
-            return False
-        if not self._block_persistent():
-            return False
-        if now_ts() < self._cooldown_until:
-            return False
-        if now_ts() < self._restart_lock_until:
-            return False
-        # fenêtre restarts/heure
-        self._restarts_window = [t for t in self._restarts_window if now_ts() - t < 3600]
-        if len(self._restarts_window) >= self.cfg.auto.max_restarts_per_hour:
-            return False
-        # orchestrateur prêt ?
-        if not self._orchestrator.available():
-            return False
-        # Approuver
-        self.emit_event(
-            type="cw::policy",
-            level="WARN",
-            message="full_restart_approved",
-            data={"by": "CW-auto"},
-            correlation_id=corr,
-        )
-        self._execute_restart(corr, reason, requested_by="CW-auto")
-        return True
+        return False
 
     def approve_restart(self, correlation_id: str, by: str = "operator") -> None:
-        # Validation basique: doit correspondre au pending en cours
-        if not self._pending_corr or correlation_id != self._pending_corr:
-            # rien à faire
-            return
-        # Cooldown/lock vérifiés côté exécution
+
         self.emit_event(
             type="cw::policy",
             level="WARN",
@@ -897,52 +935,6 @@ class CentralWatchdog:
             data={"by": by},
             correlation_id=correlation_id,
         )
-        self._execute_restart(correlation_id, f"approved by {by}", requested_by=by)
-
-    def _execute_restart(self, corr: str, reason: str, requested_by: str) -> None:
-        # Locks/cooldown
-        if now_ts() < self._restart_lock_until or now_ts() < self._cooldown_until:
-            self.emit_event(
-                type="cw::policy",
-                level="INFO",
-                message="restart_throttled",
-                data={"cooldown_until": int(self._cooldown_until), "lock_until": int(self._restart_lock_until)},
-                correlation_id=corr,
-            )
-            return
-        # verrou & cooldown immédiats
-        self._restart_lock_until = now_ts() + self.cfg.auto.lock_ttl_s
-        self._cooldown_until = now_ts() + self.cfg.auto.cooldown_s
-
-        ok, exec_id = self._orchestrator.post_restart(
-            service=self.service_name,
-            reason=reason,
-            correlation_id=corr,
-            requested_by=requested_by,
-        )
-        if ok:
-            self._restarts_window.append(now_ts())
-            self.emit_event(
-                type="cw::policy",
-                level="INFO",
-                message="full_restart_executed",
-                data={"exec_id": exec_id, "cooldown_s": self.cfg.auto.cooldown_s},
-                correlation_id=corr,
-            )
-            # reset états
-            self._pending_corr = None
-            self._pending_since = 0.0
-            self._block_since = None
-            self._last_crit_since = None
-        else:
-            # Orchestrateur indisponible → retombe MANUEL
-            self.emit_event(
-                type="cw::policy",
-                level="ERROR",
-                message="orchestrator_unavailable",
-                data={},
-                correlation_id=corr,
-            )
 
     def _remind_pending(self) -> None:
         if not self._pending_corr:
@@ -969,6 +961,7 @@ class CentralWatchdog:
             "last_crit_since": int(self._last_crit_since or 0),
             "sent_count": self._sent_count,
             "dropped_count": self._dropped_count,
+            "snapshot_dedup_drops": self._snapshot_dedup_drops,
             "retry_count": self._retry_count,
             "children": children,
             "history_tail": self._history[-10:],  # petit tail pour debug

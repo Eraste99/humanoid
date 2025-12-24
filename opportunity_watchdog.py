@@ -144,6 +144,7 @@ class OpportunityWatchdog(BaseWatchdogV2):
             reasons=reasons,
             details=details,
             component="OpportunityScanner",
+            module="OpportunityScanner",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
 
@@ -166,7 +167,7 @@ class OpportunityWatchdog(BaseWatchdogV2):
         if self.state_fn:
             state = await self.safe_call(self.state_fn, default={}, errors=errors, error_label="state_fn")
         if not state:
-            missing.append("state_fn")
+            missing.append("MISSING_FIELD:state_fn")
         return {
             "observed_at_ms": observed_at_ms,
             "module_state": state or {},
@@ -175,22 +176,35 @@ class OpportunityWatchdog(BaseWatchdogV2):
         }
 
     def evaluate(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
+        missing = list(snapshot.get("missing") or [])
         s = snapshot.get("module_state", {}) or {}
-        load = s.get("load", {}) or {}
-        lat = s.get("latency", {}) or {}
-        emi = s.get("emissions", {}) or {}
-        bkl = s.get("backlog", {}) or {}
-        hnt = s.get("hints", {}) or {}
-        err = s.get("errors", {}) or {}
+        load = self.safe_get(s, "load", default={}, missing=missing)
+        lat = self.safe_get(s, "latency", default={}, missing=missing)
+        emi = self.safe_get(s, "emissions", default={}, missing=missing)
+        bkl = self.safe_get(s, "backlog", default={}, missing=missing)
+        hnt = self.safe_get(s, "hints", default={}, missing=missing)
+        err = self.safe_get(s, "errors", default={}, missing=missing)
+        if not isinstance(load, dict):
+            load = {}
+        if not isinstance(lat, dict):
+            lat = {}
+        if not isinstance(emi, dict):
+            emi = {}
+        if not isinstance(bkl, dict):
+            bkl = {}
+        if not isinstance(hnt, dict):
+            hnt = {}
+        if not isinstance(err, dict):
+            err = {}
         reasons: list[str] = []
         details: Dict[str, Any] = {}
-        missing = list(snapshot.get("missing") or [])
+
 
         any_warn = False
         any_crit = False
 
-        tgt = float(load.get("target_hz", 0.0))
-        eff = float(load.get("effective_hz", 0.0))
+        tgt = self.safe_float(load, "target_hz", default=0.0, missing=missing)
+        eff = self.safe_float(load, "effective_hz", default=0.0, missing=missing)
         ratio = (eff / tgt) if tgt > 0 else 1.0
         if tgt > 0:
             if ratio <= self.th.effective_ratio_crit:
@@ -199,10 +213,10 @@ class OpportunityWatchdog(BaseWatchdogV2):
             elif ratio <= self.th.effective_ratio_warn:
                 any_warn = True
         else:
-            missing.append("target_hz")
+            missing.append("MISSING_FIELD:target_hz")
 
-        d95 = float(lat.get("decision_p95_ms", 0.0))
-        e95 = float(lat.get("emit_p95_ms", 0.0))
+        d95 = self.safe_float(lat, "decision_p95_ms", default=0.0, missing=missing)
+        e95 = self.safe_float(lat, "emit_p95_ms", default=0.0, missing=missing)
         if d95 >= self.th.decision_p95_crit_ms or e95 >= self.th.emit_p95_crit_ms:
             reasons.append("WD_LOOP_STOPPED")
             any_crit = True
@@ -210,8 +224,9 @@ class OpportunityWatchdog(BaseWatchdogV2):
             any_warn = True
 
         for tier, meta in bkl.items():
-            d = int((meta or {}).get("depth", 0))
-            m = int((meta or {}).get("max", 0) or 1)
+            meta = meta or {}
+            d = self.safe_int(meta, "depth", default=0, missing=missing)
+            m = self.safe_int(meta, "max", default=1, missing=missing) or 1
             r = d / float(m)
             if r >= self.th.backlog_crit_ratio:
                 reasons.append("WD_QUEUE_BACKLOG")
@@ -219,9 +234,9 @@ class OpportunityWatchdog(BaseWatchdogV2):
             elif r >= self.th.backlog_warn_ratio:
                 any_warn = True
 
-        em = float(emi.get("emitted_per_min", 0.0))
-        rj = float(emi.get("rejected_per_min", 0.0))
-        dd = float(emi.get("dedup_hits_per_min", 0.0))
+        em = self.safe_float(emi, "emitted_per_min", default=0.0, missing=missing)
+        rj = self.safe_float(emi, "rejected_per_min", default=0.0, missing=missing)
+        dd = self.safe_float(emi, "dedup_hits_per_min", default=0.0, missing=missing)
         tot = em + rj
         rej_ratio = (rj / tot) if tot > 0 else 0.0
 
@@ -237,16 +252,16 @@ class OpportunityWatchdog(BaseWatchdogV2):
         elif rej_ratio >= self.th.rejection_ratio_warn and tot > 0:
             any_warn = True
 
-        slip_age = float(hnt.get("slip_age_s", 0.0))
-        vol_age = float(hnt.get("vol_age_s", 0.0))
-        fees_age = float(hnt.get("fees_age_s", 0.0))
+        slip_age = self.safe_float(hnt, "slip_age_s", default=0.0, missing=missing)
+        vol_age = self.safe_float(hnt, "vol_age_s", default=0.0, missing=missing)
+        fees_age = self.safe_float(hnt, "fees_age_s", default=0.0, missing=missing)
         if slip_age >= self.th.slip_age_crit_s or vol_age >= self.th.vol_age_crit_s or fees_age >= self.th.fees_age_crit_s:
             reasons.append("WD_STALE")
             any_crit = True
         elif slip_age >= self.th.slip_age_warn_s or vol_age >= self.th.vol_age_warn_s or fees_age >= self.th.fees_age_warn_s:
             any_warn = True
 
-        se = float(err.get("scanner_errors_per_min", 0.0))
+        se = self.safe_float(err, "scanner_errors_per_min", default=0.0, missing=missing)
         if se >= self.th.scanner_err_crit_per_min:
             reasons.append("WD_LOOP_STOPPED")
             any_crit = True

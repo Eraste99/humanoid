@@ -155,6 +155,7 @@ class PrivateWSHubWatchdog(BaseWatchdogV2):
             reasons=reasons,
             details=details,
             component="PrivateWS",
+            module="PrivateWS",
             observed_at_ms=snapshot.get("observed_at_ms"),
         )
 
@@ -190,7 +191,7 @@ class PrivateWSHubWatchdog(BaseWatchdogV2):
             state = await self.safe_call(getattr(self.hub, "get_status", None), default={}, errors=errors,
                                          error_label="hub.get_status")
         if not state:
-            missing.append("get_status")
+            missing.append("MISSING_FIELD:get_status")
         return {
             "observed_at_ms": observed_at_ms,
             "module_state": state or {},
@@ -203,35 +204,40 @@ class PrivateWSHubWatchdog(BaseWatchdogV2):
         missing = list(snapshot.get("missing") or [])
         reasons: list[str] = []
         details: Dict[str, Any] = {}
-        global_m = state.get("global", {}) or {}
-        streams = state.get("streams", {}) or {}
+        global_m = self.safe_get(state, "global", default={}, missing=missing)
+        streams = self.safe_get(state, "streams", default={}, missing=missing)
+        if not isinstance(global_m, dict):
+            global_m = {}
+        if not isinstance(streams, dict):
+            streams = {}
 
         any_warn = False
         any_crit = False
 
-        g_hb = float(global_m.get("hb_gap_s", 0.0))
-        g_ack = float(global_m.get("acks_p95_ms", 0.0))
-        g_fill = float(global_m.get("fills_p95_ms", 0.0))
-        g_429 = float(global_m.get("rate_429", 0.0))
+        g_hb = self.safe_float(global_m, "hb_gap_s", default=0.0, missing=missing)
+        g_ack = self.safe_float(global_m, "acks_p95_ms", default=0.0, missing=missing)
+        g_fill = self.safe_float(global_m, "fills_p95_ms", default=0.0, missing=missing)
+        g_429 = self.safe_float(global_m, "rate_429", default=0.0, missing=missing)
 
 
         if g_hb >= self.th.hb_crit_s or g_ack >= self.th.ack_crit_ms or g_fill >= self.th.fill_crit_ms or g_429 >= self.th.rate429_crit:
-            reasons.append("PRIVATE_WS_STALE")
-            any_crit = True
+                reasons.append("PRIVATE_WS_STALE")
+                any_crit = True
         elif g_hb >= self.th.hb_warn_s or g_ack >= self.th.ack_warn_ms or g_fill >= self.th.fill_warn_ms or g_429 >= self.th.rate429_warn:\
-                any_warn = True
+                    any_warn = True
 
 
         for key, info in streams.items():
             ex = (key.split(":", 1)[0] if ":" in key else key).upper()
-            hb = float((info or {}).get("hb_gap_s", 0.0))
-            ack = float((info or {}).get("acks_p95_ms", 0.0))
-            fill = float((info or {}).get("fills_p95_ms", 0.0))
-            qd = int((info or {}).get("queue_depth", 0))
-            qmax = int((info or {}).get("queue_max", 0) or 1)
+            info = info or {}
+            hb = self.safe_float(info, "hb_gap_s", default=0.0, missing=missing)
+            ack = self.safe_float(info, "acks_p95_ms", default=0.0, missing=missing)
+            fill = self.safe_float(info, "fills_p95_ms", default=0.0, missing=missing)
+            qd = self.safe_int(info, "queue_depth", default=0, missing=missing)
+            qmax = self.safe_int(info, "queue_max", default=1, missing=missing) or 1
             ratio = qd / float(qmax)
-            dedup = float((info or {}).get("dedup_hit_rate", 0.0))
-            r429 = float((info or {}).get("rate_429", 0.0))
+            dedup = self.safe_float(info, "dedup_hit_rate", default=0.0, missing=missing)
+            r429 = self.safe_float(info, "rate_429", default=0.0, missing=missing)
             ack_warn, ack_crit, fill_warn, fill_crit = self._per_exchange_ms(ex)
 
 

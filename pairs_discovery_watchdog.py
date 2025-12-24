@@ -110,6 +110,7 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
                 reasons=reasons,
                 details=details,
                 component="PairsDiscovery",
+                module="PairsDiscovery",
                 observed_at_ms=snapshot["observed_at_ms"],
             )
             return
@@ -137,6 +138,7 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
                 reasons=reasons,
                 details=details,
                 component="PairsDiscovery",
+                module="PairsDiscovery",
                 observed_at_ms=snapshot["observed_at_ms"],
             )
             return
@@ -191,6 +193,7 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
             reasons=reasons,
             details=details,
             component="PairsDiscovery",
+            module="PairsDiscovery",
             observed_at_ms=snapshot["observed_at_ms"],
         )
     # -------------- helpers --------------
@@ -252,16 +255,19 @@ class PairsDiscoveryWatchdog(BaseWatchdogV2):
     def _evaluate_snapshot(self, snapshot: Dict[str, Any]) -> Tuple[str, list[str], Dict[str, Any]]:
         reasons: list[str] = []
         details: Dict[str, Any] = {}
+        missing: list[str] = []
         now = time.time()
-        last = float(snapshot.get("last_discovery_ts") or 0.0)
+        last = self.safe_float(snapshot, "last_discovery_ts", default=0.0, missing=missing)
         if last <= 0:
             reasons.append("MISSING_FIELD")
-            details["missing_fields"] = ["last_discovery_ts"]
+            details["missing_fields"] = ["MISSING_FIELD:last_discovery_ts"]
         else:
             gap = now - last
             details["refresh_gap_s"] = gap
             if gap >= self.cfg.thresholds.max_refresh_gap_s:
                 reasons.append("WD_STALE")
+        if missing and "missing_fields" not in details:
+            details["missing_fields"] = missing
         severity = "OK"
         if "WD_STALE" in reasons:
             severity = "WARN"

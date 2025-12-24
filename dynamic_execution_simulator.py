@@ -113,6 +113,17 @@ class DynamicExecutionSimulator:
         self.last_restart_reason = None
         self.last_latency_ms: float = 0.0  # NEW: latence dernière simu (ms)
 
+        # --- cache + workers (priming) ---
+        self._plan_cache: Dict[tuple, Dict[str, Any]] = {}
+        self._plan_events: Dict[tuple, asyncio.Event] = {}
+        self._latest_job_by_key: Dict[tuple, Dict[str, Any]] = {}
+        self._mm_hints_cache: Dict[str, Dict[str, Any]] = {}
+        self._last_books_by_pair: Dict[str, Dict[str, Any]] = {}
+        self._jobs_queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: Optional[asyncio.Task] = None
+        self._mm_hints_task: Optional[asyncio.Task] = None
+        self._workers_started = False
+
     # ----------------- hooks RiskManager -----------------
     def set_event_sink(self, sink: Optional[Callable[[dict], None]]) -> None:
         self._event_sink = sink
@@ -1319,138 +1330,93 @@ class DynamicExecutionSimulator:
             # Calcule un score maker/taker + probabilité de fill/hedge
             return await self._simulate_tm(payload, extra_latency_s=cb_bonus)
 
-            # --- 2) Run en parallèle + annulation croisée -------------------------
-            tt = asyncio.create_task(_sim_tt())
-            tm = asyncio.create_task(_sim_tm())
-            done, pending = await asyncio.wait({tt, tm}, timeout=timeout_each, return_when=asyncio.ALL_COMPLETED)
+        # --- 2) Run en parallèle + annulation croisée -------------------------
+        tt = asyncio.create_task(_sim_tt())
+        tm = asyncio.create_task(_sim_tm())
+        done, pending = await asyncio.wait({tt, tm}, timeout=timeout_each, return_when=asyncio.ALL_COMPLETED)
 
-            # Annulation si timeout partiel
-            if pending:
-                for p in pending:
-                    p.cancel()
+        # Annulation si timeout partiel
+        if pending:
+            for p in pending:
+                p.cancel()
 
-            # --- 3) Agrégation des résultats -------------------------------------
-            # --- 3) Agrégation des résultats — STRICT, pas de fallback muet ---
+        # --- 3) Agrégation des résultats -------------------------------------
+        # --- 3) Agrégation des résultats — STRICT, pas de fallback muet ---
+        notional = {}
+        try:
+            notional = (payload.get("bundle") or {}).get("notional_quote") or {}
+        except Exception:
             notional = {}
-            try:
-                notional = (payload.get("bundle") or {}).get("notional_quote") or {}
-            except Exception:
-                notional = {}
-            notional_ccy = str(notional.get("ccy") or "")
-            notional_amount = float(notional.get("amount") or 0.0)
+        notional_ccy = str(notional.get("ccy") or "")
+        notional_amount = float(notional.get("amount") or 0.0)
 
-            def _extract(task, label: str):
-                # task annulée (timeout partiel) => TIMEOUT explicite
-                if task.cancelled():
-                    return {
-                        "ok": False, "reason": f"{label}_TIMEOUT",
-                        "dev_bps": float("inf"), "fills_ratio": 0.0,
-                        "lat_ms": timeout_each * 1000.0,
-                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
-                    }
-                try:
-                    r = task.result()
-                    # Certaines branches renvoient None (combo non autorisé, depth vide, budget=0)
-                    if not r:
-                        return {
-                            "ok": False, "reason": f"{label}_NONE_RESULT",
-                            "dev_bps": float("inf"), "fills_ratio": 0.0,
-                            "lat_ms": timeout_each * 1000.0,
-                            "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
-                        }
-                    # Normalisation champs attendus
-                    r.setdefault("ok", False)
-                    r.setdefault("dev_bps", float("inf"))
-                    r.setdefault("fills_ratio", 0.0)
-                    r.setdefault("lat_ms", timeout_each * 1000.0)
-                    r.setdefault("guards", {})
-                    r.setdefault("reason", None)
-                    if isinstance(r.get("guards"), dict):
-                        r["guards"].setdefault("notional_ccy", notional_ccy)
-                        r["guards"].setdefault("notional_amount", notional_amount)
-                    return r
-                except SimulationError as e:
-                    return {
-                        "ok": False, "reason": f"{label}_SIM_ERROR",
-                        "dev_bps": float("inf"), "fills_ratio": 0.0,
-                        "lat_ms": timeout_each * 1000.0,
-                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
-                    }
-                except Exception as e:
-                    # Pas de “pass” : on expose la classe d’erreur
-                    return {
-                        "ok": False, "reason": f"{label}_TASK_ERROR:{e.__class__.__name__}",
-                        "dev_bps": float("inf"), "fills_ratio": 0.0,
-                        "lat_ms": timeout_each * 1000.0,
-                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
-                    }
-
-            tt_r = _extract(tt, "TT")
-            tm_r = _extract(tm, "TM")
-
-            ok_tt = bool(tt_r.get("ok", False))
-            ok_tm = bool(tm_r.get("ok", False))
-
-            tm_blocked_ioc = tm_r.get("reason") == "TM_BLOCKED_IOC_ONLY"
-
-            if tm_blocked_ioc and not ok_tt:
-                dev_bps = float(tm_r.get("dev_bps", float("inf")))
-                fills_ratio = float(tm_r.get("fills_ratio", 0.0))
-                sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
-                try:
-                    sim_on_run("standard", blocked=True)
-                except Exception:
-                    pass
-                if not math.isfinite(dev_bps):
-                    dev_bps = 1e6
+        def _extract(task, label: str):
+            # task annulée (timeout partiel) => TIMEOUT explicite
+            if task.cancelled():
                 return {
-                    "ok": False,
-                    "reason": tm_r.get("reason"),
-                    "dev_bps": float(dev_bps),
-                    "fills_ratio": float(fills_ratio),
-                    "lat_ms": float(sim_lat_ms),
-                    "sim_vwap_dev_bps": float(dev_bps if math.isfinite(dev_bps) else 1e6),
-                    "fills_expected_ratio": float(fills_ratio),
-                    "sim_latency_ms": sim_lat_ms,
-                    "guards": {
-                        "tt_ok": ok_tt,
-                        "tm_ok": ok_tm,
-                        "tt_reason": tt_r.get("reason"),
-                        "tm_reason": tm_r.get("reason"),
-                        "split_mode": split_mode,
-                        "notional_ccy": notional_ccy,
-                        "notional_amount": notional_amount,
-                    },
+                    "ok": False, "reason": f"{label}_TIMEOUT",
+                    "dev_bps": float("inf"), "fills_ratio": 0.0,
+                    "lat_ms": timeout_each * 1000.0,
+                    "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
+                }
+            try:
+                r = task.result()
+                # Certaines branches renvoient None (combo non autorisé, depth vide, budget=0)
+                if not r:
+                    return {
+                        "ok": False, "reason": f"{label}_NONE_RESULT",
+                        "dev_bps": float("inf"), "fills_ratio": 0.0,
+                        "lat_ms": timeout_each * 1000.0,
+                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
+                    }
+                # Normalisation champs attendus
+                r.setdefault("ok", False)
+                r.setdefault("dev_bps", float("inf"))
+                r.setdefault("fills_ratio", 0.0)
+                r.setdefault("lat_ms", timeout_each * 1000.0)
+                r.setdefault("guards", {})
+                r.setdefault("reason", None)
+                if isinstance(r.get("guards"), dict):
+                    r["guards"].setdefault("notional_ccy", notional_ccy)
+                    r["guards"].setdefault("notional_amount", notional_amount)
+                return r
+            except SimulationError as e:
+                return {
+                    "ok": False, "reason": f"{label}_SIM_ERROR",
+                    "dev_bps": float("inf"), "fills_ratio": 0.0,
+                    "lat_ms": timeout_each * 1000.0,
+                    "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
+                }
+            except Exception as e:
+                # Pas de “pass” : on expose la classe d’erreur
+                return {
+                    "ok": False, "reason": f"{label}_TASK_ERROR:{e.__class__.__name__}",
+                    "dev_bps": float("inf"), "fills_ratio": 0.0,
+                    "lat_ms": timeout_each * 1000.0,
+                    "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
                 }
 
-            # Sélection conservatrice : si au moins une branche OK, on prend celle au dev_bps minimal.
-            if ok_tt or ok_tm:
-                if ok_tt and (not ok_tm or float(tt_r.get("dev_bps", float("inf"))) <= float(
-                        tm_r.get("dev_bps", float("inf")))):
-                    chosen = tt_r
-                else:
-                    chosen = tm_r
-                dev_bps = float(chosen.get("dev_bps", float("inf")))
-                fills_ratio = float(chosen.get("fills_ratio", 0.0))
-                reason = None  # succès explicite
-            else:
-                # Double échec → reason concaténée, jamais “SIM_TIMEOUT” générique
-                dev_bps = float("inf")
-                fills_ratio = 0.0
-                reason = f"TT:{tt_r.get('reason')}|TM:{tm_r.get('reason')}"
+        tt_r = _extract(tt, "TT")
+        tm_r = _extract(tm, "TM")
 
+        ok_tt = bool(tt_r.get("ok", False))
+        ok_tm = bool(tm_r.get("ok", False))
+
+        tm_blocked_ioc = tm_r.get("reason") == "TM_BLOCKED_IOC_ONLY"
+
+        if tm_blocked_ioc and not ok_tt:
+            dev_bps = float(tm_r.get("dev_bps", float("inf")))
+            fills_ratio = float(tm_r.get("fills_ratio", 0.0))
             sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
+            try:
+                sim_on_run("standard", blocked=True)
+            except Exception:
+                pass
             if not math.isfinite(dev_bps):
                 dev_bps = 1e6
-            if reason:
-                try:
-                    sim_on_run("standard", blocked=True)
-                except Exception:
-                    pass
-
             return {
-                "ok": reason is None and math.isfinite(dev_bps),
-                "reason": reason,
+                "ok": False,
+                "reason": tm_r.get("reason"),
                 "dev_bps": float(dev_bps),
                 "fills_ratio": float(fills_ratio),
                 "lat_ms": float(sim_lat_ms),
@@ -1465,8 +1431,53 @@ class DynamicExecutionSimulator:
                     "split_mode": split_mode,
                     "notional_ccy": notional_ccy,
                     "notional_amount": notional_amount,
-                }
+                },
             }
+
+        # Sélection conservatrice : si au moins une branche OK, on prend celle au dev_bps minimal.
+        if ok_tt or ok_tm:
+            if ok_tt and (not ok_tm or float(tt_r.get("dev_bps", float("inf"))) <= float(
+                    tm_r.get("dev_bps", float("inf")))):
+                chosen = tt_r
+            else:
+                chosen = tm_r
+            dev_bps = float(chosen.get("dev_bps", float("inf")))
+            fills_ratio = float(chosen.get("fills_ratio", 0.0))
+            reason = None  # succès explicite
+        else:
+            # Double échec → reason concaténée, jamais “SIM_TIMEOUT” générique
+            dev_bps = float("inf")
+            fills_ratio = 0.0
+            reason = f"TT:{tt_r.get('reason')}|TM:{tm_r.get('reason')}"
+
+        sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
+        if not math.isfinite(dev_bps):
+            dev_bps = 1e6
+        if reason:
+            try:
+                sim_on_run("standard", blocked=True)
+            except Exception:
+                pass
+
+        return {
+            "ok": reason is None and math.isfinite(dev_bps),
+            "reason": reason,
+            "dev_bps": float(dev_bps),
+            "fills_ratio": float(fills_ratio),
+            "lat_ms": float(sim_lat_ms),
+            "sim_vwap_dev_bps": float(dev_bps if math.isfinite(dev_bps) else 1e6),
+            "fills_expected_ratio": float(fills_ratio),
+            "sim_latency_ms": sim_lat_ms,
+            "guards": {
+                "tt_ok": ok_tt,
+                "tm_ok": ok_tm,
+                "tt_reason": tt_r.get("reason"),
+                "tm_reason": tm_r.get("reason"),
+                "split_mode": split_mode,
+                "notional_ccy": notional_ccy,
+                "notional_amount": notional_amount,
+            }
+        }
 
     # ------------------------- Helpers Maker -------------------------
     def quote_for_maker(self, side: str, levels: List[Level], *, depth_clip: int = 5, skew_bps: float = 1.0) -> Optional[float]:
@@ -1560,3 +1571,245 @@ class DynamicExecutionSimulator:
         self.fragmented_trade_count = 0
         self.last_result = None
         self.last_latency_ms = 0.0
+
+
+    # ------------------------- priming / cache -------------------------
+    def _now_ms(self) -> int:
+        return int(time.time() * 1000)
+
+    def start(self) -> None:
+        if self._workers_started:
+            return
+        loop = asyncio.get_event_loop()
+        self._worker_task = loop.create_task(self._plan_worker())
+        self._mm_hints_task = loop.create_task(self._mm_hints_worker())
+        self._workers_started = True
+
+    def stop(self) -> None:
+        for t in (self._worker_task, self._mm_hints_task):
+            if t:
+                t.cancel()
+
+    def _make_plan_key(self, branch: str, route_combo: str, pair: str, quote: str, bucket: float, fingerprint: Any) -> tuple:
+        return (str(branch).upper(), str(route_combo), str(pair).upper(), str(quote).upper(), float(bucket), fingerprint)
+
+    def _book_fingerprint(self, book_snapshot: Dict[str, Any]) -> Any:
+        mode = str(getattr(self.config, "sim_book_fingerprint_mode", "TOP_AND_SUMMARY") or "TOP_AND_SUMMARY").upper()
+        levels = int(getattr(self.config, "sim_book_fingerprint_levels", 5) or 5)
+        def _top_levels(side: List[Tuple[Any, Any]], reverse: bool = False) -> List[Tuple[float, float]]:
+            cleaned = []
+            for p, q in (side or [])[: levels]:
+                try:
+                    pf, qf = float(p), float(q)
+                    cleaned.append((pf, qf))
+                except Exception:
+                    continue
+            if reverse:
+                cleaned.sort(key=lambda x: x[0], reverse=True)
+            else:
+                cleaned.sort(key=lambda x: x[0])
+            return cleaned[:levels]
+        asks = _top_levels((book_snapshot or {}).get("asks") or [])
+        bids = _top_levels((book_snapshot or {}).get("bids") or [], reverse=True)
+        recv_ts = int((book_snapshot or {}).get("recv_ts_ms") or 0)
+        ts_bucket = (recv_ts // 50) * 50
+        if not asks or not bids:
+            return (ts_bucket,)
+        best_bid = bids[0]
+        best_ask = asks[0]
+        mid = (best_bid[0] + best_ask[0]) / 2 if (best_bid and best_ask) else 0.0
+        base = (best_bid[0], best_bid[1], best_ask[0], best_ask[1], ts_bucket)
+        if mode == "TOP_ONLY":
+            return base
+        m = min(levels, len(asks), len(bids))
+        sum_bid = sum(q for _, q in bids[:m])
+        sum_ask = sum(q for _, q in asks[:m])
+        mid_bucket = round(mid, 4)
+        return base + (sum_bid, sum_ask, mid_bucket)
+
+    def _parse_buckets(self, text: str) -> List[float]:
+        return [float(x) for x in str(text).split(',') if str(x).strip()]
+
+    def _candidate_buckets(self, notional: float, *, profile: Optional[str] = None, vol_size_factor: Optional[float] = None) -> List[float]:
+        base = self._parse_buckets(getattr(self.config, "sim_notional_buckets_base", "250,500,1000,2000,4000"))
+        profile_key = str(profile or getattr(getattr(self.config, "g", object()), "capital_profile", "")).upper()
+        per_profile = getattr(self.config, "sim_buckets_per_profile", {}) or {}
+        if profile_key and profile_key in per_profile:
+            try:
+                base = self._parse_buckets(per_profile[profile_key])
+            except Exception:
+                pass
+        factor = vol_size_factor
+        if getattr(self.config, "sim_buckets_adapt_with_vol", True):
+            if factor is None:
+                factor = 1.0
+            floor = float(getattr(self.config, "sim_vol_size_factor_floor", 0.6))
+            ceil = float(getattr(self.config, "sim_vol_size_factor_ceil", 1.0))
+            factor = max(floor, min(ceil, float(factor)))
+        else:
+            factor = 1.0
+        buckets = sorted({max(1.0, round(b * factor)) for b in base})
+        return [b for b in buckets if b >= max(1.0, notional * 0.25)]
+
+    def _nearest_buckets(self, notional: float, candidates: List[float], k: int) -> List[float]:
+        if not candidates:
+            return []
+        candidates = sorted(candidates)
+        closest = min(candidates, key=lambda b: abs(b - notional))
+        idx = candidates.index(closest)
+        res = [closest]
+        if idx - 1 >= 0 and len(res) < k:
+            res.append(candidates[idx - 1])
+        if idx + 1 < len(candidates) and len(res) < k:
+            res.append(candidates[idx + 1])
+        return res[:k]
+
+    def prime(
+        self,
+        *,
+        branch: str,
+        route_combo: str,
+        pair: str,
+        quote: str,
+        notional_quote: float,
+        book_snapshot: Dict[str, Any],
+        vol_size_factor: Optional[float] = None,
+    ) -> None:
+        try:
+            k = int(getattr(self.config, "sim_prime_multibucket_k", 3) or 3)
+            buckets = self._candidate_buckets(float(notional_quote), profile=getattr(getattr(self.config, "g", object()), "capital_profile", None), vol_size_factor=vol_size_factor)
+            buckets = self._nearest_buckets(float(notional_quote), buckets or [float(notional_quote)], k)
+            fingerprint = self._book_fingerprint(book_snapshot or {})
+            for bucket in buckets:
+                key = self._make_plan_key(branch, route_combo, pair, quote, bucket, fingerprint)
+                job = {
+                    "branch": branch,
+                    "route_combo": route_combo,
+                    "pair": pair,
+                    "quote": quote,
+                    "bucket": bucket,
+                    "book_snapshot": book_snapshot or {},
+                    "fingerprint": fingerprint,
+                }
+                self._latest_job_by_key[key] = job
+                if key not in self._plan_events:
+                    self._plan_events[key] = asyncio.Event()
+                try:
+                    self._jobs_queue.put_nowait(key)
+                except asyncio.QueueFull:
+                    self._latest_job_by_key.pop(key, None)
+            if pair and book_snapshot:
+                self._last_books_by_pair[pair.upper()] = book_snapshot
+        except Exception:
+            report_nonfatal("DynamicExecutionSimulator", "prime_failed", None, pair=pair)
+
+    def peek_plan(self, key: tuple) -> Optional[Dict[str, Any]]:
+        ttl_ms = int(getattr(self.config, "sim_cache_ttl_ms", 300) or 300)
+        entry = self._plan_cache.get(key)
+        if not entry:
+            return None
+        if self._now_ms() - entry.get("computed_at_ms", 0) > ttl_ms:
+            return None
+        return entry.get("plan")
+
+    def plan_age_ms(self, key: tuple) -> Optional[int]:
+        entry = self._plan_cache.get(key)
+        if not entry:
+            return None
+        return max(0, self._now_ms() - entry.get("computed_at_ms", 0))
+
+    async def wait_plan(self, key: tuple, max_wait_ms: int) -> Optional[Dict[str, Any]]:
+        plan = self.peek_plan(key)
+        if plan:
+            return plan
+        ev = self._plan_events.get(key)
+        if not ev:
+            return None
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=max(0.001, max_wait_ms / 1000.0))
+        except asyncio.TimeoutError:
+            return None
+        return self.peek_plan(key)
+
+    async def _plan_worker(self) -> None:
+        max_jobs = int(getattr(self.config, "sim_max_inflight_jobs", 32) or 32)
+        while True:
+            key = await self._jobs_queue.get()
+            job = self._latest_job_by_key.pop(key, None)
+            if job is None:
+                continue
+            while self._jobs_queue.qsize() > max_jobs:
+                try:
+                    self._jobs_queue.get_nowait()
+                except Exception:
+                    break
+            try:
+                plan = self._compute_fragmentation_plan(job)
+                self._plan_cache[key] = {
+                    "plan": plan,
+                    "computed_at_ms": self._now_ms(),
+                    "fingerprint": job.get("fingerprint"),
+                }
+                ev = self._plan_events.get(key)
+                if ev:
+                    ev.set()
+            except Exception as e:
+                report_nonfatal("DynamicExecutionSimulator", "plan_worker_failed", e, key=str(key))
+
+    def _compute_fragmentation_plan(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        asks = (job.get("book_snapshot") or {}).get("asks") or []
+        bids = (job.get("book_snapshot") or {}).get("bids") or []
+        asks = asks[: int(getattr(self.config, "sim_prime_depth_levels", self.depth_limit))]
+        bids = bids[: int(getattr(self.config, "sim_prime_depth_levels", self.depth_limit))]
+        plan = self.suggest_slices(
+            budget_usdc=float(job.get("bucket") or 0.0),
+            asks=asks,
+            bids=bids,
+        )
+        plan["bucket"] = float(job.get("bucket") or 0.0)
+        return plan
+
+    async def _mm_hints_worker(self) -> None:
+        interval_ms = int(getattr(self.config, "sim_mm_hints_interval_ms", 0) or 0)
+        levels = int(getattr(self.config, "sim_mm_hints_levels", 5) or 5)
+        if interval_ms <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval_ms / 1000.0)
+            try:
+                for pair, book in list(self._last_books_by_pair.items()):
+                    asks = (book or {}).get("asks") or []
+                    bids = (book or {}).get("bids") or []
+                    asks_top = asks[:levels]
+                    bids_top = bids[:levels]
+                    sum_ask = sum(q for _, q in asks_top if q is not None)
+                    sum_bid = sum(q for _, q in bids_top if q is not None)
+                    imbalance = 0.0
+                    if sum_ask + sum_bid > 0:
+                        imbalance = (sum_bid - sum_ask) / max(sum_ask + sum_bid, 1e-9)
+                    hint = {
+                        "expected_fill_ratio_hint": max(0.0, min(1.0, (sum_bid / max(sum_ask + sum_bid, 1e-9)))) if (sum_ask + sum_bid) > 0 else 0.5,
+                        "cancel_pressure_hint": imbalance,
+                        "safe_size_factor": max(0.0, min(1.0, 1.0 - abs(imbalance))),
+                        "computed_at_ms": self._now_ms(),
+                    }
+                    self._mm_hints_cache[pair] = hint
+            except Exception as e:
+                report_nonfatal("DynamicExecutionSimulator", "mm_hints_failed", e)
+
+    def get_mm_hints(self, pair_key: str) -> Optional[Dict[str, Any]]:
+        return self._mm_hints_cache.get(str(pair_key).upper())
+
+    # utilitaire pour RM/Scanner
+    def make_plan_key_from_payload(self, opp: Dict[str, Any], branch: str) -> Optional[tuple]:
+        snap = (opp.get("sim_snapshot") or {})
+        bucket = float(opp.get("notional_quote_amount") or opp.get("volume_usdc") or 0.0)
+        route_combo = opp.get("route") or f"{opp.get('buy_ex')}->{opp.get('sell_ex')}"
+        pair = opp.get("pair_key") or opp.get("pair")
+        quote = (opp.get("quote_ccy") or opp.get("quote") or "USDC").upper()
+        fingerprint = self._book_fingerprint(snap)
+        candidates = self._nearest_buckets(bucket, self._candidate_buckets(bucket, profile=getattr(getattr(self.config, "g", object()), "capital_profile", None), vol_size_factor=opp.get("vol_size_factor")), int(getattr(self.config, "sim_prime_multibucket_k", 3) or 3))
+        if not candidates:
+            return None
+        target = min(candidates, key=lambda b: abs(b - bucket))
+        return self._make_plan_key(branch, route_combo, pair, quote, target, fingerprint)

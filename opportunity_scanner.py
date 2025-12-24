@@ -104,6 +104,8 @@ try:
         SC_ROTATION_AUDITION_SIZE,    # gauge
         SC_STRATEGY_SCORE,            # gauge
         SC_ELIGIBLE,                  # gauge
+        SIM_PRIME_TOTAL,
+        SIM_PRIME_ERROR_TOTAL,
         inc_blocked,                  # function(module, reason, pair)
         mark_scanner_to_rm_ts,        # latence Scanner→RM (wrapper ts_ns)
     )
@@ -124,6 +126,8 @@ except Exception:
     SC_ROTATION_AUDITION_SIZE = _MetricNoOp()
     SC_STRATEGY_SCORE = _MetricNoOp()
     SC_ELIGIBLE = _MetricNoOp()
+    SIM_PRIME_TOTAL = _MetricNoOp()
+    SIM_PRIME_ERROR_TOTAL = _MetricNoOp()
 
     def inc_blocked(*_a, **_k): pass
 
@@ -302,7 +306,7 @@ class OpportunityScanner:
       - FEES PATCH: ingestion/caching maker/taker fees
     """
 
-    def __init__(self, cfg, risk_manager, market_router, history_logger=None):
+    def __init__(self, cfg, risk_manager, market_router, history_logger=None, simulator=None):
         """
         Scanner piloté 100% par BotConfig.
         - Aucune lecture d'env ici (0 os.getenv)
@@ -317,6 +321,7 @@ class OpportunityScanner:
         # --- dépendances / config ---
         self.cfg = cfg
         self.risk_manager = risk_manager
+        self.simulator = simulator
 
         self.rm = risk_manager  # compat legacy
         self.router = market_router
@@ -2681,6 +2686,34 @@ class OpportunityScanner:
             "ts_buy_ex_ms": int(buy_data.get("exchange_ts_ms") or buy_data.get("recv_ts_ms") or 0),
             "ts_sell_ex_ms": int(sell_data.get("exchange_ts_ms") or sell_data.get("recv_ts_ms") or 0),
         }
+        sim_snapshot = {
+            "asks": list((buy_data.get("asks") or [])[: self._binance_depth_level]),
+            "bids": list((sell_data.get("bids") or [])[: self._binance_depth_level]),
+            "recv_ts_ms": min([ts for ts in (buy_recv_ts_ms, sell_recv_ts_ms) if ts > 0]) if (
+                        buy_recv_ts_ms or sell_recv_ts_ms) else 0,
+        }
+        payload["sim_snapshot"] = sim_snapshot
+        try:
+            sim = getattr(self, "simulator", None)
+            if sim:
+                branch = payload.get("strategy") or "TT"
+                SIM_PRIME_TOTAL.labels(branch=str(branch).upper()).inc()
+                sim.prime(
+                    branch=branch,
+                    route_combo=route_combo,
+                    pair=pair,
+                    quote=quote,
+                    notional_quote=float(target_quote),
+                    book_snapshot=sim_snapshot,
+                    vol_size_factor=None,
+                )
+                if hasattr(sim, "start"):
+                    try:
+                        sim.start()
+                    except Exception:
+                        pass
+        except Exception:
+            SIM_PRIME_ERROR_TOTAL.labels(branch=str(payload.get("strategy") or "TT")).inc()
 
         if self._jp_disabled(region_buy) or self._jp_disabled(region_sell):
             self._record_rejection(

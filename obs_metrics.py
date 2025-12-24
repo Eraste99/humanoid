@@ -102,7 +102,17 @@ SCANNER_HINT_TOPQTY_MISSING_TOTAL = Counter(
     "Hints L1 (top_qty) manquants (non bloquant)",
     ["pair", "ex", "side"]
 )
-
+# Simulator priming
+SIM_PRIME_TOTAL = Counter(
+    "sim_prime_total",
+    "Prime requests enqueued",
+    ["branch"],
+)
+SIM_PRIME_ERROR_TOTAL = Counter(
+    "sim_prime_error_total",
+    "Prime errors",
+    ["branch"],
+)
 # LHM – rotations fichiers (demandée précédemment)
 LOGGERH_FILE_ROTATIONS_TOTAL = Counter(
     "loggerh_file_rotations_total",
@@ -701,7 +711,24 @@ SCANNER_REJECT_REASONS = {
 SLIP_REASONS = {
     "slip_unknown_or_stale",
 }
-
+WATCHDOG_SNAPSHOT_TOTAL = _metric(
+    Counter,
+    "watchdog_snapshot_total",
+    "Watchdog health snapshots emitted",
+    ["watchdog", "severity"],
+)
+WATCHDOG_DEGRADED_TOTAL = _metric(
+    Counter,
+    "watchdog_degraded_total",
+    "Watchdog degraded reasons observed",
+    ["watchdog", "reason"],
+)
+WATCHDOG_RESTART_INTENT_TOTAL = _metric(
+    Counter,
+    "watchdog_restart_intent_total",
+    "Watchdog restart intents emitted",
+    ["reason"],
+)
 VOL_REASONS = {
     "vol_unknown_or_stale",
 }
@@ -718,6 +745,23 @@ OBS_REASON_REGISTRY = {
     "slip": SLIP_REASONS,
     "vol": VOL_REASONS,
 }
+def watchdog_snapshot_total(watchdog: str, severity: str) -> None:
+    try:
+        WATCHDOG_SNAPSHOT_TOTAL.labels(_norm(watchdog), _norm(severity)).inc()
+    except Exception:
+        pass
+
+def watchdog_degraded_total(watchdog: str, reason: str) -> None:
+    try:
+        WATCHDOG_DEGRADED_TOTAL.labels(_norm(watchdog), _norm(reason)).inc()
+    except Exception:
+        pass
+
+def watchdog_restart_intent_total(reason: str) -> None:
+    try:
+        WATCHDOG_RESTART_INTENT_TOTAL.labels(_norm(reason)).inc()
+    except Exception:
+        pass
 def watchdog_fallback_used(watchdog: str, key: str) -> None:
     try:
         WATCHDOG_FALLBACK_USED_TOTAL.labels(_norm(watchdog), _norm(key)).inc()
