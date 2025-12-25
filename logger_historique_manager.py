@@ -3760,13 +3760,25 @@ class LoggerHistoriqueManager:
     ) -> list[dict[str, Any]]:
         now_ms = now_ms or int(time.time() * 1000)
         try:
-            rows = self._writer.fetch_ops_journal(op_type="TRANSFER_FSM", status="SUBMITTED")
+            rows = self._writer.fetch_ops_journal(op_type="TRANSFER_FSM")
+            inflight = [
+                r
+                for r in rows or []
+                if str(r.get("status") or "").upper() in {"REQUESTED", "PREPARED", "SUBMITTED"}
+            ]
             if include_expired:
-                return list(rows or [])
-            return [r for r in rows or [] if r.get("expires_ts_ms") is None or int(r.get("expires_ts_ms")) > now_ms]
+                return inflight
+            return [
+                r
+                for r in inflight
+                if r.get("expires_ts_ms") is None or int(r.get("expires_ts_ms")) > now_ms
+                ]
         except Exception:
             logger.exception("get_inflight_transfers failed")
             return []
+
+    def list_inflight_transfers(self, *, include_expired: bool = False) -> list[dict[str, Any]]:
+        return self.get_inflight_transfers(include_expired=include_expired)
 
     def get_transfer_state(self, op_id: str) -> Optional[dict[str, Any]]:
         if not op_id:
@@ -3793,6 +3805,27 @@ class LoggerHistoriqueManager:
             status="REQUESTED",
             reason=reason,
             payload=payload,
+            payload_hash=self._payload_hash(payload),
+        )
+
+    def mark_transfer_prepared(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+            expires_ts_ms: Optional[int] = None,
+            attempt_count: Optional[int] = None,
+    ) -> None:
+        reason = self._normalize_reason_code("TRANSFER_FSM")
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="TRANSFER_FSM",
+            status="PREPARED",
+            reason=reason,
+            payload=payload,
+            expires_ts_ms=expires_ts_ms,
+            payload_hash=self._payload_hash(payload),
+            attempt_count=attempt_count,
         )
 
     def mark_transfer_submitted(
@@ -3801,6 +3834,7 @@ class LoggerHistoriqueManager:
             op_id: str,
             payload: Optional[dict[str, Any]] = None,
             expires_ts_ms: Optional[int] = None,
+            attempt_count: Optional[int] = None,
     ) -> None:
         reason = self._normalize_reason_code("TRANSFER_FSM")
         self._writer.upsert_ops_journal(
@@ -3810,6 +3844,8 @@ class LoggerHistoriqueManager:
             reason=reason,
             payload=payload,
             expires_ts_ms=expires_ts_ms,
+            payload_hash=self._payload_hash(payload),
+            attempt_count=attempt_count,
         )
 
     def mark_transfer_settled(
@@ -3825,6 +3861,7 @@ class LoggerHistoriqueManager:
             status="SETTLED",
             reason=reason,
             payload=payload,
+            payload_hash=self._payload_hash(payload),
         )
 
     def mark_transfer_failed(
@@ -3843,8 +3880,20 @@ class LoggerHistoriqueManager:
             reason=reason_code,
             payload=payload,
             last_error=last_error,
+            payload_hash=self._payload_hash(payload),
         )
 
+    @staticmethod
+    def _payload_hash(payload: Optional[dict[str, Any]]) -> Optional[str]:
+        if payload is None:
+            return None
+        try:
+            raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+            import hashlib
+
+            return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        except Exception:
+            return None
     def get_rpc_idem_state(self, key: str) -> Optional[dict[str, Any]]:
         if not key:
             return None

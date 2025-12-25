@@ -1492,6 +1492,43 @@ WS_RECO_MISS_PER_MINUTE = _metric(
     'Miss détectés par minute (fenêtre glissante ~60s)',
     ['exchange', 'alias'],
 )
+TRANSFER_FSM_EVENTS_TOTAL = _metric(
+    Counter,
+    'transfer_fsm_events_total',
+    'Transfer FSM events by status and reason',
+    ['status', 'reason'],
+)
+TRANSFER_INFLIGHT_COUNT = _metric(
+    Gauge,
+    'transfer_inflight_count',
+    'Durable inflight transfers (in-progress states)',
+)
+TRANSFER_RECOVERY_RECONCILED_TOTAL = _metric(
+    Counter,
+    'transfer_recovery_reconciled_total',
+    'Transfer recovery reconciled events',
+)
+
+
+def inc_transfer_fsm_event(status: str, reason: Optional[str] = None) -> None:
+    try:
+        TRANSFER_FSM_EVENTS_TOTAL.labels(_norm(status), _norm(reason)).inc()
+    except Exception:
+        pass
+
+
+def set_transfer_inflight(count: int) -> None:
+    try:
+        TRANSFER_INFLIGHT_COUNT.set(int(count))
+    except Exception:
+        pass
+
+
+def inc_transfer_recovery_reconciled() -> None:
+    try:
+        TRANSFER_RECOVERY_RECONCILED_TOTAL.inc()
+    except Exception:
+        pass
 PWS_CALLBACK_ERRORS_TOTAL = _metric(
     Counter,
     'pws_callback_errors_total',

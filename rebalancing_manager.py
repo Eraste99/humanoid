@@ -366,6 +366,28 @@ class RebalancingManager:
             if transfer_id:
                 self._inflight_transfers.setdefault(transfer_id, {"state": "SUBMITTED", "ts": now})
 
+    def restore_inflight_from_journal(self, *, lhm=None, now_ms: Optional[int] = None) -> None:
+        lhm = lhm or getattr(self.rm, "_lhm_manager", None) or getattr(self.rm, "history_logger", None)
+        if lhm is None:
+            return
+        now_ms = now_ms or int(time.time() * 1000)
+        try:
+            rows = lhm.list_inflight_transfers(include_expired=True)
+        except Exception:
+            log.exception("restore_inflight_from_journal failed")
+            return
+        self._inflight_transfers = {}
+        for row in rows or []:
+            op_id = str(row.get("op_id") or "")
+            if not op_id.startswith("XFER/"):
+                continue
+            transfer_id = op_id.split("/", 1)[-1]
+            status = str(row.get("status") or "").upper()
+            expires = row.get("expires_ts_ms")
+            if expires is not None and int(expires) <= now_ms:
+                continue
+            self._inflight_transfers[transfer_id] = {"state": status or "SUBMITTED", "ts": _now()}
+
     def mark_transfer_status(self, transfer_id: Optional[str], status: Optional[str]) -> None:
         if not transfer_id:
             return

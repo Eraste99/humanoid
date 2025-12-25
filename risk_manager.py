@@ -40,7 +40,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from typing import Dict, Any, List, Optional, Tuple
-from modules.obs_metrics import inc_blocked
+from modules.obs_metrics import inc_blocked, set_transfer_inflight, inc_transfer_fsm_event
 import logging
 from collections import defaultdict
 from modules.obs_metrics import TIME_SKEW_MS
@@ -977,6 +977,13 @@ class TransferController:
         self._states: Dict[str, Dict[str, Any]] = {}
         self._lhm = logger_historique_manager
         self._submitted_timeout_s = float(submitted_timeout_s or 300.0)
+        self._order = {
+            "REQUESTED": 0,
+            "PREPARED": 1,
+            "SUBMITTED": 2,
+            "SETTLED": 3,
+            "FAILED": 3,
+        }
 
     @staticmethod
     def canonical_transfer_id(payload: Dict[str, Any]) -> str:
@@ -993,33 +1000,52 @@ class TransferController:
             if not op_id.startswith("XFER/"):
                 continue
             transfer_id = op_id.split("/", 1)[-1]
-            expires = row.get("expires_ts_ms")
-            state = str(row.get("status") or "SUBMITTED").upper()
-            last_ts = float(row.get("updated_ts_ms") or row.get("created_ts_ms") or now_ms) / 1000.0
-            self._states[transfer_id] = {
-                "state": state,
-                "last_ts": last_ts,
-                "expires_ts_ms": expires,
-                "payload": row.get("payload"),
-            }
-            if state == "SUBMITTED" and expires is not None and int(expires) <= now_ms:
-                self._fail_stuck(transfer_id=transfer_id, op_id=op_id, payload=row.get("payload"))
+            self._set_state_from_row(row=row, transfer_id=transfer_id, now_ms=now_ms)
 
-    def _fail_stuck(self, *, transfer_id: str, op_id: str, payload: Optional[dict[str, Any]]) -> None:
+    def restore_from_journal(self, *, now_ms: Optional[int] = None) -> None:
+        now_ms = now_ms or int(time.time() * 1000)
+        if not self._lhm:
+            return
+        try:
+            inflight = self._lhm.list_inflight_transfers(include_expired=True)
+        except Exception:
+            logger.exception("[TransferController] restore_from_journal failed")
+            return
+        self.rehydrate(inflight, now_ms=now_ms)
+        try:
+            set_transfer_inflight(self.inflight_count())
+        except Exception:
+            pass
+
+    def _set_state_from_row(self, *, row: dict[str, Any], transfer_id: str, now_ms: int) -> None:
+        expires = row.get("expires_ts_ms")
+        state = str(row.get("status") or "SUBMITTED").upper()
+        last_ts = float(row.get("updated_ts_ms") or row.get("created_ts_ms") or now_ms) / 1000.0
+        payload = row.get("payload")
+        attempts = row.get("attempt_count")
+
         self._states[transfer_id] = {
-            "state": "FAILED",
-            "last_ts": time.time(),
+            "state": state,
+            "last_ts": last_ts,
+            "expires_ts_ms": expires,
             "payload": payload,
-            "error": "stuck_submitted_timeout",
+            "attempts": attempts,
         }
+        if state in {"SUBMITTED", "REQUESTED", "PREPARED"} and expires is not None and int(expires) <= now_ms:
+            op_id = self._op_id(transfer_id)
+            self._fail_stuck(transfer_id=transfer_id, op_id=op_id, payload=payload)
+
+        def _fail_stuck(self, *, transfer_id: str, op_id: str, payload: Optional[dict[str, Any]]) -> None:
+            self._transition(
+                transfer_id=transfer_id,
+                new_state="FAILED",
+                payload=payload,
+                error="stuck_submitted_timeout",
+                reason="XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+            )
         try:
             if self._lhm:
-                self._lhm.mark_transfer_failed(
-                    op_id=op_id,
-                    payload=payload,
-                    last_error="stuck_submitted_timeout",
-                    reason="XFER_STUCK_SUBMITTED_FAIL_CLOSED",
-                )
+
                 self._lhm.activate_fail_closed_latch(
                     op_id="TRANSFERS/XFER_STUCK_SUBMITTED_FAIL_CLOSED",
                     reason="XFER_STUCK_SUBMITTED_FAIL_CLOSED",
@@ -1033,7 +1059,7 @@ class TransferController:
             return
         now_ms = int(time.time() * 1000)
         for transfer_id, state in list(self._states.items()):
-            if state.get("state") != "SUBMITTED":
+            if state.get("state") not in {"SUBMITTED", "REQUESTED", "PREPARED"}:
                 continue
             expires = state.get("expires_ts_ms")
             if expires is not None and int(expires) <= now_ms:
@@ -1048,6 +1074,8 @@ class TransferController:
         payload: Optional[dict[str, Any]] = None,
         expires_ts_ms: Optional[int] = None,
         error: Optional[str] = None,
+        attempts: Optional[int] = None,
+        reason: Optional[str] = None,
     ) -> None:
         op_id = self._op_id(transfer_id)
         if not self._lhm:
@@ -1055,14 +1083,26 @@ class TransferController:
         try:
             if state == "REQUESTED":
                 self._lhm.mark_transfer_requested(op_id=op_id, payload=payload)
+            elif state == "PREPARED":
+                self._lhm.mark_transfer_prepared(
+                    op_id=op_id,
+                    payload=payload,
+                    expires_ts_ms=expires_ts_ms,
+                    attempt_count=attempts,
+                )
             elif state == "SUBMITTED":
                 self._lhm.mark_transfer_submitted(
-                    op_id=op_id, payload=payload, expires_ts_ms=expires_ts_ms
+                    op_id=op_id,
+                    payload=payload,
+                    expires_ts_ms=expires_ts_ms,
+                    attempt_count=attempts,
                 )
             elif state == "SETTLED":
                 self._lhm.mark_transfer_settled(op_id=op_id, payload=payload)
             elif state == "FAILED":
-                self._lhm.mark_transfer_failed(op_id=op_id, payload=payload, last_error=error)
+                self._lhm.mark_transfer_failed(
+                    op_id=op_id, payload=payload, last_error=error, reason=reason
+                )
         except Exception:
             logger.exception("[TransferController] persist state failed")
 
@@ -1078,6 +1118,67 @@ class TransferController:
             "type": str(payload.get("type") or payload.get("kind") or "transfer"),
         }
 
+    def _state_is_in_progress(self, state: Optional[dict[str, Any]]) -> bool:
+        if not state:
+            return False
+        return str(state.get("state") or "").upper() in {"REQUESTED", "PREPARED", "SUBMITTED"}
+
+    def inflight_count(self) -> int:
+        return sum(1 for st in (self._states or {}).values() if self._state_is_in_progress(st))
+
+    def _transition(
+            self,
+            *,
+            transfer_id: str,
+            new_state: str,
+            payload: Optional[dict[str, Any]] = None,
+            expires_ts_ms: Optional[int] = None,
+            error: Optional[str] = None,
+            attempts: Optional[int] = None,
+            reason: Optional[str] = None,
+    ) -> dict:
+        now = time.time()
+        current = self._states.get(transfer_id)
+        cur_state = str((current or {}).get("state") or "").upper()
+        new_state_up = str(new_state or "").upper()
+        if cur_state in {"FAILED", "SETTLED"}:
+            return current or {}
+        if cur_state and self._order.get(new_state_up, -1) < self._order.get(cur_state, -1):
+            return current or {}
+        if cur_state == new_state_up and attempts is None and reason is None and error is None:
+            return current or {}
+        state_entry = {
+            "state": new_state_up,
+            "last_ts": now,
+            "payload": payload,
+            "expires_ts_ms": expires_ts_ms,
+        }
+        if error is not None:
+            state_entry["error"] = error
+        if attempts is not None:
+            state_entry["attempts"] = attempts
+        self._states[transfer_id] = state_entry
+        try:
+            self._persist_state(
+                transfer_id=transfer_id,
+                state=new_state_up,
+                payload=payload,
+                expires_ts_ms=expires_ts_ms,
+                error=error,
+                attempts=attempts,
+                reason=reason,
+            )
+        except Exception:
+            logger.exception("[TransferController] persist state failed")
+        try:
+            set_transfer_inflight(self.inflight_count())
+        except Exception:
+            pass
+        try:
+            inc_transfer_fsm_event(new_state_up, reason or error)
+        except Exception:
+            pass
+        return state_entry
 
     async def submit(self, *, payload: Dict[str, Any], submit_fn: Callable[[], Any], venue: str) -> Dict[str, Any]:
         transfer_id = payload.get("transfer_id") or self.canonical_transfer_id(payload)
@@ -1087,79 +1188,88 @@ class TransferController:
         if state is None and self._lhm:
             existing = self._lhm.get_transfer_state(op_id)
             if existing:
-                state = {
-                    "state": str(existing.get("status") or "").upper(),
-                    "payload": existing.get("payload"),
-                    "expires_ts_ms": existing.get("expires_ts_ms"),
+                self._set_state_from_row(row=existing, transfer_id=transfer_id, now_ms=int(time.time() * 1000))
+                state = self._states.get(transfer_id)
+            if self._state_is_in_progress(state):
+                try:
+                    inc_transfer_fsm_event(state.get("state"), "TRANSFER_FSM_IN_PROGRESS_SKIP")
+                except Exception:
+                    pass
+                return {
+                    "status": state.get("state"),
+                    "transfer_id": transfer_id,
+                    "replayed": True,
+                    "reason": "TRANSFER_FSM_IN_PROGRESS_SKIP",
                 }
-                self._states[transfer_id] = state
-        if state and state.get("state") in {"SUBMITTED", "SETTLED"}:
-            return {"status": state.get("state"), "transfer_id": transfer_id, "replayed": True}
+
         state_payload = self._state_payload(payload)
-        self._persist_state(transfer_id=transfer_id, state="REQUESTED", payload=state_payload)
+        expires_ts_ms = int(time.time() * 1000 + (self._submitted_timeout_s * 1000.0))
+        self._transition(
+            transfer_id=transfer_id,
+            new_state="REQUESTED",
+            payload=state_payload,
+            expires_ts_ms=expires_ts_ms,
+        )
+        self._transition(
+            transfer_id=transfer_id,
+            new_state="PREPARED",
+            payload=state_payload,
+            expires_ts_ms=expires_ts_ms,
+        )
         outcome = await awith_retry(submit_fn, venue=venue, policy=self._policy)
         if outcome.ok:
-            expires_ts_ms = int(time.time() * 1000 + (self._submitted_timeout_s * 1000.0))
-            self._states[transfer_id] = {
-                "state": "SUBMITTED",
-                "attempts": outcome.attempts,
-                "last_ts": time.time(),
-                "expires_ts_ms": expires_ts_ms,
-                "payload": state_payload,
-            }
-            self._persist_state(
+
+            self._transition(
                 transfer_id=transfer_id,
-                state="SUBMITTED",
+                new_state="SUBMITTED",
                 payload=state_payload,
                 expires_ts_ms=expires_ts_ms,
+                attempts=outcome.attempts,
             )
             return {"status": "SUBMITTED", "transfer_id": transfer_id, "attempts": outcome.attempts}
 
-        self._states[transfer_id] = {
-            "state": "FAILED",
-            "attempts": outcome.attempts,
-            "last_ts": time.time(),
-            "error": str(outcome.last_exception) if outcome.last_exception else "unknown",
-            "payload": state_payload,
-        }
-        self._persist_state(
+        self._transition(
             transfer_id=transfer_id,
-            state="FAILED",
+            new_state="FAILED",
             payload=state_payload,
             error=str(outcome.last_exception) if outcome.last_exception else "unknown",
+            attempts=outcome.attempts,
         )
         return {"status": "FAILED", "transfer_id": transfer_id, "attempts": outcome.attempts}
 
     def mark_settled(self, transfer_id: Optional[str], *, payload: Optional[dict[str, Any]] = None) -> None:
         if not transfer_id:
             return
-        now = time.time()
-        self._states[transfer_id] = {
-            "state": "SETTLED",
-            "last_ts": now,
-            "payload": payload,
-        }
-        try:
-            self._persist_state(transfer_id=transfer_id, state="SETTLED", payload=payload)
-        except Exception:
-            logger.exception("[TransferController] mark_settled persist failed")
+        self._transition(transfer_id=transfer_id, new_state="SETTLED", payload=payload)
 
-        def mark_failed(self, transfer_id: Optional[str], *, payload: Optional[dict[str, Any]] = None,
-                        error: Optional[str] = None) -> None:
-            if not transfer_id:
-                return
-            now = time.time()
-            self._states[transfer_id] = {
-                "state": "FAILED",
-                "last_ts": now,
-                "payload": payload,
-                "error": error,
-            }
-            try:
-                self._persist_state(transfer_id=transfer_id, state="FAILED", payload=payload, error=error)
-            except Exception:
-                logger.exception("[TransferController] mark_failed persist failed")
+    def mark_submitted(
+            self,
+            transfer_id: Optional[str],
+            *,
+            payload: Optional[dict[str, Any]] = None,
+            expires_ts_ms: Optional[int] = None,
+            attempts: Optional[int] = None,
+    ) -> None:
+        if not transfer_id:
+            return
+        self._transition(
+            transfer_id=transfer_id,
+            new_state="SUBMITTED",
+            payload=payload,
+            expires_ts_ms=expires_ts_ms,
+            attempts=attempts,
+        )
 
+    def mark_failed(
+            self,
+            transfer_id: Optional[str],
+            *,
+            payload: Optional[dict[str, Any]] = None,
+            error: Optional[str] = None,
+    ) -> None:
+        if not transfer_id:
+            return
+        self._transition(transfer_id=transfer_id, new_state="FAILED", payload=payload, error=error)
 
 class RiskManager:
     """
@@ -1672,9 +1782,12 @@ class RiskManager:
             submitted_timeout_s=transfer_timeout_s,
         )
         try:
-            if self._lhm_manager is not None:
-                inflight = self._lhm_manager.get_inflight_transfers(include_expired=True)
-                self._transfer_controller.rehydrate(inflight, now_ms=int(time.time() * 1000))
+            now_ms = int(time.time() * 1000)
+            self._transfer_controller.restore_from_journal(now_ms=now_ms)
+            if getattr(self, "rebalancing", None) and hasattr(
+                    self.rebalancing, "restore_inflight_from_journal"
+            ):
+                self.rebalancing.restore_inflight_from_journal(now_ms=now_ms)
         except Exception:
             logger.exception("[RiskManager] failed to rehydrate transfer state")
         self._decision_id_cache: Dict[str, Dict[str, str]] = {}

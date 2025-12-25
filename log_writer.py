@@ -746,13 +746,26 @@ class LogWriter:
               created_ts_ms INTEGER,
               updated_ts_ms INTEGER,
               expires_ts_ms INTEGER,
-              last_error TEXT
+              last_error TEXT,
+              payload_hash TEXT,
+              attempt_count INTEGER
             );
             """
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_type ON ops_journal(op_type);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_status ON ops_journal(status);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_expires ON ops_journal(expires_ts_ms);")
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ops_type_status_updated ON ops_journal(op_type, status, updated_ts_ms);"
+        )
+        self._ensure_columns(
+            conn,
+            "ops_journal",
+            {
+                "payload_hash": "TEXT",
+                "attempt_count": "INTEGER",
+            },
+        )
         conn.commit()
         # [PATCH-SCHEMA] Tags SPLIT / profil / pacer + qualité PnL (idempotent)
         self._ensure_columns(conn, "trades", {
@@ -2263,6 +2276,8 @@ class LogWriter:
             payload: Optional[Dict[str, Any]] = None,
             expires_ts_ms: Optional[int] = None,
             last_error: Optional[str] = None,
+            payload_hash: Optional[str] = None,
+            attempt_count: Optional[int] = None,
     ) -> Dict[str, Any]:
         now_ms = int(time.time() * 1000)
 
@@ -2281,7 +2296,11 @@ class LogWriter:
                 with self._conn() as conn:
                     cur = conn.cursor()
                     cur.execute(
-                        "SELECT status, reason, payload_json, expires_ts_ms, last_error FROM ops_journal WHERE op_id = ?",
+                        """
+                        SELECT status, reason, payload_json, expires_ts_ms, last_error, payload_hash, attempt_count
+                          FROM ops_journal
+                         WHERE op_id = ?
+                        """,
                         (op_id,),
                     )
                     row = cur.fetchone()
@@ -2292,6 +2311,8 @@ class LogWriter:
                                 and (row[2] or None) == payload_json
                                 and row[3] == expires_ts_ms
                                 and (row[4] or None) == (last_error or None)
+                                and (row[5] or None) == (payload_hash or None)
+                                and (row[6] or None) == (attempt_count if attempt_count is not None else None)
                         ):
                             return {"status": "UNCHANGED", "op_id": op_id}
 
@@ -2304,7 +2325,9 @@ class LogWriter:
                                    payload_json = ?,
                                    updated_ts_ms = ?,
                                    expires_ts_ms = ?,
-                                   last_error = ?
+                                   last_error = ?,
+                                   payload_hash = ?,
+                                   attempt_count = ?
                              WHERE op_id = ?
                             """,
                             (
@@ -2315,6 +2338,8 @@ class LogWriter:
                                 now_ms,
                                 expires_ts_ms,
                                 last_error,
+                                payload_hash,
+                                attempt_count,
                                 op_id,
                             ),
                         )
@@ -2325,8 +2350,9 @@ class LogWriter:
                         """
                         INSERT INTO ops_journal (
                           op_id, op_type, status, reason, payload_json,
-                          created_ts_ms, updated_ts_ms, expires_ts_ms, last_error
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                          created_ts_ms, updated_ts_ms, expires_ts_ms, last_error,
+                          payload_hash, attempt_count
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             op_id,
@@ -2338,6 +2364,8 @@ class LogWriter:
                             now_ms,
                             expires_ts_ms,
                             last_error,
+                            payload_hash,
+                            attempt_count,
                         ),
                     )
                     conn.commit()
@@ -2358,7 +2386,11 @@ class LogWriter:
                 self._rotate_if_needed()
                 with self._conn() as conn:
                     cur = conn.cursor()
-                    query = "SELECT op_id, op_type, status, reason, payload_json, created_ts_ms, updated_ts_ms, expires_ts_ms, last_error FROM ops_journal WHERE 1=1"
+                    query = (
+                        "SELECT op_id, op_type, status, reason, payload_json, created_ts_ms, "
+                        "updated_ts_ms, expires_ts_ms, last_error, payload_hash, attempt_count "
+                        "FROM ops_journal WHERE 1=1"
+                    )
                     params: List[Any] = []
                     if op_id:
                         query += " AND op_id = ?"
@@ -2388,6 +2420,8 @@ class LogWriter:
                                 "updated_ts_ms": r[6],
                                 "expires_ts_ms": r[7],
                                 "last_error": r[8],
+                                "payload_hash": r[9],
+                                "attempt_count": r[10],
                             }
                         )
                     return out
