@@ -586,6 +586,34 @@ class MarketDataRouter:
         except Exception:
             logger.exception("[Router] backpressure note_drop failed")
 
+    def _extract_pair_for_drop(self, payload: dict) -> Optional[str]:
+        """Best-effort: retourne la paire si elle est déjà présente dans le payload."""
+        try:
+            if isinstance(payload, Mapping):
+                for key in ("pair_key", "pair"):
+                    value = payload.get(key)
+                    if value:
+                        return str(value).upper()
+        except Exception:
+            return None
+        return None
+
+    def _emit_drop_event(self, *, queue_label: str, payload: dict) -> None:
+        if not self._event_sink:
+            return
+        pair = self._extract_pair_for_drop(payload)
+        evt = {
+            "type": "router_drop",
+            "reason": "queue_full",
+            "pair": pair,
+            "queue_label": queue_label,
+            "ts_ms": int(time.time() * 1000),
+        }
+        try:
+            self._event_sink(evt)
+        except Exception:
+            logger.exception("[Router] event_sink drop dispatch failed")
+
     # ----------------------- Latest store (full & light) -----------------------
     def _light_from_full(self, b: Dict[str, Any]) -> Dict[str, Any]:
         bids = b.get("bids") or b.get("b") or []
@@ -1360,6 +1388,7 @@ class MarketDataRouter:
                 queue=queue_label,
                 reason="queue_full",
             )
+            self._emit_drop_event(queue_label=queue_label, payload=payload)
             self._bp_note_drop(queue_label, reason="queue_full")
             return
         try:
@@ -1381,6 +1410,7 @@ class MarketDataRouter:
                     queue=queue_label,
                     reason="queue_full",
                 )
+                self._emit_drop_event(queue_label=queue_label, payload=payload)
             except asyncio.QueueFull:
                 safe_inc(
                     ROUTER_DROPPED_TOTAL,
@@ -1389,6 +1419,7 @@ class MarketDataRouter:
                     queue=queue_label,
                     reason="queue_full",
                 )
+                self._emit_drop_event(queue_label=queue_label, payload=payload)
 
     def _publish_combo(self, a: str, b: str, payload: Dict[str, Any]) -> None:
         if not self.publish_combo_to_bus:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
 import time
 import contextlib
 import inspect
@@ -107,6 +108,17 @@ class _LazyScannerProxy:
             return None
         return t.update_orderbook(ev)
 
+    def get_cohort(self, pair: str) -> Optional[str]:
+        t = self._target
+        if t is None:
+            return None
+        fn = getattr(t, "get_cohort", None) or getattr(t, "_cohort_of", None)
+        if callable(fn):
+            try:
+                return fn(pair)
+            except Exception:
+                return None
+        return None
 
 # --------------------------------- Boot ------------------------------------
 class Boot:
@@ -155,6 +167,8 @@ class Boot:
         self._router_health_stale_counts: Dict[str, int] = {}
         self._router_health_warned: bool = False
         self._obs_inc_cb: Optional[Any] = None
+        self._router_drop_events: Dict[str, deque] = {}
+        self._router_drop_latch_emitted: bool = False
         self._obs_counter_cache: Dict[Tuple[str, tuple[str, ...]], Any] = {}
         self._critical_deps = ["config", "obs", "rate_limiter", "pacer"]
         self._module_state: Dict[str, Any] = {}
@@ -903,6 +917,10 @@ class Boot:
             self._wire_slippage_handler()
         except Exception:
             self.log.exception("[Boot] Wiring slippage handler failed")
+        try:
+            self._wire_router_event_sink()
+        except Exception:
+            self.log.exception("[Boot] Wiring router event sink failed")
 
         # Lance Router en tâche non-bloquante
         self._router_task = asyncio.create_task(self.ctx.router.start(), name="boot-router-start")
@@ -1094,7 +1112,15 @@ class Boot:
             self.log.exception("[Boot] set_fail_closed_callback failed")
         if hasattr(self.ctx.rm, "start"):
             await self.ctx.rm.start()
-
+        try:
+            lhm = getattr(self.ctx, "lhm", None)
+            if lhm is not None and hasattr(lhm, "get_active_latches"):
+                active_latches = lhm.get_active_latches() or []
+                if active_latches and hasattr(self.ctx.rm, "set_logging_fail_closed"):
+                    reason = active_latches[0].get("reason") or "TRUTH_PERSISTENCE_FAILED"
+                    self.ctx.rm.set_logging_fail_closed(reason)
+        except Exception:
+            self.log.exception("[Boot] failed to apply persisted latches to RM")
         if getattr(self.ctx.rm, "ready_event", None):
             with contextlib.suppress(Exception):
                 self.ready_rm_loops.set()
@@ -1232,6 +1258,7 @@ class Boot:
                 "bybit_accounts": bybit_accounts,
                 "coinbase_at_accounts": coinbase_accounts,
                 "transfer_clients": transfer_clients,
+                "logger_historique_manager": getattr(self.ctx, "lhm", None),
             }
             hub_kwargs = {k: v for k, v in hub_kwargs.items() if v}
 
@@ -1398,7 +1425,10 @@ class Boot:
         if not getattr(self.ctx, "engine", None):
             # Garantit la présence du hub privé avant l'Engine
             if getattr(self.ctx, "pws_hub", None) is None:
-                self.ctx.pws_hub = PrivateWSHub(getattr(self, "cfg", None))
+                self.ctx.pws_hub = PrivateWSHub(
+                    getattr(self, "cfg", None),
+                    logger_historique_manager=getattr(self.ctx, "lhm", None),
+                )
 
             self.ctx.engine = ExecutionEngine(
                 private_ws=self.ctx.pws_hub,
@@ -1498,7 +1528,7 @@ class Boot:
         if not getattr(self.ctx, "rpc", None):
             try:
                 # Nouvelle signature: RPCServer(cfg, handlers, ...)
-                self.ctx.rpc = RPCServer(self.cfg, handlers)
+                self.ctx.rpc = RPCServer(self.cfg, handlers, lhm=getattr(self.ctx, "lhm", None))
             except TypeError:
                 # Ancienne signature: RPCServer(cfg)
                 self.ctx.rpc = RPCServer(self.cfg)
@@ -2226,7 +2256,119 @@ class Boot:
         except Exception:
             self.log.exception("[Boot] MBF.set_event_sink a échoué")
 
+    def _wire_router_event_sink(self) -> None:
+        router = getattr(self.ctx, "router", None)
+        if router is None or not hasattr(router, "set_event_sink"):
+            return
+        drop_window_s = float(getattr(router, "drop_window_s", 3.0) or 3.0)
+        latch_threshold = int(getattr(router, "drop_alert_threshold", 64) or 64)
+        freeze_s = int(getattr(getattr(self.cfg, "router", object()), "queue_full_freeze_s", 60) or 60)
 
+        def handler(evt: Dict[str, Any]) -> None:
+            try:
+                self._handle_router_drop_event(
+                    evt,
+                    drop_window_s=drop_window_s,
+                    latch_threshold=latch_threshold,
+                    freeze_s=freeze_s,
+                )
+            except Exception:
+                self.log.exception("[Boot] router drop handler failed")
+
+        try:
+            router.set_event_sink(handler)
+            self.log.info("[Boot] Router event sink branché (queue_full drops)")
+        except Exception:
+            self.log.exception("[Boot] router.set_event_sink a échoué")
+
+    def _handle_router_drop_event(
+            self,
+            evt: Dict[str, Any],
+            *,
+            drop_window_s: float,
+            latch_threshold: int,
+            freeze_s: int,
+    ) -> None:
+        if not isinstance(evt, dict):
+            return
+        if evt.get("type") != "router_drop" or evt.get("reason") != "queue_full":
+            return
+        pair = evt.get("pair") or evt.get("pair_key")
+        if not pair:
+            return
+        pair_norm = str(pair).upper()
+        scanner = getattr(self.ctx, "scanner", None) or self._scanner_proxy
+        cohort = None
+        fn = getattr(scanner, "get_cohort", None)
+        if callable(fn):
+            try:
+                cohort = fn(pair_norm)
+            except Exception:
+                self.log.exception("[Boot] router drop: cohort lookup failed")
+        if str(cohort or "").upper() not in {"CORE", "PRIMARY"}:
+            return
+        lhm = getattr(self.ctx, "lhm", None)
+        if lhm is None:
+            return
+        queue_label = evt.get("queue_label")
+        payload = {"queue_label": queue_label} if queue_label else None
+        expires_ts_ms = None
+        ts_ms = evt.get("ts_ms")
+        try:
+            expires_ts_ms = int(ts_ms) + int(max(1, freeze_s) * 1000) if ts_ms is not None else None
+        except Exception:
+            expires_ts_ms = None
+        try:
+            lhm.pause_pair(
+                pair_norm,
+                duration=int(max(1, freeze_s)),
+                reason="ROUTER_QUEUE_FULL_PAIR_FROZEN",
+                op_id=f"PAIR/{pair_norm}/ROUTER_QUEUE_FULL",
+                payload=payload,
+                expires_ts_ms=expires_ts_ms,
+            )
+        except Exception:
+            self.log.exception("[Boot] router drop pause failed for %s", pair_norm)
+        self._record_router_drop(
+            pair_norm,
+            drop_window_s=drop_window_s,
+            latch_threshold=latch_threshold,
+            lhm=lhm,
+            freeze_s=freeze_s,
+        )
+
+    def _record_router_drop(
+            self,
+            pair: str,
+            *,
+            drop_window_s: float,
+            latch_threshold: int,
+            lhm: Any,
+            freeze_s: int,
+    ) -> None:
+        dq = self._router_drop_events.setdefault(pair, deque())
+        now = time.monotonic()
+        dq.append(now)
+        horizon = now - float(drop_window_s)
+        while dq and dq[0] < horizon:
+            dq.popleft()
+        if self._router_drop_latch_emitted:
+            return
+        if len(dq) >= int(latch_threshold):
+            self._router_drop_latch_emitted = True
+            try:
+                lhm.activate_fail_closed_latch(
+                    op_id="ROUTER/DROP_CORE_PRIMARY",
+                    reason="ROUTER_QUEUE_FULL_PAIR_FROZEN",
+                    payload={
+                        "pair": pair,
+                        "drops_in_window": len(dq),
+                        "window_s": drop_window_s,
+                        "freeze_s": freeze_s,
+                    },
+                )
+            except Exception:
+                self.log.exception("[Boot] router drop latch activation failed")
     def _publish_private_hub_status(self, *, reason: str = "update") -> Optional[Dict[str, Any]]:
         """Expose l'état du hub vers Boot.status_sink et RiskManager."""
         hub = getattr(self.ctx, "pws_hub", None)

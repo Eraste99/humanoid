@@ -43,6 +43,8 @@ Patchs demandés (inclus)
 
 from __future__ import annotations
 import enum
+import hashlib
+import json
 import math
 import time
 import re
@@ -1598,6 +1600,8 @@ KNOWN_REASON_CODES = {
     "BOOT_MODE_FALLBACK",
     "RPC_MISSING_IDEMPOTENCY_KEY",
     "TRADING_NOT_READY",
+    "RPC_IDEMPOTENCY",
+    "RPC_IDEMPOTENCY_DEGRADED",
     "PWS_QUEUE_BACKPRESSURE_TIMEOUT",
     "TRUTH_PERSISTENCE_FAILED",
     "ENGINE_DEDUP_BROKEN",
@@ -1624,13 +1628,30 @@ KNOWN_REASON_CODES = {
     "PUBLIC_FEED_STALE",
     "PUBLIC_FEED_COVERAGE_LOW",
     "PRIVATE_WS_STALE",
+    "PWS_UNSAFE_DEDUP",
     "ENGINE_BLOCKED",
     "BALANCE_STALE",
     "MISSING_FIELD",
     "FALLBACK_THRESHOLD_USED",
     "HEALTH_QUEUE_BACKLOG",
+    "ROUTER_QUEUE_FULL_PAIR_FROZEN",
+    "TRANSFER_FSM",
+    "TRANSFER_FAILED",
+    "XFER_STUCK_SUBMITTED_FAIL_CLOSED",
 }
-
+def canonical_transfer_id(payload: Dict[str, Any]) -> str:
+    base = {
+        "exchange": str(payload.get("exchange") or ""),
+        "from_alias": str(payload.get("from_alias") or payload.get("from") or ""),
+        "to_alias": str(payload.get("to_alias") or payload.get("to") or ""),
+        "from_wallet": str(payload.get("from_wallet") or ""),
+        "to_wallet": str(payload.get("to_wallet") or ""),
+        "ccy": str(payload.get("ccy") or payload.get("currency") or ""),
+        "amount": float(payload.get("amount") or payload.get("amount_quote") or payload.get("amount_usdc") or 0.0),
+        "type": str(payload.get("type") or payload.get("kind") or "transfer"),
+    }
+    data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(data.encode("utf-8")).hexdigest()
 
 def normalize_reason_code(reason: Optional[str]) -> Optional[str]:
     """Normalise un code de reason (safe, best-effort)."""

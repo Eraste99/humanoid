@@ -44,7 +44,13 @@ from modules.obs_metrics import inc_blocked
 import logging
 from collections import defaultdict
 from modules.obs_metrics import TIME_SKEW_MS
-from contracts.payloads import make_submit_bundle, submit_leg_from_intent, normalize_leg_dict, normalize_reason_code
+from contracts.payloads import (
+    make_submit_bundle,
+    submit_leg_from_intent,
+    normalize_leg_dict,
+    normalize_reason_code,
+    canonical_transfer_id,
+)
 from modules.retry_policy import BackoffPolicy, awith_retry
 
 
@@ -960,13 +966,108 @@ def _cfg_list_upper(cfg, name: str, default: list) -> list:
         return [str(x).upper() for x in default]
 
 class TransferController:
-    def __init__(self, *, policy: Optional[BackoffPolicy] = None) -> None:
+    def __init__(
+            self,
+            *,
+            policy: Optional[BackoffPolicy] = None,
+            logger_historique_manager=None,
+            submitted_timeout_s: float = 300.0,
+    ) -> None:
         self._policy = policy or BackoffPolicy()
         self._states: Dict[str, Dict[str, Any]] = {}
+        self._lhm = logger_historique_manager
+        self._submitted_timeout_s = float(submitted_timeout_s or 300.0)
 
     @staticmethod
-    def _canonical_transfer_id(payload: Dict[str, Any]) -> str:
-        base = {
+    def canonical_transfer_id(payload: Dict[str, Any]) -> str:
+        return canonical_transfer_id(payload)
+
+    @staticmethod
+    def _op_id(transfer_id: str) -> str:
+        return f"XFER/{transfer_id}"
+
+    def rehydrate(self, inflight: list[dict[str, Any]], now_ms: Optional[int] = None) -> None:
+        now_ms = now_ms or int(time.time() * 1000)
+        for row in inflight or []:
+            op_id = str(row.get("op_id") or "")
+            if not op_id.startswith("XFER/"):
+                continue
+            transfer_id = op_id.split("/", 1)[-1]
+            expires = row.get("expires_ts_ms")
+            state = str(row.get("status") or "SUBMITTED").upper()
+            last_ts = float(row.get("updated_ts_ms") or row.get("created_ts_ms") or now_ms) / 1000.0
+            self._states[transfer_id] = {
+                "state": state,
+                "last_ts": last_ts,
+                "expires_ts_ms": expires,
+                "payload": row.get("payload"),
+            }
+            if state == "SUBMITTED" and expires is not None and int(expires) <= now_ms:
+                self._fail_stuck(transfer_id=transfer_id, op_id=op_id, payload=row.get("payload"))
+
+    def _fail_stuck(self, *, transfer_id: str, op_id: str, payload: Optional[dict[str, Any]]) -> None:
+        self._states[transfer_id] = {
+            "state": "FAILED",
+            "last_ts": time.time(),
+            "payload": payload,
+            "error": "stuck_submitted_timeout",
+        }
+        try:
+            if self._lhm:
+                self._lhm.mark_transfer_failed(
+                    op_id=op_id,
+                    payload=payload,
+                    last_error="stuck_submitted_timeout",
+                    reason="XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+                )
+                self._lhm.activate_fail_closed_latch(
+                    op_id="TRANSFERS/XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+                    reason="XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+                    payload={"op_id": op_id},
+                )
+        except Exception:
+            logger.exception("[TransferController] failed to mark stuck transfer")
+
+    def check_timeouts(self) -> None:
+        if not self._states:
+            return
+        now_ms = int(time.time() * 1000)
+        for transfer_id, state in list(self._states.items()):
+            if state.get("state") != "SUBMITTED":
+                continue
+            expires = state.get("expires_ts_ms")
+            if expires is not None and int(expires) <= now_ms:
+                op_id = self._op_id(transfer_id)
+                self._fail_stuck(transfer_id=transfer_id, op_id=op_id, payload=state.get("payload"))
+
+    def _persist_state(
+        self,
+        *,
+        transfer_id: str,
+        state: str,
+        payload: Optional[dict[str, Any]] = None,
+        expires_ts_ms: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        op_id = self._op_id(transfer_id)
+        if not self._lhm:
+            return
+        try:
+            if state == "REQUESTED":
+                self._lhm.mark_transfer_requested(op_id=op_id, payload=payload)
+            elif state == "SUBMITTED":
+                self._lhm.mark_transfer_submitted(
+                    op_id=op_id, payload=payload, expires_ts_ms=expires_ts_ms
+                )
+            elif state == "SETTLED":
+                self._lhm.mark_transfer_settled(op_id=op_id, payload=payload)
+            elif state == "FAILED":
+                self._lhm.mark_transfer_failed(op_id=op_id, payload=payload, last_error=error)
+        except Exception:
+            logger.exception("[TransferController] persist state failed")
+
+    def _state_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return {
             "exchange": str(payload.get("exchange") or ""),
             "from_alias": str(payload.get("from_alias") or payload.get("from") or ""),
             "to_alias": str(payload.get("to_alias") or payload.get("to") or ""),
@@ -976,23 +1077,42 @@ class TransferController:
             "amount": float(payload.get("amount") or payload.get("amount_quote") or payload.get("amount_usdc") or 0.0),
             "type": str(payload.get("type") or payload.get("kind") or "transfer"),
         }
-        data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
-        return hashlib.sha1(data.encode("utf-8")).hexdigest()
+
 
     async def submit(self, *, payload: Dict[str, Any], submit_fn: Callable[[], Any], venue: str) -> Dict[str, Any]:
-        transfer_id = payload.get("transfer_id") or self._canonical_transfer_id(payload)
+        transfer_id = payload.get("transfer_id") or self.canonical_transfer_id(payload)
         payload["transfer_id"] = transfer_id
-        state = self._states.get(transfer_id, {})
-        if state.get("state") in {"SUBMITTED", "SETTLED"}:
+        op_id = self._op_id(transfer_id)
+        state = self._states.get(transfer_id)
+        if state is None and self._lhm:
+            existing = self._lhm.get_transfer_state(op_id)
+            if existing:
+                state = {
+                    "state": str(existing.get("status") or "").upper(),
+                    "payload": existing.get("payload"),
+                    "expires_ts_ms": existing.get("expires_ts_ms"),
+                }
+                self._states[transfer_id] = state
+        if state and state.get("state") in {"SUBMITTED", "SETTLED"}:
             return {"status": state.get("state"), "transfer_id": transfer_id, "replayed": True}
-
+        state_payload = self._state_payload(payload)
+        self._persist_state(transfer_id=transfer_id, state="REQUESTED", payload=state_payload)
         outcome = await awith_retry(submit_fn, venue=venue, policy=self._policy)
         if outcome.ok:
+            expires_ts_ms = int(time.time() * 1000 + (self._submitted_timeout_s * 1000.0))
             self._states[transfer_id] = {
                 "state": "SUBMITTED",
                 "attempts": outcome.attempts,
                 "last_ts": time.time(),
+                "expires_ts_ms": expires_ts_ms,
+                "payload": state_payload,
             }
+            self._persist_state(
+                transfer_id=transfer_id,
+                state="SUBMITTED",
+                payload=state_payload,
+                expires_ts_ms=expires_ts_ms,
+            )
             return {"status": "SUBMITTED", "transfer_id": transfer_id, "attempts": outcome.attempts}
 
         self._states[transfer_id] = {
@@ -1000,16 +1120,45 @@ class TransferController:
             "attempts": outcome.attempts,
             "last_ts": time.time(),
             "error": str(outcome.last_exception) if outcome.last_exception else "unknown",
+            "payload": state_payload,
         }
+        self._persist_state(
+            transfer_id=transfer_id,
+            state="FAILED",
+            payload=state_payload,
+            error=str(outcome.last_exception) if outcome.last_exception else "unknown",
+        )
         return {"status": "FAILED", "transfer_id": transfer_id, "attempts": outcome.attempts}
 
-    def mark_settled(self, transfer_id: Optional[str]) -> None:
+    def mark_settled(self, transfer_id: Optional[str], *, payload: Optional[dict[str, Any]] = None) -> None:
         if not transfer_id:
             return
+        now = time.time()
         self._states[transfer_id] = {
             "state": "SETTLED",
-            "last_ts": time.time(),
+            "last_ts": now,
+            "payload": payload,
         }
+        try:
+            self._persist_state(transfer_id=transfer_id, state="SETTLED", payload=payload)
+        except Exception:
+            logger.exception("[TransferController] mark_settled persist failed")
+
+        def mark_failed(self, transfer_id: Optional[str], *, payload: Optional[dict[str, Any]] = None,
+                        error: Optional[str] = None) -> None:
+            if not transfer_id:
+                return
+            now = time.time()
+            self._states[transfer_id] = {
+                "state": "FAILED",
+                "last_ts": now,
+                "payload": payload,
+                "error": error,
+            }
+            try:
+                self._persist_state(transfer_id=transfer_id, state="FAILED", payload=payload, error=error)
+            except Exception:
+                logger.exception("[TransferController] mark_failed persist failed")
 
 
 class RiskManager:
@@ -1516,7 +1665,18 @@ class RiskManager:
         self.transfer_clients: Dict[str, Any] = {str(k).upper(): v for k, v in (transfer_clients or {}).items()}
         retry_cfg = getattr(getattr(self.cfg, "rm", None), "transfer_retry_policy", None)
         retry_cfg = retry_cfg or getattr(self.cfg, "transfer_retry_policy", None)
-        self._transfer_controller = TransferController(policy=BackoffPolicy.from_cfg(retry_cfg))
+        transfer_timeout_s = float(self._resolve_rm_param("transfer_submitted_timeout_s", 300.0) or 300.0)
+        self._transfer_controller = TransferController(
+            policy=BackoffPolicy.from_cfg(retry_cfg),
+            logger_historique_manager=self._lhm_manager,
+            submitted_timeout_s=transfer_timeout_s,
+        )
+        try:
+            if self._lhm_manager is not None:
+                inflight = self._lhm_manager.get_inflight_transfers(include_expired=True)
+                self._transfer_controller.rehydrate(inflight, now_ms=int(time.time() * 1000))
+        except Exception:
+            logger.exception("[RiskManager] failed to rehydrate transfer state")
         self._decision_id_cache: Dict[str, Dict[str, str]] = {}
 
         # Routes autorisées tri-CEX (configurable)
@@ -5673,6 +5833,29 @@ class RiskManager:
             event = "private_ws_recovered" if healthy else "private_ws_degraded"
             self._emit_private_plane_event(event, healthy=bool(healthy))
 
+    def _handle_pws_unsafe_dedup(self, payload: Optional[Dict[str, Any]] = None) -> None:
+        if getattr(self, "_pws_unsafe_dedup_seen", False):
+            return
+        try:
+            self._pws_unsafe_dedup_seen = True
+        except Exception:
+            pass
+        reason = normalize_reason_code("PWS_UNSAFE_DEDUP") or "PWS_UNSAFE_DEDUP"
+        try:
+            inc_blocked("rm", reason, None)
+        except Exception:
+            pass
+        try:
+            mgr = getattr(self, "_lhm_manager", None)
+            if mgr and hasattr(mgr, "activate_fail_closed_latch"):
+                mgr.activate_fail_closed_latch(
+                    op_id="PWS/PWS_UNSAFE_DEDUP",
+                    reason=reason,
+                    payload=payload if isinstance(payload, dict) else None,
+                )
+        except Exception:
+            logger.exception("[RiskManager] activate_fail_closed_latch failed")
+        self.set_logging_fail_closed(reason)
     def _set_trading_state(self, state: str, *, reason: Optional[str] = None) -> None:
         new_state = str(state or "READY").upper()
         prev_state = str(getattr(self, "trading_state", "READY") or "READY").upper()
@@ -5738,9 +5921,13 @@ class RiskManager:
         pws_health = status.get("pws_health") if isinstance(status, dict) else None
         critical_drop_seen = None
         last_reason = None
+        unsafe_dedup = False
+        unsafe_payload = None
         if isinstance(pws_health, dict):
             critical_drop_seen = pws_health.get("critical_drop_seen")
             last_reason = pws_health.get("last_critical_drop_reason")
+            unsafe_dedup = bool(pws_health.get("unsafe_dedup_seen"))
+            unsafe_payload = pws_health.get("last_unsafe_dedup")
         if critical_drop_seen is None and isinstance(status, dict):
             critical_drop_seen = status.get("critical_drop_seen")
         if critical_drop_seen:
@@ -5757,6 +5944,11 @@ class RiskManager:
                     self._pws_blocked_emitted = True
                 self._set_trading_state("BLOCKED", reason=reason)
 
+        if unsafe_dedup:
+            try:
+                self._handle_pws_unsafe_dedup(unsafe_payload)
+            except Exception:
+                logger.exception("[RiskManager] handle_pws_unsafe_dedup failed")
     def set_engine(self, engine) -> None:
         """
         Injection tardive de l'Engine (après création réelle dans le Boot).
@@ -8413,6 +8605,10 @@ class RiskManager:
     async def _loop_balances(self):
         while self._running:
             try:
+                try:
+                    self._transfer_controller.check_timeouts()
+                except Exception:
+                    logger.exception("[RiskManager] transfer timeout check failed")
                 if getattr_bool(self.cfg, "dry_run", False):
                     bals = self._virtual_balances.copy()
                     self._last_balances = bals
@@ -10844,11 +11040,14 @@ class RiskManager:
             payload = {}
         try:
             transfer_id = payload.get("transfer_id") or ev.get("transfer_id")
+            if not transfer_id:
+                transfer_id = self._transfer_controller.canonical_transfer_id(payload)
             if status in ("OK", "SUCCESS"):
-                self._transfer_controller.mark_settled(transfer_id)
+                self._transfer_controller.mark_settled(transfer_id, payload=payload)
                 if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
                     self.rebalancing.mark_transfer_status(transfer_id, "SETTLED")
             elif status in ("ERROR", "FAILED", "REJECTED"):
+                self._transfer_controller.mark_failed(transfer_id, payload=payload, error=str(ev.get("error")))
                 if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
                     self.rebalancing.mark_transfer_status(transfer_id, status)
         except Exception:
@@ -11086,7 +11285,7 @@ class RiskManager:
             "amount_usdc": float(amount_usdc),
             "meta": {"source": "RebalancingManager", "kind": "REB_TRANSFER"},
         }
-        payload["transfer_id"] = TransferController._canonical_transfer_id(payload)
+        payload["transfer_id"] = TransferController.canonical_transfer_id(payload)
         return payload
 
     def _make_cross_cex_opportunity(self, plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -14954,6 +15153,18 @@ class RiskManager:
 
         ev = dict(evt or {})
         if str(ev.get("type") or "").lower() == "pws_health":
+            reason = normalize_reason_code(ev.get("reason")) if ev.get("reason") else None
+            if reason == "PWS_UNSAFE_DEDUP":
+                try:
+                    self._handle_pws_unsafe_dedup({
+                        "reason": reason,
+                        "exchange": ev.get("exchange"),
+                        "alias": ev.get("alias"),
+                        "kind": ev.get("kind"),
+                    })
+                except Exception:
+                    logger.exception("[RiskManager] pws_health unsafe_dedup handling failed")
+                return
             status = {
                 "pws_health": {
                     "critical_drop_seen": True,

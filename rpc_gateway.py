@@ -190,6 +190,8 @@ class RPCSettings:
     region: str  # "EU" | "US"
     timeout_s: float
     max_retries: int  # ≤ 2
+    idempotency_ttl_s: int
+    memoize_response: bool
     mtls_enabled: bool
     ca_cert: Optional[str]
     server_cert: Optional[str]
@@ -214,6 +216,8 @@ class RPCSettings:
             except Exception:
                 pass
         max_retries = int(min(getattr(cfg, "rpc_max_retries", 2), 2))
+        idempotency_ttl_s = getattr_int(cfg, "rpc_idempotency_ttl_s", 600)
+        memoize_response = getattr_bool(cfg, "rpc_idempotency_memoize_response", True)
         mtls_enabled = getattr_bool(cfg, "rpc_mtls_enabled", True)
         ca_cert = getattr(cfg, "rpc_ca_cert", None)
         server_cert = getattr(cfg, "rpc_server_cert", None)
@@ -222,7 +226,7 @@ class RPCSettings:
         client_key = getattr(cfg, "rpc_client_key", None)
         require_client_cert = getattr_bool(cfg, "rpc_require_client_cert", True)
         return RPCSettings(
-            enabled, host, port, region, timeout_s, max_retries,
+            enabled, host, port, region, timeout_s, max_retries, idempotency_ttl_s, memoize_response,
             mtls_enabled, ca_cert, server_cert, server_key, client_cert, client_key, require_client_cert
         )
 
@@ -262,7 +266,6 @@ class RPCServer:
         self._app = None
         self._runner = None
         self._site = None
-        self._idem = _TTLIdempotencyStore(maxsize=20000, ttl_s=600)
         self._lhm = lhm  # <= LoggerHistoriqueManager (facultatif)
         self._admin_enabled = getattr_bool(cfg, "rpc_admin_enabled", False)
         self._admin_token = admin_token or getattr_str(cfg, "rpc_admin_token", None)
@@ -276,13 +279,15 @@ class RPCServer:
         if not key:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
             raise ValueError("RPC_MISSING_IDEMPOTENCY_KEY")
-        seen, resp = await self._idem.peek(key)
-        if seen:
-            _inc(RPC_IDEMPOTENCY_HIT_TOTAL, 1.0, method="submit_bundle", region=self.settings.region)
-            return resp or {"replayed": True}
-        res = await self.handlers.submit_bundle(payload)
 
-        await self._idem.put(key, res)
+        res, replayed = await self._process_idempotent_flow(
+            key=key,
+            method="submit_bundle",
+            payload=payload,
+            handler=self.handlers.submit_bundle,
+        )
+        if replayed:
+            _inc(RPC_IDEMPOTENCY_HIT_TOTAL, 1.0, method="submit_bundle", region=self.settings.region)
         return res
 
     async def cancel(self, payload: dict) -> dict:
@@ -314,8 +319,8 @@ class RPCServer:
         app = web.Application(middlewares=[self._mw_timing_and_errors])
         app.add_routes([
             web.get("/rpc/health", self._handle_health),
-            web.post("/rpc/submit_bundle", self._wrap_idempotent(self._handle_submit_bundle)),
-            web.post("/rpc/cancel", self._wrap_idempotent(self._handle_cancel)),
+            web.post("/rpc/submit_bundle", self._handle_submit_bundle),
+            web.post("/rpc/cancel", self._handle_cancel),
             web.post("/rpc/status", self._handle_status),
             web.get("/rpc/stream", self._handle_stream_sse),
 
@@ -468,59 +473,27 @@ class RPCServer:
 
         self._status_handler = _handle_status
 
-    def _wrap_idempotent(self, fn: Callable):
-        async def inner(request):
-            # Ici : check rapide sur headers uniquement (pour ne pas consommer le body prématurément)
-            idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-            if idem:
-                seen, cached = await self._idem.peek(idem)
-                if seen:
-                    _inc(
-                        RPC_IDEMPOTENCY_HIT_TOTAL,
-                        1.0,
-                        method=str(request.path or "").replace("/rpc/", ""),
-                        region=self.settings.region,
-                    )
-                    return web.json_response(cached or {"replayed": True}, headers={"X-Idempotent-Replay": "1"})
-
-            return await fn(request)
-
-        return inner
 
     # ----- endpoint handlers -----
 
     async def _handle_health(self, request: web.Request):
-
         return web.json_response({"ok": True, "region": self.settings.region})
 
     async def _handle_submit_bundle(self, request: web.Request):
-        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-        if not idem:
-            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
-            raise web.HTTPBadRequest(text="missing idempotency key")
-        body = await self._read_json(request, method="submit_bundle")
-        if body is None:
-            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
-            raise web.HTTPBadRequest(text="invalid JSON")
-        body = self._validate_submit_payload(body)
-        res = await self.handlers.submit_bundle(body)
-        await self._idem.put(idem, res)
-        return web.json_response(res)
+        return await self._handle_idempotent_request(
+            request,
+            method="submit_bundle",
+            validator=self._validate_submit_payload,
+            handler=self.handlers.submit_bundle,
+        )
 
     async def _handle_cancel(self, request: web.Request):
-        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-        if not idem:
-            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
-            raise web.HTTPBadRequest(text="missing idempotency key")
-        body = await self._read_json(request, method="cancel")
-        if body is None:
-            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
-            raise web.HTTPBadRequest(text="invalid JSON")
-        body = self._validate_cancel_payload(body)
-
-        res = await self.handlers.cancel(body)
-        await self._idem.put(idem, res)
-        return web.json_response(res)
+        return await self._handle_idempotent_request(
+            request,
+            method="cancel",
+            validator=self._validate_cancel_payload,
+            handler=self.handlers.cancel,
+        )
 
     async def _handle_status(self, request: web.Request):
         body = await self._read_json(request, method="status", required=False)
@@ -554,7 +527,122 @@ class RPCServer:
         return response
 
     # ----- utils -----
+    async def _handle_idempotent_request(self, request: web.Request, *, method: str, validator: Callable[[dict], dict],
+                                         handler: Callable[[dict], Awaitable[dict]]):
+        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
+        if not idem:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
+            raise web.HTTPBadRequest(text="missing idempotency key")
 
+        body = await self._read_json(request, method=method)
+        if body is None:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
+            raise web.HTTPBadRequest(text="invalid JSON")
+
+        body = validator(body)
+        res, replayed = await self._process_idempotent_flow(
+            key=idem,
+            method=method,
+            payload=body,
+            handler=handler,
+        )
+        if replayed:
+            _inc(RPC_IDEMPOTENCY_HIT_TOTAL, 1.0, method=method, region=self.settings.region)
+            return web.json_response(res or {"replayed": True}, headers={"X-Idempotent-Replay": "1"})
+        return web.json_response(res)
+
+    async def _process_idempotent_flow(
+            self,
+            *,
+            key: str,
+            method: str,
+            payload: dict,
+            handler: Callable[[dict], Awaitable[dict]],
+    ) -> tuple[dict, bool]:
+        op_id = f"RPC/{key}"
+        lhm = self._lhm
+        if not lhm:
+            raise web.HTTPServiceUnavailable(text="idempotency store unavailable")
+
+        try:
+            state = await asyncio.to_thread(lhm.get_rpc_idem_state, op_id)
+        except Exception as e:
+            self._mark_rpc_idem_degraded(e)
+            raise web.HTTPServiceUnavailable(text="idempotency degraded")
+
+        if state:
+            status = str(state.get("status") or "").upper()
+            if status == "DONE":
+                cached = state.get("payload")
+                return cached or {"replayed": True}, True
+            if status == "STARTED":
+                raise web.HTTPConflict(text="idempotent request already started")
+            if status == "FAILED":
+                raise web.HTTPConflict(text="idempotent request previously failed")
+
+        try:
+            await asyncio.to_thread(
+                lhm.mark_rpc_idem_started,
+                op_id=op_id,
+                payload=self._safe_rpc_payload(method, payload),
+            )
+        except Exception as e:
+            self._mark_rpc_idem_degraded(e)
+            raise web.HTTPServiceUnavailable(text="idempotency degraded")
+
+        try:
+            res = await handler(payload)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(
+                    lhm.mark_rpc_idem_failed,
+                    op_id=op_id,
+                    payload=self._safe_rpc_payload(method, payload),
+                    last_error=str(e)[:400],
+                )
+            raise
+
+        expires_ts_ms: Optional[int] = None
+        if self.settings.idempotency_ttl_s > 0:
+            expires_ts_ms = int(time.time() * 1000 + max(0, self.settings.idempotency_ttl_s) * 1000)
+
+        try:
+            await asyncio.to_thread(
+                lhm.mark_rpc_idem_done,
+                op_id=op_id,
+                payload=self._safe_rpc_payload(method, payload),
+                response=res if self.settings.memoize_response else None,
+                expires_ts_ms=expires_ts_ms,
+            )
+        except Exception as e:
+            self._mark_rpc_idem_degraded(e)
+            raise web.HTTPServiceUnavailable(text="idempotency degraded")
+
+        return res, False
+
+    def _safe_rpc_payload(self, method: str, payload: Optional[dict]) -> dict:
+        snap: dict[str, Any] = {"method": method}
+        if isinstance(payload, dict):
+            try:
+                snap["payload_keys"] = sorted(payload.keys())
+            except Exception:
+                snap["payload_repr"] = str(payload)
+        return snap
+
+    def _mark_rpc_idem_degraded(self, exc: Optional[Exception] = None) -> None:
+        mgr = self._lhm
+        if not mgr:
+            return
+        payload = {"error": str(exc)} if exc else None
+        try:
+            if hasattr(mgr, "activate_fail_closed_latch"):
+                mgr.activate_fail_closed_latch(
+                    op_id="RPC/IDEMPOTENCY_DEGRADED",
+                    reason="RPC_IDEMPOTENCY_DEGRADED",
+                    payload=payload,
+                )
+        except Exception:
+            pass
     async def _read_json(self, request: web.Request, *, method: str, required: bool = True) -> Optional[dict]:
         try:
             raw = await request.read()

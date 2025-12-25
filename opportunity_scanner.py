@@ -1721,6 +1721,10 @@ class OpportunityScanner:
         # Rétro-compat conservatrice: si hors listes, traite comme AUDITION
         return "AUDITION"
 
+    def get_cohort(self, pair: str) -> str:
+        """API read-only minimale: expose la cohorte actuelle d'une paire."""
+        return self._cohort_of(pair)
+
     # À mettre dans opportunity_scanner.py (dans la classe)
     def apply_runtime_config(self, cfg: Any) -> None:
         """

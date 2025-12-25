@@ -214,7 +214,8 @@ class LogWriter:
         *,
         rotate_bytes: int = 256 * 1024 * 1024,   # 256 MiB (borne taille)
         backup_count: int = 10,                  # nombre de rotations à conserver (compressées)
-        compress_rotations: bool = True          # compresser les rotations
+        compress_rotations: bool = True,  # compresser les rotations
+        ops_retention_days: int = 30,
     ) -> None:
         self.db_dir = db_dir
         os.makedirs(self.db_dir, exist_ok=True)
@@ -223,6 +224,7 @@ class LogWriter:
         self._rotate_bytes = int(max(1, rotate_bytes))
         self._backup_count = int(max(0, backup_count))
         self._compress_rot = bool(compress_rotations)
+        self._ops_retention_days = int(max(0, ops_retention_days)) or 30
 
         self._current_date = datetime.utcnow().date()
         self.db_path = self._daily_db_path()
@@ -243,7 +245,10 @@ class LogWriter:
             self.backup_database()
         except Exception:
             logger.exception("backup at boot failed")
-
+        try:
+            self.purge_ops_journal(retention_days=self._ops_retention_days)
+        except Exception:
+            logger.exception("purge_ops_journal at boot failed")
 
     # ------------------------------------------------------------------
     # Rotation & maintenance
@@ -730,7 +735,24 @@ class LogWriter:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_bundle ON trade_fsm_events(bundle_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_decision ON trade_fsm_events(decision_id);")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_trade_fsm_idem ON trade_fsm_events(idempotency_key);")
-
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ops_journal (
+              op_id TEXT PRIMARY KEY,
+              op_type TEXT,
+              status TEXT,
+              reason TEXT,
+              payload_json TEXT,
+              created_ts_ms INTEGER,
+              updated_ts_ms INTEGER,
+              expires_ts_ms INTEGER,
+              last_error TEXT
+            );
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_type ON ops_journal(op_type);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_status ON ops_journal(status);")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ops_expires ON ops_journal(expires_ts_ms);")
         conn.commit()
         # [PATCH-SCHEMA] Tags SPLIT / profil / pacer + qualité PnL (idempotent)
         self._ensure_columns(conn, "trades", {
@@ -2231,6 +2253,172 @@ class LogWriter:
         res = self._run_db("idempotency_store", _do)
         return bool(res)
 
+    def upsert_ops_journal(
+            self,
+            *,
+            op_id: str,
+            op_type: str,
+            status: str,
+            reason: str,
+            payload: Optional[Dict[str, Any]] = None,
+            expires_ts_ms: Optional[int] = None,
+            last_error: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now_ms = int(time.time() * 1000)
+
+        def _payload_json() -> Optional[str]:
+            if payload is None:
+                return None
+            try:
+                return json.dumps(payload, ensure_ascii=False, default=str)
+            except Exception:
+                return json.dumps({"payload_repr": str(payload)}, ensure_ascii=False)
+
+        def _do() -> Dict[str, Any]:
+            payload_json = _payload_json()
+            with self._lock:
+                self._rotate_if_needed()
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        "SELECT status, reason, payload_json, expires_ts_ms, last_error FROM ops_journal WHERE op_id = ?",
+                        (op_id,),
+                    )
+                    row = cur.fetchone()
+                    if row:
+                        if (
+                                str(row[0] or "").upper() == str(status or "").upper()
+                                and str(row[1] or "") == str(reason or "")
+                                and (row[2] or None) == payload_json
+                                and row[3] == expires_ts_ms
+                                and (row[4] or None) == (last_error or None)
+                        ):
+                            return {"status": "UNCHANGED", "op_id": op_id}
+
+                        cur.execute(
+                            """
+                            UPDATE ops_journal
+                               SET op_type = ?,
+                                   status = ?,
+                                   reason = ?,
+                                   payload_json = ?,
+                                   updated_ts_ms = ?,
+                                   expires_ts_ms = ?,
+                                   last_error = ?
+                             WHERE op_id = ?
+                            """,
+                            (
+                                op_type,
+                                status,
+                                reason,
+                                payload_json,
+                                now_ms,
+                                expires_ts_ms,
+                                last_error,
+                                op_id,
+                            ),
+                        )
+                        conn.commit()
+                        return {"status": "UPDATED", "op_id": op_id}
+
+                    cur.execute(
+                        """
+                        INSERT INTO ops_journal (
+                          op_id, op_type, status, reason, payload_json,
+                          created_ts_ms, updated_ts_ms, expires_ts_ms, last_error
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            op_id,
+                            op_type,
+                            status,
+                            reason,
+                            payload_json,
+                            now_ms,
+                            now_ms,
+                            expires_ts_ms,
+                            last_error,
+                        ),
+                    )
+                    conn.commit()
+                    return {"status": "CREATED", "op_id": op_id}
+
+        res = self._run_db("ops_journal_upsert", _do)
+        return res if isinstance(res, dict) else {"status": "ERROR", "op_id": op_id}
+
+    def fetch_ops_journal(
+            self,
+            *,
+            op_id: Optional[str] = None,
+            op_type: Optional[str] = None,
+            status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        def _do() -> List[Dict[str, Any]]:
+            with self._lock:
+                self._rotate_if_needed()
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    query = "SELECT op_id, op_type, status, reason, payload_json, created_ts_ms, updated_ts_ms, expires_ts_ms, last_error FROM ops_journal WHERE 1=1"
+                    params: List[Any] = []
+                    if op_id:
+                        query += " AND op_id = ?"
+                        params.append(op_id)
+                    if op_type:
+                        query += " AND op_type = ?"
+                        params.append(op_type)
+                    if status:
+                        query += " AND status = ?"
+                        params.append(status)
+                    cur.execute(query, tuple(params))
+                    rows = cur.fetchall()
+                    out: List[Dict[str, Any]] = []
+                    for r in rows:
+                        try:
+                            payload = json.loads(r[4]) if r[4] else None
+                        except Exception:
+                            payload = {"raw_payload": r[4]}
+                        out.append(
+                            {
+                                "op_id": r[0],
+                                "op_type": r[1],
+                                "status": r[2],
+                                "reason": r[3],
+                                "payload": payload,
+                                "created_ts_ms": r[5],
+                                "updated_ts_ms": r[6],
+                                "expires_ts_ms": r[7],
+                                "last_error": r[8],
+                            }
+                        )
+                    return out
+
+        res = self._run_db("ops_journal_fetch", _do)
+        return res if isinstance(res, list) else []
+
+    def purge_ops_journal(self, *, retention_days: int = 30, now_ms: Optional[int] = None) -> Dict[str, Any]:
+        retention_ms = int(max(0, retention_days)) * 86_400_000
+        now_ms = now_ms or int(time.time() * 1000)
+        cutoff = now_ms - retention_ms if retention_ms > 0 else now_ms
+
+        def _do() -> Dict[str, Any]:
+            with self._lock:
+                self._rotate_if_needed()
+                with self._conn() as conn:
+                    cur = conn.cursor()
+                    cur.execute(
+                        """
+                        DELETE FROM ops_journal
+                         WHERE (status IN ('EXPIRED','CLEARED') AND updated_ts_ms < ?)
+                            OR (op_type = 'RPC_IDEMPOTENCY' AND status = 'DONE' AND expires_ts_ms IS NOT NULL AND expires_ts_ms < ?)
+                        """,
+                        (cutoff, now_ms),
+                    )
+                    deleted = cur.rowcount or 0
+                    conn.commit()
+                    return {"deleted": deleted}
+
+        res = self._run_db("ops_journal_purge", _do)
+        return res if isinstance(res, dict) else {"deleted": 0}
     def insert_latencies_bulk(self, events: Iterable[Dict[str, Any]]) -> int:
         events = list(events or [])
         with self._lock:

@@ -984,6 +984,7 @@ class PrivateWSHubCfg:
     PWS_QUEUE_MAXLEN: int = 5000
     PWS_QUEUE_SATURATION_RATIO: float = 0.85
     ff_pws_no_drop_critical_enforced: bool = False
+    ff_pws_strict_dedup_enforced: bool = False
     PWS_PING_INTERVAL_S: int = 20
     PWS_PONG_TIMEOUT_S: int = 10
     PWS_HEARTBEAT_MAX_GAP_S: int = 30
@@ -1179,6 +1180,8 @@ class RPCCfg:
     timeout_s: float = 2.0
     timeout_ms: int = 1500
     max_retries: int = 2
+    rpc_idempotency_ttl_s: int = 600
+    rpc_idempotency_memoize_response: bool = True
     loopback_inproc: bool = True
     ready_strict: bool = True
     mtls_enabled: bool = True
@@ -1458,6 +1461,10 @@ class BotConfig:
         g.min_fragment_quote = {k: float(v) for k,v in _Env.get_dict("MIN_FRAGMENT_QUOTE", g.min_fragment_quote).items()}
         g.guards = _Env.get_dict("GUARDS", g.guards)
         g.vol_slip_ttl = _Env.get_dict("VOL_SLIP_TTL", g.vol_slip_ttl)
+        cfg.pws.ff_pws_strict_dedup_enforced = _Env.get_bool(
+            "PWS_STRICT_DEDUP_ENFORCED",
+            cfg.pws.ff_pws_strict_dedup_enforced,
+        )
 
         g.ac = _Env.get_dict("AC_CONFIG", g.ac)
         g.mode = _Env.get("MODE", g.mode)

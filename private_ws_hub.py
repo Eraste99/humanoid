@@ -98,7 +98,7 @@ import random
 import time
 import asyncio as _asyncio
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
-from contracts.payloads import normalize_reason_code
+from contracts.payloads import canonical_transfer_id, normalize_reason_code
 # --- Prometheus metrics (fallback no-op si registre absent) -------------------
 try:
     from modules.obs_metrics import (
@@ -1170,6 +1170,7 @@ class PrivateWSHub:
         cb_interval_s: float = 1.5,
         transfer_clients: Optional[Dict[str, Any]] = None,
         config: Any | None = None,
+        logger_historique_manager: Any | None = None,
         coinbase_ws_ack_clients: Dict[str, Any] | None = None,
         **_  # future-proof
     ):
@@ -1180,6 +1181,10 @@ class PrivateWSHub:
         # Indicateur compat: True si _rm_callback a été déduit automatiquement
         # à partir d'un précédent callback "engine" (mode test uniquement).
         self._wiring_auto_rm_from_engine: bool = False
+        self._lhm_manager = logger_historique_manager if logger_historique_manager else None
+        self._unsafe_dedup_seen = False
+        self._unsafe_dedup_payload: Optional[Dict[str, Any]] = None
+        self._unsafe_dedup_emitted = False
 
         self._started = False
         self._hb_task: Optional[asyncio.Task] = None
@@ -1349,7 +1354,9 @@ class PrivateWSHub:
         self._ff_no_drop_critical_enforced = bool(
             getattr(pws, "ff_pws_no_drop_critical_enforced", False)
         )
-
+        self._ff_strict_dedup_enforced = bool(
+            getattr(pws, "ff_pws_strict_dedup_enforced", False)
+        )
 
         # Pools WS par région (optionnel, valeur non bloquante si métrique absente)
         try:
@@ -1686,6 +1693,54 @@ class PrivateWSHub:
                 kind=kind,
             )
 
+    def _handle_unsafe_dedup(self, ev: dict, meta: Dict[str, Any]) -> None:
+        if self._unsafe_dedup_emitted:
+            return
+        self._unsafe_dedup_seen = True
+        try:
+            reason = normalize_reason_code("PWS_UNSAFE_DEDUP") or "PWS_UNSAFE_DEDUP"
+        except Exception:
+            reason = "PWS_UNSAFE_DEDUP"
+        try:
+            details = {
+                "event_type": str(ev.get("type") or ""),
+                "status": str(ev.get("status") or ""),
+                "exchange": _upper(ev.get("exchange")),
+                "alias": _upper(ev.get("alias")),
+                "unsafe_reason": meta.get("unsafe_reason"),
+            }
+            missing: List[str] = []
+            if not meta.get("robust_id"):
+                missing.append("robust_fill_id")
+            if not meta.get("order_id"):
+                missing.append("order_id")
+            if missing:
+                details["missing"] = missing
+            self._unsafe_dedup_payload = details
+        except Exception:
+            details = {"event_repr": str(ev)[:500]}
+            self._unsafe_dedup_payload = details
+
+        try:
+            mgr = getattr(self, "_lhm_manager", None)
+            if mgr and hasattr(mgr, "activate_fail_closed_latch"):
+                mgr.activate_fail_closed_latch(
+                    op_id="PWS/PWS_UNSAFE_DEDUP",
+                    reason=reason,
+                    payload=details,
+                )
+        except Exception:
+            log.exception("[PrivateWSHub] activate_fail_closed_latch failed")
+        try:
+            self._emit_pws_health_event(
+                exchange=_upper(ev.get("exchange")),
+                alias=_upper(ev.get("alias")),
+                reason=reason,
+                kind="dedup",
+            )
+        except Exception:
+            pass
+        self._unsafe_dedup_emitted = True
     def _pws_observe_latency(self, exchange: str, status: str, ev: dict) -> None:
         """Observe la latence entre ts_exchange et ts_local pour ACK/FILL/PARTIAL."""
         try:
@@ -1702,11 +1757,17 @@ class PrivateWSHub:
             pass
 
     # ------------------------- dispatch / callbacks ----------------------------
+    def _is_critical_event(self, ev: dict) -> bool:
+        status = str(ev.get("status") or "").upper()
+        if status in ("FILL", "PARTIAL", "ACK"):
+            return True
+        return False
 
     def _dedup_key(self, ev: dict):
-        """Clé robuste de dédup: (exchange, alias, orderId/clientId, seq/ts, type)"""
+        """Clé robuste de dédup: (exchange, alias, orderId/clientId, seq/ts, type)."""
         ex = ev.get("exchange") or ev.get("ex")
         alias = ev.get("alias") or ev.get("account") or "default"
+        robust_id = ev.get("fill_id") or ev.get("trade_id") or ev.get("exec_id")
         oid = (
             ev.get("exchange_order_id")
             or ev.get("orderId")
@@ -1714,6 +1775,7 @@ class PrivateWSHub:
             or ev.get("clientOrderId")
             or ev.get("client_id")
         )
+
         seq = (
             ev.get("seq")
             or ev.get("u")
@@ -1722,8 +1784,17 @@ class PrivateWSHub:
             or ev.get("T")
             or ev.get("timestamp")
         )
+        ts_component = ev.get("ts_exchange") or ev.get("ts_ms") or ev.get("ts")
+        seq_component = seq or ts_component
         typ = ev.get("type")
-        return (ex, alias, oid, seq, typ)
+        unsafe_reason = None
+        if robust_id is None and oid is None:
+            if seq_component is not None:
+                unsafe_reason = "timestamp_only"
+            else:
+                unsafe_reason = "missing_ids"
+        key = (ex, alias, robust_id or oid, seq_component, typ)
+        return key, {"unsafe_reason": unsafe_reason, "robust_id": robust_id, "order_id": oid}
 
     def _dedup_seen(self, key) -> bool:
         if key in self._seen_events:
@@ -1748,7 +1819,13 @@ class PrivateWSHub:
             ev.setdefault("exchange", exu)
             ev.setdefault("alias", alu)
             try:
-                key_d = self._dedup_key(ev)
+                key_d, key_meta = self._dedup_key(ev)
+                if (
+                        self._ff_strict_dedup_enforced
+                        and self._is_critical_event(ev)
+                        and key_meta.get("unsafe_reason")
+                ):
+                    self._handle_unsafe_dedup(ev, key_meta)
                 if self._dedup_seen(key_d):
                     try:
                         PWS_DEDUP_HITS_TOTAL.labels(exchange=exu, alias=alu).inc()
@@ -1774,7 +1851,13 @@ class PrivateWSHub:
                 e.setdefault("alias", alu)
                 e.setdefault("exchange", exu)
                 try:
-                    key_d = self._dedup_key(e)
+                    key_d, key_meta = self._dedup_key(e)
+                    if (
+                            self._ff_strict_dedup_enforced
+                            and self._is_critical_event(e)
+                            and key_meta.get("unsafe_reason")
+                    ):
+                        self._handle_unsafe_dedup(e, key_meta)
                     if self._dedup_seen(key_d):
                         try:
                             PWS_DEDUP_HITS_TOTAL.labels(exchange=exu, alias=alu).inc()
@@ -2322,6 +2405,14 @@ class PrivateWSHub:
             amount = float(base_payload.get("amount") or 0.0)
         except Exception:
             amount = 0.0
+        try:
+            transfer_id = base_payload.get("transfer_id")
+            if not transfer_id:
+                base_payload["exchange"] = exu
+                transfer_id = canonical_transfer_id(base_payload)
+                base_payload["transfer_id"] = transfer_id
+        except Exception:
+            transfer_id = None
 
         from_alias: Optional[str] = None
         to_alias: Optional[str] = None
@@ -2372,6 +2463,7 @@ class PrivateWSHub:
             "to_alias": to_alias,
             "from_wallet": from_wallet,
             "to_wallet": to_wallet,
+            "transfer_id": transfer_id,
             "payload": base_payload,
             "result": result,
             "error": error,
@@ -2440,7 +2532,19 @@ class PrivateWSHub:
             "from_wallet": _upper(from_wallet), "to_wallet": _upper(to_wallet),
             "ccy": _upper(ccy), "amount": float(amount),
         }
-
+        try:
+            payload["transfer_id"] = canonical_transfer_id({
+                "exchange": exu,
+                "from_alias": alu,
+                "to_alias": alu,
+                "from_wallet": _upper(from_wallet),
+                "to_wallet": _upper(to_wallet),
+                "ccy": _upper(ccy),
+                "amount": float(amount),
+                "type": "internal_wallet_transfer",
+            })
+        except Exception:
+            pass
         if amount <= 0:
             err = "amount must be > 0"
             self._emit_transfer_event(subtype="wallet", exchange=exu, alias=alu, status="ERROR",
@@ -2480,7 +2584,17 @@ class PrivateWSHub:
             "ex": exu, "from_alias": _upper(from_alias), "to_alias": _upper(to_alias),
             "ccy": _upper(ccy), "amount": float(amount),
         }
-
+        try:
+            payload["transfer_id"] = canonical_transfer_id({
+                "exchange": exu,
+                "from_alias": _upper(from_alias),
+                "to_alias": _upper(to_alias),
+                "ccy": _upper(ccy),
+                "amount": float(amount),
+                "type": "internal_subaccount_transfer",
+            })
+        except Exception:
+            pass
         if amount <= 0:
             err = "amount must be > 0"
             self._emit_transfer_event(subtype="subaccount", exchange=exu, alias=_upper(to_alias),
@@ -2759,8 +2873,11 @@ class PrivateWSHub:
             "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
             "pws_health": {
                 "critical_drop_seen": bool(getattr(self, "_critical_drop_seen", False)),
+                "unsafe_dedup_seen": bool(getattr(self, "_unsafe_dedup_seen", False)),
                 "last_critical_drop_reason": getattr(self, "_last_critical_drop_reason", None),
                 "last_critical_drop_ts": float(getattr(self, "_last_critical_drop_ts", 0.0) or 0.0),
+                "unsafe_dedup_seen": bool(getattr(self, "_unsafe_dedup_seen", False)),
+                "last_unsafe_dedup": getattr(self, "_unsafe_dedup_payload", None),
             },
             "wiring": wiring,
             "submodules": {

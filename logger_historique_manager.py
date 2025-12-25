@@ -490,7 +490,7 @@ class LoggerHistoriqueManager:
 
         # -------- I/O & trackers ---------------------------------
         db_dir = str(Path(out_dir))
-        self._writer = LogWriter(db_dir=db_dir)
+        self._writer = LogWriter(db_dir=db_dir, ops_retention_days=self._ops_retention_days)
         self._tracker = PairHistoryTracker(tracker_config)
         try:
             self._tracker.rotation_logger = getattr(self, "log_rotation_decision", None)
@@ -519,6 +519,9 @@ class LoggerHistoriqueManager:
         self._db_lane_q: asyncio.Queue | None = None
         self._db_lane_task: asyncio.Task | None = None
         self._db_lane_executor: ThreadPoolExecutor | None = None
+        self._ops_retention_days = int(getattr(L, "OPS_RETENTION_DAYS", 30)) or 30
+        self._fail_closed_latch_op_id = "LHM/TRUTH_PERSISTENCE_FAILED"
+        self._fail_closed_latch_persisted = False
         self._opportunity_queue: asyncio.Queue | None = None
         self._opportunity_task: asyncio.Task | None = None
 
@@ -971,6 +974,12 @@ class LoggerHistoriqueManager:
                     return await asyncio.to_thread(self._writer.finalize_day, **(payload or {}))
                 if op == "pair_history":
                     return await asyncio.to_thread(self._writer.write_pair_history, payload)
+                if op == "ops_journal":
+                    return await asyncio.to_thread(self._writer.upsert_ops_journal, **(payload or {}))
+                if op == "ops_fetch":
+                    return await asyncio.to_thread(self._writer.fetch_ops_journal, **(payload or {}))
+                if op == "ops_purge":
+                    return await asyncio.to_thread(self._writer.purge_ops_journal, **(payload or {}))
             except Exception as exc:  # noqa: PERF203
                 logger.exception("DB lane direct call failed: %s", op)
                 return {"status": "ERROR", "op": str(op), "err": str(exc)}
@@ -1053,6 +1062,12 @@ class LoggerHistoriqueManager:
                     return self._writer.insert_opportunity(**payload)
                 if op == "finalize_day":
                     return self._writer.finalize_day(**(payload or {}))
+                if op == "ops_journal":
+                    return self._writer.upsert_ops_journal(**(payload or {}))
+                if op == "ops_fetch":
+                    return self._writer.fetch_ops_journal(**(payload or {}))
+                if op == "ops_purge":
+                    return self._writer.purge_ops_journal(**(payload or {}))
                 return None
 
             t0 = time.perf_counter()
@@ -1311,9 +1326,12 @@ class LoggerHistoriqueManager:
                     # Erreur de stockage → pipeline PnL potentiellement non audit-grade
 
                     try:
-                        self._storage_error_seen = True
+                        self._mark_storage_error(
+                            reason="TRUTH_PERSISTENCE_FAILED",
+                            payload={"stream": name, "stage": "jsonl_write"},
+                        )
                     except Exception:
-                        pass
+                        logger.exception("jsonl write: storage error marking failed")
 
             # Rotation par âge testée à chaque tick (et comptabilisée)
             try:
@@ -1326,9 +1344,12 @@ class LoggerHistoriqueManager:
             except Exception:
                 logger.exception("jsonl age-rotation failed for %s", name)
                 try:
-                    self._storage_error_seen = True
+                    self._mark_storage_error(
+                        reason="TRUTH_PERSISTENCE_FAILED",
+                        payload={"stream": name, "stage": "jsonl_rotate"},
+                    )
                 except Exception:
-                    pass
+                    logger.exception("jsonl rotate: storage error marking failed")
 
         return wrote_any
 
@@ -2165,9 +2186,12 @@ class LoggerHistoriqueManager:
             logger.exception("DB enqueue failed for log_type=%s", log_type)
             # Erreur DB = I/O critique côté PnL (on ne sait pas si la ligne a été persistée)
             try:
-                self._storage_error_seen = True
+                self._mark_storage_error(
+                    reason="TRUTH_PERSISTENCE_FAILED",
+                    payload={"log_type": log_type, "stage": "db_enqueue", "count": len(enriched)},
+                )
             except Exception:
-                pass
+                logger.exception("db enqueue: storage error marking failed")
             await self._enqueue_jsonl(
                 "errors",
                 self._build_envelope(
@@ -3565,6 +3589,91 @@ class LoggerHistoriqueManager:
             except Exception:
                 pass
 
+    def _schedule_fail_closed_latch_persist(self, reason: str, payload: Optional[dict[str, Any]] = None) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except Exception:
+            try:
+                self._writer.upsert_ops_journal(
+                    op_id=self._fail_closed_latch_op_id,
+                    op_type="FAIL_CLOSED_LATCH",
+                    status="ACTIVE",
+                    reason=reason,
+                    payload=payload,
+                )
+                self._fail_closed_latch_persisted = True
+            except Exception:
+                logger.exception("_schedule_fail_closed_latch_persist: fallback failed")
+            return
+
+        loop.create_task(
+            self._persist_fail_closed_latch(reason=reason, payload=payload),
+            name="LHM-PersistFailClosedLatch",
+        )
+
+    async def _persist_fail_closed_latch(self, *, reason: str, payload: Optional[dict[str, Any]] = None) -> None:
+        if self._fail_closed_latch_persisted and bool(getattr(self, "_storage_error_seen", False)):
+            return
+        op_payload = None
+        if payload:
+            try:
+                op_payload = dict(payload)
+            except Exception:
+                op_payload = {"payload_repr": str(payload)}
+        try:
+            res = await asyncio.to_thread(
+                self._writer.upsert_ops_journal,
+                op_id=self._fail_closed_latch_op_id,
+                op_type="FAIL_CLOSED_LATCH",
+                status="ACTIVE",
+                reason=reason,
+                payload=op_payload,
+            )
+            if isinstance(res, dict) and res.get("status") in {"CREATED", "UPDATED", "UNCHANGED"}:
+                self._fail_closed_latch_persisted = True
+        except Exception:
+            logger.exception("_persist_fail_closed_latch failed")
+
+    def activate_fail_closed_latch(
+            self,
+            *,
+            op_id: str,
+            reason: str,
+            payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        reason_code = self._normalize_reason_code(reason)
+        try:
+            self._trigger_fail_closed_logging(reason_code)
+        except Exception:
+            logger.exception("activate_fail_closed_latch: trigger failed")
+        try:
+            self._writer.upsert_ops_journal(
+                op_id=op_id,
+                op_type="FAIL_CLOSED_LATCH",
+                status="ACTIVE",
+                reason=reason_code,
+                payload=payload,
+            )
+        except Exception:
+            logger.exception("activate_fail_closed_latch: persist failed")
+
+    def _mark_storage_error(self, *, reason: str, payload: Optional[dict[str, Any]] = None) -> None:
+        already_seen = bool(getattr(self, "_storage_error_seen", False))
+        try:
+            self._storage_error_seen = True
+        except Exception:
+            pass
+
+        if not self._fail_closed_logging:
+            return
+
+        if not self._fail_closed_latch_persisted or not already_seen:
+            reason_code = self._normalize_reason_code(reason)
+            self._trigger_fail_closed_logging(reason_code)
+            try:
+                self._schedule_fail_closed_latch_persist(reason_code, payload)
+            except Exception:
+                logger.exception("_mark_storage_error: latch persistence scheduling failed")
     def on_btl_flush_latency(self, log_type: str, *, ms: float) -> None:
         try:
             from modules.obs_metrics import LOGGERH_WRITE_MS
@@ -3612,6 +3721,201 @@ class LoggerHistoriqueManager:
             "db_lane_disabled": bool(getattr(self, "_db_lane_disabled_seen", False)),
         }
 
+    def get_active_latches(self) -> list[dict[str, Any]]:
+        try:
+            rows = self._writer.fetch_ops_journal(op_type="FAIL_CLOSED_LATCH", status="ACTIVE")
+            return list(rows or [])
+        except Exception:
+            logger.exception("get_active_latches failed")
+            return []
+
+    def get_active_pair_pauses(self, now_ms: Optional[int] = None) -> list[dict[str, Any]]:
+        now_ms = now_ms or int(time.time() * 1000)
+        try:
+            rows = self._writer.fetch_ops_journal(op_type="PAIR_PAUSE", status="ACTIVE")
+            active: list[dict[str, Any]] = []
+            for r in rows or []:
+                expires = r.get("expires_ts_ms")
+                if expires is not None and int(expires) <= now_ms:
+                    try:
+                        self._writer.upsert_ops_journal(
+                            op_id=str(r.get("op_id")),
+                            op_type="PAIR_PAUSE",
+                            status="EXPIRED",
+                            reason=self._normalize_reason_code(r.get("reason")),
+                            payload=r.get("payload"),
+                            expires_ts_ms=expires,
+                        )
+                    except Exception:
+                        logger.exception("get_active_pair_pauses: mark expired failed")
+                    continue
+                active.append(r)
+            return active
+        except Exception:
+            logger.exception("get_active_pair_pauses failed")
+            return []
+
+    def get_inflight_transfers(
+            self, now_ms: Optional[int] = None, *, include_expired: bool = False
+    ) -> list[dict[str, Any]]:
+        now_ms = now_ms or int(time.time() * 1000)
+        try:
+            rows = self._writer.fetch_ops_journal(op_type="TRANSFER_FSM", status="SUBMITTED")
+            if include_expired:
+                return list(rows or [])
+            return [r for r in rows or [] if r.get("expires_ts_ms") is None or int(r.get("expires_ts_ms")) > now_ms]
+        except Exception:
+            logger.exception("get_inflight_transfers failed")
+            return []
+
+    def get_transfer_state(self, op_id: str) -> Optional[dict[str, Any]]:
+        if not op_id:
+            return None
+        try:
+            rows = self._writer.fetch_ops_journal(op_id=op_id, op_type="TRANSFER_FSM")
+            if not rows:
+                return None
+            return rows[0]
+        except Exception:
+            logger.exception("get_transfer_state failed")
+            return None
+
+    def mark_transfer_requested(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        reason = self._normalize_reason_code("TRANSFER_FSM")
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="TRANSFER_FSM",
+            status="REQUESTED",
+            reason=reason,
+            payload=payload,
+        )
+
+    def mark_transfer_submitted(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+            expires_ts_ms: Optional[int] = None,
+    ) -> None:
+        reason = self._normalize_reason_code("TRANSFER_FSM")
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="TRANSFER_FSM",
+            status="SUBMITTED",
+            reason=reason,
+            payload=payload,
+            expires_ts_ms=expires_ts_ms,
+        )
+
+    def mark_transfer_settled(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        reason = self._normalize_reason_code("TRANSFER_FSM")
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="TRANSFER_FSM",
+            status="SETTLED",
+            reason=reason,
+            payload=payload,
+        )
+
+    def mark_transfer_failed(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+            last_error: Optional[str] = None,
+            reason: Optional[str] = None,
+    ) -> None:
+        reason_code = self._normalize_reason_code(reason or "TRANSFER_FAILED")
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="TRANSFER_FSM",
+            status="FAILED",
+            reason=reason_code,
+            payload=payload,
+            last_error=last_error,
+        )
+
+    def get_rpc_idem_state(self, key: str) -> Optional[dict[str, Any]]:
+        if not key:
+            return None
+        try:
+            rows = self._writer.fetch_ops_journal(op_id=key, op_type="RPC_IDEMPOTENCY")
+            if not rows:
+                return None
+            entry = rows[0]
+            expires = entry.get("expires_ts_ms")
+            if entry.get("status") == "DONE" and expires is not None and int(expires) <= int(time.time() * 1000):
+                return None
+            return entry
+        except Exception:
+            logger.exception("get_rpc_idem_state failed")
+            return None
+
+    def mark_rpc_idem_started(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        reason = self._normalize_reason_code("RPC_IDEMPOTENCY")
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="RPC_IDEMPOTENCY",
+            status="STARTED",
+            reason=reason,
+            payload=payload,
+        )
+
+    def mark_rpc_idem_done(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+            response: Optional[dict[str, Any]] = None,
+            expires_ts_ms: Optional[int] = None,
+    ) -> None:
+        reason = self._normalize_reason_code("RPC_IDEMPOTENCY")
+        combined_payload = payload or {}
+        if response is not None:
+            try:
+                combined_payload = {**combined_payload, "response": response}
+            except Exception:
+                combined_payload = payload or {"response_repr": str(response)}
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="RPC_IDEMPOTENCY",
+            status="DONE",
+            reason=reason,
+            payload=combined_payload,
+            expires_ts_ms=expires_ts_ms,
+        )
+
+    def mark_rpc_idem_failed(
+            self,
+            *,
+            op_id: str,
+            payload: Optional[dict[str, Any]] = None,
+            last_error: Optional[str] = None,
+    ) -> None:
+        reason = self._normalize_reason_code("RPC_IDEMPOTENCY")
+        self._writer.upsert_ops_journal(
+            op_id=op_id,
+            op_type="RPC_IDEMPOTENCY",
+            status="FAILED",
+            reason=reason,
+            payload=payload,
+            last_error=last_error,
+        )
     def tt_contract_missing_fields(self, payload: dict) -> list[str]:
         """Retourne les champs TT manquants pour un payload (bundle/decision/log)."""
         try:
@@ -3918,6 +4222,13 @@ class LoggerHistoriqueManager:
             await self._db_lane_barrier(timeout_s=2.0)
         except Exception:
             logger.exception("flush_now: db_lane barrier failed")
+        try:
+            await asyncio.to_thread(
+                self._writer.purge_ops_journal,
+                retention_days=self._ops_retention_days,
+            )
+        except Exception:
+            logger.exception("flush_now: purge_ops_journal failed")
 
 
     # ---------------- event sink (trades batch) ----------------
@@ -4923,7 +5234,16 @@ class LoggerHistoriqueManager:
 
         # ----- API pauses/tiers exposée au Scanner / RM -----
 
-    def pause_pair(self, pair: str, duration: int | None = None) -> None:
+    def pause_pair(
+            self,
+            pair: str,
+            duration: int | None = None,
+            *,
+            reason: str | None = None,
+            op_id: str | None = None,
+            payload: Optional[dict[str, Any]] = None,
+            expires_ts_ms: Optional[int] = None,
+    ) -> None:
         """
         Met en pause une paire via le PairHistoryTracker.
         Utilisé notamment par le Scanner pour l'autopause audition.
@@ -4934,11 +5254,44 @@ class LoggerHistoriqueManager:
                 fn(pair, duration=duration)
             except Exception:
                 logger.exception("pause_pair failed for %s", pair, exc_info=True)
+        if reason is None and op_id is None and expires_ts_ms is None:
+            return
+
+        reason_code = self._normalize_reason_code(reason)
+        try:
+            now_ms = int(time.time() * 1000)
+            if expires_ts_ms is None:
+                dur_s = int(duration or 0)
+                if dur_s <= 0:
+                    dur_s = int(getattr(getattr(self._tracker, "cfg", object()), "pause_secs", 0) or 0)
+                if dur_s <= 0:
+                    return
+                expires_ts_ms = now_ms + (dur_s * 1000)
+
+            payload_obj = None
+            if payload:
+                try:
+                    payload_obj = dict(payload)
+                except Exception:
+                    payload_obj = {"payload_repr": str(payload)}
+
+            self._writer.upsert_ops_journal(
+                op_id=op_id or f"PAIR/{str(pair).upper()}/PAUSE",
+                op_type="PAIR_PAUSE",
+                status="ACTIVE",
+                reason=reason_code,
+                payload=payload_obj,
+                expires_ts_ms=int(expires_ts_ms),
+            )
+        except Exception:
+            logger.exception("pause_pair: persist failed for %s", pair, exc_info=True)
 
     def is_paused(self, pair: str) -> bool:
         """
-        Retourne True si la paire est actuellement en pause côté tracker.
+        Met en pause une paire via le PairHistoryTracker et persiste optionnellement dans l'ops_journal.
         """
+        if not pair:
+            return
         fn = getattr(self._tracker, "is_paused", None)
         if callable(fn):
             try:
@@ -4946,6 +5299,7 @@ class LoggerHistoriqueManager:
             except Exception:
                 logger.exception("is_paused failed for %s", pair, exc_info=True)
         return False
+
 
 
     # ---------------- exports / backup / rétention ----------------
