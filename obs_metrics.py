@@ -1320,187 +1320,92 @@ ENGINE_ACK_TIMEOUT_TOTAL = _metric(Counter, 'engine_ack_timeout_total', 'Engine 
 
 # === OBS READINESS (Lot B) — strict + stubs + métriques Lot B ===
 
-import logging
-# --- Wrappers sûrs pour éviter les try/except:pass dans les modules ---
-if "OBS_NOOP_TOTAL" not in globals():
-    OBS_NOOP_TOTAL = Counter("obs_noop_total", "Appels metrics no-op (init manquante, labels, etc.)", ["metric","where"])
-if "OBS_INIT_ERROR_TOTAL" not in globals():
-    OBS_INIT_ERROR_TOTAL = Counter("obs_init_error_total", "Echecs d'initialisation de métriques", ["metric","kind"])
-if "OBS_LABEL_MISMATCH_TOTAL" not in globals():
-    OBS_LABEL_MISMATCH_TOTAL = Counter("obs_label_mismatch_total", "Labels fournis non conformes", ["metric"])
-
-def _safe_labels(metric, name: str, where: str, **labels):
-    try:
-        return metric.labels(**labels)
-    except Exception:
-        OBS_LABEL_MISMATCH_TOTAL.labels(metric=name).inc()
-        OBS_NOOP_TOTAL.labels(metric=name, where=where).inc()
-        return metric
-
-def safe_inc(metric, name: str, where: str, **labels):
-    try:
-        _safe_labels(metric, name, where, **labels).inc()
-    except Exception:
-        OBS_NOOP_TOTAL.labels(metric=name, where=where).inc()
-
-def safe_set(metric, name: str, where: str, value: float, **labels):
-    try:
-        _safe_labels(metric, name, where, **labels).set(value)
-    except Exception:
-        OBS_NOOP_TOTAL.labels(metric=name, where=where).inc()
-
-def safe_observe(metric, name: str, where: str, value: float, **labels):
-    try:
-        _safe_labels(metric, name, where, **labels).observe(value)
-    except Exception:
-        OBS_NOOP_TOTAL.labels(metric=name, where=where).inc()
-
-# === Router (public) ===
-if "ROUTER_DROPPED_TOTAL" not in globals():
-    ROUTER_DROPPED_TOTAL = Counter(
-        "router_dropped_total", "Evénements rejetés côté Router", ["reason","topic"]
-    )
-if "ROUTER_TO_SCANNER_MS" not in globals():
-    ROUTER_TO_SCANNER_MS = Histogram(
-        "router_to_scanner_ms", "Latency Router→Scanner (ms)", ["topic"]
-    )
-if "ROUTER_TO_SCANNER_ERRORS_TOTAL" not in globals():
-    ROUTER_TO_SCANNER_ERRORS_TOTAL = Counter(
-        "router_to_scanner_errors_total", "Erreurs Router→Scanner", ["reason","topic"]
-    )
-if "ROUTER_ROUTE_MUTED_TOTAL" not in globals():
-    ROUTER_ROUTE_MUTED_TOTAL = Counter(
-        "router_route_muted_total", "Routes mises en mute par le Router", ["reason","exchange","pair"]
-    )
 
 # === WS publics ===
-if "WS_RECONNECTS_TOTAL" not in globals():
-    WS_RECONNECTS_TOTAL = Counter(
-        "ws_reconnects_total", "Reconnects WS publics", ["exchange","reason"]
-    )
-if "WS_BACKOFF_SECONDS" not in globals():
-    WS_BACKOFF_SECONDS = Gauge(
-        "ws_backoff_seconds", "Backoff courant (secondes) WS publics", ["exchange"]
-    )
-if "WS_CONNECTIONS_OPEN" not in globals():
-    WS_CONNECTIONS_OPEN = Gauge(
-        "ws_connections_open", "Connexions WS publiques ouvertes", ["exchange"]
-    )
-if "WS_PUBLIC_DROPPED_TOTAL" not in globals():
-    WS_PUBLIC_DROPPED_TOTAL = Counter(
-        "ws_public_dropped_total", "Evénements WS publics rejetés", ["exchange", "reason"]
-    )
-
-if "WS_PUBLIC_PING_INTERVAL_SECONDS_CONFIG" not in globals():
-    WS_PUBLIC_PING_INTERVAL_SECONDS_CONFIG = Gauge(
-        "ws_public_ping_interval_seconds_config",
-        "Configured ping interval (seconds) for public WS",
-    )
-if "WS_PUBLIC_PONG_TIMEOUT_SECONDS_CONFIG" not in globals():
-    WS_PUBLIC_PONG_TIMEOUT_SECONDS_CONFIG = Gauge(
-        "ws_public_pong_timeout_seconds_config",
-        "Configured pong timeout (seconds) for public WS",
-    )
-if "WS_PUBLIC_CONNECT_TIMEOUT_SECONDS_CONFIG" not in globals():
-    WS_PUBLIC_CONNECT_TIMEOUT_SECONDS_CONFIG = Gauge(
-        "ws_public_connect_timeout_seconds_config",
-        "Configured connect/open timeout (seconds) for public WS",
-    )
-if "WS_PUBLIC_READ_TIMEOUT_SECONDS_CONFIG" not in globals():
-    WS_PUBLIC_READ_TIMEOUT_SECONDS_CONFIG = Gauge(
-        "ws_public_read_timeout_seconds_config",
-        "Configured read/close timeout (seconds) for public WS",
-    )
-if "WS_PUBLIC_OUT_QUEUE_PUT_TIMEOUT_SECONDS_CONFIG" not in globals():
-    WS_PUBLIC_OUT_QUEUE_PUT_TIMEOUT_SECONDS_CONFIG = Gauge(
-        "ws_public_out_queue_put_timeout_seconds_config",
-        "Configured out_queue put timeout (seconds) for public WS",
-    )
-if "WS_PUBLIC_CHUNK_SIZE_CONFIG" not in globals():
-    WS_PUBLIC_CHUNK_SIZE_CONFIG = Gauge(
-        "ws_public_chunk_size_config",
-        "Configured chunk size by exchange for public WS",
-        ["exchange"],
-    )
-
+WS_RECONNECTS_TOTAL = _metric(Counter, 'ws_reconnects_total', 'Reconnects WS publics', ['exchange', 'reason'])
+WS_BACKOFF_SECONDS = _metric(Gauge, 'ws_backoff_seconds', 'Backoff courant (secondes) WS publics', ['exchange'])
+WS_PUBLIC_DROPPED_TOTAL = _metric(Counter, 'ws_public_dropped_total', 'Evénements WS publics rejetés', ['exchange', 'reason'])
+WS_PUBLIC_PING_INTERVAL_SECONDS_CONFIG = _metric(
+    Gauge,
+    'ws_public_ping_interval_seconds_config',
+    'Configured ping interval (seconds) for public WS',
+)
+WS_PUBLIC_PONG_TIMEOUT_SECONDS_CONFIG = _metric(
+    Gauge,
+    'ws_public_pong_timeout_seconds_config',
+    'Configured pong timeout (seconds) for public WS',
+)
+WS_PUBLIC_CONNECT_TIMEOUT_SECONDS_CONFIG = _metric(
+    Gauge,
+    'ws_public_connect_timeout_seconds_config',
+    'Configured connect/open timeout (seconds) for public WS',
+)
+WS_PUBLIC_READ_TIMEOUT_SECONDS_CONFIG = _metric(
+    Gauge,
+    'ws_public_read_timeout_seconds_config',
+    'Configured read/close timeout (seconds) for public WS',
+)
+WS_PUBLIC_OUT_QUEUE_PUT_TIMEOUT_SECONDS_CONFIG = _metric(
+    Gauge,
+    'ws_public_out_queue_put_timeout_seconds_config',
+    'Configured out_queue put timeout (seconds) for public WS',
+)
+WS_PUBLIC_CHUNK_SIZE_CONFIG = _metric(
+    Gauge,
+    'ws_public_chunk_size_config',
+    'Configured chunk size by exchange for public WS',
+    ['exchange'],
+)
 # === WS publics v2 (exchange / region / deployment_mode) ===
-if "WS_PUBLIC_EVENTS_TOTAL_V2" not in globals():
-    WS_PUBLIC_EVENTS_TOTAL_V2 = Counter(
-        "ws_public_events_total_v2",
-        "Evénements WS publics reçus (v2, taggés par exchange/region/deployment_mode/stream)",
-        ["exchange", "region", "deployment_mode", "stream"],
-    )
+WS_PUBLIC_EVENTS_TOTAL_V2 = _metric(
+    Counter,
+    'ws_public_events_total_v2',
+    'Evénements WS publics reçus (v2, taggés par exchange/region/deployment_mode/stream)',
+    ['exchange', 'region', 'deployment_mode', 'stream'],
+)
+WS_PUBLIC_ERRORS_TOTAL_V2 = _metric(
+    Counter,
+    'ws_public_errors_total_v2',
+    'Erreurs WS publics (v2, taggées par exchange/region/deployment_mode/raison)',
+    ['exchange', 'region', 'deployment_mode', 'reason'],
+)
 
-if "WS_PUBLIC_ERRORS_TOTAL_V2" not in globals():
-    WS_PUBLIC_ERRORS_TOTAL_V2 = Counter(
-        "ws_public_errors_total_v2",
-        "Erreurs WS publics (v2, taggées par exchange/region/deployment_mode/raison)",
-        ["exchange", "region", "deployment_mode", "reason"],
-    )
+WS_PUBLIC_RECONNECTS_TOTAL_V2 = _metric(
+    Counter,
+    'ws_public_reconnects_total_v2',
+    'Reconnects WS publics (v2, taggées par exchange/region/deployment_mode/raison)',
+    ['exchange', 'region', 'deployment_mode', 'reason'],
+)
 
-if "WS_PUBLIC_RECONNECTS_TOTAL_V2" not in globals():
-    WS_PUBLIC_RECONNECTS_TOTAL_V2 = Counter(
-        "ws_public_reconnects_total_v2",
-        "Reconnects WS publics (v2, taggées par exchange/region/deployment_mode/raison)",
-        ["exchange", "region", "deployment_mode", "reason"],
-    )
+WS_PUBLIC_BACKOFF_SECONDS_V2 = _metric(
+    Gauge,
+    'ws_public_backoff_seconds_v2',
+    'Backoff courant (secondes) WS publics (v2)',
+    ['exchange', 'region', 'deployment_mode'],
+)
 
-if "WS_PUBLIC_BACKOFF_SECONDS_V2" not in globals():
-    WS_PUBLIC_BACKOFF_SECONDS_V2 = Gauge(
-        "ws_public_backoff_seconds_v2",
-        "Backoff courant (secondes) WS publics (v2)",
-        ["exchange", "region", "deployment_mode"],
-    )
+WS_PUBLIC_CONNECTIONS_OPEN_V2 = _metric(
+    Gauge,
+    'ws_public_connections_open_v2',
+    'Connexions WS publiques ouvertes (v2)',
+    ['exchange', 'region', 'deployment_mode'],
+)
 
-if "WS_PUBLIC_CONNECTIONS_OPEN_V2" not in globals():
-    WS_PUBLIC_CONNECTIONS_OPEN_V2 = Gauge(
-        "ws_public_connections_open_v2",
-        "Connexions WS publiques ouvertes (v2)",
-        ["exchange", "region", "deployment_mode"],
-    )
-
-if "WS_PUBLIC_DROPPED_TOTAL_V2" not in globals():
-    WS_PUBLIC_DROPPED_TOTAL_V2 = Counter(
-        "ws_public_dropped_total_v2",
-        "Evénements WS publics rejetés (v2)",
-        ["exchange", "region", "deployment_mode", "reason"],
-    )
-
-if "WS_PUBLIC_STALENESS_SECONDS" not in globals():
-    WS_PUBLIC_STALENESS_SECONDS = Gauge(
-        "ws_public_staleness_seconds",
-        "Staleness estimée des flux WS publics (secondes, v2)",
-        ["exchange", "region", "deployment_mode"],
-    )
+WS_PUBLIC_DROPPED_TOTAL_V2 = _metric(
+    Counter,
+    'ws_public_dropped_total_v2',
+    'Evénements WS publics rejetés (v2)',
+    ['exchange', 'region', 'deployment_mode', 'reason'],
+)
 
 
 
-# === Déjà utilisés ailleurs (cohérence Lot A & B) ===
-if "SCANNER_HINT_TOPQTY_MISSING_TOTAL" not in globals():
-    SCANNER_HINT_TOPQTY_MISSING_TOTAL = Counter(
-        "scanner_hint_topqty_missing_total", "Hints L1 (top_qty) manquants", ["pair","ex","side"]
-    )
-if "LOGGERH_FILE_ROTATIONS_TOTAL" not in globals():
-    LOGGERH_FILE_ROTATIONS_TOTAL = Counter(
-        "loggerh_file_rotations_total", "Rotations LoggerHistorique", ["reason"]
-    )
-# Engine/AC stubs si absents
-if "AC_KV_ERRORS_TOTAL" not in globals():
-    AC_KV_ERRORS_TOTAL = Counter("ac_kv_errors_total", "Erreurs KV (anti-crossing)", ["kind"])
-if "AC_RESERVE_CONFLICT_TOTAL" not in globals():
-    AC_RESERVE_CONFLICT_TOTAL = Counter("ac_reserve_conflict_total", "Conflits de réservation AC", ["branch","ex"])
-if "AC_RELEASE_ERRORS_TOTAL" not in globals():
-    AC_RELEASE_ERRORS_TOTAL = Counter("ac_release_errors_total", "Erreurs release AC", ["kind"])
-if "ENGINE_WORKER_ERRORS_TOTAL" not in globals():
-    ENGINE_WORKER_ERRORS_TOTAL = Counter("engine_worker_errors_total", "Erreurs worker Engine", ["phase"])
-if "ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL" not in globals():
-    ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL = Counter(
-        "engine_inflight_gauge_set_errors_total", "Echecs INFLIGHT_GAUGE.set", ["exchange"]
-    )
-if "ENGINE_BEST_PRICE_MISSING_TOTAL" not in globals():
-    ENGINE_BEST_PRICE_MISSING_TOTAL = Counter(
-        "engine_best_price_missing_total", "Best price manquant côté Engine", ["exchange","pair","side"]
-    )
+WS_PUBLIC_STALENESS_SECONDS = _metric(
+    Gauge,
+    'ws_public_staleness_seconds',
+    'Staleness estimée des flux WS publics (secondes, v2)',
+    ['exchange', 'region', 'deployment_mode'],
+)
 
 # Log “strict” one-shot (optionnel)
 _log_once = set()
