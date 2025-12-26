@@ -3150,6 +3150,8 @@ class ExecutionEngine:
 
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
+        strategy_tag = str(meta.get("strategy_tag") or meta.get("strategy") or meta.get("branch") or "").upper()
+        is_fast_lane = self._is_fast_lane_meta(meta)
         is_fast_lane = self._is_fast_lane_meta(meta)
         branch, profile = self._require_branch_profile(meta)
         strategy_tag = str(meta.get("strategy_tag") or meta.get("strategy") or meta.get("branch") or "").upper()
@@ -4119,6 +4121,8 @@ class ExecutionEngine:
         # 1-bis) Langage commun de capacité (branch / profil / caps_local)
         meta = bundle.get("meta") or {}
         route = bundle.get("route") or {}
+        strategy_tag = str(meta.get("strategy_tag") or meta.get("strategy") or meta.get("branch") or "").upper()
+        is_fast_lane = self._is_fast_lane_meta(meta)
         branch, profile = self._require_branch_profile(meta)
         idk = meta.get("idempotency_key") or meta.get("idempotence_key")
         if self.ff_enforce_client_oid_deterministic and not idk:
@@ -7690,6 +7694,8 @@ class ExecutionEngine:
     ):
         # READINESS GUARD
         self._ensure_ready()
+        meta = dict(buy_leg.get("meta") or sell_leg.get("meta") or {})
+        bundle = bundle_frag_plan or {}
 
         total_usdc = min(float(buy_leg["volume_usdc"]), float(sell_leg["volume_usdc"]))
         if total_usdc <= 0:

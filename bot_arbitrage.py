@@ -119,14 +119,15 @@ def _load_alert_dispatcher(cfg) -> Any:
         from modules.observability_pacer import AlertDispatcher  # type: ignore
         return AlertDispatcher(cfg)
     except Exception:
-        # Fallback Telegram natif si token dispo
-        if os.getenv("TELEGRAM_BOT_TOKEN"):
+        # Fallback Telegram natif si token dispo via configuration
+        tcfg = getattr(cfg, "telegram", None)
+        if tcfg and tcfg.bot_token:
             try:
                 return TelegramAlerts(cfg)
             except Exception:
                 return _NoopAlerts()
         return _NoopAlerts()
-
+    
 # -----------------------------------------------------------------------------
 # Alertes Telegram (long-poll, no-op si aiohttp absent ou token manquant)
 # -----------------------------------------------------------------------------
@@ -148,11 +149,13 @@ class TelegramAlerts(_NoopAlerts):
             self._enabled = False
             return
         self._enabled = True
-        self._token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-        self._allowed = self._parse_allowed(os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""))
-        self._chat_info = os.getenv("TELEGRAM_CHAT_ID_INFO")
-        self._chat_warn = os.getenv("TELEGRAM_CHAT_ID_WARN")
-        self._chat_crit = os.getenv("TELEGRAM_CHAT_ID_CRIT")
+        tcfg = getattr(cfg, "telegram", None)
+        self._token = "" if tcfg is None else tcfg.bot_token or ""
+        allowed = [] if tcfg is None else tcfg.allowed_user_ids or []
+        self._allowed = set(int(x) for x in allowed)
+        self._chat_info = None if tcfg is None else tcfg.chat_id_info
+        self._chat_warn = None if tcfg is None else tcfg.chat_id_warn
+        self._chat_crit = None if tcfg is None else tcfg.chat_id_crit
         self._last_known_chat = None
         self._session = None
         self._task = None
@@ -342,10 +345,19 @@ class TelegramAlerts(_NoopAlerts):
 # Logging
 # -----------------------------------------------------------------------------
 log = logging.getLogger("arbitrage.main")
+try:
+    from modules.bot_config import BotConfig as _GlobalBotCfg
+
+    _LOG_LEVEL = getattr(_GlobalBotCfg.from_env().obs, "log_level", "INFO")
+except Exception:
+    _LOG_LEVEL = "INFO"
+
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=_LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
+
 
 # -----------------------------------------------------------------------------
 # Budgets & helpers
@@ -772,6 +784,7 @@ async def main() -> None:
     # Obs
     metrics = _metrics_factory()
     metrics.set_deployment_info(region, dep_mode, cap_profile)
+    status_bus = getattr(cfg, "status_bus", None)
     cfg.status_sink = status_bus
 
     # Alertes
@@ -788,18 +801,19 @@ async def main() -> None:
     boot = Boot(cfg)
     # [OBS-SUPERVISEUR INIT] — Observabilité côté superviseur (pas dans Boot)
     # Contexte & probes (idempotentes)
-    region = os.getenv("POD_REGION", getattr(cfg, "POD_REGION", "EU"))
-    mode = os.getenv("DEPLOYMENT_MODE", getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY"))
+    region = getattr(cfg, "POD_REGION", "EU")
+    mode = getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY")
     set_region(region)
     set_deployment_mode(mode)
     start_loop_lag_probe()
     start_time_skew_probe()
 
-    # Politique: 9110 unique (ready/status/metrics), 9108 optionnel si OBS_ENABLE_9108=1/true
-    status_port = int(os.getenv("STATUS_PORT", 9110))
-    obs_enable_9108 = os.getenv("OBS_ENABLE_9108", "0").lower() in ("1", "true", "yes")
-    obs_port = int(os.getenv("OBS_PORT", 9108))
-    include_metrics_on_9110 = not obs_enable_9108
+    # Politique: 9110 unique (ready/status/metrics), 9108 optionnel selon cfg.obs
+    status_port = int(getattr(cfg.obs, "status_port", 9110))
+    obs_enable_9108 = bool(getattr(cfg.obs, "enable_obs_port", False))
+    obs_port = int(getattr(cfg.obs, "obs_port", 9108))
+    include_metrics_on_9110 = bool(getattr(cfg.obs, "expose_metrics_on_status", True)) and not obs_enable_9108
+
 
     # Démarre UN seul StatusHTTPServer (et y branche le Boot)
     status_http = StatusHTTPServer(port=status_port, include_metrics=include_metrics_on_9110)

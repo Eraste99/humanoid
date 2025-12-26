@@ -24,22 +24,22 @@ Dépendances
 
 Sécurité
 --------
-- Secrets lus depuis ENV: TELEGRAM_*, RESTART_WEBHOOK_* (jamais loggés).
+- Secrets pilotés via BotConfig (section alerting), jamais loggés.
 - HMAC-SHA256 pour le webhook d'orchestrateur, idempotency key = correlation_id.
 - Verrous, cooldown, circuit-breaker pour éviter les storm restarts.
 
 Usage résumée
 -------------
 cw = CentralWatchdog(config=CWConfig(...))
-cw.attach_telegram_from_env()          # optionnel (notifs + ACK)
-cw.attach_webhook_from_env()           # optionnel (exécuteur externe)
+cw.attach_telegram()                   # optionnel (notifs + ACK)
+cw.attach_webhook()                    # optionnel (exécuteur externe)
 for wd in watchdogs: wd.register_event_sink(cw.on_child_event)  # abonnement enfants
 cw.start()  # non-bloquant; ou cw.run_forever() pour une boucle asynchrone simple
 
 """
 
 from __future__ import annotations
-import os, time, hmac, hashlib, json, threading, queue, uuid
+import time, hmac, hashlib, json, threading, queue, uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -392,38 +392,25 @@ class CentralWatchdog:
         self._wd_interval_s = float(cfg.wd.interval_s)
 
 
-    # ----- intégrations optionnelles via ENV -----
+    # ----- intégrations optionnelles (pilotées par cfg.alerting) -----
 
     def attach_telegram_from_env(self) -> None:
-        # Si vous préférez piloter par ENV après init
-        token = os.getenv("TELEGRAM_BOT_TOKEN")
-        if token:
-            self.cfg.telegram.bot_token = token
-            self.cfg.telegram.chat_id_crit = os.getenv("TELEGRAM_CHAT_ID_CRIT", self.cfg.telegram.chat_id_crit)
-            self.cfg.telegram.chat_id_warn = os.getenv("TELEGRAM_CHAT_ID_WARN", self.cfg.telegram.chat_id_warn)
-            self.cfg.telegram.chat_id_info = os.getenv("TELEGRAM_CHAT_ID_INFO", self.cfg.telegram.chat_id_info)
-            allowed = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
-            if allowed:
-                try:
-                    self.cfg.telegram.allowed_user_ids = [int(x.strip()) for x in allowed.split(",") if x.strip()]
-                except Exception:
-                    pass
-            self.cfg.telegram.ack_pin = os.getenv("TELEGRAM_ACK_PIN", self.cfg.telegram.ack_pin)
-            self._telegram = TelegramSink(self.cfg.telegram)
+        """Compat: garde la signature historique mais s'appuie sur BotConfig."""
+        self.attach_telegram()
+
+    def attach_telegram(self) -> None:
+        tcfg = getattr(self.cfg, "telegram", None)
+        if tcfg and tcfg.bot_token:
+            self._telegram = TelegramSink(tcfg)
 
     def attach_webhook_from_env(self) -> None:
-        url = os.getenv("RESTART_WEBHOOK_URL")
-        hmac_secret = os.getenv("RESTART_WEBHOOK_HMAC_KEY")
-        if url and hmac_secret:
-            self.cfg.webhook.url = url
-            self.cfg.webhook.hmac_secret = hmac_secret
-            t = os.getenv("RESTART_WEBHOOK_TIMEOUT_S")
-            if t:
-                try:
-                    self.cfg.webhook.timeout_s = float(t)
-                except Exception:
-                    pass
-            self._orchestrator = OrchestratorClient(self.cfg.webhook)
+        """Compat: garde la signature historique mais s'appuie sur BotConfig."""
+        self.attach_webhook()
+
+    def attach_webhook(self) -> None:
+        wcfg = getattr(self.cfg, "webhook", None)
+        if wcfg and wcfg.url and wcfg.hmac_secret:
+            self._orchestrator = OrchestratorClient(wcfg)
 
     # ----- wiring enfants / sinks -----
 
@@ -656,15 +643,9 @@ class CentralWatchdog:
             # On force un "minimun 1 drop" pour déclencher l'alerte si nécessaire
             dropped = 1
 
-        # SLO / budgets lus depuis l'env (alignés avec obs_metrics.py)
-        try:
-            slo_lag = float(os.getenv("LHM_SLO_LAG_SECONDS_MAX_TARGET", "5.0"))
-        except Exception:
-            slo_lag = 5.0
-        try:
-            budget = float(os.getenv("LHM_SLO_DROPPED_TRADES_BUDGET", "0.0"))
-        except Exception:
-            budget = 0.0
+            # SLO / budgets pilotés par config (alignés avec obs_metrics.py)
+            slo_lag = float(getattr(self.cfg.lhm, "LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET", 5.0))
+            budget = float(getattr(self.cfg.lhm, "LHM_SLO_DROPPED_TRADES_BUDGET", 0.0))
 
         # 3) Alerte sur lag pipeline (si on a un lag exploitable)
         if lag is not None and slo_lag > 0.0:

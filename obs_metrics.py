@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-import os as _os
+
 from typing import Any, Dict,List, Optional
 from dataclasses import dataclass, asdict
 log = logging.getLogger('obs_metrics')
@@ -47,9 +47,39 @@ except Exception:
     REGISTRY = None  # type: ignore
 
 # --- BEGIN OM-0: STRICT + PROM READY + Noop ---
-import os
-STRICT_OBS = int(os.getenv("STRICT_OBS", "0"))  # 0 par défaut en dry-run
+try:
+    from modules.bot_config import BotConfig as _ObsBotConfig
+except Exception:
+    _ObsBotConfig = None
 
+STRICT_OBS = 0
+
+def _load_obs_defaults() -> dict[str, object]:
+    global STRICT_OBS
+    defaults = {
+        "status_port": 9110,
+        "expose_metrics_on_status": True,
+        "enable_obs_port": False,
+        "obs_port": 9108,
+    }
+    if _ObsBotConfig is None:
+        return defaults
+    try:
+        cfg = _ObsBotConfig.from_env()
+    except Exception:
+        return defaults
+    obs_cfg = getattr(cfg, "obs", None)
+    if obs_cfg is None:
+        return defaults
+    STRICT_OBS = 1 if getattr(obs_cfg, "strict_obs", False) else 0
+    return {
+        "status_port": getattr(obs_cfg, "status_port", defaults["status_port"]),
+        "expose_metrics_on_status": getattr(obs_cfg, "expose_metrics_on_status", defaults["expose_metrics_on_status"]),
+        "enable_obs_port": getattr(obs_cfg, "enable_obs_port", defaults["enable_obs_port"]),
+        "obs_port": getattr(obs_cfg, "obs_port", defaults["obs_port"]),
+    }
+
+_OBS_DEFAULTS = _load_obs_defaults()
 try:
     from prometheus_client import Counter, Gauge, Histogram  # déjà présent en général
     _PROM_READY = True
@@ -298,9 +328,7 @@ def lbl_mode(m: str) -> str:
     m = _norm(m).upper()
     return m if m in ('EU_ONLY', 'SPLIT') else m
 
-def _env_bool(name: str, default: bool) -> bool:
-    v = str(_os.getenv(name, '1' if default else '0')).strip().lower()
-    return v in ('1', 'true', 'yes', 'on')
+
 DEPLOYMENT_REGION = _metric(Gauge, 'deployment_region_info', "Region info gauge (label 'region')", ['region'])
 DEPLOYMENT_MODE = _metric(Gauge, 'deployment_mode_info', "Mode info gauge (label 'mode')", ['mode'])
 
@@ -398,6 +426,19 @@ BF_API_LATENCY_MS = _metric(
 BF_CACHE_AGE_SECONDS = _metric(Gauge, 'bf_cache_age_seconds', 'Age of balances cache (seconds)', ['exchange', 'alias'])
 BF_LAST_SUCCESS_TS = _metric(Gauge, 'bf_last_success_ts_seconds', 'Last successful BF ts (epoch seconds)', ['exchange', 'alias'])
 FEE_TOKEN_BALANCE = _metric(Gauge, 'fee_token_balance', 'Fee token balance', ['exchange', 'alias', 'token'])
+FEE_TOKEN_CHECK_ERRORS_TOTAL = _metric(
+    Counter,
+    'fee_token_check_errors_total',
+    'Fee token check errors',
+    ['reason'],
+)
+FEE_TOKEN_TOPUP_REQUESTED_TOTAL = _metric(
+    Counter,
+    'fee_token_topup_requested_total',
+    'Fee token top-up requests',
+    ['symbol'],
+)
+
 BF_BALANCES_TTL_NORMAL_SECONDS = _metric(
     Gauge,
     'bf_balances_ttl_normal_seconds',
@@ -812,7 +853,12 @@ RM_DROPPED_TOTAL = _metric(
     'Opportunities dropped by the RM',
     labelnames=('reason',),
 )
-
+RM_INVALID_PRIVATE_EVENT_TOTAL = _metric(
+    Counter,
+    'rm_invalid_private_event_total',
+    'Invalid private events observed by RM',
+    ['exchange', 'alias', 'reason'],
+)
 RM_SHUTDOWN_SECONDS = _metric(
     Histogram,
     'rm_shutdown_seconds',
@@ -1090,6 +1136,24 @@ def mark_rm_to_engine(ok: bool, dt_ms: float, **labels: Any) -> None:
 MM_FILLS_BOTH = _metric(Counter, 'mm_fills_both_total', 'Both maker orders filled (MM) before TTL; no hedge needed', ['pair'])
 MM_SINGLE_FILL_HEDGED = _metric(Counter, 'mm_single_fill_hedged_total', 'Single maker order filled (MM) then hedged with a taker', ['pair'])
 MM_PANIC_HEDGE_TOTAL = _metric(Counter, 'mm_panic_hedge_total', 'Panic hedge triggered due to exception/timeout during MM', ['pair'])
+MM_THROTTLED_TOTAL = _metric(
+    Counter,
+    'mm_throttled_total',
+    'MM throttle hits by action',
+    ['reason', 'exchange', 'pair'],
+)
+MM_MAKERS_EXPIRED_TTL_TOTAL = _metric(
+    Counter,
+    'mm_makers_expired_ttl_total',
+    'MM makers expired on TTL enforcement',
+    ['exchange', 'pair'],
+)
+MM_MAKERS_CANCELED_TOTAL = _metric(
+    Counter,
+    'mm_makers_canceled_total',
+    'MM makers canceled proactively',
+    ['reason', 'exchange', 'pair'],
+)
 ENGINE_SUBMIT_TO_ACK_MS = _metric(Histogram, 'engine_submit_to_ack_ms', 'Engine submit→ack latency (ms)', buckets=BUCKETS_MS)
 ENGINE_ACK_TO_FILL_MS = _metric(Histogram, 'engine_ack_to_fill_ms', 'Engine ack→fill latency (ms)', buckets=BUCKETS_MS)
 ENGINE_CANCELLATIONS_TOTAL = _metric(Counter, 'engine_cancellations_total', 'Engine cancellations', ['exchange', 'pair', 'reason'])
@@ -1213,6 +1277,11 @@ ENGINE_PACER_UNAVAILABLE_TOTAL = _metric(
     'engine_pacer_unavailable_total',
     'Engine pacer unavailable events',
     ['reason'],
+)
+ENGINE_RM_OVERRIDES_TOTAL = _metric(
+    Counter,
+    'engine_rm_overrides_total',
+    'Engine overrides applied for RM decisions',
 )
 ENGINE_RL_TIMEOUT_TOTAL = _metric(
     Counter,
@@ -1471,6 +1540,12 @@ PWS_HEARTBEAT_GAP_SLO_SECONDS = _metric(
     'PrivateWS heartbeat gap SLO (seconds)',
     ['exchange', 'alias'],
 )
+PWS_HEARTBEAT_GAP_BREACH_TOTAL = _metric(
+    Counter,
+    'pws_heartbeat_gap_breach_total',
+    'PrivateWS heartbeat gap SLO breaches',
+    ['exchange', 'alias'],
+)
 PWS_HEALTH_STATE = _metric(
     Gauge,
     'pws_health_state',
@@ -1484,6 +1559,24 @@ WS_FAILOVER_TOTAL = _metric(Counter, 'ws_failover_total', 'PrivateWS failovers',
 PWS_POOL_SIZE = _metric(Gauge, 'pws_pool_size', 'Private WS connection pool size', ['exchange'])
 PWS_QUEUE_DEPTH = _metric(Gauge, 'pws_queue_depth', 'PrivateWS submit queue depth', ['exchange', 'alias', 'kind'])
 PWS_QUEUE_CAP = _metric(Gauge, 'pws_queue_cap', 'PrivateWS submit queue capacity', ['exchange', 'alias', 'kind'])
+PWS_QUEUE_FILL_RATIO = _metric(
+    Gauge,
+    'pws_queue_fill_ratio',
+    'PrivateWS queue fill ratio',
+    ['exchange', 'alias', 'kind'],
+)
+PWS_QUEUE_SATURATION_TOTAL = _metric(
+    Counter,
+    'pws_queue_saturation_total',
+    'PrivateWS queue saturation events',
+    ['exchange', 'alias', 'kind'],
+)
+PWS_ALERT_TOTAL = _metric(
+    Counter,
+    'pws_alert_total',
+    'PrivateWS alerts emitted',
+    ['severity', 'reason', 'exchange', 'alias', 'kind'],
+)
 WS_RECO_RUN_MS = _metric(Histogram, 'ws_reco_run_ms', 'Private WS reconciler run duration (ms)', ['exchange'], buckets=BUCKETS_MS)
 WS_RECO_ERRORS_TOTAL = _metric(Counter, 'ws_reco_errors_total', 'Errors in private WS reconciler', ['exchange'])
 WS_RECO_MISS_PER_MINUTE = _metric(
@@ -1647,7 +1740,13 @@ LOGGERH_DB_STALLS_TOTAL = _metric(Counter, 'loggerh_db_stalls_total', 'DB stalls
 LOGGERH_DB_FILE_BYTES = _metric(Gauge, 'loggerh_db_file_bytes', 'LoggerHistorique DB file size (bytes)')
 LOGGERH_DB_LANE_QUEUE_DEPTH = _metric(Gauge, 'loggerh_db_lane_queue_depth', 'DB lane queue depth (pending write batches)')
 LOGGERH_DB_LANE_DROPS_TOTAL = _metric(Counter, 'loggerh_db_lane_drops_total', 'DB lane drops when queue is full', ['op'])
-
+LHM_DB_LANE_QUEUE_DEPTH = _metric(Gauge, 'lhm_db_lane_queue_depth', 'DB lane queue depth (pending write batches)')
+LHM_TRADE_CONTRACT_INVALID_TOTAL = _metric(
+    Counter,
+    'lhm_trade_contract_invalid_total',
+    'Invalid trade contracts observed by LoggerHistorique',
+    ['reason'],
+)
 LHM_JSONL_QUEUE_CAP = _metric(Gauge, 'lhm_jsonl_queue_cap', 'Configured JSONL queue capacity (records)')
 
 LOGGERH_DB_LANE_DROPPED_TOTAL = _metric(
@@ -1876,6 +1975,7 @@ loggerh_write_ms = LOGGERH_WRITE_MS
 lhm_jsonl_ingested_total = LHM_JSONL_INGESTED_TOTAL
 lhm_jsonl_dropped_total = LHM_JSONL_DROPPED_TOTAL
 lhm_jsonl_queue_size = LHM_JSONL_QUEUE_SIZE
+lhm_jsonl_queue_cap = LHM_JSONL_QUEUE_CAP
 lhm_flush_batch_current = LHM_FLUSH_BATCH_CURRENT
 schema_violation_total = SCHEMA_VIOLATION_TOTAL
 log_dedup_total = LOG_DEDUP_TOTAL
@@ -1889,6 +1989,11 @@ def mark_ingested(stream: str, n: int=1) -> None:
 
 def mark_drop(stream: str, reason: str, n: int=1) -> None:
     lhm_on_dropped(stream, reason, n)
+def mark_schema_violation(field: str) -> None:
+    try:
+        SCHEMA_VIOLATION_TOTAL.labels(field=str(field)).inc()
+    except Exception:
+        pass
 
 def set_flush_batch(n: int) -> None:
     try:
@@ -2415,35 +2520,36 @@ class MainMetrics:
         except Exception:
             pass
 
-def start_servers_from_env(boot=None) -> dict[str, object]:
+def start_servers(boot=None, cfg=None) -> dict[str, object]:
     """
-    Démarre StatusHTTPServer(9110) avec /metrics activable par env,
-    et ObsServer(9108) optionnel. Retourne {"status_server": .., "obs_server": ..}.
-
-    ENV:
-      - STATUS_PORT (def 9110)
-      - EXPOSE_METRICS_ON_9110 (def 1 → expose /metrics sur 9110)
-      - OBS_ENABLE_9108 (def 0 → pas d’ObsServer séparé)
-      - OBS_PORT (def 9108)
+    Démarre StatusHTTPServer avec /metrics activable par configuration,
+    et ObsServer optionnel. Retourne {"status_server": .., "obs_server": ..}.
     """
     servers: dict[str, object] = {}
+    obs_cfg = getattr(cfg, "obs", None)
+    defaults = dict(_OBS_DEFAULTS)
+    status_port = int(getattr(obs_cfg, "status_port", defaults["status_port"]))
+    expose_9110 = bool(getattr(obs_cfg, "expose_metrics_on_status", defaults["expose_metrics_on_status"]))
+    enable_obs_port = bool(getattr(obs_cfg, "enable_obs_port", defaults["enable_obs_port"]))
+    obs_port = int(getattr(obs_cfg, "obs_port", defaults["obs_port"]))
     try:
-        status_port = int(_os.getenv('STATUS_PORT', '9110'))
-        expose_9110 = _env_bool('EXPOSE_METRICS_ON_9110', True)
+
         st = StatusHTTPServer(port=status_port, include_metrics=expose_9110)
         if boot is not None:
             st.set_boot(boot)
         servers['status_server'] = st
     except Exception:
-        log.exception('start_servers_from_env: StatusHTTPServer init a échoué')
+        log.exception('start_servers: StatusHTTPServer init a échoué')
     try:
-        if _env_bool('OBS_ENABLE_9108', False):
-            obs_port = int(_os.getenv('OBS_PORT', '9108'))
+        if enable_obs_port:
             servers['obs_server'] = ObsServer(port=obs_port)
     except Exception:
-        log.exception('start_servers_from_env: ObsServer init a échoué')
+        log.exception('start_servers: ObsServer init a échoué')
     return servers
 
+# Compatibilité: signature historique
+def start_servers_from_env(boot=None) -> dict[str, object]:
+    return start_servers(boot=boot)
 # --- [LHM/LAT] Métriques latence & pipeline centralisées ----------------------
 
 # Histos latence (submit→ack / submit→first_fill / submit→all_filled / e2e)

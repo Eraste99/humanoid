@@ -4998,6 +4998,7 @@ class RiskManager:
         try:
             accepted = None
             submitter = None
+            route = bundle.get("route") or {}
             try:
                 ex_key = str(route.get("buy_ex") or route.get("sell_ex") or meta.get("exchange") or "").upper()
             except Exception:
@@ -14349,8 +14350,10 @@ class RiskManager:
         et payloads.submit_leg_from_intent. La fragmentation est suggérée par le Simulateur (suggest_slices)
         et embarquée en meta (cohortes G1/G2/G3).
         """
+        meta = dict(opp.get("meta") or {})
 
         def _record_decision_reason(reason: str) -> None:
+
             if decision_ctx is None:
                 return
             if reason:
@@ -14663,7 +14666,7 @@ class RiskManager:
             frag_plan = sim_plan
             if frag_plan is None:
                 if sim_mode == "ON":
-                    _record_reason("SIM_CACHE_MISS")
+                    _record_decision_reason("SIM_CACHE_MISS")
                     try:
                         inc_rm_reject(reason="SIM_CACHE_MISS", pair=pair)
                     except Exception:
@@ -14671,7 +14674,7 @@ class RiskManager:
                     return decision_ctx
                 if sim_mode == "BYPASS_SAFE":
                     if self.live and not sim_bypass_live:
-                        _record_reason("SIM_CACHE_MISS")
+                        _record_decision_reason("SIM_CACHE_MISS")
                         return decision_ctx
                     decision_ctx["simulator_bypassed"] = True
         if frag_plan and (frag_plan.get("amounts") or []):

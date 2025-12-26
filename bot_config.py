@@ -236,6 +236,39 @@ class Globals:
         "engine_real": False,
         "simulator": True,
     })
+# --- Observabilité / Alerting ---
+
+@dataclass
+class ObservabilityCfg:
+    strict_obs: bool = False
+    log_level: str = "INFO"
+    status_port: int = 9110
+    expose_metrics_on_status: bool = True
+    enable_obs_port: bool = False
+    obs_port: int = 9108
+
+
+@dataclass
+class TelegramCfg:
+    bot_token: str = ""
+    allowed_user_ids: List[int] = field(default_factory=list)
+    chat_id_info: Optional[str] = None
+    chat_id_warn: Optional[str] = None
+    chat_id_crit: Optional[str] = None
+    ack_pin: Optional[str] = None
+
+
+@dataclass
+class WebhookCfg:
+    url: str = ""
+    hmac_secret: str = ""
+    timeout_s: float = 5.0
+
+
+@dataclass
+class AlertingCfg:
+    telegram: TelegramCfg = field(default_factory=TelegramCfg)
+    webhook: WebhookCfg = field(default_factory=WebhookCfg)
 
 @dataclass
 class FlowSafetyConfig:
@@ -316,6 +349,7 @@ class WatchdogCfg:
     cooldown_s: float = 5.0
     persistence_s: float = 120.0
     persistence_cycles: int = 3
+    notify_only_default: bool = True
 
     router_interval_s: float = 2.0
     router_health_stale_ms: int = 1300
@@ -1343,6 +1377,8 @@ class BotConfig:
     lhm: LoggerCfg = field(default_factory=LoggerCfg)
     dashboard: DashboardCfg = field(default_factory=DashboardCfg)
     tests: TestsCfg = field(default_factory=TestsCfg)
+    obs: ObservabilityCfg = field(default_factory=ObservabilityCfg)
+    alerting: AlertingCfg = field(default_factory=AlertingCfg)
     overrides: List[Dict[str, Any]] = field(default_factory=list)
 
     # cache à plat pour l'accès rétro-compat
@@ -1384,6 +1420,14 @@ class BotConfig:
         if not val:
             return "EU_ONLY"
         return str(val).upper()
+
+    @property
+    def telegram(self) -> TelegramCfg:
+        return self.alerting.telegram
+
+    @property
+    def webhook(self) -> WebhookCfg:
+        return self.alerting.webhook
 
     @property
     def DESK_REBAL_POLICY(self) -> Dict[str, Any]:
@@ -1472,6 +1516,38 @@ class BotConfig:
         if str(g.mode).upper() in ("DEV", "DEVELOPMENT"):
             g.mode = "DRY_RUN"
         g.feature_switches = _Env.get_dict("FEATURE_SWITCHES", g.feature_switches)
+        # --- Observabilité / Alerting ---
+        cfg.obs.strict_obs = _Env.get_bool("STRICT_OBS", cfg.obs.strict_obs)
+        cfg.obs.log_level = _Env.get("LOG_LEVEL", cfg.obs.log_level)
+        cfg.obs.status_port = _Env.get_int("STATUS_PORT", cfg.obs.status_port)
+        cfg.obs.expose_metrics_on_status = _Env.get_bool(
+            "EXPOSE_METRICS_ON_9110", cfg.obs.expose_metrics_on_status
+        )
+        cfg.obs.enable_obs_port = _Env.get_bool("OBS_ENABLE_9108", cfg.obs.enable_obs_port)
+        cfg.obs.obs_port = _Env.get_int("OBS_PORT", cfg.obs.obs_port)
+
+        cfg.alerting.telegram.bot_token = _Env.get("TELEGRAM_BOT_TOKEN", cfg.alerting.telegram.bot_token)
+        cfg.alerting.telegram.allowed_user_ids = [
+            int(x)
+            for x in _Env.get_list("TELEGRAM_ALLOWED_USER_IDS", cfg.alerting.telegram.allowed_user_ids)
+            if str(x).strip()
+        ]
+        cfg.alerting.telegram.chat_id_info = _Env.get(
+            "TELEGRAM_CHAT_ID_INFO", cfg.alerting.telegram.chat_id_info
+        )
+        cfg.alerting.telegram.chat_id_warn = _Env.get(
+            "TELEGRAM_CHAT_ID_WARN", cfg.alerting.telegram.chat_id_warn
+        )
+        cfg.alerting.telegram.chat_id_crit = _Env.get(
+            "TELEGRAM_CHAT_ID_CRIT", cfg.alerting.telegram.chat_id_crit
+        )
+        cfg.alerting.telegram.ack_pin = _Env.get("TELEGRAM_ACK_PIN", cfg.alerting.telegram.ack_pin)
+
+        cfg.alerting.webhook.url = _Env.get("RESTART_WEBHOOK_URL", cfg.alerting.webhook.url)
+        cfg.alerting.webhook.hmac_secret = _Env.get(
+            "RESTART_WEBHOOK_HMAC_KEY", cfg.alerting.webhook.hmac_secret
+        )
+        cfg.alerting.webhook.timeout_s = _Env.get_float("RESTART_WEBHOOK_TIMEOUT_S", cfg.alerting.webhook.timeout_s)
         overrides_raw = _Env.get("CONFIG_OVERRIDES", None)
         if overrides_raw:
             try:
@@ -1536,6 +1612,7 @@ class BotConfig:
         cfg.wd.cooldown_s = _Env.get_float("WD_COOLDOWN_S", cfg.wd.cooldown_s)
         cfg.wd.persistence_s = _Env.get_float("WD_PERSISTENCE_S", cfg.wd.persistence_s)
         cfg.wd.persistence_cycles = _Env.get_int("WD_PERSISTENCE_CYCLES", cfg.wd.persistence_cycles)
+        cfg.wd.notify_only_default = _Env.get_bool("WATCHDOG_NOTIFY_ONLY", cfg.wd.notify_only_default)
 
         cfg.wd.router_interval_s = _Env.get_float("WD_ROUTER_INTERVAL_S", cfg.wd.router_interval_s)
         cfg.wd.router_health_stale_ms = _Env.get_int("ROUTER_HEALTH_STALE_MS", cfg.wd.router_health_stale_ms)

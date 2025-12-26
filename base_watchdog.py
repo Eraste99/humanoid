@@ -45,10 +45,15 @@ class BaseWatchdogV2:
         self._sink: Optional[EventSink] = event_sink
 
         # --- CEINTURE notify-only ---
-        env_flag = str(os.getenv("WATCHDOG_NOTIFY_ONLY", "1")).strip().lower()
-        env_default = env_flag in ("1", "true", "yes", "on")
-        self.notify_only: bool = env_default if notify_only is None else bool(notify_only)
-
+        default_notify = None
+        if notify_only is None:
+            try:
+                from modules.bot_config import BotConfig  # lazy import pour éviter les cycles
+                default_notify = bool((BotConfig.from_env().wd.notify_only_default))
+            except Exception:
+                default_notify = None
+        self.notify_only: bool = (
+            default_notify if default_notify is not None else True) if notify_only is None else bool(notify_only)
         # boucle
         self._running = False
         self._task: Optional[asyncio.Task] = None

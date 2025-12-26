@@ -149,7 +149,8 @@ def fnum(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def _build_backoff_policy(retry_cfg: Optional[dict]) -> "BackoffPolicy":
+def _build_backoff_policy(retry_cfg: Optional[dict]) -> Any:
+
     """Adapte les formats legacy ({retries, backoff_s}) et v2 ({base_ms, max_ms, ...})."""
     try:
         from retry_policy import BackoffPolicy  # lazy import pour éviter dépendance forte
