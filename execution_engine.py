@@ -38,7 +38,7 @@ import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
 from contracts import payloads as fraglib
-from contracts.payloads import normalize_reason_code
+from contracts.payloads import normalize_reason_code, ReasonCodes
 
 from modules.engine_pacer import EnginePacer  # ensure import top-level
 from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
@@ -463,8 +463,20 @@ class AntiCrossingGuardMultiPod:
 
         coid = order.get("clientOrderId") or order.get("client_order_id") or meta.get("client_order_id")
         if not coid:
-            coid = f"ac_{int(time.time()*1e6)}"
-            order["clientOrderId"] = coid
+            idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+            leg_index = meta.get("leg_index") or meta.get("leg") or 0
+            if idk:
+                coid = f"ac_{idk}_{leg_index}_{side}_{symbol}"
+                order["clientOrderId"] = coid
+            elif getattr(self.engine, "ff_enforce_client_oid_deterministic", False):
+                if hasattr(self.engine, "_raise_engine_submit_error"):
+                    self.engine._raise_engine_submit_error(
+                        "IDEMPOTENCY_MISSING",
+                        branch=branch,
+                        profile=None,
+                        payload={"order": order, "meta": meta},
+                    )
+                return
 
         self._coid_to_keys.setdefault(coid, [])
 
@@ -634,12 +646,23 @@ class AntiCrossingGuardSinglePod:
         key    = self._key(ex, symbol, side, band)
         ttl_s  = max(0.0, self._ttl_ms_for(ex) / 1000.0)
 
-        # coid pour suivi/release
+        # coid pour suivi/release (stable ou rejet)
         coid = order.get("clientOrderId") or order.get("client_order_id") or meta.get("client_order_id")
         if not coid:
-            # fallback sur horodatage unique si pas de coid
-            coid = f"ac_{int(time.time()*1e6)}"
-            order["clientOrderId"] = coid  # ne casse pas l'API
+            idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+            leg_index = meta.get("leg_index") or meta.get("leg") or 0
+            if idk:
+                coid = f"ac_{idk}_{leg_index}_{side}_{symbol}"
+                order["clientOrderId"] = coid  # ne casse pas l'API
+            elif getattr(self.engine, "ff_enforce_client_oid_deterministic", False):
+                if hasattr(self.engine, "_raise_engine_submit_error"):
+                    self.engine._raise_engine_submit_error(
+                        "IDEMPOTENCY_MISSING",
+                        branch=branch,
+                        profile=None,
+                        payload={"order": order, "meta": meta},
+                    )
+                return
 
         # GC des réservations périmées
         self._gc()
@@ -1865,7 +1888,13 @@ class ExecutionEngine:
 
         try:
             if reconciler is None:
-                # Keep engine usable even if reconciler is disabled.
+                g_cfg = getattr(self.config, "g", None)
+                live_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD"
+                fs = getattr(g_cfg, "feature_switches", {}) if g_cfg else {}
+                require_private = bool(fs.get("private_ws", False))
+                if live_mode and require_private:
+                    self.mark_not_ready(reasons=["private_ws_reconciler_missing"], details={"reconciler": "missing"})
+                    return {"reconciler": "missing", "fail_closed": True}
                 return {"reconciler": "disabled"}
 
             # Prefer the already wired hub on the engine (set via set_private_ws_hub()).
@@ -2125,105 +2154,121 @@ class ExecutionEngine:
         """
         skip = False
 
-        meta = dict(meta or {})
-        mode_overrides: dict = {}
+
         try:
-            if isinstance(meta.get("mode_overrides"), dict):
-                mode_overrides = dict(meta.get("mode_overrides") or {})
-        except Exception:
-            mode_overrides = {}
-
-        # Flags bruts issus de l’overlay RM (on les garde pour l’obs)
-        raw_ioc_only = mode_overrides.get("ioc_only")
-        raw_mm_enabled = mode_overrides.get("mm_enabled")
-
-        ioc_only = raw_ioc_only
-        mm_enabled = raw_mm_enabled
-
-        # Contexte pour les labels obs
-        rm_mode = str(mode_overrides.get("rm_mode") or "").upper() or None
-        trade_mode = str(meta.get("mode") or "").upper() or None
-        exchange = (meta.get("exchange") or meta.get("ex") or "").upper() or None
-        alias = (meta.get("account_alias") or meta.get("alias") or meta.get("subaccount") or "").upper() or None
-        strategy = (meta.get("branch") or meta.get("strategy") or "").upper() or None
-
-        # Fallback compat : lire le RM si besoin (sans casser l’obs overlay)
-        rm = getattr(self, "risk_manager", None)
-        if rm is not None:
-            if ioc_only is None:
-                ioc_only = bool(getattr(rm, "_ioc_only", False))
-            if mm_enabled is None and hasattr(rm, "enable_mm"):
-                mm_enabled = bool(getattr(rm, "enable_mm", False))
-            if rm_mode is None:
-                try:
-                    rm_mode = str(getattr(rm, "rm_mode", "NORMAL")).upper()
-                except Exception:
-                    rm_mode = None
-            if trade_mode is None:
-                try:
-                    trade_mode = str(getattr(rm, "trade_mode", "NORMAL")).upper()
-                except Exception:
-                    trade_mode = None
-
-        self._check_invariant_rm_engine_modes(rm_mode, trade_mode, mode_overrides, meta)
-        # Flags PACER enrichis côté Engine (fusion stage="engine_fused")
-        pacer_mm_frozen = bool(mode_overrides.get("pacer_mm_frozen", False))
-
-        # Application des overrides
-        original_tif = str(tif or "").upper()
-        tif_u = original_tif
-        maker_flag = bool(maker)
-        post_only_flag = bool(post_only)
-
-        # 1) IOC-only : on loggue un override uniquement si l’overlay le demande explicitement
-        if bool(ioc_only):
-            tif_u = "IOC"
-            post_only_flag = False
-            maker_flag = False
-
-            # Observabilité : FORCED_IOC
-            if raw_ioc_only is not None and original_tif != "IOC":
-                self._engine_rm_overrides_metric(
-                    "FORCED_IOC",
-                    rm_mode=rm_mode,
-                    trade_mode=trade_mode,
-                    exchange=exchange,
-                    alias=alias,
-                    strategy=strategy,
-                )
-
-        # 2) MM désactivé : on loggue seulement si l’overlay (RM ou PACER) a explicitement coupé MM
-        if (mm_enabled is False) and maker:
-            skip = True
-            maker_flag = False
-            post_only_flag = False
-
-            # Détermination de la source pour l'obs : RM vs PACER
-            mm_source = "RM"
-
-            # Si le RM laisse MM actif au global mais que le PACER a figé les makers,
-            # on attribue la désactivation au PACER.
+            meta = dict(meta or {})
+            mode_overrides: dict = {}
             try:
-                rm_mm_global = None
-                if rm is not None and hasattr(rm, "enable_mm"):
-                    rm_mm_global = bool(getattr(rm, "enable_mm", False))
+                if isinstance(meta.get("mode_overrides"), dict):
+                    mode_overrides = dict(meta.get("mode_overrides") or {})
             except Exception:
-                rm_mm_global = None
+                mode_overrides = {}
 
-            if pacer_mm_frozen and rm_mm_global:
-                mm_source = "PACER"
+            # Flags bruts issus de l’overlay RM (on les garde pour l’obs)
+            raw_ioc_only = mode_overrides.get("ioc_only")
+            raw_mm_enabled = mode_overrides.get("mm_enabled")
 
-            if raw_mm_enabled is not None or pacer_mm_frozen:
-                self._engine_rm_overrides_metric(
-                    f"MM_DISABLED_BY_{mm_source}",
-                    rm_mode=rm_mode,
-                    trade_mode=trade_mode,
-                    exchange=exchange,
-                    alias=alias,
-                    strategy=strategy,
-                )
+            ioc_only = raw_ioc_only
+            mm_enabled = raw_mm_enabled
 
-        return tif_u, maker_flag, post_only_flag, skip
+            # Contexte pour les labels obs
+            rm_mode = str(mode_overrides.get("rm_mode") or "").upper() or None
+            trade_mode = str(meta.get("mode") or "").upper() or None
+            exchange = (meta.get("exchange") or meta.get("ex") or "").upper() or None
+            alias = (meta.get("account_alias") or meta.get("alias") or meta.get("subaccount") or "").upper() or None
+            strategy = (meta.get("branch") or meta.get("strategy") or "").upper() or None
+
+            # Fallback compat : lire le RM si besoin (sans casser l’obs overlay)
+            rm = getattr(self, "risk_manager", None)
+            if rm is not None:
+                if ioc_only is None:
+                    ioc_only = bool(getattr(rm, "_ioc_only", False))
+                if mm_enabled is None and hasattr(rm, "enable_mm"):
+                    mm_enabled = bool(getattr(rm, "enable_mm", False))
+                if rm_mode is None:
+                    try:
+                        rm_mode = str(getattr(rm, "rm_mode", "NORMAL")).upper()
+                    except Exception:
+                        rm_mode = None
+                if trade_mode is None:
+                    try:
+                        trade_mode = str(getattr(rm, "trade_mode", "NORMAL")).upper()
+                    except Exception:
+                        trade_mode = None
+
+            self._check_invariant_rm_engine_modes(rm_mode, trade_mode, mode_overrides, meta)
+            # Flags PACER enrichis côté Engine (fusion stage="engine_fused")
+            pacer_mm_frozen = bool(mode_overrides.get("pacer_mm_frozen", False))
+
+            # Application des overrides
+            original_tif = str(tif or "").upper()
+            tif_u = original_tif
+            maker_flag = bool(maker)
+            post_only_flag = bool(post_only)
+
+            # 1) IOC-only : on loggue un override uniquement si l’overlay le demande explicitement
+            if bool(ioc_only):
+                tif_u = "IOC"
+                post_only_flag = False
+                maker_flag = False
+
+                # Observabilité : FORCED_IOC
+                if raw_ioc_only is not None and original_tif != "IOC":
+                    self._engine_rm_overrides_metric(
+                        "FORCED_IOC",
+                        rm_mode=rm_mode,
+                        trade_mode=trade_mode,
+                        exchange=exchange,
+                        alias=alias,
+                        strategy=strategy,
+                    )
+
+            # 2) MM désactivé : on loggue seulement si l’overlay (RM ou PACER) a explicitement coupé MM
+            if (mm_enabled is False) and maker:
+                skip = True
+                maker_flag = False
+                post_only_flag = False
+
+                # Détermination de la source pour l'obs : RM vs PACER
+                mm_source = "RM"
+                # Si le RM laisse MM actif au global mais que le PACER a figé les makers,
+                # on attribue la désactivation au PACER.
+                try:
+                    rm_mm_global = None
+                    if rm is not None and hasattr(rm, "enable_mm"):
+                        rm_mm_global = bool(getattr(rm, "enable_mm", False))
+                except Exception:
+                    rm_mm_global = None
+
+                if pacer_mm_frozen and rm_mm_global:
+                    mm_source = "PACER"
+
+                if raw_mm_enabled is not None or pacer_mm_frozen:
+                    self._engine_rm_overrides_metric(
+                        f"MM_DISABLED_BY_{mm_source}",
+                        rm_mode=rm_mode,
+                        trade_mode=trade_mode,
+                        exchange=exchange,
+                        alias=alias,
+                        strategy=strategy,
+                    )
+
+            return tif_u, maker_flag, post_only_flag, skip
+        except Exception:
+            try:
+                if bool(getattr(getattr(self, "engine", None), "fail_closed_on_rm_override_exception", True)):
+                    self._engine_rm_overrides_metric(
+                        ReasonCodes.RM_OVERRIDE_EXCEPTION,
+                        rm_mode=None,
+                        trade_mode=None,
+                        exchange=(meta or {}).get("exchange") if isinstance(meta, dict) else None,
+                        alias=(meta or {}).get("account_alias") if isinstance(meta, dict) else None,
+                        strategy=(meta or {}).get("branch") if isinstance(meta, dict) else None,
+                    )
+                    return "IOC", False, False, True
+            except Exception:
+                pass
+            return str(tif or "").upper(), bool(maker), bool(post_only), False
 
     # Helpers simplifiés
     def _is_maker(self, order: dict) -> bool:
@@ -2812,10 +2857,17 @@ class ExecutionEngine:
                         loop = asyncio.get_running_loop()
                         loop.create_task(rel)
                     except RuntimeError:
-                        # pas de loop → best-effort sync (ignore)
-                        pass
+                        loop = getattr(self, "_loop", None)
+                        if loop:
+                            asyncio.run_coroutine_threadsafe(rel, loop)
+                        else:
+                            import threading
+                            threading.Thread(target=lambda: asyncio.run(rel), daemon=True).start()
             except Exception:
-                pass
+                try:
+                    AC_RELEASE_ERRORS_TOTAL.labels(kind="release_schedule").inc()
+                except Exception:
+                    pass
 
         inner = getattr(self, "_on_private_order_update_inner", None)
         if callable(inner):
@@ -3164,8 +3216,12 @@ class ExecutionEngine:
         self._enforce_mm_enabled(branch, strategy_tag, bundle)
         self._enforce_reb_enabled(branch, strategy_tag, bundle)
         idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+        bundle_id = meta.get("bundle_id")
         if self.ff_enforce_client_oid_deterministic and not idk:
             ack_base["reason_code"] = "IDEMPOTENCY_MISSING"
+            return ack_base
+        if self.ff_enforce_client_oid_deterministic and not bundle_id:
+            ack_base["reason_code"] = "BUNDLE_ILLEGAL"
             return ack_base
         dedup_mgr = getattr(self, "history_fsm", None)
         if idk and dedup_mgr and hasattr(dedup_mgr, "check_and_mark_idempotency"):
@@ -3182,6 +3238,7 @@ class ExecutionEngine:
                 except Exception:
                     pass
                 ack_base["state"] = "ENGINE_DUPLICATE"
+                ack_base["reason_code"] = "DUPLICATE_BUNDLE"
                 return ack_base
             if dedup_ok is None and self.ff_fail_closed_idempotence:
                 ack_base["reason_code"] = "ENGINE_DEDUP_BROKEN"
@@ -3202,26 +3259,26 @@ class ExecutionEngine:
             now = time.time()
             self._prune_seen_cids(now)
             if self._seen_cid_store.seen(cid, now):
-                # Idempotence: le bundle (logique) est déjà en file; on no-op mais on
-                # considère que l'appel RM est "accepté" pour rester simple côté desk.
+                # Idempotence: le bundle (logique) est déjà en file
                 try:
                     logger.info(
-                        "[ExecutionEngine] execute_bundle: bundle déjà vu (cid=%s) — no-op",
+                        "[ExecutionEngine] execute_bundle: bundle déjà vu (cid=%s) — duplicate",
                         cid,
                     )
                 except Exception:
                     pass
                 try:
-                    ENGINE_DEDUP_HITS_TOTAL.labels(source="idempotency_key").inc()
+                    ENGINE_DEDUP_HITS_TOTAL.labels(source="bundle_cid").inc()
                 except Exception:
                     pass
-                ack_base["state"] = "ENGINE_ACCEPTED"
-                ack_base["deadlines"]["ack_deadline_ts"] = time.time() + float(self._submit_ack_sla_s or 0.0)
+                ack_base["state"] = "ENGINE_DUPLICATE"
+                ack_base["reason_code"] = "DUPLICATE_BUNDLE"
                 return ack_base
 
-        except Exception:
-            # Défensif: si la déduplication casse, on ne bloque jamais le RM.
-            cid = None
+
+        except ValueError:
+            ack_base["reason_code"] = "ENGINE_DEDUP_BROKEN"
+            return ack_base
 
         # 3) Contexte backpressure (queue globale + profondeur par branche + high watermark)
         queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
@@ -4101,22 +4158,6 @@ class ExecutionEngine:
                     payload=bundle,
                 )
 
-        # 1) Idempotence via CID stable
-        # 1) Idempotence via CID stable (bundle canonique)
-        cid = self._bundle_cid_for_dedupe(bundle)
-        now = time.time()
-        self._prune_seen_cids(now)
-        if self._seen_cid_store.seen(cid, now):
-            # Idempotence: on court-circuite silencieusement (même bundle logique vu récemment)
-            # Compat: on ne renvoie pas d'exception pour ne pas surprendre le RM
-            try:
-                logger.info(
-                    "[ExecutionEngine] submit: bundle déjà vu (cid=%s) — no-op",
-                    cid,
-                )
-            except Exception:
-                pass
-            return
 
         # 1-bis) Langage commun de capacité (branch / profil / caps_local)
         meta = bundle.get("meta") or {}
@@ -4125,8 +4166,11 @@ class ExecutionEngine:
         is_fast_lane = self._is_fast_lane_meta(meta)
         branch, profile = self._require_branch_profile(meta)
         idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+        bundle_id = meta.get("bundle_id")
         if self.ff_enforce_client_oid_deterministic and not idk:
             self._raise_engine_submit_error("IDEMPOTENCY_MISSING", branch=branch, profile=profile, payload=bundle)
+        if self.ff_enforce_client_oid_deterministic and not bundle_id:
+            self._raise_engine_submit_error("BUNDLE_ILLEGAL", branch=branch, profile=profile, payload=bundle)
         dedup_mgr = getattr(self, "history_fsm", None)
         if idk and dedup_mgr and hasattr(dedup_mgr, "check_and_mark_idempotency"):
             try:
@@ -4142,9 +4186,26 @@ class ExecutionEngine:
                 except Exception:
                     pass
                 logger.info("[Engine] dedup persistent hit (idempotency_key=%s)", idk)
-                return
+                self._raise_engine_submit_error("DUPLICATE_BUNDLE", branch=branch, profile=profile, payload=bundle)
             if dedup_ok is None and self.ff_fail_closed_idempotence:
                 self._raise_engine_submit_error("ENGINE_DEDUP_BROKEN", branch=branch, profile=profile, payload=bundle)
+
+        # 1) Idempotence via CID stable (bundle canonique)
+        try:
+            cid = self._bundle_cid_for_dedupe(bundle)
+        except ValueError:
+            self._raise_engine_submit_error("ENGINE_DEDUP_BROKEN", branch=branch, profile=profile,
+                                            payload=bundle)
+            return
+        now = time.time()
+        self._prune_seen_cids(now)
+        if self._seen_cid_store.seen(cid, now):
+            try:
+                ENGINE_DEDUP_HITS_TOTAL.labels(source="bundle_cid").inc()
+            except Exception:
+                pass
+            self._raise_engine_submit_error("DUPLICATE_BUNDLE", branch=branch, profile=profile, payload=bundle)
+
         try:
             fsm_payload = {
                 "event_type": "ENQUEUE",
@@ -4583,8 +4644,7 @@ class ExecutionEngine:
         h = hashlib.sha256()
         try:
             h.update(json.dumps(canonical, sort_keys=True, default=str).encode("utf-8"))
-        except Exception:
-            # fallback très conservateur: on ne casse jamais l'appelant
+        except Exception as exc:
             try:
                 logger.warning(
                     "[ExecutionEngine] submit/execute_bundle: "
@@ -4592,6 +4652,7 @@ class ExecutionEngine:
                 )
             except Exception:
                 pass
+            raise ValueError("ENGINE_CID_SERIALIZE_FAILED") from exc
         return h.hexdigest()[:16]
 
 
@@ -5146,6 +5207,24 @@ class ExecutionEngine:
                     mark_engine_ack(latency_ms)  # wrapper tolérant: reçoit un delta en ms
                 except Exception:
                     logging.exception("Unhandled exception")
+                try:
+                    ack_key = f"ACK_LOG:{clid}"
+                    if self._ack_mark_once(ack_key):
+                        ex_sym = self._client_symbol_map.get(clid, (None, None))
+                        ack_evt = {
+                            "status": "ack",
+                            "exchange": event.get("exchange") or ex_sym[0],
+                            "symbol": event.get("symbol") or ex_sym[1],
+                            "client_id": clid,
+                            "exchange_order_id": event.get("exchange_order_id"),
+                            "t_sent_ms": fsm.t_sent_ms,
+                            "t_ack_ms": fsm.t_ack_ms,
+                            "event": event,
+                            "meta": getattr(fsm, "meta", None),
+                        }
+                        self._record_engine_ack(ack_evt)
+                except Exception:
+                    logging.exception("Unhandled exception")
 
             elif st == "FILLED":
                 fsm.on_filled()
@@ -5428,6 +5507,10 @@ class ExecutionEngine:
                     self.anti_crossing_guard = None
         except Exception:
             self.anti_crossing_guard = None
+        g_cfg = getattr(cfg, "g", None)
+        live_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD"
+        if live_mode and pods_enabled:
+            self.mark_not_ready(reasons=["anti_crossing_guard_unavailable"], details={"pods_enabled": True})
 
     def _hydrate_prices_for_legs(self, legs: List[Dict[str, Any]]) -> None:
         for l in legs or []:
@@ -9677,20 +9760,63 @@ class ExecutionEngine:
         if not client_id:
             meta = order.get("meta") or {}
             idk = meta.get("idempotency_key") or meta.get("idempotence_key")
-            slice_id = meta.get("slice_id") or meta.get("slice")
+            bundle_id = meta.get("bundle_id")
+            slice_id = meta.get("slice_id") or meta.get("slice") or "single"
             leg = str(meta.get("leg_id") or side or "")
-            if idk and slice_id and leg:
-                base = f"{idk}:{slice_id}:{leg}"
+            if idk and bundle_id and slice_id and leg:
+                base = f"{idk}:{bundle_id}:{slice_id}:{leg}"
                 client_id = hashlib.sha1(base.encode("utf-8")).hexdigest()[:32]
             elif self.ff_enforce_client_oid_deterministic:
-                err = EngineSubmitError("IDEMPOTENCY_MISSING")
-                try:
-                    err.reason = "IDEMPOTENCY_MISSING"
-                except Exception:
-                    pass
-                raise err
+                if not idk:
+                    err = EngineSubmitError("IDEMPOTENCY_MISSING")
+                    try:
+                        err.reason = "IDEMPOTENCY_MISSING"
+                    except Exception:
+                        pass
+                    raise err
+                if not bundle_id:
+                    err = EngineSubmitError("BUNDLE_ILLEGAL")
+                    try:
+                        err.reason = "BUNDLE_ILLEGAL"
+                    except Exception:
+                        pass
+                    raise err
             else:
                 client_id = f"S{int(time.time() * 1000)}"
+        try:
+            meta = order.get("meta") or {}
+            idk = meta.get("idempotency_key") or meta.get("idempotence_key")
+            dedup_mgr = getattr(self, "history_fsm", None)
+            if idk and dedup_mgr and hasattr(dedup_mgr, "check_and_mark_idempotency"):
+                try:
+                    dedup_ok = dedup_mgr.check_and_mark_idempotency(
+                        idempotency_key=str(idk),
+                        ttl_s=self.idempotency_ttl_s,
+                    )
+                except Exception:
+                    dedup_ok = None
+                if dedup_ok is False:
+                    try:
+                        ENGINE_DEDUP_HITS_TOTAL.labels(source="idempotency_store").inc()
+                    except Exception:
+                        pass
+                    err = EngineSubmitError("DUPLICATE_BUNDLE")
+                    try:
+                        err.reason = "DUPLICATE_BUNDLE"
+                    except Exception:
+                        pass
+                    raise err
+                if dedup_ok is None and self.ff_fail_closed_idempotence:
+                    err = EngineSubmitError("ENGINE_DEDUP_BROKEN")
+                    try:
+                        err.reason = "ENGINE_DEDUP_BROKEN"
+                    except Exception:
+                        pass
+                    raise err
+        except EngineSubmitError:
+            raise
+        except Exception:
+            pass
 
 
 
@@ -10004,7 +10130,7 @@ class ExecutionEngine:
             except Exception:
                 logging.exception("Unhandled exception extracting orderId")
 
-            # log "submitted"
+            # log "submitted" (engine_submits stream; avoid trade schema without trade_id)
             submit_evt = {
                 "status": "submitted",
                 "exchange": ex,
@@ -10020,7 +10146,7 @@ class ExecutionEngine:
                 "t_sent_ms": fsm.t_sent_ms,
                 "t_ack_ms": fsm.t_ack_ms,
             }
-            await self._hist("trade", submit_evt)
+            self._record_engine_submit(submit_evt)
 
             # Attente optionnelle ACK
             if bool(meta.get("wait_ack", False)):
@@ -10136,6 +10262,39 @@ def _emit_trade_fsm_event(self: "ExecutionEngine", payload: Dict[str, Any], *, e
     except Exception:
         logging.exception("ExecutionEngine._emit_trade_fsm_event failed", exc_info=False)
 
+def _record_engine_submit(self: "ExecutionEngine", payload: Dict[str, Any]) -> None:
+    mgr = getattr(self, "history_fsm", None)
+    if not mgr or not hasattr(mgr, "record_engine_submit"):
+        return
+    try:
+        result = mgr.record_engine_submit(payload)
+        if inspect.isawaitable(result):
+            asyncio.create_task(result)
+    except Exception:
+        logging.exception("ExecutionEngine._record_engine_submit failed", exc_info=False)
+
+def _record_engine_ack(self: "ExecutionEngine", payload: Dict[str, Any]) -> None:
+    mgr = getattr(self, "history_fsm", None)
+    if not mgr or not hasattr(mgr, "record_engine_ack"):
+        return
+    try:
+        result = mgr.record_engine_ack(payload)
+        if inspect.isawaitable(result):
+            asyncio.create_task(result)
+    except Exception:
+        logging.exception("ExecutionEngine._record_engine_ack failed", exc_info=False)
+
+def _record_engine_event(self: "ExecutionEngine", payload: Dict[str, Any]) -> None:
+    mgr = getattr(self, "history_fsm", None)
+    if not mgr or not hasattr(mgr, "record_engine_event"):
+        return
+    try:
+        result = mgr.record_engine_event(payload)
+        if inspect.isawaitable(result):
+            asyncio.create_task(result)
+    except Exception:
+        logging.exception("ExecutionEngine._record_engine_event failed", exc_info=False)
+
 # ---------------------------------------------------------------------------
 # Rejet "propre" (stats + navette observabilité + historisation)
 # ---------------------------------------------------------------------------
@@ -10220,10 +10379,11 @@ def _reject(self, pair: str, order_or_payload: Dict[str, Any], reason: str) -> N
 
         # Push vers LHM / history_sink (si câblé)
         try:
-            self._hist("reject", evt)
+            evt.setdefault("event_type", "ENGINE_REJECT")
+            self._record_engine_event(evt)
         except Exception:
             # Hist ne doit jamais casser les rejets
-            logger.exception("[Engine] _hist reject failed", exc_info=False)
+            logger.exception("[Engine] _record_engine_event reject failed", exc_info=False)
 
         try:
             fsm_payload = {
@@ -10424,8 +10584,15 @@ async def _cancel_order(self: "ExecutionEngine", exchange: str, symbol: str, cli
 
         # DRY-RUN → rien à appeler
         if self._is_dry(ex_u):
-            evt = {"exchange": ex_u, "symbol": symbol, "client_id": client_id, "status": "cancel_simulated", "reason": reason}
-            await self._hist("cancel", evt)
+            evt = {
+                "exchange": ex_u,
+                "symbol": symbol,
+                "client_id": client_id,
+                "status": "cancel_simulated",
+                "reason": reason,
+                "event_type": "ENGINE_CANCEL",
+            }
+            self._record_engine_event(evt)
             return evt
 
         # LIVE: dispatch
@@ -10441,7 +10608,15 @@ async def _cancel_order(self: "ExecutionEngine", exchange: str, symbol: str, cli
         else:
             raise ValueError(f"Exchange non supporté pour cancel: {exchange}")
 
-        await self._hist("cancel", {"exchange": ex_u, "symbol": symbol, "client_id": client_id, "status": "cancel_sent", "reason": reason, "resp": res})
+        self._record_engine_event({
+            "exchange": ex_u,
+            "symbol": symbol,
+            "client_id": client_id,
+            "status": "cancel_sent",
+            "reason": reason,
+            "resp": res,
+            "event_type": "ENGINE_CANCEL",
+        })
         return res
     except Exception as e:
         logging.getLogger("ExecutionEngine").debug("cancel error", exc_info=True)
@@ -10452,6 +10627,9 @@ async def _cancel_order(self: "ExecutionEngine", exchange: str, symbol: str, cli
 # ---------------------------------------------------------------------------
 ExecutionEngine._cb_sign = _cb_sign
 ExecutionEngine._hist = _hist
+ExecutionEngine._record_engine_submit = _record_engine_submit
+ExecutionEngine._record_engine_ack = _record_engine_ack
+ExecutionEngine._record_engine_event = _record_engine_event
 ExecutionEngine._reject = _reject
 ExecutionEngine._on_filled = _on_filled
 ExecutionEngine._wait_ack = _wait_ack

@@ -35,10 +35,11 @@ from __future__ import annotations
     """
 import asyncio, time, inspect
 import time, uuid, random
-import hashlib
+import hashlib,json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+from dataclasses import fields
 from typing import Dict, Any, List, Optional, Tuple
 from modules.obs_metrics import inc_blocked, set_transfer_inflight, inc_transfer_fsm_event
 import logging
@@ -49,6 +50,7 @@ from contracts.payloads import (
     submit_leg_from_intent,
     normalize_leg_dict,
     normalize_reason_code,
+    ReasonCodes,
     canonical_transfer_id,
 )
 from modules.retry_policy import BackoffPolicy, awith_retry
@@ -1326,18 +1328,29 @@ class RiskManager:
 
         rm_cfg = self._rm_cfg()
         bot_cfg = getattr(self, "bot_cfg", None)
+        cfg_obj = getattr(self, "cfg", None)
 
         for name in names:
-            if rm_cfg is not None:
-                val = getattr(rm_cfg, name, None)
-                if val is not None:
-                    return val
-            if bot_cfg is not None:
-                val = getattr(bot_cfg, name, None)
-                if val is not None:
-                    return val
-            val = getattr(self.cfg, name, None)
+            val = getattr(rm_cfg, name, None) if rm_cfg is not None else None
             if val is not None:
+                legacy_vals = []
+                for src in (bot_cfg, cfg_obj):
+                    if src is None:
+                        continue
+                    legacy_val = getattr(src, name, None)
+                    if legacy_val is not None and legacy_val != val:
+                        legacy_vals.append((type(src).__name__, legacy_val))
+                if legacy_vals:
+                    try:
+                        logger.warning(
+                            "[RiskManager] config divergence for %s: rm=%s legacy=%s",
+                            name,
+                            val,
+                            legacy_vals,
+                        )
+                        inc_rm_reject(reason="FALLBACK_THRESHOLD_USED")
+                    except Exception:
+                        pass
                 return val
 
         return default
@@ -1894,13 +1907,18 @@ class RiskManager:
         # rm_mode      : état "business" interne (OPP_VOLUME / OPP_VOL / SEVERE…)
         # trade_mode   : mode consolidé exposé à l'Engine (rm_mode × pacer_mode)
         # pacer_mode   : vue consolidée du Pacer (NORMAL / CONSTRAINED / SEVERE)
+        rm_cfg = getattr(self, "cfg", None)
+        rm_cfg = getattr(rm_cfg, "rm", rm_cfg)
+        self._switch_knobs = getattr(rm_cfg, "switch_knobs", None)
+        self._signal_policy = getattr(rm_cfg, "signal_policy", None)
         self.rm_mode = "NORMAL"  # NORMAL | OPP_VOLUME | OPP_VOL | SEVERE
         self.trade_mode = "NORMAL"  # NORMAL | CONSTRAINED | SEVERE | OPPORTUNISTE
         self.pacer_mode = "NORMAL"  # NORMAL | CONSTRAINED | SEVERE (injecté par watcher/Pacer)
         self._mode_since = 0.0
-        self._mode_timeout_s = 30 * 60  # 30 min fenêtre opportuniste
-        self._enter_hyst_s = 180  # 3 min verts
-        self._exit_hyst_s = 120  # 2 min verts
+        self._mode_timeout_s = float(self._switch_knobs.mode_timeout_s)
+        self._opp_volume_timeout_s = float(self._switch_knobs.opp_volume_timeout_s)
+        self._enter_hyst_s = int(self._switch_knobs.enter_hyst_s)
+        self._exit_hyst_s = int(self._switch_knobs.exit_hyst_s)
         self._last_rm_mode_obs = self.rm_mode
         self._last_trade_mode_obs = self.trade_mode
 
@@ -1932,33 +1950,53 @@ class RiskManager:
 
 
         # Plancher net (empêche “volume toxique”)
-        self._net_floor_bps = _cfg_float(self.cfg, "net_floor_bps", 4.5)
+        self._net_floor_bps = float(self._switch_knobs.net_floor_bps)
 
         # Deltas par mode (défauts sûrs ; profile-aware clamp appliqué plus bas)
         self._overlay = {
-            "OPP_VOLUME": {"tt_min_bps_delta": -2.0, "tm_min_bps_delta": -2.0, "cap_factor": 1.0, "mm_enable": True},
-            "OPP_VOL": {"tt_min_bps_delta": +3.0, "tm_min_bps_delta": +6.0, "cap_factor": 0.7, "mm_enable": False},
-            "SEVERE": {"tt_min_bps_delta": +5.0, "tm_min_bps_delta": +8.0, "cap_factor": 0.5, "mm_enable": False,
-                       "ioc_only": True},
+            "OPP_VOLUME": {
+                "tt_min_bps_delta": float(self._switch_knobs.opp_volume_tt_min_bps_delta),
+                "tm_min_bps_delta": float(self._switch_knobs.opp_volume_tm_min_bps_delta),
+                "cap_factor": float(self._switch_knobs.opp_volume_cap_factor),
+                "mm_enable": bool(self._switch_knobs.opp_volume_mm_enable),
+            },
+            "OPP_VOL": {
+                "tt_min_bps_delta": float(self._switch_knobs.opp_vol_tt_min_bps_delta),
+                "tm_min_bps_delta": float(self._switch_knobs.opp_vol_tm_min_bps_delta),
+                "cap_factor": float(self._switch_knobs.opp_vol_cap_factor),
+                "mm_enable": bool(self._switch_knobs.opp_vol_mm_enable),
+            },
+            "SEVERE": {
+                "tt_min_bps_delta": float(self._switch_knobs.severe_tt_min_bps_delta),
+                "tm_min_bps_delta": float(self._switch_knobs.severe_tm_min_bps_delta),
+                "cap_factor": float(self._switch_knobs.severe_cap_factor),
+                "mm_enable": bool(self._switch_knobs.severe_mm_enable),
+                "ioc_only": bool(self._switch_knobs.severe_ioc_only),
+            },
         }
         # Overlay consolidé par trade_mode (normalisé, clamp down uniquement)
         self._overlay_by_trade_mode = {
-            "NORMAL": {"tt_min_bps_delta": 0.0, "tm_min_bps_delta": 0.0, "cap_factor": 1.0, "ioc_only": False},
+            "NORMAL": {
+                "tt_min_bps_delta": float(self._switch_knobs.normal_tt_min_bps_delta),
+                "tm_min_bps_delta": float(self._switch_knobs.normal_tm_min_bps_delta),
+                "cap_factor": float(self._switch_knobs.normal_cap_factor),
+                "ioc_only": bool(self._switch_knobs.normal_ioc_only),
+            },
             "CONSTRAINED": {
-                "tt_min_bps_delta": float(getattr(self.cfg, "RM_CONSTR_TT_MIN_BPS_DELTA", +1.0)),
-                "tm_min_bps_delta": float(getattr(self.cfg, "RM_CONSTR_TM_MIN_BPS_DELTA", +1.0)),
-                "cap_factor": float(getattr(self.cfg, "RM_CONSTR_CAP_FACTOR", 0.5)),
-                "mm_enable": True,
-                "ioc_only": bool(getattr(self.cfg, "RM_CONSTR_IOC_ONLY", False)),
+                "tt_min_bps_delta": float(self._switch_knobs.constr_tt_min_bps_delta),
+                "tm_min_bps_delta": float(self._switch_knobs.constr_tm_min_bps_delta),
+                "cap_factor": float(self._switch_knobs.constr_cap_factor),
+                "mm_enable": bool(self._switch_knobs.constr_mm_enable),
+                "ioc_only": bool(self._switch_knobs.constr_ioc_only),
             },
             "SEVERE": dict(self._overlay.get("SEVERE", {})),
             "OPPORTUNISTE": {},  # fusionné avec le sous-mode opportuniste (OPP_VOLUME / OPP_VOL)
         }
 
         # --- PnL guard (config & état) ---
-        self._pnl_guard_lvl1 = _cfg_float(self.cfg, "pnl_guard_day_lvl1_pct", -0.3)  # %
-        self._pnl_guard_lvl2 = _cfg_float(self.cfg, "pnl_guard_day_lvl2_pct", -0.7)  # %
-        self._pnl_cooldown_s = _cfg_int(self.cfg, "pnl_cooldown_s", 1800)  # 30 min
+        self._pnl_guard_lvl1 = float(self._switch_knobs.pnl_guard_day_lvl1_pct)  # %
+        self._pnl_guard_lvl2 = float(self._switch_knobs.pnl_guard_day_lvl2_pct)  # %
+        self._pnl_cooldown_s = int(self._switch_knobs.pnl_cooldown_s)  # 30 min
         self._last_bad_ts = 0.0
         # --- Balances TTL (MBF → RM) ----------------------------------------
         # Paramètres RM côté config (en secondes). Defaults à ajuster dans BotConfig
@@ -3155,7 +3193,8 @@ class RiskManager:
             self._last_bad_ts = now
 
         # Sortie (cooldown)
-        if self.rm_mode in ("OPP_VOL", "SEVERE") and day > min(self._pnl_guard_lvl1, -0.05):
+        recover_floor = float(self._switch_knobs.pnl_guard_recover_floor_pct)
+        if self.rm_mode in ("OPP_VOL", "SEVERE") and day > min(self._pnl_guard_lvl1, recover_floor):
             if (now - max(self._last_bad_ts, self._mode_since)) >= self._pnl_cooldown_s:
                 self.rm_mode = "NORMAL"
                 self._mode_since = now
@@ -5775,8 +5814,15 @@ class RiskManager:
                 def _runner():
                     try:
                         asyncio.run(simulator.simulate_both_parallel(shadow_payload))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        try:
+                            logger.exception("[RiskManager] shadow_simulate failed", exc_info=exc)
+                            inc_rm_reject(reason="SIM_SHADOW_EXCEPTION")
+                        except Exception:
+                            pass
+                        rm_cfg = getattr(self, "_rm_cfg_obj", None) or getattr(self, "cfg", None)
+                        if rm_cfg is not None and bool(getattr(rm_cfg, "strict_config", False)):
+                            raise
 
                 threading.Thread(target=_runner, daemon=True).start()
         except Exception as e:
@@ -7222,6 +7268,26 @@ class RiskManager:
             getattr(self, "enable_tm", True),
             getattr(getattr(self, "cfg", None), "dry_run", False),
         )
+        try:
+            rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+            mode = str(
+                getattr(self, "split_mode", None) or getattr(getattr(self, "cfg", None), "DEPLOYMENT_MODE", "")).upper()
+            base_delta_ms, skew_ms, stale_ms = self._split_latency_defaults(mode)
+            thresholds = {
+                "base_ms": float(getattr(rm_cfg, "split_breach_thr_base_ms", 180.0)),
+                "skew_ms": float(getattr(rm_cfg, "split_breach_thr_skew_ms", 40.0)),
+                "stale_ms": float(getattr(rm_cfg, "split_breach_thr_stale_ms", 1300.0)),
+            }
+            cap_bps = float(getattr(rm_cfg, "split_penalty_bps_max", 6.0))
+            logger.info(
+                "[RiskManager] region_mode=%s latency=%s thresholds=%s penalty_cap_bps=%s",
+                mode,
+                {"base_delta_ms": base_delta_ms, "skew_ms": skew_ms, "stale_ms": stale_ms},
+                thresholds,
+                cap_bps,
+            )
+        except Exception:
+            logger.exception("[RiskManager] region snapshot log failed", exc_info=False)
 
         self._tasks = [
             asyncio.create_task(self._loop_orderbooks(), name="rm-orderbooks"),
@@ -8407,6 +8473,7 @@ class RiskManager:
             ev = str(event.get("event") or "").lower()
             level = str(event.get("level") or "INFO").upper()
             pair = event.get("pair")
+            event_id = str(event.get("event_id") or event.get("id") or event.get("event") or "")
 
             # 1) Alerte centralisée (pager/digest)
             try:
@@ -8516,6 +8583,23 @@ class RiskManager:
             except Exception:
                 # Historique = best-effort, jamais bloquant
                 pass
+            if module == "PWS":
+                try:
+                    if not event_id:
+                        event_id = hashlib.sha1(
+                            json.dumps(event or {}, sort_keys=True, default=str).encode("utf-8")
+                        ).hexdigest()
+                except Exception:
+                    event_id = event_id or ""
+                payload = dict(event or {})
+                payload.setdefault("event_id", event_id)
+                payload.setdefault("ts_ns", int(time.time_ns()))
+                if hasattr(self._lhm_manager, "record_privatews_event"):
+                    result = self._lhm_manager.record_privatews_event(payload)
+                    if inspect.isawaitable(result):
+                        asyncio.create_task(result)
+                else:
+                    self._hist_rm_event("privatews.event", payload)
 
             # VOL: la boucle _loop_volatility publie déjà VOL_* → no-op ici.
 
@@ -9247,7 +9331,29 @@ class RiskManager:
             except Exception:
                 pass
         # Fallback "pire cas" : on renvoie un âge élevé pour forcer prudence
-        return float(getattr(self.cfg, "opp_age_fallback_s", 9_999.0))
+        return float(self._switch_knobs.opp_age_fallback_s)
+
+    def _latest_book_age_s_with_missing(self) -> tuple[float, bool]:
+        import time
+        now_ms = int(time.time() * 1000)
+        ts_ms = (
+                getattr(self, "last_orderbook_recv_ts_ms", None)
+                or getattr(self, "router_last_ob_recv_ts_ms", None)
+                or getattr(self, "books_last_recv_ts_ms", None)
+        )
+        if ts_ms is None:
+            return float(self._switch_knobs.opp_age_fallback_s), True
+        try:
+            return max(0.0, (now_ms - int(ts_ms)) / 1000.0), False
+        except Exception:
+            return float(self._switch_knobs.opp_age_fallback_s), True
+
+    def _signal_missing(self, name: str) -> None:
+        reason = normalize_reason_code(ReasonCodes.signal_missing(name)) or ReasonCodes.signal_missing(name)
+        try:
+            inc_rm_reject(reason=reason)
+        except Exception:
+            pass
 
     def _green_calme(self) -> bool:
         """
@@ -9259,27 +9365,41 @@ class RiskManager:
           - simulateur aligné (shadow_error_bps_p50 ≤ seuil),
           - pacer en NORMAL.
         """
+        policy = self._signal_policy
         # 1) Fraîcheur du book
-        age_s = self._latest_book_age_s()
-        age_ok = bool(age_s <= float(getattr(self.cfg, "opp_vol_slip_age_s_max", 1.2)))
+        age_s, age_missing = self._latest_book_age_s_with_missing()
+        if age_missing and bool(getattr(policy, "require_book_age_for_opp", True)):
+            self._signal_missing("BOOK_AGE")
+            return False
+        age_ok = bool(age_s <= float(self._switch_knobs.opp_vol_slip_age_s_max))
 
         # 2) Volatilité p95 (bps)
         try:
-            vm = self.vol_manager.get_current_metrics(None) if hasattr(self, "vol_manager") else {}
-            vol_p95 = float((vm or {}).get("p95_bps", 0.0))
+            vm = self.vol_manager.get_current_metrics(None) if hasattr(self, "vol_manager") else None
+            vol_p95 = None if not vm else (vm or {}).get("p95_bps")
         except Exception:
-            vol_p95 = 0.0
-        vol_ok = bool(vol_p95 <= float(getattr(self.cfg, "opp_vol_p95_bps_max", 40.0)))
+            vol_p95 = None
+            if vol_p95 is None and bool(getattr(policy, "require_vol_signal_for_opp", True)):
+                self._signal_missing("VOL_P95")
+                return False
+            vol_ok = bool(float(vol_p95 or 0.0) <= float(self._switch_knobs.opp_vol_p95_bps_max))
 
         # 3) Rate-limits / 429
-        rl_ok = bool(getattr(self, "rate_limits_healthy", True))
+        rl_health = getattr(self, "rate_limits_healthy", None)
+        if rl_health is None and bool(getattr(policy, "require_rl_health_for_opp", True)):
+            self._signal_missing("RATE_LIMITS")
+            return False
+        rl_ok = bool(rl_health)
 
         # 4) Simulateur (shadow)
         try:
-            shadow_p50 = float(getattr(self, "shadow_error_bps_p50", 0.0))
+            shadow_p50 = getattr(self, "shadow_error_bps_p50", None)
         except Exception:
-            shadow_p50 = 0.0
-        shadow_ok = bool(shadow_p50 <= float(getattr(self.cfg, "opp_shadow_p50_bps_max", 2.5)))
+            shadow_p50 = None
+            if shadow_p50 is None and bool(getattr(policy, "require_shadow_for_opp", True)):
+                self._signal_missing("SHADOW_P50")
+                return False
+            shadow_ok = bool(float(shadow_p50 or 0.0) <= float(self._switch_knobs.opp_shadow_p50_bps_max))
 
         # 5) Pacer
         pacer_ok = (str(getattr(self, "pacer_mode", "NORMAL")).upper() == "NORMAL")
@@ -9294,17 +9414,29 @@ class RiskManager:
           - books trop vieux (age > seuil),
           - private WS/acks dégradé si exposé.
         """
-        age_s = self._latest_book_age_s()
-        stale_bad = bool(age_s > float(getattr(self.cfg, "opp_vol_exit_slip_age_s_max", 1.6)))
-
+        policy = self._signal_policy
+        age_s, age_missing = self._latest_book_age_s_with_missing()
+        stale_bad = bool(age_s > float(self._switch_knobs.opp_vol_exit_slip_age_s_max))
+        if age_missing and bool(getattr(policy, "require_book_age_for_opp", True)):
+            self._signal_missing("BOOK_AGE")
+            stale_bad = True
         try:
-            vm = self.vol_manager.get_current_metrics(None) if hasattr(self, "vol_manager") else {}
-            vol_p95 = float((vm or {}).get("p95_bps", 0.0))
+            vm = self.vol_manager.get_current_metrics(None) if hasattr(self, "vol_manager") else None
+            vol_p95 = None if not vm else (vm or {}).get("p95_bps")
         except Exception:
-            vol_p95 = 0.0
-        vol_bad = bool(vol_p95 >= float(getattr(self.cfg, "oppvol_p95_bps_min", 80.0)))
+            vol_p95 = None
+            if vol_p95 is None and bool(getattr(policy, "require_vol_signal_for_opp", True)):
+                self._signal_missing("VOL_P95")
+                vol_bad = True
+            else:
+                vol_bad = bool(float(vol_p95 or 0.0) >= float(self._switch_knobs.oppvol_p95_bps_min))
 
-        pws_bad = not bool(getattr(self, "private_ws_healthy", True))
+        pws_health = getattr(self, "private_ws_healthy", None)
+        if pws_health is None and bool(getattr(policy, "require_pws_health_for_opp", True)):
+            self._signal_missing("PWS_HEALTH")
+            pws_bad = True
+        else:
+            pws_bad = not bool(pws_health)
 
         return bool(vol_bad or stale_bad or pws_bad)
 
@@ -9479,7 +9611,7 @@ class RiskManager:
                 pass
 
             try:
-                strict = bool(getattr(self.cfg, "RM_INVARIANT_STRICT", False))
+                strict = bool(self._switch_knobs.rm_invariant_strict)
             except Exception:
                 strict = False
 
@@ -9556,8 +9688,8 @@ class RiskManager:
             getattr(self, "ws_reco_miss_rate_per_min", getattr(self, "ws_reco_miss_per_minute", 0.0))
             or 0.0
         )
-        thr_con = int(getattr(self.cfg, "RM_RECO_MISS_PER_MINUTE_CONSTRAINED", 30))
-        thr_sev = int(getattr(self.cfg, "RM_RECO_MISS_PER_MINUTE_SEVERE", 60))
+        thr_con = int(self._switch_knobs.rm_reco_miss_per_minute_constrained)
+        thr_sev = int(self._switch_knobs.rm_reco_miss_per_minute_severe)
 
         if miss_rate >= thr_sev:
             target_mode, target_reason = "SEVERE", "ws_reco_miss_burst"
@@ -9567,17 +9699,17 @@ class RiskManager:
         # --- 4) Latences WS (heartbeat/event/ack/fill) --------------------
         latency_checks = [
             ("pws_heartbeat_gap_seconds",
-             float(getattr(self.cfg, "RM_PWS_HEARTBEAT_GAP_SEVERE_S", 12.0)),
-             float(getattr(self.cfg, "RM_PWS_HEARTBEAT_GAP_CONSTRAINED_S", 6.0))),
+             float(self._switch_knobs.rm_pws_heartbeat_gap_severe_s),
+             float(self._switch_knobs.rm_pws_heartbeat_gap_constrained_s)),
             ("pws_event_lag_ms",
-             float(getattr(self.cfg, "RM_PWS_EVENT_LAG_SEVERE_MS", 1200.0)),
-             float(getattr(self.cfg, "RM_PWS_EVENT_LAG_CONSTRAINED_MS", 600.0))),
+             float(self._switch_knobs.rm_pws_event_lag_severe_ms),
+             float(self._switch_knobs.rm_pws_event_lag_constrained_ms)),
             ("pws_ack_latency_ms",
-             float(getattr(self.cfg, "RM_PWS_ACK_LATENCY_SEVERE_MS", 450.0)),
-             float(getattr(self.cfg, "RM_PWS_ACK_LATENCY_CONSTRAINED_MS", 250.0))),
+             float(self._switch_knobs.rm_pws_ack_latency_severe_ms),
+             float(self._switch_knobs.rm_pws_ack_latency_constrained_ms)),
             ("pws_fill_latency_ms",
-             float(getattr(self.cfg, "RM_PWS_FILL_LATENCY_SEVERE_MS", 1200.0)),
-             float(getattr(self.cfg, "RM_PWS_FILL_LATENCY_CONSTRAINED_MS", 700.0))),
+             float(self._switch_knobs.rm_pws_fill_latency_severe_ms),
+             float(self._switch_knobs.rm_pws_fill_latency_constrained_ms)),
         ]
         for name, sev_thr, con_thr in latency_checks:
             try:
@@ -9597,7 +9729,7 @@ class RiskManager:
         # --- 5) Fee tokens "LOW" prolongés -------------------------------
         fee_meta = getattr(self, "_last_fee_tokens_meta", {}) or {}
         fee_low_now = False
-        min_pct = float(getattr(self.cfg, "RM_FEE_TOKEN_MIN_PCT", 5.0))
+        min_pct = float(self._switch_knobs.rm_fee_token_min_pct)
 
         for token_meta in fee_meta.values():
             if not isinstance(token_meta, dict):
@@ -9623,7 +9755,7 @@ class RiskManager:
             # AttributeError possible si __slots__, on ignore.
             pass
 
-        min_low_s = float(getattr(self.cfg, "RM_FEE_LOW_MIN_SECONDS", 60.0))
+        min_low_s = float(self._switch_knobs.rm_fee_low_min_seconds)
         if (
                 fee_low_now
                 and low_since is not None
@@ -9705,11 +9837,33 @@ class RiskManager:
         b = str(r2).upper()
         return f"{a}-{b}" if a <= b else f"{b}-{a}"
 
+    def _split_rm_cfg(self) -> Any:
+        cfg = getattr(self, "cfg", None) or getattr(self, "config", None) or self
+        return getattr(cfg, "rm", None)
+
+    def _split_latency_defaults(self, mode: Optional[str] = None) -> tuple[float, float, float]:
+        cfg = getattr(self, "cfg", None) or getattr(self, "config", None) or self
+        g = getattr(cfg, "g", None)
+        mode_key = str(mode or getattr(self, "split_mode", "") or getattr(g, "deployment_mode", "")).upper()
+        if g is not None:
+            latency = None
+            if mode_key == "JP_ONLY":
+                latency = getattr(g, "jp_latency", None)
+            elif mode_key == "EU_ONLY":
+                latency = getattr(g, "eu_latency", None)
+            else:
+                latency = getattr(g, "split_latency", None)
+            if isinstance(latency, dict):
+                base = float(latency.get("base_delta_ms", 0.0) or 0.0)
+                skew = float(latency.get("skew_ms", 0.0) or 0.0)
+                stale = float(latency.get("stale_ms", 0.0) or 0.0)
+                return base, skew, stale
+        return 0.0, 0.0, 0.0
     def _split_metrics_for_edge(self, edge_key: str) -> tuple[float, float, float]:
         """
         Retourne (base_delta_ms, skew_ms, stale_ms) pour une paire de régions.
         - Si le pacer/boot injecte self.split_edge_metrics[edge_key], on l’utilise.
-        - Sinon fallback sur les métriques globales self.split_base_delta_ms / split_skew_ms / split_stale_ms.
+        - Sinon fallback sur les métriques globales de config (cfg.g.split_latency).
         """
         try:
             em = getattr(self, "split_edge_metrics", None)
@@ -9723,26 +9877,29 @@ class RiskManager:
         except Exception:
             pass
 
-        base = float(getattr(self, "split_base_delta_ms", 0.0) or 0.0)
-        skew = float(getattr(self, "split_skew_ms", 0.0) or 0.0)
-        stale = float(getattr(self, "split_stale_ms", 0.0) or 0.0)
-        return base, skew, stale
+        return self._split_latency_defaults()
+
 
     def _split_penalty_bps(self, buy_ex: str, sell_ex: str) -> float:
         """
         Penalty deterministica basata su metriche SPLIT correnti e soglie cfg.
         """
         mode = str(getattr(self, "split_mode", "EU_ONLY")).upper()
-        if mode != "SPLIT":
+        if mode not in {"SPLIT", "JP_ONLY"}:
             return 0.0
 
-        base = float(getattr(self, "split_base_delta_ms", 0.0))
-        skew = float(getattr(self, "split_skew_ms", 0.0))
-        stale = float(getattr(self, "split_stale_ms", 0.0))
+        buy_region = self._resolve_exchange_region(buy_ex)
+        sell_region = self._resolve_exchange_region(sell_ex)
+        if buy_region and sell_region:
+            edge_key = self._split_edge_key(buy_region, sell_region)
+            base, skew, stale = self._split_metrics_for_edge(edge_key)
+        else:
+            base, skew, stale = self._split_latency_defaults(mode)
 
-        thr_base = float(getattr(self.cfg, "split_breach_thr_base_ms", 180.0))
-        thr_skew = float(getattr(self.cfg, "split_breach_thr_skew_ms", 40.0))
-        thr_stal = float(getattr(self.cfg, "split_breach_thr_stale_ms", 1300.0))
+        rm_cfg = self._split_rm_cfg()
+        thr_base = float(getattr(rm_cfg, "split_breach_thr_base_ms", 180.0))
+        thr_skew = float(getattr(rm_cfg, "split_breach_thr_skew_ms", 40.0))
+        thr_stal = float(getattr(rm_cfg, "split_breach_thr_stale_ms", 1300.0))
 
         ratio = max(
             base / max(thr_base, 1e-9),
@@ -9750,7 +9907,7 @@ class RiskManager:
             stale / max(thr_stal, 1e-9),
             0.0
         )
-        cap = float(getattr(self.cfg, "split_penalty_bps_max", 6.0))
+        cap = float(getattr(rm_cfg, "split_penalty_bps_max", 6.0))
         return float(min(cap, cap * ratio))
 
     def _total_cost_bps(self, buy_ex: str, sell_ex: str, pair_key: str) -> float:
@@ -9842,8 +9999,7 @@ class RiskManager:
                 pass
 
             # Timeout (robuste) + conditions "calme" + net floor
-            timeout_s = int(getattr(self, "_opp_volume_timeout_s",
-                                    getattr(self, "_mode_timeout_s", 1800)))
+            timeout_s = int(self._opp_volume_timeout_s or self._mode_timeout_s)
             if (now - self._mode_since > timeout_s) or (not self._green_calme()) or net_floor_hit:
                 self.rm_mode, self._mode_since = "NORMAL", now
                 exit_reason = "opp_volume_exit"
@@ -9863,13 +10019,13 @@ class RiskManager:
         if self.rm_mode == "NORMAL":
             if self._red_tempete():
                 self.rm_mode, self._mode_since = "OPP_VOL", now
-                exit_reason = "tempete"
+                exit_reason = normalize_reason_code(ReasonCodes.TEMPETE) or ReasonCodes.TEMPETE
             elif self._green_calme():
                 # Hystérésis d'entrée : temps écoulé depuis le dernier "pas calme"
                 enter_hyst = int(getattr(self, "_enter_hyst_s", 180))
                 if (now - getattr(self, "_last_all_green_ts", now)) >= enter_hyst:
                     self.rm_mode, self._mode_since = "OPP_VOLUME", now
-                    exit_reason = "calm_entry"
+                    exit_reason = normalize_reason_code(ReasonCodes.CALM_ENTRY) or ReasonCodes.CALM_ENTRY
             else:
                 # Marqueur : dernier "pas calme" (reset la fenêtre d'hystérésis)
                 self._last_all_green_ts = now
@@ -9879,7 +10035,18 @@ class RiskManager:
             self._update_trade_mode()
         except Exception:
             # Fallback : ne jamais casser la FSM pour un problème de consolidation
-            self.trade_mode = getattr(self, "trade_mode", "NORMAL") or "NORMAL"
+            try:
+                rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+                fallback_mode = str(
+                    getattr(rm_cfg, "fallback_on_tick_exception", "CONSTRAINED")
+                ).upper()
+            except Exception:
+                fallback_mode = "CONSTRAINED"
+            if fallback_mode not in ("CONSTRAINED", "SEVERE"):
+                fallback_mode = "CONSTRAINED"
+            self.trade_mode = fallback_mode
+            self.rm_mode = fallback_mode
+            self._mode_since = now
 
         new_rm_mode = getattr(self, "rm_mode", "NORMAL")
         if old_rm_mode != new_rm_mode:
@@ -9936,7 +10103,7 @@ class RiskManager:
 
         # ---- Appliquer les overlays du mode courant ----
         self._apply_mode_overrides()
-        self._update_trade_mode()
+
         # risk_manager.py — dans _tick_mode(), juste avant de sortir de la méthode
         self._split_auto_fallback_tick()
 
@@ -11042,14 +11209,39 @@ class RiskManager:
         _add("cb_executor_workers", int(getattr(rm_cfg, "cb_executor_workers", 2) or 2), 2)
         _add("trading_ready_require_scanner_hook", bool(getattr(rm_cfg, "trading_ready_require_scanner_hook", False)),
              False)
+        _add(
+            "fallback_on_tick_exception",
+            str(getattr(rm_cfg, "fallback_on_tick_exception", "CONSTRAINED")).upper(),
+            "CONSTRAINED",
+        )
+        knobs = getattr(self, "_switch_knobs", None)
+        if knobs is not None:
+            default_knobs = type(knobs)()
+            for field in fields(default_knobs):
+                key = f"switch_knobs.{field.name}"
+                _add(key, getattr(knobs, field.name), getattr(default_knobs, field.name))
+        policy = getattr(self, "_signal_policy", None)
+        if policy is not None:
+            default_policy = type(policy)()
+            for field in fields(default_policy):
+                key = f"signal_policy.{field.name}"
+                _add(key, getattr(policy, field.name), getattr(default_policy, field.name))
 
-        return {
+        payload= {
             "module": "RM",
             "event": "config_audit",
             "ts_ms": int(time.time() * 1000),
             "entries": entries,
             "strict": bool(strict),
         }
+        try:
+            payload["snapshot_hash"] = hashlib.sha1(
+                json.dumps(entries, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            payload["snapshot_hash"] = None
+        return payload
+
 
     def _legacy_convert(self, op: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Conversion des anciens formats d'opérations de rebalancing.
@@ -14734,13 +14926,15 @@ class RiskManager:
             tm_controls = (tm_controls or {}) | degraded["tm_controls"]
 
         # SPLIT/EU_ONLY en meta additif (facultatif)
-        split_meta = None
-        split_mode = getattr(self, "split_mode", "EU_ONLY")  # "EU_ONLY"|"SPLIT"
+        split_mode = getattr(self, "split_mode", "EU_ONLY")  # "EU_ONLY"|"SPLIT"|"JP_ONLY"
+        if split_mode in ("EU_ONLY", "SPLIT", "JP_ONLY"):
+            base_delta_ms, skew_ms, stale_ms = self._split_latency_defaults(split_mode)
         if split_mode in ("EU_ONLY", "SPLIT"):
             split_meta = {
                 "mode": split_mode,
-                "skew_ms": getattr(self, "split_skew_ms", 20 if split_mode == "SPLIT" else 12),
-                "base_delta_ms": getattr(self, "split_base_delta_ms", 180 if split_mode == "SPLIT" else 140),
+                "skew_ms": skew_ms,
+                "base_delta_ms": base_delta_ms,
+                "stale_ms": stale_ms,
             }
         # [INSÉRER ICI — juste après 'caps_local |= degraded["caps"]' et avant 'if not legs:']
         # --- Guard pré-bundle: vol fraîche + coût total SFC (no fallback implicite)
@@ -15062,12 +15256,13 @@ class RiskManager:
     # ---------------------------------------------------------------------
     def _multicast_shadow(self, bundle: Dict[str, Any], decision_ctx: Optional[Dict[str, Any]] = None) -> bool:
         # 1) Envoi Engine (non-bloquant, avec fallbacks gérés)
-        self._record_budget_spend(bundle.get("branch"), bundle)
+
         engine_ok = self.engine_enqueue_bundle(bundle, decision_ctx=decision_ctx)
         # 2) Shadow Simu (non-bloquant, sampling interne)
         self.shadow_simulate(bundle, l2_cache=getattr(self, "l2_cache", None))
         # 3) Comptage des budgets (branch × profil × combo)
-        self._record_budget_spend(bundle.get("branch"), bundle)
+        if engine_ok:
+            self._record_budget_spend(bundle.get("branch"), bundle)
 
         # 4) Observabilité expo (M3-4) : notional par branche/profil/combo
         #    On ne logue que TM/MM/REB, via la helper dédiée.
@@ -15198,7 +15393,13 @@ class RiskManager:
             try:
                 mute_s = int(getattr(self, "route_mute_after_fail_s", 30))
                 if hasattr(self, "mute_route_for"):
-                    self.mute_route_for(buy_ex, sell_ex, pair, ttl_s=mute_s, reason="ENGINE_ERRORS")
+                    self.mute_route_for(
+                        buy_ex,
+                        sell_ex,
+                        pair,
+                        ttl_s=mute_s,
+                        reason=normalize_reason_code(ReasonCodes.ENGINE_ERRORS) or ReasonCodes.ENGINE_ERRORS,
+                    )
             except Exception:
                 pass
             if getattr(self, "log", None): self.log.error(f"RM.FAIL combo={combo_key} (final)")
@@ -15482,9 +15683,9 @@ class RiskManager:
         """
         Auto-fallback SPLIT -> EU_ONLY si dégradation inter-région persistante,
         puis auto-restore EU_ONLY -> SPLIT après stabilisation.
-        S'appuie sur les métriques publiques RM:
-          - split_base_delta_ms, split_stale_ms, split_skew_ms
-        et sur la config (cfg):
+        S'appuie sur les métriques configurées (cfg.g.split_latency)
+        et sur la config RM:
+
           - split_breach_thr_base_ms / split_breach_thr_skew_ms / split_breach_thr_stale_ms
           - split_breach_min_s (durée de dépassement avant fallback)
           - split_fallback_cooldown_s (durée minimale en EU_ONLY)
@@ -15493,20 +15694,20 @@ class RiskManager:
         now = time.time()
 
         mode = str(getattr(self, "split_mode", "EU_ONLY")).upper()
+        if mode not in {"SPLIT", "EU_ONLY"}:
+            return
 
-        base = float(getattr(self, "split_base_delta_ms", 0.0))
-        skew = float(getattr(self, "split_skew_ms", 0.0))
-        stale = float(getattr(self, "split_stale_ms", 0.0))
+        base, skew, stale = self._split_latency_defaults(mode)
 
-        thr_base = float(getattr(self.cfg, "split_breach_thr_base_ms", 180.0))  # ~EU<->US ack-delta
-        thr_skew = float(getattr(self.cfg, "split_breach_thr_skew_ms", 40.0))  # skew clock inter-pods
-        thr_stal = float(getattr(self.cfg, "split_breach_thr_stale_ms", 1300.0))  # obsolescence books cross
-
+        rm_cfg = self._split_rm_cfg()
+        thr_base = float(getattr(rm_cfg, "split_breach_thr_base_ms", 180.0))  # ~EU<->US ack-delta
+        thr_skew = float(getattr(rm_cfg, "split_breach_thr_skew_ms", 40.0))  # skew clock inter-pods
+        thr_stal = float(getattr(rm_cfg, "split_breach_thr_stale_ms", 1300.0))  # obsolescence books cross
         breach = (base >= thr_base) or (skew >= thr_skew) or (stale >= thr_stal)
 
-        min_breach_s = float(getattr(self.cfg, "split_breach_min_s", 3.0))
-        cd_s = float(getattr(self.cfg, "split_fallback_cooldown_s", 60.0))
-        restore_s = float(getattr(self.cfg, "split_restore_stable_s", 20.0))
+        min_breach_s = float(getattr(rm_cfg, "split_breach_min_s", 3.0))
+        cd_s = float(getattr(rm_cfg, "split_fallback_cooldown_s", 60.0))
+        restore_s = float(getattr(rm_cfg, "split_restore_stable_s", 20.0))
 
         # state locals
         if not hasattr(self, "_split_breach_since"):
@@ -15811,7 +16012,7 @@ class RiskManager:
                 "rm_mode": getattr(self, "rm_mode", "NORMAL"),
                 "private_plane_state": self.private_plane_state,
                 "rm_mode_since": getattr(self, "_mode_since", 0.0),
-                "rm_mode_timeout_s": getattr(self, "_mode_timeout_s", 30 * 60),
+                "rm_mode_timeout_s": float(getattr(self, "_mode_timeout_s", 0.0)),
                 "rm_daily_budgets": getattr(self, "daily_strategy_budget_quote", {}),
                 "rm_spent_today_quote": getattr(self, "_spent_today_quote", {}),
                 "rm_balance_ttl_s_normal": getattr(self, "_balance_ttl_s_normal", None),

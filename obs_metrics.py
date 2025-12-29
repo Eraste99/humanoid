@@ -326,7 +326,7 @@ def lbl_region(r: str) -> str:
 
 def lbl_mode(m: str) -> str:
     m = _norm(m).upper()
-    return m if m in ('EU_ONLY', 'SPLIT') else m
+    return m if m in ('EU_ONLY', 'SPLIT', 'JP_ONLY') else m
 
 
 DEPLOYMENT_REGION = _metric(Gauge, 'deployment_region_info', "Region info gauge (label 'region')", ['region'])

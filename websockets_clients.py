@@ -277,7 +277,7 @@ class WebSocketExchangeClient:
         self.next_delay: float = 0.0
 
         # RNG deterministe optionnelle (tests)
-        seed_val = getattr(config, "ws_backoff_seed", None) if config is not None else None
+        seed_val = getattr(wscfg, "ws_backoff_seed", None)
         self._rng = random.Random(int(seed_val)) if seed_val is not None else random.Random()
 
         # --- RL buckets (fallback no-op si non fournis par cfg) ---
@@ -405,6 +405,9 @@ class WebSocketExchangeClient:
         """
         add = add or []
         remove = remove or []
+        cfg_jitter_ms = int(getattr(self.cfg.ws_public, "update_pairs_jitter_ms", 200))
+        if jitter_ms is None or (jitter_ms == 200 and cfg_jitter_ms != 200):
+            jitter_ms = cfg_jitter_ms
 
         # 1) Unsubscribe d'abord
         for i in range(0, len(remove), chunk_size):
@@ -415,7 +418,7 @@ class WebSocketExchangeClient:
                 logging.exception("RL acquire (unsub) failed")
             await self._maybe_await(self._unsubscribe_impl, batch)
             self._subscribed.difference_update(batch)
-            await asyncio.sleep((jitter_ms + random.randint(0, jitter_ms)) / 1000.0)
+            await asyncio.sleep((jitter_ms + self._rng.randint(0, jitter_ms)) / 1000.0)
 
         # 2) Subscribe ensuite
         for i in range(0, len(add), chunk_size):
@@ -426,7 +429,7 @@ class WebSocketExchangeClient:
                 logging.exception("RL acquire (sub) failed")
             await self._maybe_await(self._subscribe_impl, batch)
             self._subscribed.update(batch)
-            await asyncio.sleep((jitter_ms + random.randint(0, jitter_ms)) / 1000.0)
+            await asyncio.sleep((jitter_ms + self._rng.randint(0, jitter_ms)) / 1000.0)
 
     def update_pairs(
         self,
@@ -440,6 +443,9 @@ class WebSocketExchangeClient:
         - si une event loop est présente : planifie aupdate_pairs(...)
         - sinon : exécute via asyncio.run (thread superviseur)
         """
+        cfg_jitter_ms = int(getattr(self.cfg.ws_public, "update_pairs_jitter_ms", 200))
+        if jitter_ms is None or (jitter_ms == 200 and cfg_jitter_ms != 200):
+            jitter_ms = cfg_jitter_ms
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(self.aupdate_pairs(add, remove, chunk_size, jitter_ms))
@@ -817,6 +823,7 @@ class WebSocketExchangeClient:
             return
         bid, ask, ex_ts = l1
         if bid <= 0 or ask <= 0 or ask < bid:
+            self._note_drop(ex, reason="schema_mismatch", kind="emit")
             return
         bids, asks, l2_ts = self._l2[ex].get(ex_symbol, ([], [], ex_ts))
         now_ms = int(time.time() * 1000)
@@ -855,6 +862,7 @@ class WebSocketExchangeClient:
 
         key = (ex, ex_symbol, int(ex_ts_norm or 0))
         if key in self._seen_events:
+            self._note_drop(ex, reason="dedup", kind="emit")
             return
         self._seen_events[key] = True
         # LRU bornée
@@ -963,7 +971,8 @@ class WebSocketExchangeClient:
             if self.pair_mapping.get(p, {}).get("binance"):
                 syms.append(self.get_symbol(p, "binance").lower())
             if not syms:
-              return
+                self._note_drop("BINANCE", reason="unknown_pair", kind="subscribe")
+                return
         streams = "/".join([f"{s}@bookTicker" for s in syms] +
                            [f"{s}@depth{self.depth_level}@{self.binance_interval_ms}ms" for s in syms])
         url = f"{self.BINANCE_WS_BASE}?streams={streams}"

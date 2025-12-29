@@ -45,7 +45,13 @@ from modules.rpc_gateway import RPCServer, make_submitter_for_exchange
 from modules.balance_fetcher import MultiBalanceFetcher
 from contracts.payloads import normalize_reason_code
 from modules.utils.rate_limiter import RateLimiter
-from modules import obs_metrics
+try:
+    from modules import obs_metrics as _obs_metrics
+    _OBS_IMPORT_ERROR: Exception | None = None
+except Exception as exc:
+    _obs_metrics = None
+    _OBS_IMPORT_ERROR = exc
+
 from modules.retry_policy import BackoffPolicy
 from contracts import  payloads as contracts
 
@@ -57,6 +63,44 @@ except Exception:  # pragma: no cover
 
 LOGGER = logging.getLogger("Boot")
 
+class _ObsNoopMetric:
+    def labels(self, **_kwargs: Any) -> "_ObsNoopMetric":
+        return self
+
+    def inc(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def set(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class _ObsNoop:
+    OBS_NOOP_TOTAL = _ObsNoopMetric()
+    BOT_STARTUPS_TOTAL = _ObsNoopMetric()
+    BOT_STATE = _ObsNoopMetric()
+    NONFATAL_ERRORS_TOTAL = _ObsNoopMetric()
+    BLOCKED_TOTAL = _ObsNoopMetric()
+
+    def safe_inc(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def safe_set(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def get_counter(self, *_args: Any, **_kwargs: Any) -> _ObsNoopMetric:
+        return _ObsNoopMetric()
+
+    def set_strict_obs(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def init_lhm_slo_targets(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def inc_blocked(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+obs_metrics = _obs_metrics or _ObsNoop()
 
 # ----------------------------- Contexte de Boot -----------------------------
 @dataclass
@@ -92,20 +136,48 @@ class BootContext:
 # --------------------------- Proxy Scanner paresseux ------------------------
 class _LazyScannerProxy:
     """Brise la dépendance circulaire Router⇄Scanner. Droppe tant que pas bindé."""
-    __slots__ = ("_target", "dropped")
+    __slots__ = ("_target", "dropped", "_cfg", "_log", "_buffer", "_buffer_maxlen", "_mode")
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: Any, log: logging.Logger) -> None:
         self._target: Any | None = None
         self.dropped: int = 0
+        self._cfg = cfg
+        self._log = log
+        boot_cfg = getattr(cfg, "boot", None)
+        mode = str(getattr(boot_cfg, "scanner_proxy_mode", "REJECT") or "REJECT").upper()
+        if mode not in {"STRICT_ORDER", "BUFFER", "REJECT"}:
+            mode = "REJECT"
+        self._mode = mode
+        self._buffer_maxlen = int(getattr(boot_cfg, "scanner_proxy_buffer_maxlen", 0) or 0)
+        self._buffer: deque = deque()
 
     def bind(self, scanner: Any) -> None:
         self._target = scanner
+        if self._buffer:
+            buffered = list(self._buffer)
+            self._buffer.clear()
+            for ev in buffered:
+                try:
+                    scanner.update_orderbook(ev)
+                except Exception:
+                    self.dropped += 1
+                    self._inc_blocked("BOOT_SCANNER_PROXY_FLUSH_FAILED", ev)
+
 
     def update_orderbook(self, ev: Dict[str, Any]) -> None:
         t = self._target
         if t is None:
-            self.dropped += 1
-            return None
+            mode = self._mode
+            if mode == "BUFFER":
+                if self._buffer_maxlen <= 0:
+                    return self._reject(ev, reason="BOOT_SCANNER_PROXY_BUFFER_DISABLED")
+                if len(self._buffer) >= self._buffer_maxlen:
+                    return self._reject(ev, reason="BOOT_SCANNER_PROXY_BUFFER_FULL")
+                self._buffer.append(ev)
+                return None
+            if mode == "STRICT_ORDER":
+                return self._reject(ev, reason="BOOT_SCANNER_PROXY_UNBOUND")
+            return self._reject(ev, reason="BOOT_SCANNER_PROXY_UNBOUND")
         return t.update_orderbook(ev)
 
     def get_cohort(self, pair: str) -> Optional[str]:
@@ -120,6 +192,24 @@ class _LazyScannerProxy:
                 return None
         return None
 
+    def _reject(self, ev: Dict[str, Any], *, reason: str) -> None:
+        self.dropped += 1
+        self._inc_blocked(reason, ev)
+        if self._mode == "STRICT_ORDER":
+            self._log.warning(
+                "[Boot] Scanner proxy strict-order blocked event before bind (reason=%s)", reason
+            )
+        return None
+
+    def _inc_blocked(self, reason: str, ev: Dict[str, Any]) -> None:
+        reason_code = normalize_reason_code(reason) or reason
+        pair = None
+        if isinstance(ev, dict):
+            pair = ev.get("pair") or ev.get("symbol")
+        try:
+            obs_metrics.inc_blocked("scanner_proxy", reason_code, pair)
+        except Exception:
+            pass
 # --------------------------------- Boot ------------------------------------
 class Boot:
     def __init__(self, cfg: BotConfig, *, logger: Optional[logging.Logger] = None) -> None:
@@ -151,7 +241,7 @@ class Boot:
         self._balances_task: Optional[asyncio.Task] = None
 
         self._running = False
-        self._scanner_proxy = _LazyScannerProxy()
+        self._scanner_proxy = _LazyScannerProxy(cfg, self.log)
         self._log = logging.getLogger(getattr(self, "__class__", type("Boot", (object,), {})).__name__)
         self._status_sink = getattr(self.cfg, "status_sink", None)  # callable(payload)|None
         self.boot_complete = asyncio.Event()
@@ -166,6 +256,7 @@ class Boot:
         self._router_health_pairs_seen: Dict[str, Dict[str, int]] = {}
         self._router_health_stale_counts: Dict[str, int] = {}
         self._router_health_warned: bool = False
+        self._public_pipeline_started: bool = False
         self._obs_inc_cb: Optional[Any] = None
         self._router_drop_events: Dict[str, deque] = {}
         self._router_drop_latch_emitted: bool = False
@@ -233,8 +324,40 @@ class Boot:
 
         self._obs_inc_cb = _obs_inc
         return self._obs_inc_cb
+
+    def _scanner_proxy_mode(self) -> str:
+        boot_cfg = getattr(self.cfg, "boot", None)
+        return str(getattr(boot_cfg, "scanner_proxy_mode", "REJECT") or "REJECT").upper()
+
+    def _check_obs_preflight(self) -> None:
+        obs_cfg = getattr(self.cfg, "obs", None) or getattr(self.cfg, "observability", None)
+        strict = bool(getattr(obs_cfg, "strict_obs", False))
+        obs_ready = True
+        details = ""
+        if _OBS_IMPORT_ERROR is not None:
+            obs_ready = False
+            details = f"import_error:{_OBS_IMPORT_ERROR}"
+        else:
+            prom_ready = getattr(obs_metrics, "prom_ready", None)
+            if callable(prom_ready):
+                try:
+                    if not prom_ready():
+                        obs_ready = False
+                        details = "prom_not_ready"
+                except Exception as exc:
+                    obs_ready = False
+                    details = f"prom_ready_error:{exc}"
+        if obs_ready:
+            return
+        if strict:
+            self.log.error("[Boot] observability preflight failed (%s); strict_obs=True", details)
+            raise RuntimeError(f"obs_metrics unavailable: {details}")
+        self.log.warning("[Boot] observability degraded (%s); strict_obs=False", details)
+        self._mark_degraded("OBS_METRICS_UNAVAILABLE", where=details)
+
     # ------------------------------- Public API ----------------------------
     async def start(self) -> BootContext:
+        self._check_obs_preflight()
         # boot.py — dans async def start(self): juste au début
         mode = (
                 getattr(self.cfg, "DEPLOYMENT_MODE", None)
@@ -299,7 +422,8 @@ class Boot:
             # 2) Discovery (optionnelle) -> active pairs
             await self._discover_pairs_and_compute_active()
             # 3) Public WS + Router
-            await self._start_public_pipeline()
+            strict_order = self._scanner_proxy_mode() == "STRICT_ORDER"
+            await self._start_public_pipeline(start_tasks=not strict_order)
 
             # 4) Balances plane (MBF) avant RM
             await self._start_balances_plane()
@@ -307,6 +431,8 @@ class Boot:
             await self._start_rm()
             # 6) Scanner (bind Router push)
             await self._start_scanner()
+            if strict_order:
+                await self._start_public_pipeline_tasks()
             # 7) Private plane (Hub, Reco, Balances)
             await self._start_private_plane()
             # 7bis) Dépendances Engine (RL + retry)
@@ -733,6 +859,15 @@ class Boot:
         # 4) Marque de progression + log
         self._mark_stage("lhm_started")
         self.log.info("[Boot] LHM prêt (out_dir=%s)", out_dir)
+        try:
+            self.log.info(
+                "[Boot][LHM] config batch_size=%s flush_interval_s=%.2f q_stream_max=%s",
+                getattr(lhm_cfg, "LHM_TRADE_BATCH_SIZE", None),
+                float(getattr(lhm_cfg, "LHM_TRADE_FLUSH_INTERVAL_S", 0.0)),
+                getattr(lhm_cfg, "LHM_Q_STREAM_MAX", None),
+            )
+        except Exception:
+            pass
 
         # 5) Démarrer la surveillance du pipeline PnL (LHM/JSONL/DB)
         try:
@@ -817,7 +952,7 @@ class Boot:
 
 
 
-    async def _start_public_pipeline(self) -> None:
+    async def _start_public_pipeline(self, *, start_tasks: bool = True) -> None:
         """
         Démarre la pipeline publique sans bloquer le bootstrap :
           1) crée la in_queue
@@ -851,29 +986,6 @@ class Boot:
         if not hasattr(self, "ready_router"):
             self.ready_router = asyncio.Event()
 
-        # Lance WS en tâche non-bloquante
-        # APRÈS (tolerant à None / "", "none", "null")
-        _raw = getattr(self.cfg, "WS_READY_TIMEOUT_S", None)
-        ws_ready_to = float(
-            5.0 if (_raw is None or (isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})) else _raw)
-
-        # start() peut être une coroutine longue; on la met en tâche:
-        self._ws_task = asyncio.create_task(self.ctx.ws_public.start(), name="boot-ws-start")
-
-        # Attente best-effort d’un signal de readiness (si exposé)
-        try:
-            if hasattr(self.ctx.ws_public, "ready_event"):
-                await asyncio.wait_for(self.ctx.ws_public.ready_event.wait(), timeout=ws_ready_to)
-            else:
-                # fallback léger pour laisser le temps de bootstrapper
-                await asyncio.sleep(0.2)
-        except asyncio.TimeoutError:
-            self.log.warning("[Boot] WS public pas prêt après %.1fs, on continue.", ws_ready_to)
-
-        # Marque ready + stage + log (comme chez toi)
-        self.ready_ws.set()
-        self._mark_stage("ws_public_started")
-        self.log.info("[Boot] WS publics: %d pairs", len(pairs))
 
         # --- 3.2) Capteurs auxiliaires (inchangés)
         try:
@@ -921,13 +1033,51 @@ class Boot:
             self._wire_router_event_sink()
         except Exception:
             self.log.exception("[Boot] Wiring router event sink failed")
+        if start_tasks:
+            await self._start_public_pipeline_tasks(pairs, combos)
+        else:
+            self.log.info("[Boot] Public pipeline tasks deferred (strict order)")
+
+        async def _start_public_pipeline_tasks(
+                self,
+                pairs: Optional[List[str]] = None,
+                combos: Optional[List[Tuple[str, str]]] = None,
+        ) -> None:
+            if self._public_pipeline_started:
+                return
+            if not pairs:
+                pairs = list(getattr(self.ctx, "active_pairs", []) or [])
+            if not combos:
+                combos = getattr(getattr(self.cfg, "router", object()), "combos", None)
+                if not combos:
+                    combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
+
+            # Lance WS en tâche non-bloquante
+            _raw = getattr(self.cfg, "WS_READY_TIMEOUT_S", None)
+            ws_ready_to = float(
+                5.0 if (_raw is None or (
+                            isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})) else _raw)
+
+            self._ws_task = asyncio.create_task(self.ctx.ws_public.start(), name="boot-ws-start")
+
+            try:
+                if hasattr(self.ctx.ws_public, "ready_event"):
+                    await asyncio.wait_for(self.ctx.ws_public.ready_event.wait(), timeout=ws_ready_to)
+                else:
+                    await asyncio.sleep(0.2)
+            except asyncio.TimeoutError:
+                self.log.warning("[Boot] WS public pas prêt après %.1fs, on continue.", ws_ready_to)
+
+            self.ready_ws.set()
+            self._mark_stage("ws_public_started")
+            self.log.info("[Boot] WS publics: %d pairs", len(pairs))
 
         # Lance Router en tâche non-bloquante
         self._router_task = asyncio.create_task(self.ctx.router.start(), name="boot-router-start")
-        
-        # Attente best-effort d’un signal de readiness (si exposé)
+
         _raw = getattr(self.cfg, "ROUTER_READY_TIMEOUT_S", None)
-        router_ready_to = float(5.0 if (_raw is None or (isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})) else _raw)
+        router_ready_to = float(
+            5.0 if (_raw is None or (isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})) else _raw)
         try:
             if hasattr(self.ctx.router, "ready_event"):
                 await asyncio.wait_for(self.ctx.router.ready_event.wait(), timeout=router_ready_to)
@@ -940,6 +1090,7 @@ class Boot:
         self._mark_stage("router_started")
         self.log.info("[Boot] Router démarré. combos=%s", combos)
         self._ensure_router_health_watchdog()
+        self._public_pipeline_started = True
 
     def _wire_volatility_monitor(self) -> None:
         """Attache les files bus vol et forward scanner/config pour la Volatility."""
@@ -1088,6 +1239,9 @@ class Boot:
             "execution_engine": getattr(self.ctx, "engine", None),
             "history_logger": getattr(self.ctx, "lhm", None),
         }
+        lhm = getattr(self.ctx, "lhm", None)
+        if lhm is not None and hasattr(lhm, "record_alert"):
+            rm_kwargs["alert_callback"] = lhm.record_alert
         rm_kwargs["exchanges"] = list(
             getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"]))
         rm_kwargs["symbols"] = list(self.ctx.active_pairs)
@@ -1098,6 +1252,11 @@ class Boot:
         rm_kwargs = {k: v for k, v in rm_kwargs.items() if k in sig.parameters}
 
         self.ctx.rm = RiskManager(**rm_kwargs)
+        try:
+            dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY") or "EU_ONLY").upper()
+            self.ctx.rm.split_mode = dep_mode
+        except Exception:
+            pass
         try:
             cb = self._get_obs_inc_callback()
             if cb and hasattr(self.ctx.rm, "set_obs_inc_callback"):
@@ -1188,12 +1347,18 @@ class Boot:
             # (3) Applique au Scanner (fallback binaire si 4-tiers non fournis)
             dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY"))
             if coh:
+                def _sorted_pairs(values: Any) -> List[str]:
+                    if not values:
+                        return []
+                    if isinstance(values, (set, tuple, list)):
+                        return sorted(values)
+                    return sorted(list(values))
                 self.ctx.scanner.set_universe(
                     mode=dep_mode,
-                    core=coh.get("CORE", []),
-                    primary=coh.get("PRIMARY", []),
-                    audition=coh.get("AUDITION", []),
-                    sandbox=coh.get("SANDBOX", []),
+                    core=_sorted_pairs(coh.get("CORE", [])),
+                    primary=_sorted_pairs(coh.get("PRIMARY", [])),
+                    audition=_sorted_pairs(coh.get("AUDITION", [])),
+                    sandbox=_sorted_pairs(coh.get("SANDBOX", [])),
                 )
             else:
                 self.ctx.scanner.set_universe(
@@ -2098,7 +2263,7 @@ class Boot:
                     reasons.append("engine_private_hub_wiring_incomplete")
 
         dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY")).upper()
-        if dep_mode not in {"EU_ONLY", "SPLIT", "JP"}:
+        if dep_mode not in {"EU_ONLY", "SPLIT", "JP_ONLY"}:
             reasons.append("BOOT_MODE_FALLBACK")
 
         # Décision READY / DEGRADED

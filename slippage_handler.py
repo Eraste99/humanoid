@@ -907,7 +907,14 @@ class SlippageHandler:
 
             self._slip_bps = getattr(self, "_slip_bps", {})
             self._slip_ts = getattr(self, "_slip_ts", {})
-            now_s = time.time()
+            ts_ms = (
+                    msg.get("recv_ts_ms")
+                    or msg.get("exchange_ts_ms")
+                    or msg.get("ts_ms")
+                    or msg.get("ts_ex_ms")
+                    or 0
+            )
+            now_s = (float(ts_ms) / 1000.0) if ts_ms else time.time()
             if slip_buy_bps is not None:
                 self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
             if slip_sell_bps is not None:
@@ -915,15 +922,7 @@ class SlippageHandler:
             self._slip_ts[(ex, pair)] = now_s
 
             try:
-                event_ts_ms = (
-                        msg.get("recv_ts_ms")
-                        or msg.get("ts_ms")
-                        or msg.get("exchange_ts_ms")
-                        or msg.get("ts_ex_ms")
-                        or 0
-                )
-                event_age_s = max(0.0, now_s - float(event_ts_ms) / 1000.0) if event_ts_ms else 0.0
-
+                event_age_s = max(0.0, now_s - float(ts_ms) / 1000.0) if ts_ms else 0.0
                 if slip_buy_bps is not None:
                     set_slip_age_seconds(pair, ex, "buy", event_age_s)
                 if slip_sell_bps is not None:

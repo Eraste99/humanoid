@@ -1551,6 +1551,16 @@ def make_rm_shutdown_event(*,
         "timed_out": bool(timed_out),
     }
 
+class ReasonCodes:
+    TEMPETE = "TEMPETE"
+    CALM_ENTRY = "CALM_ENTRY"
+    ENGINE_ERRORS = "ENGINE_ERRORS"
+    RM_OVERRIDE_EXCEPTION = "RM_OVERRIDE_EXCEPTION"
+    SIGNAL_MISSING_PREFIX = "SIGNAL_MISSING_"
+
+    @staticmethod
+    def signal_missing(name: str) -> str:
+        return f"{ReasonCodes.SIGNAL_MISSING_PREFIX}{name}"
 
 KNOWN_REASON_CODES = {
     "RM_BALANCE_TTL_DEGRADED",
@@ -1592,8 +1602,21 @@ KNOWN_REASON_CODES = {
     "BOOT_DEP_START_FAIL",
     "BOOT_READY_BLOCKED",
     "BOOT_STOP_TIMEOUT",
+    "BOOT_SCANNER_PROXY_UNBOUND",
+    "BOOT_SCANNER_PROXY_BUFFER_FULL",
+    "BOOT_SCANNER_PROXY_BUFFER_DISABLED",
+    "BOOT_SCANNER_PROXY_FLUSH_FAILED",
+    "OBS_METRICS_UNAVAILABLE",
     "SCANNER_RM_CALLBACK_MISSING",
     "SCANNER_HISTORY_SINK_MISSING",
+"SCANNER_PAIR_NOT_IN_UNIVERSE",
+    "SCANNER_PAIR_NOT_IN_PRIORITY",
+    "SCANNER_PAIR_PAUSED",
+    "SCHEMA_BAD_TS",
+    "schema_mismatch",
+    "SIM_SHADOW_EXCEPTION",
+    "DUPLICATE_BUNDLE",
+    "PWS_CALLBACK_NO_LOOP",
     "ROUTER_HEALTH_UNCONSUMED",
     "PUBLIC_FEED_STALE",
     "REGION_JP_DISABLED_BY_DEFAULT",
@@ -1609,6 +1632,7 @@ KNOWN_REASON_CODES = {
     "REB_LOCK",
     "ENGINE_REBAL_LOCKED",
     "BUNDLE_ILLEGAL",
+    "DEDUP",
     "REB_LOCK_CHECK_FAILED",
     "MM_PREEMPTED",
     "PREEMPT_TT",
@@ -1639,6 +1663,10 @@ KNOWN_REASON_CODES = {
     "TRANSFER_FSM",
     "TRANSFER_FAILED",
     "XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+    ReasonCodes.TEMPETE,
+    ReasonCodes.CALM_ENTRY,
+    ReasonCodes.ENGINE_ERRORS,
+    ReasonCodes.RM_OVERRIDE_EXCEPTION,
 }
 def canonical_transfer_id(payload: Dict[str, Any]) -> str:
     base = {
@@ -1665,7 +1693,7 @@ def normalize_reason_code(reason: Optional[str]) -> Optional[str]:
     if not r:
         return None
     canon = r.upper()
-    if canon in KNOWN_REASON_CODES:
+    if canon in KNOWN_REASON_CODES or canon.startswith(ReasonCodes.SIGNAL_MISSING_PREFIX):
         return canon
     return canon
 
@@ -1789,7 +1817,7 @@ def reb_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
 # Exports publics
 # -----------------------------------------------------------------------------
 __all__ = [
-    "SCHEMA_VERSION", "SCHEMA_VERSION_MAJOR",
+    "SCHEMA_VERSION", "SCHEMA_VERSION_MAJOR", "ReasonCodes",
     "Side", "Action", "Liquidity", "PortfolioRiskMetricsFields",
     "MarketEvent", "VolEvent", "SlipEvent", "HealthEvent",
     "Opportunity", "RiskDecision", "EngineAction",

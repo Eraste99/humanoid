@@ -727,7 +727,11 @@ class VolatilityMonitor:
             pk = str(msg.get("pair_key") or "").upper()
             bid = float(msg.get("best_bid") or 0.0)
             ask = float(msg.get("best_ask") or 0.0)
-            if not ex or not pk or bid <= 0 or ask <= 0 or bid >= ask:
+            if not ex or not pk:
+                inc_blocked("volatility_monitor", "schema_missing_field", _norm_pair(pk))
+                return
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                inc_blocked("volatility_monitor", "schema_mismatch", _norm_pair(pk))
                 return
 
             data = {

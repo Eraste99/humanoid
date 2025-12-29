@@ -81,7 +81,7 @@ class BaseTradeLogger:
             flush_interval: float = 0.2,
             dry_run: bool = False,
             queue_maxsize: int = 5000,
-            drop_when_full: bool = True,
+            drop_when_full: bool = False,
             high_watermark_ratio: float = 0.8,
             critical_streams: Optional[List[str]] = None,
     ):
@@ -111,12 +111,27 @@ class BaseTradeLogger:
         self._metrics_proxy = _NoopMetricsProxy()
         self._loop: asyncio.AbstractEventLoop | None = None
 
-        # proxy métriques (fourni par LHM dynamiquement)
-        self._metrics_proxy = _NoopMetricsProxy()
+        self._degraded = False
 
     # ----------------------- configuration externe -----------------------
     def set_event_sink(self, sink: Callable[[str, List[Dict[str, Any]]], Any]) -> None:
         self._event_sink = sink
+
+    def set_metrics_proxy(self, proxy: Any | None) -> None:
+        self._metrics_proxy = proxy or _NoopMetricsProxy()
+
+    def set_degraded(self, degraded: bool) -> None:
+        self._degraded = bool(degraded)
+
+    def _emit_metric(self, name: str, *args, **kwargs) -> None:
+        proxy = self._metrics_proxy or _NoopMetricsProxy()
+        handler = getattr(proxy, name, None)
+        if not handler:
+            return
+        try:
+            handler(*args, **kwargs)
+        except Exception:
+            return
 
     # ---------------------------- ingestion -----------------------------
     def ingest(self, entry):
@@ -153,25 +168,26 @@ class BaseTradeLogger:
                 entry=data,
                 exc_info=True,
             )
-            self._metrics_proxy.on_btl_filter_exception(self.log_type)
+            self._emit_metric("on_btl_filter_exception", self.log_type)
         is_critical = self._is_critical_entry(data)
         try:
-            if is_critical:
+            should_drop = self.drop_when_full or self._degraded
+            if is_critical and not should_drop:
                 self._queue.put(data, timeout=0.05)
-            elif self.drop_when_full:
+            elif should_drop:
                 self._queue.put_nowait(data)
             else:
                 self._queue.put(data, timeout=0.05)
             qd = self._queue.qsize()
             # proxy métriques centralisé LHM
-            self._metrics_proxy.on_btl_queue_depth(self.log_type, depth=qd)
+            self._emit_metric("on_btl_queue_depth", self.log_type, depth=qd)
             if qd >= max(1000, int(self._queue.maxsize * 0.8)):
-                self._metrics_proxy.on_btl_highwater(self.log_type, depth=qd)
+                self._emit_metric("on_btl_highwater", self.log_type, depth=qd)
             self._last_enqueue_ts_ms = int(time.time() * 1000)
         except QueueFull:
             reason_code = (
                 "LOGGERH_BTL_QUEUE_FULL_DROP"
-                if (self.drop_when_full and not is_critical)
+                if should_drop
                 else "LOGGERH_BTL_PUT_TIMEOUT_DROP"
             )
             self._log_event(
@@ -180,7 +196,9 @@ class BaseTradeLogger:
                 reason_code=normalize_reason_code(reason_code) or reason_code,
                 entry=data,
             )
-            self._metrics_proxy.on_btl_drop(
+            self._emit_metric("on_btl_drop_full", self.log_type)
+            self._emit_metric(
+                "on_btl_drop",
                 self.log_type,
                 reason=normalize_reason_code(reason_code) or reason_code,
                 critical=is_critical,
@@ -267,8 +285,8 @@ class BaseTradeLogger:
                 fut.result()
             dur_ms = (time.perf_counter() - t0) * 1000.0
             # Hook métrique (centralisé côté LHM)
-            self._metrics_proxy.on_btl_flush_latency(self.log_type, ms=dur_ms)
-            self._metrics_proxy.on_btl_emitted(self.log_type, n=len(batch))
+            self._emit_metric("on_btl_flush_latency", self.log_type, ms=dur_ms)
+            self._emit_metric("on_btl_emitted", self.log_type, n=len(batch))
             return True
         except Exception:
             logging.getLogger("BaseTradeLogger").exception("emit failed")

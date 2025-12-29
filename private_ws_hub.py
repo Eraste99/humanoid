@@ -1188,6 +1188,8 @@ class PrivateWSHub:
 
         self._started = False
         self._hb_task: Optional[asyncio.Task] = None
+        self._callback_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._callback_loop_thread: Optional[asyncio.AbstractEventLoop] = None
 
 
         # LRU dédup (clé compacte)
@@ -1357,6 +1359,10 @@ class PrivateWSHub:
         self._ff_strict_dedup_enforced = bool(
             getattr(pws, "ff_pws_strict_dedup_enforced", False)
         )
+        self._drop_policy = str(getattr(pws, "pws_drop_policy", "DROP_NEW")).upper()
+        self._disable_auto_wiring_prod = bool(getattr(pws, "ff_pws_disable_auto_wiring_prod", True))
+        g_cfg = getattr(self.cfg, "g", None) if self.cfg is not None else None
+        self._prod_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD"
 
         # Pools WS par région (optionnel, valeur non bloquante si métrique absente)
         try:
@@ -1508,6 +1514,8 @@ class PrivateWSHub:
             pass
         if status == "FILL" and "ts_exchange" not in ev:
             ev["ts_exchange"] = ev.get("ts_local")
+            meta = ev.setdefault("meta", {}) or {}
+            meta.setdefault("ts_source", "local")
 
         # QoS & drop policy
         if status in ("FILL", "PARTIAL"):
@@ -1526,53 +1534,29 @@ class PrivateWSHub:
         try:
             if pri <= 1:
                 if cap > 0 and len(q) >= cap:
-                    try:
-                        attempts = max(1, int(self._queue_backpressure_ms // 5) or 1)
-                    except Exception:
-                        attempts = 1
-                    for _ in range(attempts):
-                        if len(q) < cap:
-                            break
+                    while len(q) >= cap:
                         try:
-                            self._pws_drain_one(key)
+                            dropped = q.pop()
+                            PWS_DROPPED_TOTAL.labels(exu, alu, "queue_full_other").inc()
                         except Exception:
                             break
 
-                if cap > 0 and len(q) >= cap:
-                    reason_code = normalize_reason_code(
-                        "PWS_QUEUE_BACKPRESSURE_TIMEOUT") or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
-                    try:
-                        PWS_DROPPED_TOTAL.labels(exu, alu, reason_code).inc()
-                    except Exception:
-                        pass
-                    try:
-                        from modules.obs_metrics import inc_blocked
-                        inc_blocked("private_ws_hub", reason_code, None)
-                    except Exception:
-                        pass
-                    self._record_critical_drop(
-                        exchange=exu,
-                        alias=alu,
-                        reason=reason_code,
-                        kind=cat,
-                    )
-                    self._notify_alert(
-                        severity="CRITICAL",
-                        reason=reason_code,
-                        exchange=exu,
-                        alias=alu,
-                        kind=cat,
-                        message="PrivateWS queue saturated for critical ACK/FILL",
-                    )
-                    return
+
                 q.appendleft(ev)  # fills/acks en tête
             else:
                 if cap > 0 and len(q) >= cap and pri >= 2:
-                    try:
-                        PWS_DROPPED_TOTAL.labels(exu, alu, f"queue_full_{cat}").inc()
-                    except Exception:
-                        pass
-                    return
+                    if self._drop_policy == "DROP_OLDEST" and len(q) > 0:
+                        try:
+                            _ = q.pop()
+                            PWS_DROPPED_TOTAL.labels(exu, alu, "queue_full_other").inc()
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            PWS_DROPPED_TOTAL.labels(exu, alu, "queue_full_other").inc()
+                        except Exception:
+                            pass
+                        return
                 q.append(ev)
         except Exception:
             try:
@@ -1659,12 +1643,45 @@ class PrivateWSHub:
                         lambda t, lbl=label: _log_callback_exception(t, lbl)
                     )
                 except RuntimeError:
-                    log.warning(
-                        "[PrivateWSHub] %s callback coroutine sans boucle active", label
-                    )
+                    loop = self._ensure_callback_loop()
+                    if loop:
+                        fut = asyncio.run_coroutine_threadsafe(result, loop)
+                        fut.add_done_callback(
+                            lambda _t, lbl=label: None
+                        )
+                    else:
+                        try:
+                            PWS_DROPPED_TOTAL.labels("-", "-", "PWS_CALLBACK_NO_LOOP").inc()
+                        except Exception:
+                            pass
+                        log.warning(
+                            "[PrivateWSHub] %s callback coroutine sans boucle active", label
+                        )
         except Exception:
             log.exception("[PrivateWSHub] %s callback failed", label)
 
+    def _ensure_callback_loop(self) -> Optional[asyncio.AbstractEventLoop]:
+        if self._callback_loop and self._callback_loop.is_running():
+            return self._callback_loop
+        loop_ready = asyncio.Event()
+
+        def _runner():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._callback_loop = loop
+            loop_ready.set()
+            loop.run_forever()
+
+        if self._callback_loop_thread is None:
+            import threading
+            thread = threading.Thread(target=_runner, name="pws-callback-loop", daemon=True)
+            self._callback_loop_thread = thread
+            thread.start()
+        try:
+            loop_ready.wait(1.0)
+        except Exception:
+            pass
+        return self._callback_loop
     def _emit_pws_health_event(self, *, exchange: str, alias: str, reason: str, kind: str) -> None:
         ev = {
             "type": "pws_health",
@@ -1760,6 +1777,8 @@ class PrivateWSHub:
     def _is_critical_event(self, ev: dict) -> bool:
         status = str(ev.get("status") or "").upper()
         if status in ("FILL", "PARTIAL", "ACK"):
+            return True
+        if str(ev.get("type") or "").lower() == "transfer":
             return True
         return False
 
@@ -1898,7 +1917,12 @@ class PrivateWSHub:
 
         if kind == "engine":
             prev = getattr(self, "_callback", None)
-            if prev is not None and prev is not cb and getattr(self, "_rm_callback", None) is None:
+            if (
+                    prev is not None
+                    and prev is not cb
+                    and getattr(self, "_rm_callback", None) is None
+                    and not (self._prod_mode and self._disable_auto_wiring_prod)
+            ):
                 # Mode compat: on promeut l'ancien callback "engine" en RM si aucun
                 # callback RM n'est encore enregistré. Marqué comme auto-wiring.
                 self._rm_callback = prev
@@ -1923,6 +1947,15 @@ class PrivateWSHub:
                 except Exception:
                     pass
             self._callback = cb
+            if self._prod_mode and self._disable_auto_wiring_prod and prev is not None and prev is not cb:
+                self._notify_alert(
+                    severity="WARNING",
+                    reason="auto_wiring_disabled",
+                    exchange="-",
+                    alias="-",
+                    kind="wiring",
+                    message="auto-wiring RM callback disabled in PROD",
+                )
             return
 
         if kind in ("risk", "rm", "riskmanager"):

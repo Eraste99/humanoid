@@ -18,10 +18,13 @@ Compatibilité :
 """
 from __future__ import annotations
 import asyncio
+import logging
 import math
 from types import SimpleNamespace
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger("pairs_discovery")
 
 try:
     from asyncio_throttle import Throttler  # pip install asyncio-throttle
@@ -724,6 +727,11 @@ async def discover_pairs_3cex(
         base_map: Dict[str, str] = {}
         pk_meta: Dict[str, Tuple[str, str]] = {}
         raw = len(meta or {})
+        if not raw:
+            _add_filtered("empty_meta", 1)
+            logger.warning("[discovery] empty meta map", extra={"exchange": ex})
+            stats = {"raw": 0, "kept": 0}
+            return sym_map, vol_map, quote_map, base_map, stats
         if region_blocked.get(ex):
             if raw:
                 _add_filtered("region_disabled_jp", raw)
@@ -757,8 +765,8 @@ async def discover_pairs_3cex(
             # Coinbase garde product_id hyphéné pour mapping externe
             sym_map[pk] = sym
             vol_map[pk] = v
-        quote_map[pk] = quote_u
-        base_map[pk] = base_u
+            quote_map[pk] = quote_u
+            base_map[pk] = base_u
 
         stats = {"raw": raw, "kept": len(sym_map)}
         return sym_map, vol_map, quote_map, base_map, stats

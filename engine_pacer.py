@@ -40,7 +40,9 @@ import logging
 import time
 import random
 import threading
-from dataclasses import dataclass, field
+import hashlib
+import json
+from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, Optional, Tuple, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -100,28 +102,6 @@ except Exception:  # pragma: no cover
         PACER_CLAMP_SECONDS = _NoOp()
         _METRICS_FALLBACK_LOGGED = True
 
-# --------- Default regional targets ---------
-# Cibles (hautes/sévères) utilisées pour normaliser les gaps → score de sévérité S∈[0,1].
-_DEFAULT_TARGETS: Dict[str, Dict[str, float]] = {
-    "EU":    dict(ack_target=90.0,  ack_hi=120.0, ack_sev=150.0, lag_hi=15.0, lag_sev=20.0, err_hi=0.005, err_sev=0.02, drain_hi=120.0, drain_sev=240.0),
-    "US":    dict(ack_target=150.0, ack_hi=180.0, ack_sev=210.0, lag_hi=15.0, lag_sev=20.0, err_hi=0.005, err_sev=0.02, drain_hi=120.0, drain_sev=240.0),
-    # EU-CB = Coinbase exécuté depuis EU (RTT transatlantique → ack plus tolérant)
-    "EU-CB": dict(ack_target=180.0, ack_hi=210.0, ack_sev=240.0, lag_hi=15.0, lag_sev=20.0, err_hi=0.005, err_sev=0.02, drain_hi=120.0, drain_sev=240.0),
-# JP = pod Japan/Tokyo (à affiner après mesures RTT Tokyo↔CEX)
-    "JP":   dict(ack_target=150.0, ack_hi=180.0, ack_sev=210.0, lag_hi=15.0, lag_sev=20.0, err_hi=0.005, err_sev=0.02, drain_hi=120.0, drain_sev=240.0),
-}
-
-# --------- FSM thresholds / knobs ---------
-_WARMUP_SECS = 5.0
-_ESCALATE_BAD_WINDOWS = 3    # nombre de fenêtres "mauvaises" d’affilée pour monter d’un cran
-_DEESCALATE_GOOD_WINDOWS = 2 # fenêtres "bonnes" d’affilée pour redescendre
-_HOLD_TIME_FLAGS_SECS = 5.0  # hold-time minimal avant dégel des flags
-
-# pondérations du score S
-_W_ACK  = 0.35
-_W_LAG  = 0.25
-_W_ERR  = 0.25
-_W_DRAIN= 0.15
 
 # modes (pour métriques / debug)
 _MODE_NORMAL     = 0
@@ -191,9 +171,15 @@ class EnginePacer:
 
         self._lock = threading.RLock()
         self._bot_cfg = bot_cfg
+        engine_cfg = getattr(bot_cfg, "engine", None) if bot_cfg else None
+        knobs = getattr(engine_cfg, "pacer_knobs", None)
+        if knobs is None:
+            from modules.bot_config import EnginePacerKnobs
+            knobs = EnginePacerKnobs()
+        self._pacer_knobs = knobs
         self._default_region = self._norm_region(region)
         self._regions: Dict[str, RegionState] = {}
-        self._targets: Dict[str, Dict[str, float]] = dict(_DEFAULT_TARGETS)
+        self._targets: Dict[str, Dict[str, float]] = dict(self._pacer_knobs.default_targets)
         self._targets_overrides: Dict[str, Dict[str, float]] = {}
         if targets_overrides:
             for k, v in targets_overrides.items():
@@ -226,6 +212,13 @@ class EnginePacer:
 
         # initialise l'état de la région par défaut
         self._ensure_region(self._default_region, cold_start=True)
+        try:
+            payload = asdict(self._pacer_knobs)
+            snapshot = json.dumps(payload, sort_keys=True, default=str)
+            snap_hash = hashlib.sha1(snapshot.encode("utf-8")).hexdigest()
+            logger.info("[EnginePacer] pacer_knobs=%s snapshot_hash=%s", payload, snap_hash)
+        except Exception:
+            logger.exception("[EnginePacer] pacer_knobs snapshot failed", exc_info=False)
 
     # ------------------ helpers ------------------
 
@@ -307,7 +300,7 @@ class EnginePacer:
         Reconstruit les cibles par région à partir des SLO privés.
         """
         with self._lock:
-            self._targets = dict(_DEFAULT_TARGETS)
+            self._targets = dict(self._pacer_knobs.default_targets)
 
             cfg = self._bot_cfg
             if cfg is None:
@@ -321,7 +314,8 @@ class EnginePacer:
                 mode_key = ""
 
             if not hasattr(cfg, "slo"):
-                logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur _DEFAULT_TARGETS", mode_key)
+                logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur pacer_knobs defaults",
+                               mode_key)
                 self._apply_target_overrides()
                 self._push_ack_metrics()
                 return
@@ -330,7 +324,7 @@ class EnginePacer:
 
             per_ex = slo_map.get(mode_key)
             if per_ex is None:
-                logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur _DEFAULT_TARGETS", mode_key)
+                logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur pacer_knobs defaults", mode_key)
                 self._apply_target_overrides()
                 self._push_ack_metrics()
                 return
@@ -363,7 +357,7 @@ class EnginePacer:
             agg = {r: v for r, v in agg.items() if any(val is not None for val in v.values())}
             if not agg:
                 logger.warning(
-                    "[EnginePacer] Aucun chemin SLO privé trouvé pour mode=%s, fallback sur _DEFAULT_TARGETS",
+                    "[EnginePacer] Aucun chemin SLO privé trouvé pour mode=%s, fallback sur pacer_knobs defaults",
                     mode_key,
                 )
                 self._apply_target_overrides()
@@ -474,7 +468,7 @@ class EnginePacer:
                     pass
 
             # Calcul du score de sévérité
-            targets = self._targets.get(rg, _DEFAULT_TARGETS["EU"])
+            targets = self._targets.get(rg, self._pacer_knobs.default_targets.get("EU", {}))
             S = self._severity_score(st, targets)
 
             # Transition FSM
@@ -579,7 +573,13 @@ class EnginePacer:
         g_err   = gap(st.err_rate,tgt["err_hi"],   tgt["err_sev"])
         g_drain = gap(st.drain_ms,tgt["drain_hi"], tgt["drain_sev"])
 
-        S = _W_ACK*g_ack + _W_LAG*g_lag + _W_ERR*g_err + _W_DRAIN*g_drain
+        knobs = self._pacer_knobs
+        S = (
+                float(knobs.weight_ack) * g_ack
+                + float(knobs.weight_lag) * g_lag
+                + float(knobs.weight_err) * g_err
+                + float(knobs.weight_drain) * g_drain
+        )
         return max(0.0, min(1.0, S))
 
     def _fsm_step(self, rg: str, st: RegionState, S: float) -> None:
@@ -589,15 +589,15 @@ class EnginePacer:
         if st.state == _STATE_WARMUP:
             if not st.warmup_start_ts:
                 st.warmup_start_ts = now
-            if (now - st.warmup_start_ts) >= _WARMUP_SECS:
+            if (now - st.warmup_start_ts) >= float(self._pacer_knobs.warmup_secs):
                 st.state = _STATE_NORMAL
             else:
                 # pas d'escalade en warmup
                 return
 
         # détection "bonne" ou "mauvaise" fenêtre
-        good = (S < 0.25)
-        bad  = (S >= 0.65)
+        good = (S < float(self._pacer_knobs.good_score_threshold))
+        bad = (S >= float(self._pacer_knobs.bad_score_threshold))
 
         if bad:
             st.bad_win += 1
@@ -611,7 +611,7 @@ class EnginePacer:
             st.good_win = max(0, st.good_win - 1)
 
         # escalade / désescalade avec hystérésis
-        if st.bad_win >= _ESCALATE_BAD_WINDOWS:
+        if st.bad_win >= int(self._pacer_knobs.escalate_bad_windows):
             st.bad_win = 0
             if st.state == _STATE_NORMAL:
                 st.state = _STATE_CONSTR
@@ -621,7 +621,7 @@ class EnginePacer:
                 st.flags["mm_frozen"] = True
                 st.flags["ioc_only"]  = True
                 st.last_flag_set_ts = now
-        elif st.good_win >= _DEESCALATE_GOOD_WINDOWS:
+        elif st.good_win >= int(self._pacer_knobs.deescalate_good_windows):
             st.good_win = 0
             if st.state == _STATE_SEVERE:
                 st.state = _STATE_RECOV
@@ -632,7 +632,10 @@ class EnginePacer:
 
         # hold-time minimal pour les flags
         if st.flags.get("mm_frozen") or st.flags.get("ioc_only"):
-            if (now - st.last_flag_set_ts) >= _HOLD_TIME_FLAGS_SECS and st.state in (_STATE_NORMAL, _STATE_RECOV):
+            if (
+                    (now - st.last_flag_set_ts) >= float(self._pacer_knobs.hold_time_flags_secs)
+                    and st.state in (_STATE_NORMAL, _STATE_RECOV)
+            ):
                 st.flags["mm_frozen"] = False
                 st.flags["ioc_only"]  = False
 

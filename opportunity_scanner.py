@@ -144,40 +144,7 @@ except Exception:
 
 
 # --- Helpers quotas / pacer (token-bucket) -----------------------------------
-class _TokenBucket:
-    def __init__(self, rate_per_s: float, capacity: float | None = None) -> None:
-        self.rate = max(0.1, float(rate_per_s))
-        self.capacity = float(capacity if capacity is not None else self.rate * 2.0)
-        self._tokens = self.capacity
-        self._t_last = time.time()
-
-    def _refill(self) -> None:
-        now = time.time()
-        dt = max(0.0, now - self._t_last)
-        if dt:
-            self._tokens = min(self.capacity, self._tokens + dt * self.rate)
-            self._t_last = now
-
-    def allow(self, n: float = 1.0) -> bool:
-        self._refill()
-        if self._tokens >= n:
-            self._tokens -= n
-            return True
-        return False
-
-    def load(self) -> float:
-        """0.0 = idle, 1.0 = saturé (tokens ~ 0)."""
-        self._refill()
-        return 1.0 - min(1.0, self._tokens / max(self.capacity, 1e-9))
-
-    def update_rate(self, rate_per_s: float) -> None:
-        """Met à jour le débit et réaligne la capacité/tokens sans casser les quotas."""
-        self._refill()
-        self.rate = max(0.1, float(rate_per_s))
-        # conserve au moins une capacité proportionnelle au nouveau débit
-        self.capacity = float(max(self.capacity, self.rate * 2.0))
-        self._tokens = min(self.capacity, self._tokens)
-
+from modules.utils.rate_limiter import TokenBucket
 # --- Métriques rate-limit (no-op si obs_metrics absent) ----------------------
 try:
     from modules.obs_metrics import (
@@ -575,7 +542,12 @@ class OpportunityScanner:
         self.global_eval_hz = float(getattr(s, "scanner_global_eval_hz", 200.0))
 
         # token-buckets
-        self._tb_global = _TokenBucket(rate_per_s=self.global_eval_hz, capacity=self.global_eval_hz * 2.0)
+        global_burst = float(getattr(self.cfg.scanner, "scanner_global_eval_burst_factor", 2.0))
+        self._tb_global = TokenBucket(
+            rate_per_s=self.global_eval_hz,
+            burst=max(1, int(self.global_eval_hz * global_burst)),
+            name="scanner_global",
+        )
         self._tb_pair = {}
 
         # --- Shedding pilotable ---
@@ -961,6 +933,7 @@ class OpportunityScanner:
 
         # Univers/pauses (LHM)
         if self._universe is not None and pair not in self._universe:
+            self._record_rejection(reason="SCANNER_PAIR_NOT_IN_UNIVERSE", route="*", pair=pair, ctx={"exchange": ex})
             return
         try:
             mgr = getattr(self, "logger_historique_manager", None)
@@ -980,10 +953,14 @@ class OpportunityScanner:
                         priority = get_prio()
 
                 if priority and pair not in priority:
+                    self._record_rejection(
+                        reason="SCANNER_PAIR_NOT_IN_PRIORITY", route="*", pair=pair, ctx={"exchange": ex}
+                    )
                     return
 
                 is_paused = getattr(mgr, "is_paused", None)
                 if callable(is_paused) and is_paused(pair):
+                    self._record_rejection(reason="SCANNER_PAIR_PAUSED", route="*", pair=pair, ctx={"exchange": ex})
                     return
 
         except Exception:
@@ -1039,7 +1016,7 @@ class OpportunityScanner:
     # ---------------- Pull utils ----------------
     def _top_pairs(self) -> List[str]:
         """Priorisation canonique PairHistory, raffinée par le score interne Scanner."""
-        base = set(self._universe or self.pairs or [])
+        base = sorted({_norm_pair(p) for p in (self._universe or self.pairs or []) if p})
         if not base:
             return []
 
@@ -1083,7 +1060,7 @@ class OpportunityScanner:
         }
 
 
-        base_pairs = [p for p in base if p]
+        base_pairs = list(base)
         internal_norm = {
             p: (internal.get(p, 0.0) / max_int) if max_int > 0 else 0.0 for p in base_pairs
         }
@@ -1091,7 +1068,12 @@ class OpportunityScanner:
         def _sort_key(pk: str) -> tuple:
             rk = rank_map.get(pk)
             has_rank = rk is not None
-            return (0 if has_rank else 1, rk if rk is not None else float("inf"), -internal_norm.get(pk, 0.0))
+            return (
+                0 if has_rank else 1,
+                rk if rk is not None else float("inf"),
+                -internal_norm.get(pk, 0.0),
+                pk,
+            )
 
         ordered = sorted(base_pairs, key=_sort_key)
         return ordered[: self.max_pairs_per_tick]
@@ -1371,6 +1353,7 @@ class OpportunityScanner:
 
         # Buckets par cohorte (respecte 4 Hz, fallback si CORE/SANDBOX absents)
         self._tb_pair = {}
+        burst_factor = float(getattr(self.cfg.scanner, "scanner_eval_burst_factor", 2.0))
         for p in universe:
             pk = _norm_pair(p)
             if pk in self._core_pairs:
@@ -1384,7 +1367,11 @@ class OpportunityScanner:
             else:
                 # conservateur (comme avant): toute paire non classée = AUDITION
                 rate = float(getattr(self, "eval_hz_audition", 5.0))
-            self._tb_pair[pk] = _TokenBucket(rate_per_s=rate, capacity=rate * 2.0)
+            self._tb_pair[pk] = TokenBucket(
+                rate_per_s=rate,
+                burst=max(1, int(rate * burst_factor)),
+                name="scanner_pair:universe",
+            )
 
         # (facultatif) métriques tailles si elles existent — sinon no-op
         try:
@@ -1894,11 +1881,17 @@ class OpportunityScanner:
         try:
             # _tb_global : limiter nb de paires / seconde
             if hasattr(self, "_tb_global") and self._tb_global is not None:
-                self._tb_global.update_rate(self.global_eval_hz)
-            else:
-                self._tb_global = _TokenBucket(
+                global_burst = float(getattr(self.cfg.scanner, "scanner_global_eval_burst_factor", 2.0))
+                self._tb_global.update_sync(
                     rate_per_s=self.global_eval_hz,
-                    capacity=self.global_eval_hz * 2.0,
+                    burst=max(1, int(self.global_eval_hz * global_burst)),
+                )
+            else:
+                global_burst = float(getattr(self.cfg.scanner, "scanner_global_eval_burst_factor", 2.0))
+                self._tb_global = TokenBucket(
+                    rate_per_s=self.global_eval_hz,
+                    burst=max(1, int(self.global_eval_hz * global_burst)),
+                    name="scanner_global",
                 )
         except Exception:
             # en cas de problème, on garde l'ancien bucket
@@ -2019,7 +2012,7 @@ class OpportunityScanner:
         if pk in getattr(self, "_sandbox_pairs", set()):  return "SANDBOX"
         return "AUDITION"  # défaut sûr
 
-    def _ensure_buckets_for_pair(self, pair: str) -> _TokenBucket:
+    def _ensure_buckets_for_pair(self, pair: str) -> TokenBucket:
         pk = _norm_pair(pair)
         tb = self._tb_pair.get(pk)
         if tb is not None:
@@ -2032,7 +2025,12 @@ class OpportunityScanner:
             "SANDBOX": float(getattr(self, "eval_hz_sandbox", getattr(self, "eval_hz_audition", 5.0))),
         }
         rate = max(0.5, float(rate_map.get(cohort, getattr(self, "eval_hz_audition", 5.0))))
-        tb = _TokenBucket(rate_per_s=rate, capacity=rate * 2.0)
+        burst_factor = float(getattr(self.cfg.scanner, "scanner_eval_burst_factor", 2.0))
+        tb = TokenBucket(
+            rate_per_s=rate,
+            burst=max(1, int(rate * burst_factor)),
+            name=f"scanner_pair:{cohort}",
+        )
         self._tb_pair[pk] = tb
         return tb
 
@@ -2042,7 +2040,7 @@ class OpportunityScanner:
         Retour (ok, raison_bloque).
         """
         # global
-        if hasattr(self, "_tb_global") and not self._tb_global.allow():
+        if hasattr(self, "_tb_global") and not self._tb_global.try_consume():
             self._record_rejection(reason="rate_limit_global", route="*", pair=pair)
             return False, "global"
 
@@ -2052,12 +2050,21 @@ class OpportunityScanner:
         if tb is None:
             tb = self._ensure_buckets_for_pair(pair)
 
-        if not tb.allow():
+        if not tb.try_consume():
             self._record_rejection(reason="rate_limit_pair", route="*", pair=pair, ctx={"cohort": cohort})
             return False, "pair_bucket"
 
         return True, ""
 
+    def _tb_load(self, tb: TokenBucket) -> float:
+        try:
+            tokens = float(tb.next_tokens())
+            capacity = float(getattr(tb, "capacity", 1.0))
+            if capacity <= 0:
+                return 0.0
+            return 1.0 - min(1.0, tokens / capacity)
+        except Exception:
+            return 0.0
     # opportunity_scanner.py (dans la classe)
     def _slip_age_seconds(self, pair: str) -> float:
         p = self._norm_pair(pair)
@@ -2170,7 +2177,7 @@ class OpportunityScanner:
         Charge élevée => on durcit d'abord AUDITION puis PRIMARY.
         """
         try:
-            load = self._tb_global.load()  # 0..1
+            load = self._tb_load(self._tb_global)  # 0..1
         except Exception:
             load = 0.0
         x = max(0.0, load - 0.5) / 0.5  # 0..1 quand load ∈ [0.5,1.0]
@@ -2187,7 +2194,7 @@ class OpportunityScanner:
     def _current_audition_ttl_s(self) -> float:
         """Réduit la TTL audition jusqu'à −50% si charge proche de 1."""
         try:
-            load = self._tb_global.load()
+            load = self._tb_load(self._tb_global)
         except Exception:
             load = 0.0
         shrink = 0.5 * min(1.0, max(0.0, (load - 0.5) / 0.4))  # 0 à load≤0.5 ; 0.5 à load≥0.9
@@ -3187,7 +3194,7 @@ class OpportunityScanner:
             "last_update": self.last_scan_time,
             "details": f"{self.opportunity_count} opportunités, {self.active_pairs_count} paires actives",
             "metrics": {
-                "scanner_global_load": float(getattr(self._tb_global, "load", lambda: 0.0)()),
+                "scanner_global_load": float(self._tb_load(self._tb_global)),
                 "opportunity_count": self.opportunity_count,
                 "scan_frequency": self.scan_frequency,
                 "active_pairs": self.active_pairs_count,
@@ -3405,7 +3412,7 @@ class OpportunityScanner:
 
         while getattr(self, "_running", False):
             try:
-                gl = self._tb_global.load() if hasattr(self, "_tb_global") else 0.0
+                gl = self._tb_load(self._tb_global) if hasattr(self, "_tb_global") else 0.0
                 now = time.time()
 
                 self._apply_load_shedding(gl, now)

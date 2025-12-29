@@ -19,6 +19,7 @@ import ast
 import logging
 import hashlib
 import time
+import enum
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Tuple, Optional, Union
 from contracts import payloads as contracts
@@ -29,6 +30,13 @@ from contracts import payloads as contracts
 # Utilisées comme référence unique par RiskManager, ExecutionEngine, etc.
 ALLOWED_BRANCHES = ("TT", "TM", "MM", "REB")
 ALLOWED_CAPITAL_PROFILES = ("NANO", "MICRO", "SMALL", "MID", "LARGE")
+class DeploymentMode(str, enum.Enum):
+    EU_ONLY = "EU_ONLY"
+    SPLIT = "SPLIT"
+    JP_ONLY = "JP_ONLY"
+
+
+DEPLOYMENT_MODES = {mode.value for mode in DeploymentMode}
 
 
 # ------------------------------
@@ -156,7 +164,7 @@ class ConfigError(Exception):
 
 @dataclass
 class Globals:
-    deployment_mode: str = "SPLIT"              # "EU_ONLY" | "SPLIT"
+    deployment_mode: str = "SPLIT"              # "EU_ONLY" | "SPLIT" | "JP_ONLY"
     pod_region: str = "EU"  # "EU" | "US" | "JP"
     enable_jp: bool = False
     exchange_region_map: Dict[str, str] = field(default_factory=lambda: {
@@ -174,6 +182,16 @@ class Globals:
         "base_delta_ms": 180,
         "stale_ms": 1300,
         "cb_coalesce_bonus_ms": 12,
+    })
+    eu_latency: Dict[str, int] = field(default_factory=lambda: {
+        "skew_ms": 12,
+        "base_delta_ms": 140,
+        "stale_ms": 1200,
+    })
+    jp_latency: Dict[str, int] = field(default_factory=lambda: {
+        "skew_ms": 18,
+        "base_delta_ms": 160,
+        "stale_ms": 1200,
     })
     capital_profile: str = "SMALL"              # NANO|MICRO|SMALL|MID|LARGE
     enabled_exchanges: List[str] = field(default_factory=lambda: ["BINANCE","BYBIT","COINBASE"])
@@ -247,6 +265,10 @@ class ObservabilityCfg:
     enable_obs_port: bool = False
     obs_port: int = 9108
 
+@dataclass
+class BootCfg:
+    scanner_proxy_mode: str = "REJECT"  # STRICT_ORDER | BUFFER | REJECT
+    scanner_proxy_buffer_maxlen: int = 5000
 
 @dataclass
 class TelegramCfg:
@@ -299,6 +321,8 @@ class RouterCfg:
     stale_ms: int = 1200
     # shards_per_exchange = (BINANCE, BYBIT, COINBASE)
     shards_per_exchange: Tuple[int, int, int] = (2, 1, 1)
+    staleness_mode: str = "WALLCLOCK"  # WALLCLOCK | EVENT_TIME
+    deterministic_backpressure: bool = False
     out_queues_maxlen: int = 20000
     # P0: quotas stream-centrics optionnels par kind (combo/vol/slip/health)
     # ex: {"combo": 5000, "vol": 2000, "slip": 2000, "health": 2000}
@@ -313,6 +337,10 @@ class RouterCfg:
         "AUDITION": "best_effort",
         "SANDBOX": "drop_when_backlog",
     })
+    scanner_queue_maxlen: int = 512
+    scanner_queue_drop_policy: str = "DROP_OLDEST"  # DROP_OLDEST | DROP_NEW
+    fail_fast_on_event_exception: bool = False
+
     # P0: paramètres de backpressure Router (ROUTER_BACKPRESSURE)
     deque_maxlen_per_ex: Dict[str, int] = field(default_factory=lambda: {
         "DEFAULT": 8,
@@ -335,6 +363,8 @@ class RouterCfg:
 @dataclass
 class WsPublicCfg:
     ws_backoff: Dict[str,int] = field(default_factory=lambda: {"base_ms":500, "max_ms":15_000, "jitter":1})
+    ws_backoff_seed: Optional[int] = None
+    update_pairs_jitter_ms: int = 200
     connect_timeout_s: int = 10
     read_timeout_s: int = 30
     ping_interval_s: int = 20
@@ -564,6 +594,8 @@ class ScannerCfg:
     scanner_eval_hz_audition: float = 5.0
     scanner_eval_hz_sandbox: float = 2.0
     scanner_global_eval_hz: float = 200.0
+    scanner_eval_burst_factor: float = 2.0
+    scanner_global_eval_burst_factor: float = 2.0
 
     # MM / hints publics (Scanner = couche "soft" pour le MM)
     # - mm_depth_min_quote / mm_qpos_max_ahead_quote : filtres de profondeur / queue pour les hints MM
@@ -587,6 +619,74 @@ class ScannerCfg:
 
 
 # --- Risk Manager ---
+@dataclass
+class RmSwitchKnobs:
+    enter_hyst_s: int = 180
+    exit_hyst_s: int = 120
+    mode_timeout_s: int = 1800
+    opp_volume_timeout_s: int = 1800
+    net_floor_bps: float = 4.5
+    opp_age_fallback_s: float = 9999.0
+    opp_vol_slip_age_s_max: float = 1.2
+    opp_vol_p95_bps_max: float = 40.0
+    opp_shadow_p50_bps_max: float = 2.5
+    opp_vol_exit_slip_age_s_max: float = 1.6
+    oppvol_p95_bps_min: float = 80.0
+    pnl_guard_day_lvl1_pct: float = -0.3
+    pnl_guard_day_lvl2_pct: float = -0.7
+    pnl_cooldown_s: int = 1800
+    pnl_guard_recover_floor_pct: float = -0.05
+    normal_tt_min_bps_delta: float = 0.0
+    normal_tm_min_bps_delta: float = 0.0
+    normal_cap_factor: float = 1.0
+    normal_ioc_only: bool = False
+    constr_tt_min_bps_delta: float = 1.0
+    constr_tm_min_bps_delta: float = 1.0
+    constr_cap_factor: float = 0.5
+    constr_mm_enable: bool = True
+    constr_ioc_only: bool = False
+    opp_volume_tt_min_bps_delta: float = -2.0
+    opp_volume_tm_min_bps_delta: float = -2.0
+    opp_volume_cap_factor: float = 1.0
+    opp_volume_mm_enable: bool = True
+    opp_vol_tt_min_bps_delta: float = 3.0
+    opp_vol_tm_min_bps_delta: float = 6.0
+    opp_vol_cap_factor: float = 0.7
+    opp_vol_mm_enable: bool = False
+    severe_tt_min_bps_delta: float = 5.0
+    severe_tm_min_bps_delta: float = 8.0
+    severe_cap_factor: float = 0.5
+    severe_mm_enable: bool = False
+    severe_ioc_only: bool = True
+    rm_reco_miss_per_minute_constrained: int = 30
+    rm_reco_miss_per_minute_severe: int = 60
+    rm_pws_heartbeat_gap_constrained_s: float = 6.0
+    rm_pws_heartbeat_gap_severe_s: float = 12.0
+    rm_pws_event_lag_constrained_ms: float = 600.0
+    rm_pws_event_lag_severe_ms: float = 1200.0
+    rm_pws_ack_latency_constrained_ms: float = 250.0
+    rm_pws_ack_latency_severe_ms: float = 450.0
+    rm_pws_fill_latency_constrained_ms: float = 700.0
+    rm_pws_fill_latency_severe_ms: float = 1200.0
+    rm_fee_token_min_pct: float = 5.0
+    rm_fee_low_min_seconds: float = 60.0
+    rm_invariant_strict: bool = False
+    split_breach_thr_base_ms: float = 180.0
+    split_breach_thr_skew_ms: float = 40.0
+    split_breach_thr_stale_ms: float = 1300.0
+    split_breach_min_s: float = 3.0
+    split_fallback_cooldown_s: float = 60.0
+    split_restore_stable_s: float = 20.0
+    split_penalty_bps_max: float = 6.0
+
+
+@dataclass
+class RmSignalPolicy:
+    require_vol_signal_for_opp: bool = True
+    require_shadow_for_opp: bool = True
+    require_rl_health_for_opp: bool = True
+    require_pws_health_for_opp: bool = True
+    require_book_age_for_opp: bool = True
 @dataclass
 class RiskManagerCfg:
     # Utilisé par le chantier M6-B (REB via hints, RM → Simu → Engine)
@@ -665,6 +765,9 @@ class RiskManagerCfg:
     ff_mm_enabled: bool = False
     ff_mm_opportunistic_gating_enforced: bool = False
     ff_reb_enabled: bool = False
+    switch_knobs: RmSwitchKnobs = field(default_factory=RmSwitchKnobs)
+    signal_policy: RmSignalPolicy = field(default_factory=RmSignalPolicy)
+    fallback_on_tick_exception: str = "CONSTRAINED"
 
     # Policy "Capital Ladder" — source canonique pour les profils NANO→LARGE.
     # Chaque profil porte :
@@ -888,6 +991,8 @@ class SimulatorCfg:
     sim_max_wait_ms_rm: int = 3
     sim_prime_depth_levels: int = 25
     sim_max_inflight_jobs: int = 32
+    sim_shadow_max_inflight: int = 8
+    sim_deterministic_trade_id: bool = False
     sim_notional_buckets_base: str = "250,500,1000,2000,4000"
     sim_buckets_per_profile: Dict[str, str] = field(default_factory=dict)
     sim_buckets_adapt_with_vol: bool = True
@@ -907,14 +1012,71 @@ class SimulatorCfg:
 
 # --- Engine ---
 @dataclass
+class EnginePacerKnobs:
+    warmup_secs: float = 5.0
+    escalate_bad_windows: int = 3
+    deescalate_good_windows: int = 2
+    hold_time_flags_secs: float = 5.0
+    good_score_threshold: float = 0.25
+    bad_score_threshold: float = 0.65
+    weight_ack: float = 0.35
+    weight_lag: float = 0.25
+    weight_err: float = 0.25
+    weight_drain: float = 0.15
+    default_targets: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
+        "EU": {
+            "ack_target": 90.0,
+            "ack_hi": 120.0,
+            "ack_sev": 150.0,
+            "lag_hi": 15.0,
+            "lag_sev": 20.0,
+            "err_hi": 0.005,
+            "err_sev": 0.02,
+            "drain_hi": 120.0,
+            "drain_sev": 240.0,
+        },
+        "US": {
+            "ack_target": 150.0,
+            "ack_hi": 180.0,
+            "ack_sev": 210.0,
+            "lag_hi": 15.0,
+            "lag_sev": 20.0,
+            "err_hi": 0.005,
+            "err_sev": 0.02,
+            "drain_hi": 120.0,
+            "drain_sev": 240.0,
+        },
+        "EU-CB": {
+            "ack_target": 180.0,
+            "ack_hi": 210.0,
+            "ack_sev": 240.0,
+            "lag_hi": 15.0,
+            "lag_sev": 20.0,
+            "err_hi": 0.005,
+            "err_sev": 0.02,
+            "drain_hi": 120.0,
+            "drain_sev": 240.0,
+        },
+        "JP": {
+            "ack_target": 150.0,
+            "ack_hi": 180.0,
+            "ack_sev": 210.0,
+            "lag_hi": 15.0,
+            "lag_sev": 20.0,
+            "err_hi": 0.005,
+            "err_sev": 0.02,
+            "drain_hi": 120.0,
+            "drain_sev": 240.0,
+        },
+    })
 class EngineCfg:
     pacer_min_ms: int = 2
     pacer_max_ms: int = 25
     pacer_jitter_ms: int = 2
     # Pacer : cibles régionales *strictement* bornées par les caps RM/Engine (down-clamp only).
     # Le Pacer ne peut jamais élargir la capacité au-delà des plafonds inflight RM/Engine.
-    pacer_targets: Dict[str, int] = field(default_factory=lambda: {"EU": 8, "EU_CB": 12, "US": 12})
-
+    pacer_targets: Dict[str, int] = field(default_factory=lambda: {"EU": 8, "EU_CB": 12, "US": 12, "JP": 12})
+    pacer_knobs: EnginePacerKnobs = field(default_factory=EnginePacerKnobs)
     # Ticket 10 — capacités techniques Engine (workers / inflight par CEX)
 
     # Nombre de workers (tâches ordre) par profil de capital.
@@ -970,10 +1132,12 @@ class EngineCfg:
     ff_mm_enabled: bool = False
     ff_mm_opportunistic_gating_enforced: bool = False
     ff_reb_enabled: bool = False
+    fail_closed_on_rm_override_exception: bool = True
 
     tm_exposure_ttl_ms: int = 1500
     tm_exposure_ttl_hedge_ratio: float = 0.5
     tm_watch_timeout_s: int = 2
+
 
     tm_queuepos_max_ahead_usd: float = 20000.0
     tm_queuepos_max_eta_ms: int = 1200
@@ -1019,6 +1183,8 @@ class PrivateWSHubCfg:
     PWS_QUEUE_SATURATION_RATIO: float = 0.85
     ff_pws_no_drop_critical_enforced: bool = False
     ff_pws_strict_dedup_enforced: bool = False
+    ff_pws_disable_auto_wiring_prod: bool = True
+    pws_drop_policy: str = "DROP_NEW"  # DROP_NEW | DROP_OLDEST
     PWS_PING_INTERVAL_S: int = 20
     PWS_PONG_TIMEOUT_S: int = 10
     PWS_HEARTBEAT_MAX_GAP_S: int = 30
@@ -1241,7 +1407,7 @@ class LoggerCfg:
     strict_obs: bool = False
     LHM_Q_STREAM_MAX: int = 20000
     LHM_STREAM_BATCH: int = 200
-    LHM_DROP_WHEN_FULL: bool = True
+    LHM_DROP_WHEN_FULL: bool = False
     LHM_HIGH_WATERMARK_RATIO: float = 0.85
     LHM_MAX_QUEUE_PLATEAU_S: int = 3
     ff_fail_closed_logging: bool = False
@@ -1260,14 +1426,23 @@ class LoggerCfg:
     ff_truth_fail_closed: bool = False
     LHM_MM_SAMPLING_QUOTES: float = 0.05
     LHM_MM_SAMPLING_CANCELS: float = 0.02
+    LHM_DROP_LOG_SAMPLE_RATE: float = 0.1
     LHM_JSONL_QUEUE_CAP: int = 5000
+    jsonl_queue_cap: Optional[int] = None
     LHM_JSONL_MAX_BYTES: int = 256 * 1024 * 1024
     LHM_JSONL_MAX_AGE_S: int = 3600
     LHM_DISK_WARN_PCT: float = 70.0
     LHM_DISK_CRIT_PCT: float = 85.0
+    LHM_STORAGE_ALERT_COOLDOWN_S: float = 60.0
     LHM_DB_NAME: str = "loggerh"
     LHM_DB_MAX_BYTES: int = 256 * 1024 * 1024
     LHM_DB_MAX_AGE_S: int = 24 * 3600
+    LHM_DB_LANE_ENABLED: bool = True
+    LHM_DB_LANE_Q_MAX: int = 5000
+    LHM_DB_LANE_BATCH_MAX: int = 2000
+    LHM_DB_LANE_DRAIN_MS: float = 5.0
+    LHM_DB_LANE_DROP_WHEN_FULL: bool = True
+    LHM_DB_LANE_ERROR_THRESHOLD: int = 3
     LHM_WD_INTERVAL_S: float = 2.0
     LHM_WD_PLATEAU_WINDOW: int = 15
     LHM_WD_QUEUE_MIN_SIZE: int = 50
@@ -1278,8 +1453,15 @@ class LoggerCfg:
     LHM_SLO_QUEUE_DEPTH_MAX_TARGET: float = 2000.0
     LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET: float = 5.0
     LHM_SLO_DROPPED_TRADES_BUDGET: float = 0.0
+    LHM_OPPORTUNITY_QUEUE_MAX: int = 5000
+    LHM_OPPORTUNITY_DROP_WHEN_FULL: bool = True
+    LHM_PNL_RECO_ENABLED: bool = False
+    LHM_PNL_RECO_TOL_ABS_QUOTE: float = 25.0
+    LHM_PNL_RECO_TOL_PCT: float = 0.01
+    LHM_PNL_RECO_MAX_LOOKBACK_DAYS: int = 3
+    LHM_PNL_RECO_DEFAULT_REGION: str = "EU"
+    OPS_RETENTION_DAYS: int = 30
     # PIVOT: chemins pilotés par cfg.lhm (pas d'ENV dans LHM)
-    out_dir: Optional[str] = None
     storage_path: Optional[str] = None
 
 # --- Dashboard / Tests (optionnels) ---
@@ -1378,6 +1560,7 @@ class BotConfig:
     dashboard: DashboardCfg = field(default_factory=DashboardCfg)
     tests: TestsCfg = field(default_factory=TestsCfg)
     obs: ObservabilityCfg = field(default_factory=ObservabilityCfg)
+    boot: BootCfg = field(default_factory=BootCfg)
     alerting: AlertingCfg = field(default_factory=AlertingCfg)
     overrides: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -1409,7 +1592,7 @@ class BotConfig:
         Alias utilisé par websockets_clients / Router pour le mode de déploiement.
 
         Source unique : self.g.deployment_mode (env: DEPLOYMENT_MODE).
-        Valeurs typiques : "EU_ONLY", "SPLIT", ...
+        Valeurs typiques : "EU_ONLY", "SPLIT", "JP_ONLY", ...
         """
         val = getattr(self.g, "deployment_mode", "EU_ONLY")
         if not val:
@@ -1486,6 +1669,8 @@ class BotConfig:
         g.pacer_mode = _Env.get("PACER_MODE", g.pacer_mode)
         g.engine_pod_map = _Env.get_dict("ENGINE_POD_MAP", g.engine_pod_map)
         g.split_latency = _Env.get_dict("SPLIT_LATENCY", g.split_latency)
+        g.eu_latency = _Env.get_dict("EU_LATENCY", g.eu_latency)
+        g.jp_latency = _Env.get_dict("JP_LATENCY", g.jp_latency)
         g.capital_profile = _Env.get("CAPITAL_PROFILE", g.capital_profile)
         g.enabled_exchanges = _Env.get_list("ENABLED_EXCHANGES", g.enabled_exchanges)
         g.allowed_routes = _Env.get_routes("ALLOWED_ROUTES", g.allowed_routes)
@@ -1525,6 +1710,10 @@ class BotConfig:
         )
         cfg.obs.enable_obs_port = _Env.get_bool("OBS_ENABLE_9108", cfg.obs.enable_obs_port)
         cfg.obs.obs_port = _Env.get_int("OBS_PORT", cfg.obs.obs_port)
+        cfg.boot.scanner_proxy_mode = _Env.get("BOOT_SCANNER_PROXY_MODE", cfg.boot.scanner_proxy_mode)
+        cfg.boot.scanner_proxy_buffer_maxlen = _Env.get_int(
+            "BOOT_SCANNER_PROXY_BUFFER_MAXLEN", cfg.boot.scanner_proxy_buffer_maxlen
+        )
 
         cfg.alerting.telegram.bot_token = _Env.get("TELEGRAM_BOT_TOKEN", cfg.alerting.telegram.bot_token)
         cfg.alerting.telegram.allowed_user_ids = [
@@ -1596,9 +1785,25 @@ class BotConfig:
             "ROUTER_CB_COALESCE_BUMP_MS", cfg.router.cb_coalesce_bump_ms
         )
         cfg.router.topic_max_hz = _Env.get_dict("ROUTER_TOPIC_MAX_HZ", cfg.router.topic_max_hz)
-
+        cfg.router.staleness_mode = _Env.get("ROUTER_STALENESS_MODE", cfg.router.staleness_mode)
+        cfg.router.deterministic_backpressure = _Env.get_bool(
+            "ROUTER_DETERMINISTIC_BACKPRESSURE", cfg.router.deterministic_backpressure
+        )
+        cfg.router.scanner_queue_maxlen = _Env.get_int(
+            "ROUTER_SCANNER_QUEUE_MAXLEN", cfg.router.scanner_queue_maxlen
+        )
+        cfg.router.scanner_queue_drop_policy = _Env.get(
+            "ROUTER_SCANNER_QUEUE_DROP_POLICY", cfg.router.scanner_queue_drop_policy
+        )
+        cfg.router.fail_fast_on_event_exception = _Env.get_bool(
+            "ROUTER_FAIL_FAST_ON_EVENT_EXCEPTION", cfg.router.fail_fast_on_event_exception
+        )
 
         cfg.ws_public.ws_backoff = _Env.get_dict("WS_BACKOFF", cfg.ws_public.ws_backoff)
+        cfg.ws_public.ws_backoff_seed = _Env.get_int("WS_BACKOFF_SEED", cfg.ws_public.ws_backoff_seed or 0) or None
+        cfg.ws_public.update_pairs_jitter_ms = _Env.get_int(
+            "WS_UPDATE_PAIRS_JITTER_MS", cfg.ws_public.update_pairs_jitter_ms
+        )
         cfg.ws_public.connect_timeout_s = _Env.get_int("WS_CONNECT_TIMEOUT_S", cfg.ws_public.connect_timeout_s)
         cfg.ws_public.read_timeout_s = _Env.get_int("WS_READ_TIMEOUT_S", cfg.ws_public.read_timeout_s)
         # Budget journalier par stratégie (en quote, ex: {"TT": 1_000_000, "TM": 500_000})
@@ -2017,12 +2222,147 @@ class BotConfig:
             "RM_FEE_TOKEN_MIN_PCT",
             getattr(cfg, "RM_FEE_TOKEN_MIN_PCT", 5.0),
         )
+        rm_knobs = cfg.rm.switch_knobs
+        rm_knobs.enter_hyst_s = _Env.get_int("RM_SWITCH_ENTER_HYST_S", rm_knobs.enter_hyst_s)
+        rm_knobs.exit_hyst_s = _Env.get_int("RM_SWITCH_EXIT_HYST_S", rm_knobs.exit_hyst_s)
+        rm_knobs.mode_timeout_s = _Env.get_int("RM_MODE_TIMEOUT_S", rm_knobs.mode_timeout_s)
+        rm_knobs.opp_volume_timeout_s = _Env.get_int(
+            "RM_OPP_VOLUME_TIMEOUT_S", rm_knobs.opp_volume_timeout_s
+        )
+        rm_knobs.net_floor_bps = _Env.get_float("RM_NET_FLOOR_BPS", rm_knobs.net_floor_bps)
+        rm_knobs.opp_age_fallback_s = _Env.get_float("RM_OPP_AGE_FALLBACK_S", rm_knobs.opp_age_fallback_s)
+        rm_knobs.opp_vol_slip_age_s_max = _Env.get_float(
+            "RM_OPP_VOL_SLIP_AGE_S_MAX", rm_knobs.opp_vol_slip_age_s_max
+        )
+        rm_knobs.opp_vol_p95_bps_max = _Env.get_float(
+            "RM_OPP_VOL_P95_BPS_MAX", rm_knobs.opp_vol_p95_bps_max
+        )
+        rm_knobs.opp_shadow_p50_bps_max = _Env.get_float(
+            "RM_OPP_SHADOW_P50_BPS_MAX", rm_knobs.opp_shadow_p50_bps_max
+        )
+        rm_knobs.opp_vol_exit_slip_age_s_max = _Env.get_float(
+            "RM_OPP_VOL_EXIT_SLIP_AGE_S_MAX", rm_knobs.opp_vol_exit_slip_age_s_max
+        )
+        rm_knobs.oppvol_p95_bps_min = _Env.get_float(
+            "RM_OPPVOL_P95_BPS_MIN", rm_knobs.oppvol_p95_bps_min
+        )
+        rm_knobs.pnl_guard_day_lvl1_pct = _Env.get_float(
+            "RM_PNL_GUARD_DAY_LVL1_PCT", rm_knobs.pnl_guard_day_lvl1_pct
+        )
+        rm_knobs.pnl_guard_day_lvl2_pct = _Env.get_float(
+            "RM_PNL_GUARD_DAY_LVL2_PCT", rm_knobs.pnl_guard_day_lvl2_pct
+        )
+        rm_knobs.pnl_cooldown_s = _Env.get_int("RM_PNL_COOLDOWN_S", rm_knobs.pnl_cooldown_s)
+        rm_knobs.pnl_guard_recover_floor_pct = _Env.get_float(
+            "RM_PNL_GUARD_RECOVER_FLOOR_PCT", rm_knobs.pnl_guard_recover_floor_pct
+        )
+        rm_knobs.normal_tt_min_bps_delta = _Env.get_float(
+            "RM_NORMAL_TT_MIN_BPS_DELTA", rm_knobs.normal_tt_min_bps_delta
+        )
+        rm_knobs.normal_tm_min_bps_delta = _Env.get_float(
+            "RM_NORMAL_TM_MIN_BPS_DELTA", rm_knobs.normal_tm_min_bps_delta
+        )
+        rm_knobs.normal_cap_factor = _Env.get_float("RM_NORMAL_CAP_FACTOR", rm_knobs.normal_cap_factor)
+        rm_knobs.normal_ioc_only = _Env.get_bool("RM_NORMAL_IOC_ONLY", rm_knobs.normal_ioc_only)
+        rm_knobs.constr_tt_min_bps_delta = float(cfg.RM_CONSTR_TT_MIN_BPS_DELTA)
+        rm_knobs.constr_tm_min_bps_delta = float(cfg.RM_CONSTR_TM_MIN_BPS_DELTA)
+        rm_knobs.constr_cap_factor = float(cfg.RM_CONSTR_CAP_FACTOR)
+        rm_knobs.constr_mm_enable = _Env.get_bool("RM_CONSTR_MM_ENABLE", rm_knobs.constr_mm_enable)
+        rm_knobs.constr_ioc_only = bool(cfg.RM_CONSTR_IOC_ONLY)
+        rm_knobs.opp_volume_tt_min_bps_delta = _Env.get_float(
+            "RM_OPP_VOLUME_TT_MIN_BPS_DELTA", rm_knobs.opp_volume_tt_min_bps_delta
+        )
+        rm_knobs.opp_volume_tm_min_bps_delta = _Env.get_float(
+            "RM_OPP_VOLUME_TM_MIN_BPS_DELTA", rm_knobs.opp_volume_tm_min_bps_delta
+        )
+        rm_knobs.opp_volume_cap_factor = _Env.get_float(
+            "RM_OPP_VOLUME_CAP_FACTOR", rm_knobs.opp_volume_cap_factor
+        )
+        rm_knobs.opp_volume_mm_enable = _Env.get_bool(
+            "RM_OPP_VOLUME_MM_ENABLE", rm_knobs.opp_volume_mm_enable
+        )
+        rm_knobs.opp_vol_tt_min_bps_delta = _Env.get_float(
+            "RM_OPP_VOL_TT_MIN_BPS_DELTA", rm_knobs.opp_vol_tt_min_bps_delta
+        )
+        rm_knobs.opp_vol_tm_min_bps_delta = _Env.get_float(
+            "RM_OPP_VOL_TM_MIN_BPS_DELTA", rm_knobs.opp_vol_tm_min_bps_delta
+        )
+        rm_knobs.opp_vol_cap_factor = _Env.get_float(
+            "RM_OPP_VOL_CAP_FACTOR", rm_knobs.opp_vol_cap_factor
+        )
+        rm_knobs.opp_vol_mm_enable = _Env.get_bool(
+            "RM_OPP_VOL_MM_ENABLE", rm_knobs.opp_vol_mm_enable
+        )
+        rm_knobs.severe_tt_min_bps_delta = _Env.get_float(
+            "RM_SEVERE_TT_MIN_BPS_DELTA", rm_knobs.severe_tt_min_bps_delta
+        )
+        rm_knobs.severe_tm_min_bps_delta = _Env.get_float(
+            "RM_SEVERE_TM_MIN_BPS_DELTA", rm_knobs.severe_tm_min_bps_delta
+        )
+        rm_knobs.severe_cap_factor = _Env.get_float("RM_SEVERE_CAP_FACTOR", rm_knobs.severe_cap_factor)
+        rm_knobs.severe_mm_enable = _Env.get_bool("RM_SEVERE_MM_ENABLE", rm_knobs.severe_mm_enable)
+        rm_knobs.severe_ioc_only = _Env.get_bool("RM_SEVERE_IOC_ONLY", rm_knobs.severe_ioc_only)
+        rm_knobs.rm_reco_miss_per_minute_constrained = int(cfg.RM_RECO_MISS_PER_MINUTE_CONSTRAINED)
+        rm_knobs.rm_reco_miss_per_minute_severe = int(cfg.RM_RECO_MISS_PER_MINUTE_SEVERE)
+        rm_knobs.rm_pws_heartbeat_gap_constrained_s = float(cfg.RM_PWS_HEARTBEAT_GAP_CONSTRAINED_S)
+        rm_knobs.rm_pws_heartbeat_gap_severe_s = float(cfg.RM_PWS_HEARTBEAT_GAP_SEVERE_S)
+        rm_knobs.rm_pws_event_lag_constrained_ms = float(cfg.RM_PWS_EVENT_LAG_CONSTRAINED_MS)
+        rm_knobs.rm_pws_event_lag_severe_ms = float(cfg.RM_PWS_EVENT_LAG_SEVERE_MS)
+        rm_knobs.rm_pws_ack_latency_constrained_ms = float(cfg.RM_PWS_ACK_LATENCY_CONSTRAINED_MS)
+        rm_knobs.rm_pws_ack_latency_severe_ms = float(cfg.RM_PWS_ACK_LATENCY_SEVERE_MS)
+        rm_knobs.rm_pws_fill_latency_constrained_ms = float(cfg.RM_PWS_FILL_LATENCY_CONSTRAINED_MS)
+        rm_knobs.rm_pws_fill_latency_severe_ms = float(cfg.RM_PWS_FILL_LATENCY_SEVERE_MS)
+        rm_knobs.rm_fee_token_min_pct = float(cfg.RM_FEE_TOKEN_MIN_PCT)
+        rm_knobs.rm_fee_low_min_seconds = float(cfg.RM_FEE_LOW_MIN_SECONDS)
+        rm_knobs.rm_invariant_strict = bool(cfg.RM_INVARIANT_STRICT)
+        signal_policy = cfg.rm.signal_policy
+        signal_policy.require_vol_signal_for_opp = _Env.get_bool(
+            "RM_REQUIRE_VOL_SIGNAL_FOR_OPP", signal_policy.require_vol_signal_for_opp
+        )
+        signal_policy.require_shadow_for_opp = _Env.get_bool(
+            "RM_REQUIRE_SHADOW_FOR_OPP", signal_policy.require_shadow_for_opp
+        )
+        signal_policy.require_rl_health_for_opp = _Env.get_bool(
+            "RM_REQUIRE_RL_HEALTH_FOR_OPP", signal_policy.require_rl_health_for_opp
+        )
+        signal_policy.require_pws_health_for_opp = _Env.get_bool(
+            "RM_REQUIRE_PWS_HEALTH_FOR_OPP", signal_policy.require_pws_health_for_opp
+        )
+        signal_policy.require_book_age_for_opp = _Env.get_bool(
+            "RM_REQUIRE_BOOK_AGE_FOR_OPP", signal_policy.require_book_age_for_opp
+        )
+        cfg.rm.fallback_on_tick_exception = str(
+            _Env.get("RM_FALLBACK_ON_TICK_EXCEPTION", cfg.rm.fallback_on_tick_exception)
+        ).upper()
+        cfg.engine.pacer_targets = _Env.get_dict("ENGINE_PACER_TARGETS", cfg.engine.pacer_targets)
+        cfg.rm.split_breach_thr_base_ms = _Env.get_float(
+            "RM_SPLIT_BREACH_THR_BASE_MS", cfg.rm.split_breach_thr_base_ms
+        )
+        cfg.rm.split_breach_thr_skew_ms = _Env.get_float(
+            "RM_SPLIT_BREACH_THR_SKEW_MS", cfg.rm.split_breach_thr_skew_ms
+        )
+        cfg.rm.split_breach_thr_stale_ms = _Env.get_float(
+            "RM_SPLIT_BREACH_THR_STALE_MS", cfg.rm.split_breach_thr_stale_ms
+        )
+        cfg.rm.split_breach_min_s = _Env.get_float(
+            "RM_SPLIT_BREACH_MIN_S", cfg.rm.split_breach_min_s
+        )
+        cfg.rm.split_fallback_cooldown_s = _Env.get_float(
+            "RM_SPLIT_FALLBACK_COOLDOWN_S", cfg.rm.split_fallback_cooldown_s
+        )
+        cfg.rm.split_restore_stable_s = _Env.get_float(
+            "RM_SPLIT_RESTORE_STABLE_S", cfg.rm.split_restore_stable_s
+        )
+        cfg.rm.split_penalty_bps_max = _Env.get_float(
+            "RM_SPLIT_PENALTY_BPS_MAX", cfg.rm.split_penalty_bps_max
+        )
 
         # Profils de sécurité pour les flows (optionnel, sert de carte de priorisation)
         cfg.flow_safety.profiles = _Env.get_dict(
             "FLOW_SAFETY_PROFILES",
             cfg.flow_safety.profiles,
         )
+
 
         # --- Discovery : configuration centrale de l'univers -----------------
         # Volumes minimaux 24h (USD) et par quote
@@ -2405,12 +2745,19 @@ class BotConfig:
         cfg.sim.sim_max_wait_ms_rm = _Env.get_int("SIM_MAX_WAIT_MS_RM", cfg.sim.sim_max_wait_ms_rm)
         cfg.sim.sim_prime_depth_levels = _Env.get_int("SIM_PRIME_DEPTH_LEVELS", cfg.sim.sim_prime_depth_levels)
         cfg.sim.sim_max_inflight_jobs = _Env.get_int("SIM_MAX_INFLIGHT_JOBS", cfg.sim.sim_max_inflight_jobs)
+        cfg.sim.sim_shadow_max_inflight = _Env.get_int(
+            "SIM_SHADOW_MAX_INFLIGHT", cfg.sim.sim_shadow_max_inflight
+        )
+        cfg.sim.sim_deterministic_trade_id = _Env.get_bool(
+            "SIM_DETERMINISTIC_TRADE_ID", cfg.sim.sim_deterministic_trade_id
+        )
         cfg.sim.sim_notional_buckets_base = _Env.get(
             "SIM_NOTIONAL_BUCKETS_BASE", cfg.sim.sim_notional_buckets_base
         )
         cfg.sim.sim_buckets_per_profile = _Env.get_dict(
             "SIM_BUCKETS_PER_PROFILE", cfg.sim.sim_buckets_per_profile
         )
+
         cfg.sim.sim_buckets_adapt_with_vol = _Env.get_bool(
             "SIM_BUCKETS_ADAPT_WITH_VOL", cfg.sim.sim_buckets_adapt_with_vol
         )
@@ -2506,6 +2853,37 @@ class BotConfig:
             "ENGINE_FF_REB_ENABLED",
             cfg.engine.ff_reb_enabled,
         )
+        cfg.engine.fail_closed_on_rm_override_exception = _Env.get_bool(
+            "ENGINE_FAIL_CLOSED_ON_RM_OVERRIDE_EXCEPTION",
+            cfg.engine.fail_closed_on_rm_override_exception,
+        )
+        pacer_knobs = cfg.engine.pacer_knobs
+        pacer_knobs.warmup_secs = _Env.get_float("ENGINE_PACER_WARMUP_SECS", pacer_knobs.warmup_secs)
+        pacer_knobs.escalate_bad_windows = _Env.get_int(
+            "ENGINE_PACER_ESCALATE_BAD_WINDOWS", pacer_knobs.escalate_bad_windows
+        )
+        pacer_knobs.deescalate_good_windows = _Env.get_int(
+            "ENGINE_PACER_DEESCALATE_GOOD_WINDOWS", pacer_knobs.deescalate_good_windows
+        )
+        pacer_knobs.hold_time_flags_secs = _Env.get_float(
+            "ENGINE_PACER_HOLD_TIME_FLAGS_SECS", pacer_knobs.hold_time_flags_secs
+        )
+        pacer_knobs.good_score_threshold = _Env.get_float(
+            "ENGINE_PACER_GOOD_SCORE_THRESHOLD", pacer_knobs.good_score_threshold
+        )
+        pacer_knobs.bad_score_threshold = _Env.get_float(
+            "ENGINE_PACER_BAD_SCORE_THRESHOLD", pacer_knobs.bad_score_threshold
+        )
+        pacer_knobs.weight_ack = _Env.get_float("ENGINE_PACER_WEIGHT_ACK", pacer_knobs.weight_ack)
+        pacer_knobs.weight_lag = _Env.get_float("ENGINE_PACER_WEIGHT_LAG", pacer_knobs.weight_lag)
+        pacer_knobs.weight_err = _Env.get_float("ENGINE_PACER_WEIGHT_ERR", pacer_knobs.weight_err)
+        pacer_knobs.weight_drain = _Env.get_float("ENGINE_PACER_WEIGHT_DRAIN", pacer_knobs.weight_drain)
+        targets_override = _Env.get_dict("ENGINE_PACER_DEFAULT_TARGETS", {})
+        if targets_override:
+            try:
+                pacer_knobs.default_targets = targets_override
+            except Exception:
+                pass
         cfg.engine.depth_min_quote_tt = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_TT", cfg.engine.depth_min_quote_tt)
         cfg.engine.depth_min_quote_tm = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_TM", cfg.engine.depth_min_quote_tm)
         cfg.engine.depth_min_quote_mm = _Env.get_float("ENGINE_DEPTH_MIN_QUOTE_MM", cfg.engine.depth_min_quote_mm)
@@ -2540,6 +2918,11 @@ class BotConfig:
             "PWS_NO_DROP_CRITICAL_ENFORCED",
             cfg.pws.ff_pws_no_drop_critical_enforced,
         )
+        cfg.pws.ff_pws_disable_auto_wiring_prod = _Env.get_bool(
+            "PWS_DISABLE_AUTO_WIRING_PROD",
+            cfg.pws.ff_pws_disable_auto_wiring_prod,
+        )
+        cfg.pws.pws_drop_policy = _Env.get("PWS_DROP_POLICY", cfg.pws.pws_drop_policy)
         cfg.pws.PWS_PACER_EU = _Env.get("PWS_PACER_EU", cfg.pws.PWS_PACER_EU)
         cfg.pws.PWS_PACER_US = _Env.get("PWS_PACER_US", cfg.pws.PWS_PACER_US)
         cfg.pws.PWS_ALERT_PERIOD_S = _Env.get_int("PWS_ALERT_PERIOD_S", cfg.pws.PWS_ALERT_PERIOD_S)
@@ -2708,14 +3091,27 @@ class BotConfig:
         )
         cfg.lhm.LHM_MM_SAMPLING_QUOTES = _Env.get_float("LHM_MM_SAMPLING_QUOTES", cfg.lhm.LHM_MM_SAMPLING_QUOTES)
         cfg.lhm.LHM_MM_SAMPLING_CANCELS = _Env.get_float("LHM_MM_SAMPLING_CANCELS", cfg.lhm.LHM_MM_SAMPLING_CANCELS)
+        cfg.lhm.LHM_DROP_LOG_SAMPLE_RATE = _Env.get_float(
+            "LHM_DROP_LOG_SAMPLE_RATE", cfg.lhm.LHM_DROP_LOG_SAMPLE_RATE
+        )
         cfg.lhm.LHM_JSONL_QUEUE_CAP = _Env.get_int("LHM_JSONL_QUEUE_CAP", cfg.lhm.LHM_JSONL_QUEUE_CAP)
         cfg.lhm.LHM_JSONL_MAX_BYTES = _Env.get_int("LHM_JSONL_MAX_BYTES", cfg.lhm.LHM_JSONL_MAX_BYTES)
         cfg.lhm.LHM_JSONL_MAX_AGE_S = _Env.get_int("LHM_JSONL_MAX_AGE_S", cfg.lhm.LHM_JSONL_MAX_AGE_S)
         cfg.lhm.LHM_DISK_WARN_PCT = _Env.get_float("LHM_DISK_WARN_PCT", cfg.lhm.LHM_DISK_WARN_PCT)
         cfg.lhm.LHM_DISK_CRIT_PCT = _Env.get_float("LHM_DISK_CRIT_PCT", cfg.lhm.LHM_DISK_CRIT_PCT)
+        cfg.lhm.LHM_STORAGE_ALERT_COOLDOWN_S = _Env.get_float(
+            "LHM_STORAGE_ALERT_COOLDOWN_S", cfg.lhm.LHM_STORAGE_ALERT_COOLDOWN_S
+        )
         cfg.lhm.LHM_DB_NAME = _Env.get("LHM_DB_NAME", cfg.lhm.LHM_DB_NAME)
         cfg.lhm.LHM_DB_MAX_BYTES = _Env.get_int("LHM_DB_MAX_BYTES", cfg.lhm.LHM_DB_MAX_BYTES)
         cfg.lhm.LHM_DB_MAX_AGE_S = _Env.get_int("LHM_DB_MAX_AGE_S", cfg.lhm.LHM_DB_MAX_AGE_S)
+        cfg.lhm.LHM_DB_LANE_ENABLED = _Env.get_bool("LHM_DB_LANE_ENABLED", cfg.lhm.LHM_DB_LANE_ENABLED)
+        cfg.lhm.LHM_DB_LANE_Q_MAX = _Env.get_int("LHM_DB_LANE_Q_MAX", cfg.lhm.LHM_DB_LANE_Q_MAX)
+        cfg.lhm.LHM_DB_LANE_BATCH_MAX = _Env.get_int("LHM_DB_LANE_BATCH_MAX", cfg.lhm.LHM_DB_LANE_BATCH_MAX)
+        cfg.lhm.LHM_DB_LANE_DRAIN_MS = _Env.get_float("LHM_DB_LANE_DRAIN_MS", cfg.lhm.LHM_DB_LANE_DRAIN_MS)
+        cfg.lhm.LHM_DB_LANE_DROP_WHEN_FULL = _Env.get_bool(
+            "LHM_DB_LANE_DROP_WHEN_FULL", cfg.lhm.LHM_DB_LANE_DROP_WHEN_FULL
+        )
         cfg.lhm.LHM_WD_INTERVAL_S = _Env.get_float("LHM_WD_INTERVAL_S", cfg.lhm.LHM_WD_INTERVAL_S)
         cfg.lhm.LHM_WD_PLATEAU_WINDOW = _Env.get_int("LHM_WD_PLATEAU_WINDOW", cfg.lhm.LHM_WD_PLATEAU_WINDOW)
         cfg.lhm.LHM_WD_QUEUE_MIN_SIZE = _Env.get_int("LHM_WD_QUEUE_MIN_SIZE", cfg.lhm.LHM_WD_QUEUE_MIN_SIZE)
@@ -2731,8 +3127,28 @@ class BotConfig:
             "LHM_SLO_LAG_SECONDS_MAX_TARGET", cfg.lhm.LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET)
         cfg.lhm.LHM_SLO_DROPPED_TRADES_BUDGET = _Env.get_float("LHM_SLO_DROPPED_TRADES_BUDGET",
                                                                cfg.lhm.LHM_SLO_DROPPED_TRADES_BUDGET)
+        cfg.lhm.LHM_OPPORTUNITY_QUEUE_MAX = _Env.get_int(
+            "LHM_OPPORTUNITY_QUEUE_MAX", cfg.lhm.LHM_OPPORTUNITY_QUEUE_MAX
+        )
+        cfg.lhm.LHM_OPPORTUNITY_DROP_WHEN_FULL = _Env.get_bool(
+            "LHM_OPPORTUNITY_DROP_WHEN_FULL", cfg.lhm.LHM_OPPORTUNITY_DROP_WHEN_FULL
+        )
+        cfg.lhm.LHM_PNL_RECO_ENABLED = _Env.get_bool("LHM_PNL_RECO_ENABLED", cfg.lhm.LHM_PNL_RECO_ENABLED)
+        cfg.lhm.LHM_PNL_RECO_TOL_ABS_QUOTE = _Env.get_float(
+            "LHM_PNL_RECO_TOL_ABS_QUOTE", cfg.lhm.LHM_PNL_RECO_TOL_ABS_QUOTE
+        )
+        cfg.lhm.LHM_PNL_RECO_TOL_PCT = _Env.get_float(
+            "LHM_PNL_RECO_TOL_PCT", cfg.lhm.LHM_PNL_RECO_TOL_PCT
+        )
+        cfg.lhm.LHM_PNL_RECO_MAX_LOOKBACK_DAYS = _Env.get_int(
+            "LHM_PNL_RECO_MAX_LOOKBACK_DAYS", cfg.lhm.LHM_PNL_RECO_MAX_LOOKBACK_DAYS
+        )
+        cfg.lhm.LHM_PNL_RECO_DEFAULT_REGION = _Env.get(
+            "LHM_PNL_RECO_DEFAULT_REGION", cfg.lhm.LHM_PNL_RECO_DEFAULT_REGION
+        )
+        cfg.lhm.OPS_RETENTION_DAYS = _Env.get_int("OPS_RETENTION_DAYS", cfg.lhm.OPS_RETENTION_DAYS)
         # PIVOT: chemins pilotés par cfg.lhm
-        cfg.lhm.out_dir = _Env.get("LHM_OUT_DIR", cfg.lhm.out_dir)
+
         cfg.lhm.storage_path = _Env.get("LHM_STORAGE_PATH", cfg.lhm.storage_path)
 
         # --- Dashboard (optionnel) ---
@@ -2784,7 +3200,7 @@ class BotConfig:
         cfg._rebuild_flat_cache()
         # --- Validation fail-closed ---
         dep_mode = str(cfg.g.deployment_mode or "").upper()
-        if dep_mode not in {"EU_ONLY", "SPLIT", "JP"}:
+        if dep_mode not in DEPLOYMENT_MODES:
             raise ConfigError("CONFIG_SCHEMA_INVALID", "deployment_mode")
         region = str(cfg.g.pod_region or "").upper()
         if region not in {"EU", "US", "JP"}:
@@ -3180,8 +3596,24 @@ class BotConfig:
             # On ne modifie pas directement les valeurs par exchange ici;
             # l'Engine les lira via engine_pod_map & pacer_targets.
         elif dm == "EU_ONLY":
-            # Rien de spécial, latences homogènes
-            pass
+            eu_latency = self.g.eu_latency
+            self.router.stale_ms = int(eu_latency.get("stale_ms", self.router.stale_ms))
+            self.engine.anchor_max_staleness_ms = int(
+                eu_latency.get("stale_ms", self.engine.anchor_max_staleness_ms)
+            )
+        elif dm == "JP_ONLY":
+            jp_latency = self.g.jp_latency
+            self.router.stale_ms = int(jp_latency.get("stale_ms", self.router.stale_ms))
+            self.router.out_queues_maxlen = int(getattr(self.router, "out_queues_maxlen", 20000))
+            self.wd.router_health_stale_ms = int(
+                getattr(self.wd, "router_health_stale_ms", int(jp_latency.get("stale_ms", 1300)))
+            )
+            self.wd.ws_public_stale_warn_ms = int(getattr(self.wd, "ws_public_stale_warn_ms", 900))
+            self.wd.ws_public_stale_crit_ms = int(getattr(self.wd, "ws_public_stale_crit_ms", 1200))
+            self.wd.ws_public_interval_s = float(getattr(self.wd, "ws_public_interval_s", 2.0))
+            self.engine.anchor_max_staleness_ms = int(
+                jp_latency.get("stale_ms", self.engine.anchor_max_staleness_ms)
+            )
         # Hub privé choisira ses URLs via PWS_REGION_MAP / engine_pod_map
         self.pws.PWS_REGION_MAP = dict(self.g.engine_pod_map)
 
@@ -3206,20 +3638,24 @@ class BotConfig:
             ),
         }
         p = presets.get(prof, presets["SMALL"])
-        # RM sizing
-        self.rm.default_notional = max(self.rm.default_notional, p["default_notional"])
-        self.rm.max_fragments = max(self.rm.max_fragments, p["inflight"])  # approximation sizing vs inflight
+        # RM sizing (down-clamp only)
+        self.rm.default_notional = min(self.rm.default_notional, p["default_notional"])
+        self.rm.max_fragments = min(self.rm.max_fragments,
+                                    p["inflight"])  # approximation sizing vs inflight
+
         # Engine queue/parallelism
-        self.engine.tm_max_open_makers = max(self.engine.tm_max_open_makers, p["inflight"])
+        self.engine.tm_max_open_makers = min(self.engine.tm_max_open_makers, p["inflight"])
         # Router queues
-        self.router.out_queues_maxlen = max(self.router.out_queues_maxlen, p["qlen"])
+        self.router.out_queues_maxlen = min(self.router.out_queues_maxlen, p["qlen"])
         # Min fragment par quote
         mf = dict(self.g.min_fragment_quote)
         for q in mf:
-            mf[q] = max(mf[q], p["min_fragment"])
+            mf[q] = min(mf[q], p["min_fragment"])
         self.g.min_fragment_quote = mf
         self.engine.min_fragment_quote = mf
         self.rm.min_fragment_quote = mf
+        if prof in {"SMALL", "MID", "LARGE"}:
+            self.engine.ff_enforce_client_oid_deterministic = True
 
     def _apply_quote_overlay(self) -> None:
         quote = self.g.primary_quote.upper()
@@ -3403,6 +3839,12 @@ class BotConfig:
         for section_name in [
             'g','router','ws_public','discovery','scanner','rm','sim','engine','pws','rebal','reconciler','balances','slip','vol','rl','retry','rpc','lhm','dashboard','tests']:
             _walk(f"{section_name}.", getattr(self, section_name))
+        engine_cfg = getattr(self, "engine", None)
+        pacer_targets = getattr(engine_cfg, "pacer_targets", {}) if engine_cfg else {}
+        for region in ("EU", "EU_CB", "EU-CB", "US", "JP"):
+            key = region.replace("-", "_")
+            if region in pacer_targets:
+                self._flat_cache[f"PACER_TARGETS_{key}"] = pacer_targets[region]
 
     def _resolve_alias(self, name: str) -> Optional[str]:
         if name in self._alias_map:
@@ -3433,7 +3875,7 @@ class BotConfig:
         Contrat SLO / TTL public ↔ privé, structuré comme:
             slo[deployment_mode][exchange] -> PathSLO
 
-        - deployment_mode: "EU_ONLY" ou "SPLIT"
+        - deployment_mode: "EU_ONLY", "SPLIT" ou "JP_ONLY"
         - exchange:        "BINANCE", "BYBIT", "COINBASE", ...
 
         Objectif:
@@ -3498,7 +3940,7 @@ class BotConfig:
 
         # --- Construction du contrat par mode / exchange ---
         slo: Dict[str, Dict[str, PathSLO]] = {}
-        deployment_modes = ("EU_ONLY", "SPLIT")
+        deployment_modes = ("EU_ONLY", "SPLIT", "JP_ONLY")
 
         # On normalise les exchanges à UPPER (BINANCE/BYBIT/COINBASE…)
         enabled_exchanges = [ex.upper() for ex in getattr(self.g, "enabled_exchanges", [])]

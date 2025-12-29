@@ -111,10 +111,10 @@ def _now_dt() -> datetime:
     return datetime.utcnow()  # UTC naive
 
 
-def _to_dt(ts_like) -> datetime:
+def _to_dt(ts_like) -> Optional[datetime]:
     """Accepte s / ms / µs / ns ; heuristique décroissante pour ms>=1e11."""
     if ts_like is None:
-        return _now_dt()
+        return None
     try:
         ts = float(ts_like)
         if ts >= 1e18:      # ns
@@ -126,7 +126,7 @@ def _to_dt(ts_like) -> datetime:
         return datetime.utcfromtimestamp(ts)
     except Exception as e:
         logger.error(f"[Timestamp] Conversion échouée: {ts_like} -> {e}")
-        return _now_dt()
+        return None
 
 
 def _percentile(values: List[float], p: float) -> Optional[float]:
@@ -379,7 +379,8 @@ class MarketDataRouter:
         # scanner lane décorrélée pour éviter de bloquer l'ingestion
         scanner_max = getattr_int(self.router_cfg, "scanner_queue_maxlen", 512) if self.router_cfg else 512
         self._scanner_queue: asyncio.Queue = asyncio.Queue(
-            maxsize=max(1, scanner_max)) if self.push_to_scanner else asyncio.Queue(maxsize=1)
+            maxsize=max(1, scanner_max)
+        ) if self.push_to_scanner else asyncio.Queue(maxsize=1)
         self._scanner_task: Optional[asyncio.Task] = None
         self._slip_feed_min_interval_ms = 100
 
@@ -725,21 +726,17 @@ class MarketDataRouter:
 
         Gouvernance P0 :
           - BotConfig.router.deque_maxlen_per_ex est la source unique.
-          - Fallback legacy : champ plat ROUTER_DEQUE_MAXLEN_PER_EX si présent.
           - DEFAULT sert de base pour tous les exchanges non explicitement configurés.
         """
         exu = ex.upper()
         per_ex: Mapping[str, int] = {}
 
-        cfg = self.router_cfg or getattr(self, "bot_cfg", None)
+        cfg = self.router_cfg
         if cfg is not None:
             try:
                 per_ex = getattr(cfg, "deque_maxlen_per_ex", {}) or {}
             except Exception:
                 per_ex = {}
-            if not per_ex:
-                # fallback legacy sur l'ancien champ plat
-                per_ex = getattr(cfg, "ROUTER_DEQUE_MAXLEN_PER_EX", {}) or {}
 
         default = int(per_ex.get("DEFAULT", getattr(self, "coalesce_maxlen", 8)))
         mx = int(per_ex.get(exu, default))
@@ -824,19 +821,15 @@ class MarketDataRouter:
         last_flush_ms = last_hb_ms = int(time.time() * 1000)
 
         # P0 Marché Public — backpressure piloté par BotConfig.router.backpressure
-        bp_cfg = self.router_cfg or getattr(self, "bot_cfg", None)
+        bp_cfg = self.router_cfg
         bp: Dict[str, Any] = {}
         if bp_cfg is not None:
-            # Priorité à RouterCfg.backpressure, fallback sur l'ancien champ plat ROUTER_BACKPRESSURE
+            # RouterCfg.backpressure est la source unique
             try:
                 bp = getattr(bp_cfg, "backpressure", {}) or {}
             except Exception:
                 bp = {}
-            if not bp:
-                try:
-                    bp = getattr(bp_cfg, "ROUTER_BACKPRESSURE", {}) or {}
-                except Exception:
-                    bp = {}
+
 
         wm_ratio = float(bp.get("HIGH_WM_RATIO", 0.70))
         bump_ms = int(bp.get("BP_COALESCE_BUMP_MS", 8))
@@ -885,19 +878,23 @@ class MarketDataRouter:
                             high = True
                             break
                 if high: break
+            deterministic = bool(
+                getattr(self.router_cfg, "deterministic_backpressure", False)
+            ) if self.router_cfg is not None else False
 
             ws_bp_active = bool(self._ws_backpressure_until and time.time() < self._ws_backpressure_until)
-            if high or ws_bp_active:
-                self.coalesce_window_ms = base_coalesce_ms + bump_ms
-                self.coalesce_maxlen = base_maxlen + grow
-                bp_until = max(time.time() + cooldown, self._ws_backpressure_until or 0.0)
-            elif bp_until and time.time() > bp_until:
-                # retour normal
-                self.coalesce_window_ms = base_coalesce_ms
-                self.coalesce_maxlen = base_maxlen
-                bp_until = 0.0
-                if self._ws_backpressure_until and time.time() >= self._ws_backpressure_until:
-                    self._ws_backpressure_until = 0.0
+            if not deterministic:
+                if high or ws_bp_active:
+                    self.coalesce_window_ms = base_coalesce_ms + bump_ms
+                    self.coalesce_maxlen = base_maxlen + grow
+                    bp_until = max(time.time() + cooldown, self._ws_backpressure_until or 0.0)
+                elif bp_until and time.time() > bp_until:
+                    # retour normal
+                    self.coalesce_window_ms = base_coalesce_ms
+                    self.coalesce_maxlen = base_maxlen
+                    bp_until = 0.0
+                    if self._ws_backpressure_until and time.time() >= self._ws_backpressure_until:
+                        self._ws_backpressure_until = 0.0
 
             await asyncio.sleep(0.001)
     # ------------------------ Legacy internal feeds (compat) ------------------------
@@ -994,7 +991,7 @@ class MarketDataRouter:
         P2: Coalescing pair-aware:
           - bonus de coalescing pour COINBASE en mode SPLIT (+5..15ms),
           - fenêtre recalculée au moment du flush,
-          - robuste: lit deployment_mode et bump depuis self.* ou bot_cfg.* en lower/UPPER.
+          - piloté par BotConfig (router.* + g.deployment_mode).
         """
         task = asyncio.current_task()
         try:
@@ -1002,27 +999,18 @@ class MarketDataRouter:
             base_ms = getattr_int(self, "coalesce_window_ms", 20)
 
             # --- Lecture robuste du mode de déploiement -------------------------
-            dep_mode = (
-                    getattr(self, "deployment_mode", None)
-                    or (getattr(getattr(self, "bot_cfg", None), "deployment_mode", None) if hasattr(self,
-                                                                                                    "bot_cfg") else None)
-                    or (getattr(getattr(self, "bot_cfg", None), "DEPLOYMENT_MODE", None) if hasattr(self,
-                                                                                                    "bot_cfg") else None)
-                    or "EU_ONLY"
-            )
+            dep_mode = "EU_ONLY"
+            if self.bot_cfg is not None:
+                dep_mode = str(getattr(getattr(self.bot_cfg, "g", object()), "deployment_mode", dep_mode))
             split = str(dep_mode).upper() == "SPLIT"
 
             # --- Bonus CB (5..15ms) si SPLIT et si COINBASE présent -------------
             cb_bump_ms = 0
             if split:
                 bump_src = (
-                        getattr(self, "cb_coalesce_bump_ms", None)
-                        or (getattr(getattr(self, "bot_cfg", None), "router_cb_coalesce_bump_ms", None) if hasattr(self,
-                                                                                                                   "bot_cfg") else None)
-                        or (getattr(getattr(self, "bot_cfg", None), "ROUTER_CB_COALESCE_BUMP_MS", None) if hasattr(self,
-                                                                                                                   "bot_cfg") else None)
-                        or 10
-                )
+                               getattr(self.router_cfg, "cb_coalesce_bump_ms",
+                                       None) if self.router_cfg is not None else None
+                           ) or 10
                 try:
                     cb_bump_ms = max(5, min(15, int(bump_src)))
                 except Exception:
@@ -1138,8 +1126,8 @@ class MarketDataRouter:
         """
         Charge les max_hz par CEX/topic depuis BotConfig et prépare les intervalles min (ms).
         """
-        cfg = cfg or getattr(self, "bot_cfg", None) or getattr(self, "cfg", None)
-        spec = (getattr(cfg, "ROUTER_TOPIC_MAX_HZ", None) or {})
+        cfg = cfg or self.router_cfg
+        spec = (getattr(cfg, "topic_max_hz", None) or {}) if cfg is not None else {}
 
         self._topic_min_interval_ms = {}
         for ex in self.exchanges:  # liste des CEX actifs
@@ -1256,6 +1244,7 @@ class MarketDataRouter:
                     queue="combo",
                     reason="inactive",
                 )
+                return None
 
             bid = float(ev_model.best_bid)
             ask = float(ev_model.best_ask)
@@ -1267,6 +1256,7 @@ class MarketDataRouter:
                     queue="combo",
                     reason="schema_mismatch",
                 )
+                return None
 
             ob = ev.get("orderbook") or {}
             bids, asks = _sanitize_orderbook(ob, max_levels=50) if ob else ([], [])
@@ -1282,8 +1272,18 @@ class MarketDataRouter:
 
             ex_dt = _to_dt(ev.get("exchange_ts_ms") or ev.get("recv_ts_ms"))
             recv_dt = _to_dt(ev.get("recv_ts_ms") or ev.get("exchange_ts_ms"))
+            if ex_dt is None or recv_dt is None:
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_validate_and_enrich",
+                    queue="combo",
+                    reason="SCHEMA_BAD_TS",
+                )
+                return None
             ex_ts_ms = int((ex_dt.timestamp()) * 1000)
             recv_ts_ms = int((recv_dt.timestamp()) * 1000)
+
             if recv_ts_ms < ex_ts_ms:
                 safe_inc(
                     ROUTER_DROPPED_TOTAL,
@@ -1302,6 +1302,7 @@ class MarketDataRouter:
                     queue="combo",
                     reason="missing_quote",
                 )
+                return None
             tier = ev.get("tier")
 
 
@@ -1314,7 +1315,7 @@ class MarketDataRouter:
                 "exchange": ex,
                 "pair_key": pair,
                 "symbol": ev.get("symbol") or ev_model.symbol,
-                "active": True,
+                "active": ev_model.active,
                 "best_bid": bid,
                 "best_ask": ask,
                 "bid_volume": float(ev.get("bid_volume") or 0.0),
@@ -1366,11 +1367,10 @@ class MarketDataRouter:
         queue_label = self._queue_label(route_name)
         wm_ratio = 0.70
         try:
-            cfg = self.router_cfg or getattr(self, "bot_cfg", None)
+            cfg = self.router_cfg
             if cfg is not None:
                 bp = getattr(cfg, "backpressure", {}) or {}
-                if not bp:
-                    bp = getattr(cfg, "ROUTER_BACKPRESSURE", {}) or {}
+
                 wm_ratio = float(bp.get("HIGH_WM_RATIO", wm_ratio))
         except Exception:
             wm_ratio = 0.70
@@ -1457,9 +1457,23 @@ class MarketDataRouter:
     def _enqueue_scanner(self, payload: Dict[str, Any]) -> None:
         if not self.push_to_scanner:
             return
+        policy = "DROP_OLDEST"
+        if self.router_cfg is not None:
+            policy = str(
+                getattr(self.router_cfg, "scanner_queue_drop_policy", "DROP_OLDEST") or "DROP_OLDEST"
+            ).upper()
         try:
             self._scanner_queue.put_nowait(payload)
         except asyncio.QueueFull:
+            if policy == "DROP_NEW":
+                safe_inc(
+                    ROUTER_DROPPED_TOTAL,
+                    "router_dropped_total",
+                    "_enqueue_scanner",
+                    queue="scanner",
+                    reason="queue_full",
+                )
+                return
             try:
                 _ = self._scanner_queue.get_nowait()
             except Exception:
@@ -1608,8 +1622,8 @@ class MarketDataRouter:
                 orderbook={"bids": bids, "asks": asks} if (bids or asks) else {},
                 top_bid_vol=float(ev.get("bid_volume") or 0.0),
                 top_ask_vol=float(ev.get("ask_volume") or 0.0),
-                exchange_ts_ms=int(ev["exchange_ts_ms"]),
-                recv_ts_ms=int(ev["recv_ts_ms"]),
+            exchange_ts_ms=int(ev["exchange_ts_ms"]),
+            recv_ts_ms=int(ev["recv_ts_ms"]),
             ).model_dump(exclude_none=True, by_alias=True)
             self._publish_cex(ex, "slip", payload)
             self._slip_last_pub_ts[key] = now
@@ -1626,7 +1640,7 @@ class MarketDataRouter:
             exchange=ex,
             last_ex_ts_ms=int(ev["exchange_ts_ms"]),
             last_recv_ts_ms=int(ev["recv_ts_ms"]),
-            age_ms=max(0.0, (_now_dt() - _to_dt(ev["exchange_ts_ms"])).total_seconds() * 1000.0),
+            age_ms=float(ev.get("age_ms") or 0.0),
             pairs_seen=list((self._latest_light.get(ex, {}) or {}).keys()),
             changed=False,
         ).model_dump(exclude_none=True)
@@ -1720,14 +1734,14 @@ class MarketDataRouter:
                         continue
                     if isinstance(item, dict) and item.get("__ws_error__"):
                         payload = item
-                        ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
-                        safe_inc(
-                            ROUTER_DROPPED_TOTAL,
-                            "router_dropped_total",
-                            "start",
-                            queue="health",
-                            reason="exception",
-                        )
+                    ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
+                    safe_inc(
+                        ROUTER_DROPPED_TOTAL,
+                        "router_dropped_total",
+                        "start",
+                        queue="health",
+                        reason="exception",
+                    )
 
                     ev = self._validate_and_enrich(item)
                     if not ev:
@@ -1778,8 +1792,16 @@ class MarketDataRouter:
                             exc_info=False,
                         )
 
-                    ts_ex_ms = int(ev.get("exchange_ts_ms") or 0)
-                    if ts_ex_ms and (int(time.time() * 1000) - ts_ex_ms) > stale_limit_ms:
+                    staleness_mode = str(
+                        getattr(self.router_cfg, "staleness_mode", "WALLCLOCK") if self.router_cfg else "WALLCLOCK"
+                    ).upper()
+                    if staleness_mode == "EVENT_TIME":
+                        age_ms = float(ev.get("age_ms") or 0.0)
+                        is_stale = age_ms > float(stale_limit_ms)
+                    else:
+                        ts_ex_ms = int(ev.get("exchange_ts_ms") or 0)
+                        is_stale = ts_ex_ms and (int(time.time() * 1000) - ts_ex_ms) > stale_limit_ms
+                    if is_stale:
                         safe_inc(
                             ROUTER_DROPPED_TOTAL,
                             "router_dropped_total",
@@ -1795,7 +1817,16 @@ class MarketDataRouter:
                     self._coalesce_enqueue(ev)
 
                 except Exception:
+                    safe_inc(
+                        ROUTER_DROPPED_TOTAL,
+                        "router_dropped_total",
+                        "start",
+                        queue="combo",
+                        reason="exception",
+                    )
                     logger.exception("[Router] start: event error")
+                    if self.router_cfg and getattr(self.router_cfg, "fail_fast_on_event_exception", False):
+                        raise
                 finally:
                     try:
                         self.in_queue.task_done()

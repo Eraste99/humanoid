@@ -49,7 +49,8 @@ from contracts.payloads import (
     validate_ws_alias_status_snapshot_lite,
     normalize_reason_code,
 )
-
+from modules.utils.rate_limiter import RateLimiter
+from modules.retry_policy import BackoffPolicy, awith_retry
 
 
 logger = logging.getLogger("MultiBalanceFetcher")
@@ -1922,9 +1923,50 @@ class PnlRecoCexAdapter:
         """
         self.cfg = cfg
         self._bf = balance_fetcher  # facultatif: hook si tu veux réutiliser les clients existants
+        self._retry_policy = BackoffPolicy.from_cfg(getattr(cfg, "retry", None))
+        self._rl = RateLimiter(getattr(cfg, "rl", None))
 
         # TODO (quand tu voudras): initialiser ici les clients REST/HTTP
         # par CEX pour récupérer les trades/fills du jour.
+
+    @staticmethod
+    def _region_to_tz(region: str) -> str:
+        reg = str(region or "").upper()
+        if reg in {"JP", "JP_ONLY"}:
+            return "Asia/Tokyo"
+        if reg == "US":
+            return "America/New_York"
+        return "Europe/Rome"
+
+    def _window_for_local_day(self, local_day: str, region: str) -> tuple[int | None, int | None]:
+        from datetime import datetime, timezone, timedelta
+        try:
+            from zoneinfo import ZoneInfo  # type: ignore
+        except Exception:
+            ZoneInfo = None  # type: ignore
+
+        try:
+            dt_start_loc = datetime.strptime(str(local_day), "%Y-%m-%d")
+        except Exception:
+            return None, None
+        tz_name = self._region_to_tz(region)
+        if ZoneInfo is not None:
+            try:
+                dt_start_loc = dt_start_loc.replace(tzinfo=ZoneInfo(tz_name))
+            except Exception:
+                dt_start_loc = dt_start_loc.replace(tzinfo=timezone.utc)
+        else:
+            dt_start_loc = dt_start_loc.replace(tzinfo=timezone.utc)
+        dt_end_loc = dt_start_loc + timedelta(days=1)
+        dt_start_utc = dt_start_loc.astimezone(timezone.utc)
+        dt_end_utc = dt_end_loc.astimezone(timezone.utc)
+        window_since_ms = int(dt_start_utc.timestamp() * 1000)
+        window_until_ms = int(dt_end_utc.timestamp() * 1000) - 1
+        return window_since_ms, window_until_ms
+
+    async def _fetch_empty_pnl(self, exchange: str) -> dict:
+        await self._rl.acquire(exchange, "pnl_reco", timeout=2.0)
+        return {"fills": [], "fees": [], "transfers": []}
 
     async def fetch_pnl_for_day(
         self,
@@ -1944,22 +1986,63 @@ class PnlRecoCexAdapter:
                 "trades": int,
             }
 
-        Implémentation minimale attendue (à faire quand tu seras prêt):
-        - Résoudre la fenêtre temporelle [start_of_day, end_of_day] dans
-          la timezone de `region` (EU/US).
-        - Appeler les endpoints trades/fills de la CEX pour cet account_alias.
-        - Rejouer les trades pour calculer:
-            * net_profit_quote (dans la quote canonique, ex. USDC),
-            * fees_quote,
-            * turnover_quote,
-            * trades (compte de fills / executions).
-        - Retourner ce dict.
+        Implémentation minimale:
+        - Résout la fenêtre temporelle [start_of_day, end_of_day] dans la timezone de `region`.
+        - Utilise retry/backoff + rate limiter existants.
+        - Retourne un payload "DEGRADED" si aucune API CEX n'est câblée.
 
         Pour l'instant, on laisse un NotImplementedError pour ne pas
         inventer de logique CEX-specific ici.
         """
-        raise NotImplementedError(
-            "PnlRecoCexAdapter.fetch_pnl_for_day() doit être "
-            "implémenté pour chaque CEX (Binance/Bybit/Coinbase) en s'appuyant "
-            "sur leurs endpoints de trades/fills."
+        exu = str(exchange or "").upper()
+        alias_u = str(account_alias or "").upper()
+        region_u = str(region or "").upper()
+        window_since_ms, window_until_ms = self._window_for_local_day(local_day, region_u)
+        quote_ccy = getattr(getattr(self.cfg, "g", object()), "primary_quote", None)
+
+        async def _do_fetch() -> dict:
+            return await self._fetch_empty_pnl(exu)
+
+        outcome = await awith_retry(
+            _do_fetch,
+            venue=f"pnl_reco:{exu}:{alias_u}",
+            policy=self._retry_policy,
         )
+        if not outcome.ok:
+            reason_code = "PNL_RECO_EXCEPTION"
+            return {
+                "net_profit_quote": 0.0,
+                "fees_quote": 0.0,
+                "turnover_quote": 0.0,
+                "trades": 0,
+                "fills": [],
+                "fees": [],
+                "transfers": [],
+                "base_ccy": None,
+                "quote_ccy": quote_ccy,
+                "degraded": True,
+                "reason_code": reason_code,
+                "window_since_ms": window_since_ms,
+                "window_until_ms": window_until_ms,
+            }
+
+        payload = outcome.result if isinstance(outcome.result, dict) else {}
+        return {
+            "net_profit_quote": 0.0,
+            "fees_quote": 0.0,
+            "turnover_quote": 0.0,
+            "trades": 0,
+            "fills": payload.get("fills") or [],
+            "fees": payload.get("fees") or [],
+            "transfers": payload.get("transfers") or [],
+            "base_ccy": None,
+            "quote_ccy": quote_ccy,
+            "degraded": True,
+            "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
+            "window_since_ms": window_since_ms,
+            "window_until_ms": window_until_ms,
+        }
+
+
+
+

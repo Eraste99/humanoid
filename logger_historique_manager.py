@@ -388,9 +388,7 @@ class LoggerHistoriqueManager:
         raw_cap = getattr(L, "jsonl_queue_cap", None)
         if raw_cap is None:
             raw_cap = getattr(L, "LHM_JSONL_QUEUE_CAP", None)
-        if raw_cap is None:
-            raw_cap = getattr(self.cfg, "LHM_JSONL_QUEUE_CAP", 5000)
-        self._jsonl_queue_cap = _safe_int(raw_cap, 5000)
+        self._jsonl_queue_cap = _safe_int(raw_cap, getattr(L, "LHM_JSONL_QUEUE_CAP", 5000))
 
         # -------- Tags globaux (déploiement/profil/pacer) --------
         self._deployment_mode = str(getattr(self.cfg.g, "deployment_mode", "EU_ONLY"))
@@ -445,6 +443,8 @@ class LoggerHistoriqueManager:
         self._last_storage_alert_level = None  # None|"WARN"|"ERROR"
         self._last_storage_alert_ts: float | None = None
         self._storage_alert_cooldown_s = float(getattr(L, "LHM_STORAGE_ALERT_COOLDOWN_S", 60.0))
+        self._db_lane_error_count = 0
+        self._db_lane_error_threshold = int(getattr(L, "LHM_DB_LANE_ERROR_THRESHOLD", 3))
 
         # Watchdogs/rotation DB (métriques globales + bornes taille/âge)
         # - LHM_DB_MAX_BYTES: garde-fou sur la taille maximale du fichier .db courant.
@@ -607,7 +607,7 @@ class LoggerHistoriqueManager:
 
         # Proxy metrics d’un sous-module vers LHM (si dispo)
         try:
-            self._trade_logger._metrics_proxy = self  # noqa: attr-defined
+            self._trade_logger.set_metrics_proxy(self)  # noqa: attr-defined
         except Exception:
             pass
 
@@ -624,6 +624,10 @@ class LoggerHistoriqueManager:
         # True si une erreur d'I/O (DB ou JSONL) a été observée.
         # Sert à marquer la journée comme "non audit-grade" côté PnL.
         self._storage_error_seen = False
+        # Pipeline marqué dégradé après incidents persistants (drops critiques, erreurs storage).
+        self._pipeline_degraded = False
+        self._pipeline_degraded_reasons: set[str] = set()
+
         # Timestamps des derniers incidents détectés par le watchdog.
         # Utilisés pour enrichir le statut pnl_pipeline (OK/WARN/CRIT).
         self._last_queue_plateau_ts: Optional[float] = None
@@ -908,6 +912,10 @@ class LoggerHistoriqueManager:
             self._last_critical_drop_reason = reason_code
         except Exception:
             pass
+        try:
+            self._mark_pipeline_degraded(reason_code)
+        except Exception:
+            pass
         self._trigger_fail_closed_logging(reason_code)
 
     async def _db_lane_submit_bulk(self, op: str, batch: List[Dict[str, Any]]) -> None:
@@ -917,7 +925,10 @@ class LoggerHistoriqueManager:
                 self._db_lane_disabled_seen = True
             except Exception:
                 pass
-
+            try:
+                self._handle_db_lane_issue("LOGGERH_DB_LANE_DISABLED", payload={"op": op})
+            except Exception:
+                pass
             return
 
         q: asyncio.Queue = self._db_lane_q  # type: ignore
@@ -931,6 +942,7 @@ class LoggerHistoriqueManager:
                 self._db_lane_disabled_seen = True
             except Exception:
                 pass
+
             return
         self._db_lane_try_metric_depth()
 
@@ -939,6 +951,10 @@ class LoggerHistoriqueManager:
             # fallback direct
             try:
                 self._db_lane_disabled_seen = True
+            except Exception:
+                pass
+            try:
+                self._handle_db_lane_issue("LOGGERH_DB_LANE_DISABLED", payload={"op": op})
             except Exception:
                 pass
             if op == "latency_one":
@@ -967,6 +983,10 @@ class LoggerHistoriqueManager:
             # fallback direct (best-effort)
             try:
                 self._db_lane_disabled_seen = True
+            except Exception:
+                pass
+            try:
+                self._handle_db_lane_issue("LOGGERH_DB_LANE_DISABLED", payload={"op": op})
             except Exception:
                 pass
             try:
@@ -1091,6 +1111,15 @@ class LoggerHistoriqueManager:
             except Exception as e:
                 logger.exception("DB lane op failed: %s", op)
                 res = {"status": "ERROR", "op": str(op), "err": str(e)}
+                try:
+                    self._db_lane_error_count += 1
+                    if self._db_lane_error_count >= self._db_lane_error_threshold:
+                        self._handle_db_lane_issue(
+                            "LOGGERH_DB_LANE_ERROR",
+                            payload={"op": op, "err": str(e), "count": self._db_lane_error_count},
+                        )
+                except Exception:
+                    pass
             finally:
                 if fut is not None and not fut.done():
                     try:
@@ -2066,7 +2095,8 @@ class LoggerHistoriqueManager:
             q.put_nowait(payload)
             # métriques best-effort (success path)
         except asyncio.QueueFull:
-            if critical and not getattr(self, "_drop_when_full", True):
+            degraded = bool(getattr(self, "_pipeline_degraded", False))
+            if critical and not getattr(self, "_drop_when_full", True) and not degraded:
                 try:
                     await asyncio.wait_for(q.put(payload), timeout=0.05)
                     return
@@ -2586,6 +2616,7 @@ class LoggerHistoriqueManager:
             flags = {}
         critical_drop = bool(flags.get("critical_drop_seen"))
         storage_error = bool(flags.get("storage_error_seen"))
+        pipeline_degraded = bool(flags.get("pipeline_degraded"))
         storage_alert_level = getattr(self, "_last_storage_alert_level", None)
 
         # 5) Runtime (queue + incidents récents)
@@ -2669,6 +2700,8 @@ class LoggerHistoriqueManager:
                 "critical_drop_seen": critical_drop,
                 "storage_error_seen": storage_error,
                 "storage_alert_level": storage_alert_level,
+                "pipeline_degraded": pipeline_degraded,
+                "pipeline_degraded_reasons": sorted(getattr(self, "_pipeline_degraded_reasons", set())),
             },
             "runtime": {
                 "queue_size": queue_size,
@@ -3548,6 +3581,10 @@ class LoggerHistoriqueManager:
                 self._last_critical_drop_reason = reason
             except Exception:
                 pass
+            try:
+                self._mark_pipeline_degraded(reason)
+            except Exception:
+                pass
             self._trigger_fail_closed_logging(reason)
 
     def set_fail_closed_callback(self, cb: Callable[[str], Any] | None) -> None:
@@ -3657,10 +3694,28 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("activate_fail_closed_latch: persist failed")
 
+    def _mark_pipeline_degraded(self, reason: str) -> None:
+        reason_code = self._normalize_reason_code(reason)
+        try:
+            self._pipeline_degraded = True
+            if reason_code:
+                self._pipeline_degraded_reasons.add(reason_code)
+        except Exception:
+            pass
+        btl = getattr(self, "_trade_logger", None)
+        if btl and hasattr(btl, "set_degraded"):
+            try:
+                btl.set_degraded(True)
+            except Exception:
+                pass
     def _mark_storage_error(self, *, reason: str, payload: Optional[dict[str, Any]] = None) -> None:
         already_seen = bool(getattr(self, "_storage_error_seen", False))
         try:
             self._storage_error_seen = True
+        except Exception:
+            pass
+        try:
+            self._mark_pipeline_degraded(reason)
         except Exception:
             pass
 
@@ -3674,6 +3729,24 @@ class LoggerHistoriqueManager:
                 self._schedule_fail_closed_latch_persist(reason_code, payload)
             except Exception:
                 logger.exception("_mark_storage_error: latch persistence scheduling failed")
+
+    def _storage_fail_closed_profile(self) -> bool:
+        return self._capital_profile in {"SMALL", "MID", "LARGE"}
+
+    def _handle_db_lane_issue(self, reason: str, *, payload: Optional[dict[str, Any]] = None) -> None:
+        reason_code = self._normalize_reason_code(reason)
+        if self._storage_fail_closed_profile():
+            self._mark_storage_error(reason=reason_code, payload=payload)
+        else:
+            try:
+                self._storage_error_seen = True
+            except Exception:
+                pass
+            try:
+                self._mark_pipeline_degraded(reason_code)
+            except Exception:
+                pass
+            logger.warning("[LHM] DB lane issue (best-effort profile): %s", reason_code)
     def on_btl_flush_latency(self, log_type: str, *, ms: float) -> None:
         try:
             from modules.obs_metrics import LOGGERH_WRITE_MS
@@ -3706,6 +3779,7 @@ class LoggerHistoriqueManager:
         """
         critical_drop_seen = bool(getattr(self, "_critical_drop_seen", False))
         storage_error_seen = bool(getattr(self, "_storage_error_seen", False))
+        pipeline_degraded = bool(getattr(self, "_pipeline_degraded", False))
         try:
             from modules.obs_metrics import set_lhm_pipeline_flags
             set_lhm_pipeline_flags(
@@ -3719,6 +3793,7 @@ class LoggerHistoriqueManager:
             "critical_drop_seen": critical_drop_seen,
             "storage_error_seen": storage_error_seen,
             "db_lane_disabled": bool(getattr(self, "_db_lane_disabled_seen", False)),
+            "pipeline_degraded": pipeline_degraded,
         }
 
     def get_active_latches(self) -> list[dict[str, Any]]:
@@ -4611,6 +4686,12 @@ class LoggerHistoriqueManager:
         await self._append_jsonl("engine_acks", payload, id_key="client_id")
         await self._emit_trade_fsm_event("engine_acks", payload, event_type="ENGINE_ACK")
 
+    async def record_engine_event(self, payload: Dict[str, Any]) -> None:
+        obj = dict(payload or {})
+        import time
+        obj.setdefault("event_id", obj.get("client_id") or obj.get("client_order_id") or str(time.time_ns()))
+        await self._append_jsonl("events", obj, id_key="event_id")
+
     async def record_fill_normalized(self, payload: Dict[str, Any]) -> None:
         await self._append_jsonl("fills_normalized", payload, id_key="trade_id")
 
@@ -4883,6 +4964,7 @@ class LoggerHistoriqueManager:
             if critical:
                 self._critical_drop_seen = True
                 self._last_critical_drop_reason = reason_code
+                self._mark_pipeline_degraded(reason_code)
                 self._trigger_fail_closed_logging(reason_code)
         except Exception:
             pass
@@ -5414,6 +5496,8 @@ class LoggerHistoriqueManager:
                 "critical_drop_seen": critical_drop_seen,
                 "last_critical_drop_reason": getattr(self, "_last_critical_drop_reason", None),
                 "logging_persistence_ok": not (critical_drop_seen or storage_error_seen),
+                "pipeline_degraded": bool(getattr(self, "_pipeline_degraded", False)),
+                "pipeline_degraded_reasons": sorted(getattr(self, "_pipeline_degraded_reasons", set())),
             }
         except Exception:
             st["lhm_health"] = {}

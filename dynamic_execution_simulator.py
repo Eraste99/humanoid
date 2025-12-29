@@ -28,10 +28,11 @@ IDs
 ===
 - combo_key : "EX_A->EX_B"
 - strategy  : "TT" | "TM"
-- trade_id  : "{strategy}:{combo_key}:{pair}:{ts_ms}:{nonce}"
+- - trade_id  : "{strategy}:{combo_key}:{pair}:{ts_ms}:{nonce}" (ou dérivé idempotency_key en mode déterministe)
 """
 
 import asyncio
+import hashlib
 import logging
 import random
 import time
@@ -123,6 +124,9 @@ class DynamicExecutionSimulator:
         self._worker_task: Optional[asyncio.Task] = None
         self._mm_hints_task: Optional[asyncio.Task] = None
         self._workers_started = False
+        sim_cfg = getattr(self.bot_cfg, "sim", self.bot_cfg)
+        self.max_concurrency = getattr_int(sim_cfg, "sim_max_inflight_jobs", 32)
+        self.shadow_max_inflight = getattr_int(sim_cfg, "sim_shadow_max_inflight", 8)
 
     # ----------------- hooks RiskManager -----------------
     def set_event_sink(self, sink: Optional[Callable[[dict], None]]) -> None:
@@ -213,6 +217,44 @@ class DynamicExecutionSimulator:
         nonce = format(random.randint(0, 0xFFFF), "04x").upper()
         return f"{strategy}:{combo_key}:{pair}:{ts_ms}:{nonce}"
 
+    def _deterministic_trade_id(self, *, strategy: str, combo_key: str, pair: str, opportunity: Dict[str, Any]) -> str:
+        meta = opportunity.get("meta") if isinstance(opportunity, dict) else None
+        meta = meta if isinstance(meta, dict) else {}
+        idk = (
+                opportunity.get("idempotency_key")
+                or meta.get("idempotency_key")
+                or meta.get("idempotence_key")
+        )
+        if not idk:
+            idk = f"{strategy}:{combo_key}:{pair}"
+        leg_index = meta.get("leg_index") or meta.get("leg") or opportunity.get("leg_index") or 0
+        try:
+            leg_index = int(leg_index)
+        except Exception:
+            leg_index = 0
+        base = f"{idk}:{leg_index}:{combo_key}:{pair}:{strategy}"
+        digest = hashlib.sha1(base.encode("utf-8")).hexdigest()
+        return f"{strategy}:{combo_key}:{idk}:{leg_index}:{digest[:12]}"
+
+    def _use_deterministic_trade_id(self) -> bool:
+        cfg = getattr(self, "bot_cfg", None)
+        sim_cfg = getattr(cfg, "sim", cfg)
+        return bool(getattr_bool(sim_cfg, "sim_deterministic_trade_id", False))
+
+    def _emit_shadow_event(self, payload: dict, result: dict) -> None:
+        if not self._event_sink:
+            return
+        try:
+            self._event_sink({
+                "module": "DynamicExecutionSimulator",
+                "type": "shadow_simulation_result",
+                "pair": payload.get("pair"),
+                "buy_ex": payload.get("buy_ex"),
+                "sell_ex": payload.get("sell_ex"),
+                "payload": result,
+            })
+        except Exception as e:
+            report_nonfatal("DynamicExecutionSimulator", "shadow_event_sink_error", e, phase="shadow")
     @staticmethod
     def _combo_key(buy_ex: str, sell_ex: str) -> str:
         return f"{buy_ex.upper()}->{sell_ex.upper()}"
@@ -566,14 +608,23 @@ class DynamicExecutionSimulator:
                 capital_budget_usdc,
             )
 
-        trade_id = self._mk_trade_id(strategy=strategy.upper(), combo_key=combo_key, pair=symbol)
+        strategy_up = strategy.upper()
+        if self._use_deterministic_trade_id():
+            trade_id = self._deterministic_trade_id(
+                strategy=strategy_up,
+                combo_key=combo_key,
+                pair=symbol,
+                opportunity=opportunity,
+            )
+        else:
+            trade_id = self._mk_trade_id(strategy=strategy_up, combo_key=combo_key, pair=symbol)
 
         result = {
             "timestamp": datetime.utcnow().isoformat(),
             "trade_id": trade_id,
             "pair": symbol,
             "combo_key": combo_key,
-            "strategy": strategy.upper(),
+            "strategy": strategy_up,
             "buy_exchange": buy_ex,
             "sell_exchange": sell_ex,
             "executed_volume_usdc": round(total_cost, 2),
@@ -1269,19 +1320,43 @@ class DynamicExecutionSimulator:
             max_conc = int(getattr(self, "max_concurrency", 64))
             self._sem = asyncio.Semaphore(max(1, max_conc))
 
-        async with self._sem:
-            t0 = time.time()
-            timeout_each = float(getattr(self, "timeout_each_s", 1.2))
-            split_mode = getattr(self, "split_mode", "EU_ONLY")
-            cb_bonus = 0.0
-            if split_mode == "SPLIT":
-                cb_bonus = float(getattr(self, "cb_coalescing_ms", 10.0)) / 1000.0
-            meta_payload = dict(payload.get("meta") or {})
-            region_vals = {
-                str(meta_payload.get("region") or "").upper(),
-                str(meta_payload.get("region_buy") or "").upper(),
-                str(meta_payload.get("region_sell") or "").upper(),
-            }
+        shadow = bool(payload.get("shadow") or (payload.get("meta") or {}).get("shadow"))
+        shadow_token_acquired = False
+        if shadow:
+            if not hasattr(self, "_shadow_sem"):
+                self._shadow_sem = asyncio.Semaphore(max(1, int(getattr(self, "shadow_max_inflight", 8))))
+            try:
+                await asyncio.wait_for(self._shadow_sem.acquire(), timeout=0.0)
+                shadow_token_acquired = True
+            except Exception:
+                result = {
+                    "ok": False,
+                    "reason": "SIM_SHADOW_BUSY",
+                    "dev_bps": float("inf"),
+                    "fills_ratio": 0.0,
+                    "lat_ms": 0.0,
+                    "guards": {"shadow": True},
+                    "sim_vwap_dev_bps": 1e6,
+                    "fills_expected_ratio": 0.0,
+                    "sim_latency_ms": 0,
+                }
+                self._emit_shadow_event(payload, result)
+                return result
+
+        try:
+            async with self._sem:
+                t0 = time.time()
+                timeout_each = float(getattr(self, "timeout_each_s", 1.2))
+                split_mode = getattr(self, "split_mode", "EU_ONLY")
+                cb_bonus = 0.0
+                if split_mode == "SPLIT":
+                    cb_bonus = float(getattr(self, "cb_coalescing_ms", 10.0)) / 1000.0
+                meta_payload = dict(payload.get("meta") or {})
+                region_vals = {
+                    str(meta_payload.get("region") or "").upper(),
+                    str(meta_payload.get("region_buy") or "").upper(),
+                    str(meta_payload.get("region_sell") or "").upper(),
+                }
             if str(payload.get("type") or meta_payload.get("type") or "").lower() in {
                 "rebalancing",
                 "rebalancing_trade",
@@ -1290,7 +1365,7 @@ class DynamicExecutionSimulator:
                     sim_on_run("rebalancing", blocked=True)
                 except Exception:
                     pass
-                return {
+                result = {
                     "ok": False,
                     "reason": "SIM_REB_UNSUPPORTED_PATH",
                     "dev_bps": float("inf"),
@@ -1304,12 +1379,15 @@ class DynamicExecutionSimulator:
                     "fills_expected_ratio": 0.0,
                     "sim_latency_ms": int(timeout_each * 1000.0),
                 }
+                if shadow:
+                    self._emit_shadow_event(payload, result)
+                return result
             if "JP" in region_vals:
                 try:
                     sim_on_run("standard", blocked=True)
                 except Exception:
                     pass
-                return {
+                result = {
                     "ok": False,
                     "reason": "SIM_REGION_UNSUPPORTED",
                     "dev_bps": float("inf"),
@@ -1320,103 +1398,154 @@ class DynamicExecutionSimulator:
                     "fills_expected_ratio": 0.0,
                     "sim_latency_ms": int(timeout_each * 1000.0),
                 }
+                if shadow:
+                    self._emit_shadow_event(payload, result)
+                return result
 
-    # --- 1) Définition des jobs TT/TM ------------------------------------
-        async def _sim_tt():
-            # Calcule un VWAP dev “taker/taker” sensible à la profondeur
-            return await self._simulate_tt(payload, extra_latency_s=cb_bonus)
+            # --- 1) Définition des jobs TT/TM ------------------------------------
+            async def _sim_tt():
+                # Calcule un VWAP dev “taker/taker” sensible à la profondeur
+                return await self._simulate_tt(payload, extra_latency_s=cb_bonus)
 
-        async def _sim_tm():
-            # Calcule un score maker/taker + probabilité de fill/hedge
-            return await self._simulate_tm(payload, extra_latency_s=cb_bonus)
+            async def _sim_tm():
+                # Calcule un score maker/taker + probabilité de fill/hedge
+                return await self._simulate_tm(payload, extra_latency_s=cb_bonus)
 
-        # --- 2) Run en parallèle + annulation croisée -------------------------
-        tt = asyncio.create_task(_sim_tt())
-        tm = asyncio.create_task(_sim_tm())
-        done, pending = await asyncio.wait({tt, tm}, timeout=timeout_each, return_when=asyncio.ALL_COMPLETED)
+            # --- 2) Run en parallèle + annulation croisée -------------------------
+            tt = asyncio.create_task(_sim_tt())
+            tm = asyncio.create_task(_sim_tm())
+            _done, pending = await asyncio.wait({tt, tm}, timeout=timeout_each, return_when=asyncio.ALL_COMPLETED)
 
-        # Annulation si timeout partiel
-        if pending:
-            for p in pending:
-                p.cancel()
+            # Annulation si timeout partiel
+            if pending:
+                for p in pending:
+                    p.cancel()
 
-        # --- 3) Agrégation des résultats -------------------------------------
-        # --- 3) Agrégation des résultats — STRICT, pas de fallback muet ---
-        notional = {}
-        try:
-            notional = (payload.get("bundle") or {}).get("notional_quote") or {}
-        except Exception:
+            # --- 3) Agrégation des résultats -------------------------------------
+            # --- 3) Agrégation des résultats — STRICT, pas de fallback muet ---
             notional = {}
-        notional_ccy = str(notional.get("ccy") or "")
-        notional_amount = float(notional.get("amount") or 0.0)
-
-        def _extract(task, label: str):
-            # task annulée (timeout partiel) => TIMEOUT explicite
-            if task.cancelled():
-                return {
-                    "ok": False, "reason": f"{label}_TIMEOUT",
-                    "dev_bps": float("inf"), "fills_ratio": 0.0,
-                    "lat_ms": timeout_each * 1000.0,
-                    "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
-                }
             try:
-                r = task.result()
-                # Certaines branches renvoient None (combo non autorisé, depth vide, budget=0)
-                if not r:
+                notional = (payload.get("bundle") or {}).get("notional_quote") or {}
+            except Exception:
+                notional = {}
+            notional_ccy = str(notional.get("ccy") or "")
+            notional_amount = float(notional.get("amount") or 0.0)
+
+            def _extract(task, label: str):
+                # task annulée (timeout partiel) => TIMEOUT explicite
+                if task.cancelled():
                     return {
-                        "ok": False, "reason": f"{label}_NONE_RESULT",
+                        "ok": False, "reason": f"{label}_TIMEOUT",
                         "dev_bps": float("inf"), "fills_ratio": 0.0,
                         "lat_ms": timeout_each * 1000.0,
                         "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
                     }
-                # Normalisation champs attendus
-                r.setdefault("ok", False)
-                r.setdefault("dev_bps", float("inf"))
-                r.setdefault("fills_ratio", 0.0)
-                r.setdefault("lat_ms", timeout_each * 1000.0)
-                r.setdefault("guards", {})
-                r.setdefault("reason", None)
-                if isinstance(r.get("guards"), dict):
-                    r["guards"].setdefault("notional_ccy", notional_ccy)
-                    r["guards"].setdefault("notional_amount", notional_amount)
-                return r
-            except SimulationError as e:
-                return {
-                    "ok": False, "reason": f"{label}_SIM_ERROR",
-                    "dev_bps": float("inf"), "fills_ratio": 0.0,
-                    "lat_ms": timeout_each * 1000.0,
-                    "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
+                try:
+                    r = task.result()
+                    # Certaines branches renvoient None (combo non autorisé, depth vide, budget=0)
+                    if not r:
+                        return {
+                            "ok": False, "reason": f"{label}_NONE_RESULT",
+                            "dev_bps": float("inf"), "fills_ratio": 0.0,
+                            "lat_ms": timeout_each * 1000.0,
+                            "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
+                        }
+                    # Normalisation champs attendus
+                    r.setdefault("ok", False)
+                    r.setdefault("dev_bps", float("inf"))
+                    r.setdefault("fills_ratio", 0.0)
+                    r.setdefault("lat_ms", timeout_each * 1000.0)
+                    r.setdefault("guards", {})
+                    r.setdefault("reason", None)
+                    if isinstance(r.get("guards"), dict):
+                        r["guards"].setdefault("notional_ccy", notional_ccy)
+                        r["guards"].setdefault("notional_amount", notional_amount)
+                    return r
+                except SimulationError:
+                    return {
+                        "ok": False, "reason": f"{label}_SIM_ERROR",
+                        "dev_bps": float("inf"), "fills_ratio": 0.0,
+                        "lat_ms": timeout_each * 1000.0,
+                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
+                    }
+                except Exception as e:
+                    # Pas de “pass” : on expose la classe d’erreur
+                    return {
+                        "ok": False, "reason": f"{label}_TASK_ERROR:{e.__class__.__name__}",
+                        "dev_bps": float("inf"), "fills_ratio": 0.0,
+                        "lat_ms": timeout_each * 1000.0,
+                        "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
+                    }
+
+            tt_r = _extract(tt, "TT")
+            tm_r = _extract(tm, "TM")
+
+            ok_tt = bool(tt_r.get("ok", False))
+            ok_tm = bool(tm_r.get("ok", False))
+
+            tm_blocked_ioc = tm_r.get("reason") == "TM_BLOCKED_IOC_ONLY"
+
+            if tm_blocked_ioc and not ok_tt:
+                dev_bps = float(tm_r.get("dev_bps", float("inf")))
+                fills_ratio = float(tm_r.get("fills_ratio", 0.0))
+                sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
+                try:
+                    sim_on_run("standard", blocked=True)
+                except Exception:
+                    pass
+                if not math.isfinite(dev_bps):
+                    dev_bps = 1e6
+                result = {
+                    "ok": False,
+                    "reason": tm_r.get("reason"),
+                    "dev_bps": float(dev_bps),
+                    "fills_ratio": float(fills_ratio),
+                    "lat_ms": float(sim_lat_ms),
+                    "sim_vwap_dev_bps": float(dev_bps if math.isfinite(dev_bps) else 1e6),
+                    "fills_expected_ratio": float(fills_ratio),
+                    "sim_latency_ms": sim_lat_ms,
+                    "guards": {
+                        "tt_ok": ok_tt,
+                        "tm_ok": ok_tm,
+                        "tt_reason": tt_r.get("reason"),
+                        "tm_reason": tm_r.get("reason"),
+                        "split_mode": split_mode,
+                        "notional_ccy": notional_ccy,
+                        "notional_amount": notional_amount,
+                    },
                 }
-            except Exception as e:
-                # Pas de “pass” : on expose la classe d’erreur
-                return {
-                    "ok": False, "reason": f"{label}_TASK_ERROR:{e.__class__.__name__}",
-                    "dev_bps": float("inf"), "fills_ratio": 0.0,
-                    "lat_ms": timeout_each * 1000.0,
-                    "guards": {"notional_ccy": notional_ccy, "notional_amount": notional_amount},
-                }
+                if shadow:
+                    self._emit_shadow_event(payload, result)
+                return result
 
-        tt_r = _extract(tt, "TT")
-        tm_r = _extract(tm, "TM")
+            # Sélection conservatrice : si au moins une branche OK, on prend celle au dev_bps minimal.
+            if ok_tt or ok_tm:
+                if ok_tt and (not ok_tm or float(tt_r.get("dev_bps", float("inf"))) <= float(
+                        tm_r.get("dev_bps", float("inf")))):
+                    chosen = tt_r
+                else:
+                    chosen = tm_r
+                dev_bps = float(chosen.get("dev_bps", float("inf")))
+                fills_ratio = float(chosen.get("fills_ratio", 0.0))
+                reason = None  # succès explicite
+            else:
+                # Double échec → reason concaténée, jamais “SIM_TIMEOUT” générique
+                dev_bps = float("inf")
+                fills_ratio = 0.0
+                reason = f"TT:{tt_r.get('reason')}|TM:{tm_r.get('reason')}"
 
-        ok_tt = bool(tt_r.get("ok", False))
-        ok_tm = bool(tm_r.get("ok", False))
-
-        tm_blocked_ioc = tm_r.get("reason") == "TM_BLOCKED_IOC_ONLY"
-
-        if tm_blocked_ioc and not ok_tt:
-            dev_bps = float(tm_r.get("dev_bps", float("inf")))
-            fills_ratio = float(tm_r.get("fills_ratio", 0.0))
             sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
-            try:
-                sim_on_run("standard", blocked=True)
-            except Exception:
-                pass
             if not math.isfinite(dev_bps):
                 dev_bps = 1e6
-            return {
-                "ok": False,
-                "reason": tm_r.get("reason"),
+            if reason:
+                try:
+                    sim_on_run("standard", blocked=True)
+                except Exception:
+                    pass
+
+            result = {
+                "ok": reason is None and math.isfinite(dev_bps),
+                "reason": reason,
                 "dev_bps": float(dev_bps),
                 "fills_ratio": float(fills_ratio),
                 "lat_ms": float(sim_lat_ms),
@@ -1431,53 +1560,14 @@ class DynamicExecutionSimulator:
                     "split_mode": split_mode,
                     "notional_ccy": notional_ccy,
                     "notional_amount": notional_amount,
-                },
+                }
             }
-
-        # Sélection conservatrice : si au moins une branche OK, on prend celle au dev_bps minimal.
-        if ok_tt or ok_tm:
-            if ok_tt and (not ok_tm or float(tt_r.get("dev_bps", float("inf"))) <= float(
-                    tm_r.get("dev_bps", float("inf")))):
-                chosen = tt_r
-            else:
-                chosen = tm_r
-            dev_bps = float(chosen.get("dev_bps", float("inf")))
-            fills_ratio = float(chosen.get("fills_ratio", 0.0))
-            reason = None  # succès explicite
-        else:
-            # Double échec → reason concaténée, jamais “SIM_TIMEOUT” générique
-            dev_bps = float("inf")
-            fills_ratio = 0.0
-            reason = f"TT:{tt_r.get('reason')}|TM:{tm_r.get('reason')}"
-
-        sim_lat_ms = int((time.time() - t0 + cb_bonus) * 1000.0)
-        if not math.isfinite(dev_bps):
-            dev_bps = 1e6
-        if reason:
-            try:
-                sim_on_run("standard", blocked=True)
-            except Exception:
-                pass
-
-        return {
-            "ok": reason is None and math.isfinite(dev_bps),
-            "reason": reason,
-            "dev_bps": float(dev_bps),
-            "fills_ratio": float(fills_ratio),
-            "lat_ms": float(sim_lat_ms),
-            "sim_vwap_dev_bps": float(dev_bps if math.isfinite(dev_bps) else 1e6),
-            "fills_expected_ratio": float(fills_ratio),
-            "sim_latency_ms": sim_lat_ms,
-            "guards": {
-                "tt_ok": ok_tt,
-                "tm_ok": ok_tm,
-                "tt_reason": tt_r.get("reason"),
-                "tm_reason": tm_r.get("reason"),
-                "split_mode": split_mode,
-                "notional_ccy": notional_ccy,
-                "notional_amount": notional_amount,
-            }
-        }
+            if shadow:
+                self._emit_shadow_event(payload, result)
+            return result
+        finally:
+            if shadow_token_acquired:
+                self._shadow_sem.release()
 
     # ------------------------- Helpers Maker -------------------------
     def quote_for_maker(self, side: str, levels: List[Level], *, depth_clip: int = 5, skew_bps: float = 1.0) -> Optional[float]:
