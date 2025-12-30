@@ -35,7 +35,7 @@ from modules.logger_historique.logger_historique_manager import LoggerHistorique
 from modules.pairs_discovery import discover_pairs_3cex
 from modules.websockets_clients import WebSocketExchangeClient
 from modules.slippage_handler import SlippageHandler
-from modules.market_data_router import MarketDataRouter
+from modules.market_data_router import MarketDataRouter, WSFanInMux
 from modules.volatility_monitor import VolatilityMonitor
 from modules.opportunity_scanner import OpportunityScanner
 from modules.private_ws_hub import PrivateWSHub
@@ -968,17 +968,78 @@ class Boot:
         # --- 3.1) WS Publics : instanciation identique à ta version
 
         pairs = list(self.ctx.active_pairs)
-        self.ctx.ws_public = WebSocketExchangeClient(
-            cfg=self.cfg,
-            url="multi",
-            pairs=pairs,
-            out_queue=self.ctx.in_queue,
-            pair_mapping=self.ctx.pairs_map,
-            enabled_exchanges=list(
-                getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"])
-            ),
-            config=self.cfg,
+        enabled_exchanges = list(
+            getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"])
         )
+        router_cfg = getattr(self.cfg, "router", None)
+        shards_cfg: Dict[str, int] = {}
+        raw_shards = getattr(router_cfg, "ws_shards_by_exchange", None) or {}
+        try:
+            shards_cfg = {str(k).upper(): max(1, int(v or 1)) for k, v in raw_shards.items()}
+        except Exception:
+            shards_cfg = {}
+        if not shards_cfg:
+            legacy_shards = getattr(router_cfg, "shards_per_exchange", None)
+            if isinstance(legacy_shards, (list, tuple)) and len(legacy_shards) == 3:
+                for ex, val in zip(["BINANCE", "BYBIT", "COINBASE"], legacy_shards):
+                    try:
+                        shards_cfg[ex] = max(1, int(val or 1))
+                    except Exception:
+                        shards_cfg[ex] = 1
+        for ex in enabled_exchanges:
+            shards_cfg.setdefault(str(ex).upper(), 1)
+
+        use_mux = any((shards_cfg.get(str(ex).upper(), 1) or 1) > 1 for ex in enabled_exchanges)
+        ws_clients: List[Any] = []
+        mux: WSFanInMux | None = None
+
+        def _split_pairs(seq: List[str], n: int) -> List[List[str]]:
+            if n <= 1:
+                return [list(seq)]
+            buckets: List[List[str]] = [[] for _ in range(n)]
+            for idx, item in enumerate(seq):
+                buckets[idx % n].append(item)
+            return buckets
+
+        if use_mux:
+            mux = WSFanInMux(self.ctx.in_queue, poll_ms=int(getattr(router_cfg, "mux_poll_ms", 5)))
+            self.ctx.ws_mux = mux
+            pair_mapping = getattr(self.ctx, "pairs_map", {}) or {}
+            for ex in enabled_exchanges:
+                ex_pairs = [p for p in pairs if pair_mapping.get(p, {}).get(str(ex).lower())]
+                shard_count = max(1, int(shards_cfg.get(str(ex).upper(), 1)))
+                for idx, subset in enumerate(_split_pairs(ex_pairs, shard_count)):
+                    shard_name = f"{str(ex).upper()}-S{idx + 1}"
+                    shard_queue: asyncio.Queue = asyncio.Queue(maxsize=inq_len)
+                    mux.register(ex, shard_name, shard_queue)
+                    ws_clients.append(
+                        WebSocketExchangeClient(
+                            cfg=self.cfg,
+                            url="multi",
+                            pairs=subset,
+                            out_queue=shard_queue,
+                            pair_mapping=self.ctx.pairs_map,
+                            enabled_exchanges=[ex],
+                            config=self.cfg,
+                            shard_id=shard_name,
+                        )
+                    )
+        else:
+            self.ctx.ws_public = WebSocketExchangeClient(
+                cfg=self.cfg,
+                url="multi",
+                pairs=pairs,
+                out_queue=self.ctx.in_queue,
+                pair_mapping=self.ctx.pairs_map,
+                enabled_exchanges=enabled_exchanges,
+                config=self.cfg,
+            )
+            ws_clients.append(self.ctx.ws_public)
+            self.ctx.ws_mux = None
+
+        self.ctx.ws_public_clients = ws_clients
+        if ws_clients and not getattr(self.ctx, "ws_public", None):
+            self.ctx.ws_public = ws_clients[0]
 
         # Events de readiness (créés si absents)
         if not hasattr(self, "ready_ws"):
@@ -1038,46 +1099,77 @@ class Boot:
         else:
             self.log.info("[Boot] Public pipeline tasks deferred (strict order)")
 
-        async def _start_public_pipeline_tasks(
-                self,
-                pairs: Optional[List[str]] = None,
-                combos: Optional[List[Tuple[str, str]]] = None,
-        ) -> None:
-            if self._public_pipeline_started:
-                return
-            if not pairs:
-                pairs = list(getattr(self.ctx, "active_pairs", []) or [])
+    async def _start_public_pipeline_tasks(
+            self,
+            pairs: Optional[List[str]] = None,
+            combos: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
+        if self._public_pipeline_started:
+            return
+        if not pairs:
+            pairs = list(getattr(self.ctx, "active_pairs", []) or [])
+        if not combos:
+            combos = getattr(getattr(self.cfg, "router", object()), "combos", None)
             if not combos:
-                combos = getattr(getattr(self.cfg, "router", object()), "combos", None)
-                if not combos:
-                    combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
+                combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
+        _raw = getattr(self.cfg, "WS_READY_TIMEOUT_S", None)
+        ws_ready_to = float(
+            5.0
+            if (
+                    _raw is None
+                    or (isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})
+            )
+            else _raw
+        )
 
-            # Lance WS en tâche non-bloquante
-            _raw = getattr(self.cfg, "WS_READY_TIMEOUT_S", None)
-            ws_ready_to = float(
-                5.0 if (_raw is None or (
-                            isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})) else _raw)
+        ws_clients = list(getattr(self.ctx, "ws_public_clients", []) or [])
+        if not ws_clients and getattr(self.ctx, "ws_public", None):
+            ws_clients = [self.ctx.ws_public]
 
-            self._ws_task = asyncio.create_task(self.ctx.ws_public.start(), name="boot-ws-start")
+        mux = getattr(self.ctx, "ws_mux", None)
+        if mux is not None:
+            try:
+                self._ws_mux_task = asyncio.create_task(
+                    mux.start(getattr(self.ctx.router, "note_ws_reconnect", None)), name="boot-ws-mux"
+                )
+            except Exception:
+                self._ws_mux_task = asyncio.create_task(
+                    mux.start(None), name="boot-ws-mux"
+                )
+        else:
+            self._ws_mux_task = None
+        self._ws_tasks = []
+        for idx, client in enumerate(ws_clients):
+            self._ws_tasks.append(asyncio.create_task(client.start(), name=f"boot-ws-start-{idx}"))
+        self._ws_task = self._ws_tasks[0] if len(self._ws_tasks) == 1 else None
+
+        for client in ws_clients:
 
             try:
-                if hasattr(self.ctx.ws_public, "ready_event"):
-                    await asyncio.wait_for(self.ctx.ws_public.ready_event.wait(), timeout=ws_ready_to)
+                if hasattr(client, "ready_event"):
+                    await asyncio.wait_for(client.ready_event.wait(), timeout=ws_ready_to)
                 else:
                     await asyncio.sleep(0.2)
             except asyncio.TimeoutError:
-                self.log.warning("[Boot] WS public pas prêt après %.1fs, on continue.", ws_ready_to)
+                self.log.warning(
+                    "[Boot] WS public pas prêt après %.1fs, on continue.", ws_ready_to
+                )
 
-            self.ready_ws.set()
-            self._mark_stage("ws_public_started")
-            self.log.info("[Boot] WS publics: %d pairs", len(pairs))
+        self.ready_ws.set()
+        self._mark_stage("ws_public_started")
+        self.log.info("[Boot] WS publics: %d pairs (clients=%d)", len(pairs), len(ws_clients))
 
-        # Lance Router en tâche non-bloquante
         self._router_task = asyncio.create_task(self.ctx.router.start(), name="boot-router-start")
 
         _raw = getattr(self.cfg, "ROUTER_READY_TIMEOUT_S", None)
         router_ready_to = float(
-            5.0 if (_raw is None or (isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})) else _raw)
+            5.0
+            if (
+                    _raw is None
+                    or (isinstance(_raw, str) and _raw.strip().lower() in {"", "none", "null"})
+            )
+            else _raw
+        )
         try:
             if hasattr(self.ctx.router, "ready_event"):
                 await asyncio.wait_for(self.ctx.router.ready_event.wait(), timeout=router_ready_to)
@@ -1773,9 +1865,17 @@ class Boot:
                 await asyncio.wait_for(self.ctx.router.stop(), timeout=to_router)
 
         # 2) Stop WS public (idem)
-        if getattr(self.ctx, "ws_public", None) and hasattr(self.ctx.ws_public, "stop"):
+        ws_clients = list(getattr(self.ctx, "ws_public_clients", []) or [])
+        if not ws_clients and getattr(self.ctx, "ws_public", None):
+            ws_clients = [self.ctx.ws_public]
+        for client in ws_clients:
+            if hasattr(client, "stop"):
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.stop(), timeout=to_ws)
+        mux = getattr(self.ctx, "ws_mux", None)
+        if mux is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(self.ctx.ws_public.stop(), timeout=to_ws)
+                mux.stop()
 
         # 3) Annulation défensive des tasks de bootstrap s'il en reste
         tasks = []
@@ -1785,6 +1885,15 @@ class Boot:
                 t.cancel()
                 tasks.append(t)
                 setattr(self, attr, None)
+        for t in getattr(self, "_ws_tasks", []) or []:
+            if t:
+                t.cancel()
+                tasks.append(t)
+        if getattr(self, "_ws_mux_task", None):
+            t = getattr(self, "_ws_mux_task")
+            t.cancel()
+            tasks.append(t)
+            self._ws_mux_task = None
         if tasks:
             with contextlib.suppress(Exception):
                 await asyncio.gather(*tasks, return_exceptions=True)

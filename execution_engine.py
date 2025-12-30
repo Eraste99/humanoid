@@ -1523,10 +1523,37 @@ class ExecutionEngine:
 
         # --- Rate limiting par CEX (utilise ta classe TokenBucket existante) ---
         # au lieu de self._rl_binance_order = TokenBucket(...):
-        self._rl_binance_order = self.rl.bucket_for("BINANCE", "order")
-        self._rl_bybit_order = self.rl.bucket_for("BYBIT", "order")
-        self._rl_coinbase_order = self.rl.bucket_for("COINBASE", "order")
+        self._rl_binance_order_hedge = self.rl.bucket_for("BINANCE", "order_hedge")
+        self._rl_binance_order_cancel = self.rl.bucket_for("BINANCE", "order_cancel")
+        self._rl_binance_order_maker = self.rl.bucket_for("BINANCE", "order_maker")
+        self._rl_binance_order = self._rl_binance_order_maker
 
+        self._rl_bybit_order_hedge = self.rl.bucket_for("BYBIT", "order_hedge")
+        self._rl_bybit_order_cancel = self.rl.bucket_for("BYBIT", "order_cancel")
+        self._rl_bybit_order_maker = self.rl.bucket_for("BYBIT", "order_maker")
+        self._rl_bybit_order = self._rl_bybit_order_maker
+
+        self._rl_coinbase_order_hedge = self.rl.bucket_for("COINBASE", "order_hedge")
+        self._rl_coinbase_order_cancel = self.rl.bucket_for("COINBASE", "order_cancel")
+        self._rl_coinbase_order_maker = self.rl.bucket_for("COINBASE", "order_maker")
+        self._rl_coinbase_order = self._rl_coinbase_order_maker
+
+        ex_caps = getattr(self.rl, "_rate_ex", {}) or {}
+        ex_kind = getattr(self.rl, "_rate_ex_kind", {}) or {}
+        for ex in ("BINANCE", "BYBIT", "COINBASE"):
+            lane_rates = ex_kind.get(ex, {}) or {}
+            if not lane_rates:
+                continue
+            total_lane = float(lane_rates.get("order_hedge", 0) or 0) + float(
+                lane_rates.get("order_cancel", 0) or 0) + float(lane_rates.get("order_maker", 0) or 0)
+            cap = ex_caps.get(ex)
+            if cap is None:
+                raise ValueError(f"RL lanes configured for {ex} but missing hard cap (rl.hard_caps_rps_by_exchange)")
+            if total_lane > float(cap) + 1e-9:
+                logger.critical(
+                    "[Engine] RL lanes over hard cap exchange=%s cap=%s total_lanes=%s", ex, cap, total_lane
+                )
+                raise ValueError(f"RL lanes exceed hard cap for {ex}: total_lane={total_lane} cap={cap}")
         # --- Listeners / history sink ---
         self.listeners: List[Dict[str, Any]] = []
         self.history_sink: Optional[Any] = None
@@ -1829,10 +1856,49 @@ class ExecutionEngine:
         lim_byb = _limit_for("BYBIT", "inflight_max_bybit", "INFLIGHT_MAX_BYBIT", 8)
         lim_cb = _limit_for("COINBASE", "inflight_max_coinbase", "INFLIGHT_MAX_COINBASE", 6)
 
+        def _reserved(profile_map: Dict[str, Dict[str, int]], ex: str, default: int) -> int:
+            try:
+                by_profile = profile_map.get(self._capital_profile, {}) or profile_map.get("LARGE", {}) or {}
+                return int(by_profile.get(ex, default))
+            except Exception:
+                return int(default)
+
+        hedge_res: Dict[str, int] = {}
+        cancel_res: Dict[str, int] = {}
+        try:
+            engine_cfg = getattr(self, "cfg", None)
+            engine_cfg = getattr(engine_cfg, "engine", engine_cfg)
+            hedge_res = getattr(engine_cfg, "inflight_reserved_hedge_by_exchange_by_profile", {}) or {}
+            cancel_res = getattr(engine_cfg, "inflight_reserved_cancel_by_exchange_by_profile", {}) or {}
+        except Exception:
+            hedge_res, cancel_res = {}, {}
+
+        def _caps_for(ex: str, total: int) -> tuple[int, int, int]:
+            hedge_cap = max(1, _reserved(hedge_res, ex, 1))
+            cancel_cap = max(0, _reserved(cancel_res, ex, 1))
+            maker_cap = max(1, total - hedge_cap - cancel_cap)
+            if hedge_cap + cancel_cap >= total:
+                maker_cap = 1
+                if hedge_cap + cancel_cap > total:
+                    logger.critical(
+                        "[Engine] inflight lanes over-allocated exchange=%s total=%s hedge=%s cancel=%s", ex, total,
+                        hedge_cap,
+                        cancel_cap,
+                    )
+            hedge_cap = min(total, max(1, hedge_cap))
+            cancel_cap = min(total, max(0, cancel_cap))
+            maker_cap = max(1, maker_cap)
+            return hedge_cap, cancel_cap, maker_cap
+
+        caps = {
+            "BINANCE": _caps_for("BINANCE", max(1, lim_bin)),
+            "BYBIT": _caps_for("BYBIT", max(1, lim_byb)),
+            "COINBASE": _caps_for("COINBASE", max(1, lim_cb)),
+        }
         self._sem_inflight = {
-            "BINANCE": asyncio.Semaphore(max(1, lim_bin)),
-            "BYBIT": asyncio.Semaphore(max(1, lim_byb)),
-            "COINBASE": asyncio.Semaphore(max(1, lim_cb)),
+            "hedge": {ex: asyncio.Semaphore(cap[0]) for ex, cap in caps.items()},
+            "cancel": {ex: asyncio.Semaphore(cap[1]) for ex, cap in caps.items()},
+            "maker": {ex: asyncio.Semaphore(cap[2]) for ex, cap in caps.items()},
         }
         self._inflight_curr = {"BINANCE": 0, "BYBIT": 0, "COINBASE": 0}
 
@@ -2508,17 +2574,20 @@ class ExecutionEngine:
 
 
     @asynccontextmanager
-    async def _inflight_scope(self, exchange: str):
+    async def _inflight_scope(self, exchange: str, *, lane: str = "maker", meta: Optional[Dict[str, Any]] = None):
         """
         Semaphore par CEX (plafond hard) + gauge in-flight robuste.
         """
         ex = (exchange or "").upper()
+        lane_key = str(lane or "maker").lower()
         semaphores = getattr(self, "_sem_inflight", {}) or {}
-        sem = semaphores.get(ex)
+        sem = (semaphores.get(lane_key) or {}).get(ex)
         if not sem:
             yield
             return
+        start = time.perf_counter()
         await sem.acquire()
+        inflight_wait_ms = (time.perf_counter() - start) * 1000.0
         try:
             self._inflight_curr = getattr(self, "_inflight_curr", {})
             self._inflight_curr[ex] = int(self._inflight_curr.get(ex, 0)) + 1
@@ -2527,6 +2596,31 @@ class ExecutionEngine:
             except Exception as e:
                 ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL.labels(exchange=ex).inc()
                 logging.getLogger("ExecutionEngine").debug("[Engine] INFLIGHT_GAUGE.set failed: %s", e, exc_info=False)
+            if inflight_wait_ms > 0:
+                try:
+                    warn_thresh = float(getattr(self.config, "inflight_wait_warn_ms", 500.0))
+                except Exception:
+                    warn_thresh = 500.0
+                lvl = logging.WARN if inflight_wait_ms >= warn_thresh else logging.INFO
+                logging.getLogger(__name__).log(
+                    lvl,
+                    "[Engine] inflight_wait lane=%s ex=%s inflight_wait_ms=%.2f",
+                    lane,
+                    ex,
+                    inflight_wait_ms,
+                    extra={
+                        "lane": lane,
+                        "exchange": ex,
+                        "inflight_wait_ms": inflight_wait_ms,
+                        "rl_wait_ms": 0.0,
+                        "account_alias": str((meta or {}).get("account_alias") or "").upper(),
+                        "cid": (meta or {}).get("client_order_id") or (meta or {}).get("cid"),
+                        "trace_id": (meta or {}).get("trace_id"),
+                        "bundle_id": (meta or {}).get("bundle_id"),
+                        "branch": str((meta or {}).get("branch") or "").upper(),
+                        "capital_profile": str((meta or {}).get("capital_profile") or "").upper(),
+                    },
+                )
             yield
         finally:
             try:
@@ -2921,9 +3015,19 @@ class ExecutionEngine:
             if ex and od:
                 await self._place_one(ex, od, cid, meta)
             return
-        for leg in legs:
+        def _lane_for_leg(lg: dict) -> str:
+            leg_meta = lg.get("meta") or meta or {}
+            return self._lane_from_meta(leg_meta, maker_flag=bool(lg.get("post_only")), action=lg.get("action"))
+
+        priority = {"hedge": 0, "cancel": 1, "maker": 2}
+        ordered_legs = sorted(legs, key=lambda lg: priority.get(_lane_for_leg(lg), 2))
+        for leg in ordered_legs:
             ex = leg.get("exchange") or leg.get("ex") or meta.get("exchange")
             od = leg.get("order") or leg
+            try:
+                leg.setdefault("meta", {}).setdefault("lane", _lane_for_leg(leg))
+            except Exception:
+                pass
             if not ex or not od:
                 continue
             await self._place_one(ex, od, cid, meta)
@@ -2946,7 +3050,9 @@ class ExecutionEngine:
 
         branch = (meta.get("branch") or "").upper()
         is_hedge = self._is_fast_lane_meta(meta) or kind == "TAKER" or branch == "TT"
-
+        lane = self._lane_from_meta(meta, maker_flag=bool(order.get("post_only")), action=None)
+        if is_hedge:
+            lane = "hedge"
         # RL CEX (si présent)
         rl = None
         if ex == "BINANCE":
@@ -2976,13 +3082,13 @@ class ExecutionEngine:
                     pass
 
         # Plafond in-flight (local) + place natif
-        async with self._inflight_scope(ex):
+        async with self._inflight_scope(ex, lane=lane, meta=meta):
             if ex == "BINANCE":
-                await self._binance_limit(order, meta)
+                await self._binance_limit(order, meta, lane=lane)
             elif ex == "BYBIT":
-                await self._bybit_limit(order, meta)
+                await self._bybit_limit(order, meta, lane=lane)
             elif ex == "COINBASE":
-                await self._coinbase_limit(order, meta)
+                await self._coinbase_limit(order, meta, lane=lane)
             else:
                 raise ValueError(f"Unsupported exchange {ex}")
 
@@ -5111,6 +5217,17 @@ class ExecutionEngine:
                 or bool(hedge_tag)
         )
 
+    def _lane_from_meta(self, meta: Dict[str, Any], *, maker_flag: bool = False, action: Optional[str] = None) -> str:
+        lane_action = str(action or meta.get("action") or "").lower()
+        if lane_action == "cancel":
+            return "cancel"
+        if self._is_fast_lane_meta(meta) or str(meta.get("risk_effect") or "").lower() == "hedge" or meta.get(
+                "is_hedge"):
+            return "hedge"
+        if str(meta.get("flow_kind") or "").lower() == "hedge":
+            return "hedge"
+        maker_hint = maker_flag or bool(meta.get("maker")) or bool(meta.get("post_only"))
+        return "maker" if maker_hint else "maker"
     def _is_low_priority_meta(self, meta: Dict[str, Any]) -> bool:
         kind = str(meta.get("kind") or "").upper()
         flow_kind = str(meta.get("flow_kind") or "").lower()
@@ -5160,11 +5277,61 @@ class ExecutionEngine:
         reason = mapping.get(by_u, "MM_PREEMPTED")
         return normalize_reason_code(reason) or reason
 
-    async def _acquire_rl(self, bucket, exchange: str) -> bool:
+    def _rl_for(self, exchange: str, lane: str):
+        ex = (exchange or "").upper()
+        lane_k = str(lane or "maker").lower()
+        if ex == "BINANCE":
+            if lane_k == "hedge":
+                return getattr(self, "_rl_binance_order_hedge", None)
+            if lane_k == "cancel":
+                return getattr(self, "_rl_binance_order_cancel", None)
+            return getattr(self, "_rl_binance_order_maker", None) or getattr(self, "_rl_binance_order", None)
+        if ex == "BYBIT":
+            if lane_k == "hedge":
+                return getattr(self, "_rl_bybit_order_hedge", None)
+            if lane_k == "cancel":
+                return getattr(self, "_rl_bybit_order_cancel", None)
+            return getattr(self, "_rl_bybit_order_maker", None) or getattr(self, "_rl_bybit_order", None)
+        if ex == "COINBASE":
+            if lane_k == "hedge":
+                return getattr(self, "_rl_coinbase_order_hedge", None)
+            if lane_k == "cancel":
+                return getattr(self, "_rl_coinbase_order_cancel", None)
+            return getattr(self, "_rl_coinbase_order_maker", None) or getattr(self, "_rl_coinbase_order", None)
+        return None
+
+    async def _acquire_rl(self, bucket, exchange: str, *, lane: str = "maker", meta: Optional[Dict[str, Any]] = None) -> bool:
         if bucket is None:
             return True
         try:
+            start = time.perf_counter()
             await bucket.acquire()
+            rl_wait_ms = (time.perf_counter() - start) * 1000.0
+            if rl_wait_ms > 0:
+                try:
+                    warn_thresh = float(getattr(self.config, "rl_wait_warn_ms", 500.0))
+                except Exception:
+                    warn_thresh = 500.0
+                lvl = logging.WARN if rl_wait_ms >= warn_thresh else logging.INFO
+                logging.getLogger(__name__).log(
+                    lvl,
+                    "[Engine] rl_wait lane=%s ex=%s rl_wait_ms=%.2f",
+                    lane,
+                    exchange,
+                    rl_wait_ms,
+                    extra={
+                        "lane": lane,
+                        "exchange": exchange,
+                        "rl_wait_ms": rl_wait_ms,
+                        "inflight_wait_ms": 0.0,
+                        "account_alias": str((meta or {}).get("account_alias") or "").upper(),
+                        "cid": (meta or {}).get("client_order_id") or (meta or {}).get("cid"),
+                        "trace_id": (meta or {}).get("trace_id"),
+                        "bundle_id": (meta or {}).get("bundle_id"),
+                        "branch": str((meta or {}).get("branch") or "").upper(),
+                        "capital_profile": str((meta or {}).get("capital_profile") or "").upper(),
+                    },
+                )
             return True
         except asyncio.CancelledError:
             raise
@@ -9265,9 +9432,27 @@ class ExecutionEngine:
     # ----- Binance -----
     async def _binance_limit(self: "ExecutionEngine", symbol: str, side: str, qty: float, price: float,
                              client_id: str, *,
-                             tif: str = "GTC", maker: bool = False, keys: Dict[str, str] = None):
+                             tif: str = "GTC", maker: bool = False, keys: Dict[str, str] = None,
+                             lane: str = "maker", meta: Optional[Dict[str, Any]] = None):
         assert self._session, "ClientSession not started"
-        if not await self._acquire_rl(self._rl_binance_order, "BINANCE"):
+        if isinstance(symbol, dict):
+            order_dict = symbol
+            meta = meta or (side if isinstance(side, dict) else None) or {}
+            symbol = order_dict.get("symbol") or order_dict.get("pair") or ""
+            side = order_dict.get("side", side)
+            try:
+                qty = float(order_dict.get("quantity") or order_dict.get("qty") or order_dict.get("size") or qty)
+            except Exception:
+                qty = qty
+            try:
+                price = float(order_dict.get("price") or price)
+            except Exception:
+                price = price
+            client_id = order_dict.get("clientOrderId") or order_dict.get("client_order_id") or client_id
+            tif = order_dict.get("time_in_force") or tif
+            maker = bool(order_dict.get("post_only", maker))
+        if not await self._acquire_rl(self._rl_for("BINANCE", lane) or self._rl_binance_order, "BINANCE", lane=lane,
+                                      meta=meta):
             raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.binance.com/api/v3/order"
         ts = int(time.time() * 1000)
@@ -9293,9 +9478,10 @@ class ExecutionEngine:
             return await resp.json()
 
     async def _binance_cancel(self: "ExecutionEngine", symbol: str, client_id: Optional[str] = None,
-                              order_id: Optional[str] = None, *, keys: Dict[str, str] | None = None):
+                              order_id: Optional[str] = None, *, keys: Dict[str, str] | None = None,
+                              lane: str = "cancel", meta: Optional[Dict[str, Any]] = None):
         assert self._session, "ClientSession not started"
-        if not await self._acquire_rl(self._rl_binance_order, "BINANCE"):
+        if not await self._acquire_rl(self._rl_for("BINANCE", lane) or self._rl_binance_order, "BINANCE", lane=lane, meta=meta):
             raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.binance.com/api/v3/order"
         ts = int(time.time() * 1000)
@@ -9318,9 +9504,27 @@ class ExecutionEngine:
     # ----- Bybit v5 (Spot) -----
     async def _bybit_limit(self: "ExecutionEngine", symbol: str, side: str, qty: float, price: float,
                            client_id: str,
-                           *, tif: str = "GTC", maker: bool = False, keys: Dict[str, str] = None):
+                           *, tif: str = "GTC", maker: bool = False, keys: Dict[str, str] = None,
+                           lane: str = "maker", meta: Optional[Dict[str, Any]] = None):
         assert self._session, "ClientSession not started"
-        if not await self._acquire_rl(self._rl_bybit_order, "BYBIT"):
+        if isinstance(symbol, dict):
+            order_dict = symbol
+            meta = meta or (side if isinstance(side, dict) else None) or {}
+            symbol = order_dict.get("symbol") or order_dict.get("pair") or ""
+            side = order_dict.get("side", side)
+            try:
+                qty = float(order_dict.get("quantity") or order_dict.get("qty") or order_dict.get("size") or qty)
+            except Exception:
+                qty = qty
+            try:
+                price = float(order_dict.get("price") or price)
+            except Exception:
+                price = price
+            client_id = order_dict.get("clientOrderId") or order_dict.get("client_order_id") or client_id
+            tif = order_dict.get("time_in_force") or tif
+            maker = bool(order_dict.get("post_only", maker))
+        if not await self._acquire_rl(self._rl_for("BYBIT", lane) or self._rl_bybit_order, "BYBIT", lane=lane,
+                                      meta=meta):
             raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.bybit.com/v5/order/create"
         ts = str(int(time.time() * 1000))
@@ -9354,9 +9558,10 @@ class ExecutionEngine:
             return await resp.json()
 
     async def _bybit_cancel(self: "ExecutionEngine", symbol: str, client_id: Optional[str] = None,
-                            order_id: Optional[str] = None, *, keys: Dict[str, str] | None = None):
+                            order_id: Optional[str] = None, *, keys: Dict[str, str] | None = None,
+                            lane: str = "cancel", meta: Optional[Dict[str, Any]] = None):
         assert self._session, "ClientSession not started"
-        if not await self._acquire_rl(self._rl_bybit_order, "BYBIT"):
+        if not await self._acquire_rl(self._rl_for("BYBIT", lane) or self._rl_bybit_order, "BYBIT", lane=lane, meta=meta):
             raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
         url = "https://api.bybit.com/v5/order/cancel"
         ts = str(int(time.time() * 1000))
@@ -9396,7 +9601,9 @@ class ExecutionEngine:
             *,
             tif="GTC",
             maker=False,
-            keys=None
+            keys=None,
+            lane: str = "maker",
+            meta: Optional[Dict[str, Any]] = None,
     ):
         """
         Coinbase Advanced Trade (brokerage) — création d'ordre LIMIT.
@@ -9412,7 +9619,24 @@ class ExecutionEngine:
             return {"status": "simulated", "exchange": "Coinbase", "clientOrderId": client_id}
 
         assert self._session, "ClientSession not started"
-        if not await self._acquire_rl(self._rl_coinbase_order, "COINBASE"):
+        if isinstance(symbol, dict):
+            order_dict = symbol
+            meta = meta or (side if isinstance(side, dict) else None) or {}
+            symbol = order_dict.get("symbol") or order_dict.get("product_id") or order_dict.get("pair") or ""
+            side = order_dict.get("side", side)
+            try:
+                qty = float(order_dict.get("quantity") or order_dict.get("qty") or order_dict.get("size") or qty)
+            except Exception:
+                qty = qty
+            try:
+                price = float(order_dict.get("price") or price)
+            except Exception:
+                price = price
+            client_id = order_dict.get("clientOrderId") or order_dict.get("client_order_id") or client_id
+            tif = order_dict.get("time_in_force") or tif
+            maker = bool(order_dict.get("post_only", maker))
+        if not await self._acquire_rl(self._rl_for("COINBASE", lane) or self._rl_coinbase_order, "COINBASE", lane=lane,
+                                      meta=meta):
             raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
 
         # Normalisation du product_id (BTCUSDC -> BTC-USDC) si besoin
@@ -9490,13 +9714,13 @@ class ExecutionEngine:
             return await resp.json()
 
     async def _coinbase_cancel(self, symbol: str, client_id: str | None = None, order_id: str | None = None, *,
-                               keys: dict | None = None):
+                               keys: dict | None = None, lane: str = "cancel", meta: Optional[Dict[str, Any]] = None):
         # DRY-RUN
         if getattr(self, "_is_dry", lambda *_: False)("COINBASE"):
             return {"status": "simulated", "exchange": "Coinbase", "clientOrderId": client_id, "orderId": order_id}
 
         assert self._session, "ClientSession not started"
-        if not await self._acquire_rl(self._rl_coinbase_order, "COINBASE"):
+        if not await self._acquire_rl(self._rl_for("COINBASE", lane) or self._rl_coinbase_order, "COINBASE", lane=lane, meta=meta):
             raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
 
         url = "https://api.coinbase.com/api/v3/brokerage/orders/cancel"
@@ -9854,6 +10078,11 @@ class ExecutionEngine:
             meta["kind"] = "HEDGE"
         order["meta"] = meta
         is_maker = bool(meta.get("maker", False))
+        lane = self._lane_from_meta(meta, maker_flag=is_maker, action=order.get("action"))
+        try:
+            meta.setdefault("lane", lane)
+        except Exception:
+            pass
 
         pair_key = (meta.get("pair_key")
                     or str(symbol).replace("-", "").upper())
@@ -10113,7 +10342,7 @@ class ExecutionEngine:
                 logging.exception("Unhandled exception setting _submit_ts_ns")
 
             # POST
-            async with self._inflight_scope(ex):
+            async with self._inflight_scope(ex, lane=lane, meta=meta):
                 resp = await self._place_limit(
                     ex, symbol, side, qty_base, price, client_id, tif=tif, maker=is_maker, meta=meta
                 )
@@ -10581,6 +10810,17 @@ async def _cancel_order(self: "ExecutionEngine", exchange: str, symbol: str, cli
         fsm = self._order_fsm.get(client_id)
         if fsm:
             fsm.on_cancel()
+        lane = "cancel"
+        cancel_meta: Dict[str, Any] = {
+            "account_alias": alias,
+            "strategy": strat,
+            "client_order_id": client_id,
+            "branch": (fsm.meta.get("branch") if fsm and getattr(fsm, "meta", None) else None),
+            "capital_profile": (fsm.meta.get("capital_profile") if fsm and getattr(fsm, "meta", None) else None),
+            "bundle_id": (fsm.meta.get("bundle_id") if fsm and getattr(fsm, "meta", None) else None),
+            "trace_id": (fsm.meta.get("trace_id") if fsm and getattr(fsm, "meta", None) else None),
+            "cid": client_id,
+        }
 
         # DRY-RUN → rien à appeler
         if self._is_dry(ex_u):
@@ -10596,17 +10836,18 @@ async def _cancel_order(self: "ExecutionEngine", exchange: str, symbol: str, cli
             return evt
 
         # LIVE: dispatch
-        if ex_u == "BINANCE":
-            res = await self._binance_cancel(symbol.replace("-", "").upper(), client_id=client_id,
-                                             keys=self._pick_keys("Binance", alias, strat))
-        elif ex_u == "BYBIT":
-            res = await self._bybit_cancel(symbol.replace("-", "").upper(), client_id=client_id,
-                                           keys=self._pick_keys("Bybit", alias, strat))
-        elif ex_u == "COINBASE":
-            # Coinbase AT accepte client_id pour cancel
-            res = await self._coinbase_cancel(symbol, client_id=client_id, keys=self._pick_keys("Coinbase", alias, strat))
-        else:
-            raise ValueError(f"Exchange non supporté pour cancel: {exchange}")
+        async with self._inflight_scope(ex_u, lane=lane, meta=cancel_meta):
+            if ex_u == "BINANCE":
+                res = await self._binance_cancel(symbol.replace("-", "").upper(), client_id=client_id,
+                                                 keys=self._pick_keys("Binance", alias, strat), lane=lane, meta=cancel_meta)
+            elif ex_u == "BYBIT":
+                res = await self._bybit_cancel(symbol.replace("-", "").upper(), client_id=client_id,
+                                               keys=self._pick_keys("Bybit", alias, strat), lane=lane, meta=cancel_meta)
+            elif ex_u == "COINBASE":
+                # Coinbase AT accepte client_id pour cancel
+                res = await self._coinbase_cancel(symbol, client_id=client_id, keys=self._pick_keys("Coinbase", alias, strat), lane=lane, meta=cancel_meta)
+            else:
+                raise ValueError(f"Exchange non supporté pour cancel: {exchange}")
 
         self._record_engine_event({
             "exchange": ex_u,

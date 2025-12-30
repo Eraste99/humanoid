@@ -19,7 +19,7 @@ Changements clés vs ancien :
 import time
 from collections import defaultdict, deque
 from typing import Dict, Any, Optional, List, Callable, Tuple, Iterable
-
+from contracts.payloads import canonical_transfer_id
 
 # Observabilité — sous-module PASSIF (no Prometheus ici)
 from typing import Callable, Optional, Dict, Any
@@ -322,13 +322,10 @@ class RebalancingManager:
         return len(self._reb_active_slots)
 
     def _canonical_transfer_id(self, payload: Dict[str, Any]) -> Optional[str]:
-        tc = getattr(self.rm, "_transfer_controller", None)
-        if tc and hasattr(tc, "_canonical_transfer_id"):
-            try:
-                return tc._canonical_transfer_id(payload)
-            except Exception:
-                return None
-        return None
+        try:
+            return canonical_transfer_id(payload)
+        except Exception:
+            return None
 
     def _ensure_transfer_id(self, op: Dict[str, Any], transfer_type: str) -> Optional[str]:
         if not op:

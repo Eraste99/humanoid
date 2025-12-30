@@ -36,12 +36,13 @@ import asyncio
 import aiohttp
 import time
 import hmac
+import inspect
 import hashlib
 import base64
 import logging
 import json
 import random
-from typing import Dict, Any, Optional, Tuple, List,Set, Iterable
+from typing import Dict, Any, Optional, Tuple, List,Set, Iterable, Callable
 
 from contracts.payloads import (
     validate_balance_snapshot_rm_lite,
@@ -1909,7 +1910,7 @@ class PnlRecoCexAdapter:
     - Elle ne fait que lire des trades / fills / PnL auprès des CEX.
     """
 
-    def __init__(self, cfg, balance_fetcher=None):
+    def __init__(self, cfg, balance_fetcher=None, symbols_provider: Callable | None = None):
         """
         Paramètres
         ----------
@@ -1923,6 +1924,7 @@ class PnlRecoCexAdapter:
         """
         self.cfg = cfg
         self._bf = balance_fetcher  # facultatif: hook si tu veux réutiliser les clients existants
+        self._symbols_provider = symbols_provider
         self._retry_policy = BackoffPolicy.from_cfg(getattr(cfg, "retry", None))
         self._rl = RateLimiter(getattr(cfg, "rl", None))
 
@@ -1999,9 +2001,276 @@ class PnlRecoCexAdapter:
         region_u = str(region or "").upper()
         window_since_ms, window_until_ms = self._window_for_local_day(local_day, region_u)
         quote_ccy = getattr(getattr(self.cfg, "g", object()), "primary_quote", None)
+        symbols_to_query: list[str] | None = None
+        degrade_for_symbols = False
+        if exu in {"BINANCE", "BYBIT"}:
+            symbols_to_query = []
+            provider = getattr(self, "_symbols_provider", None)
+            if provider:
+                try:
+                    provided = provider(exu, alias_u, local_day)
+                    if inspect.isawaitable(provided):  # type: ignore[attr-defined]
+                        provided = await provided  # type: ignore[assignment]
+                    if provided:
+                        for sym in provided:
+                            if sym:
+                                symbols_to_query.append(str(sym))
+                except Exception:
+                    logger.exception(
+                        "pnl_reco symbols_provider failed", extra={"exchange": exu, "account_alias": alias_u}
+                    )
+            if not symbols_to_query:
+                cfg_symbols = getattr(getattr(self.cfg, "g", object()), "pnl_reco_symbols", None)
+                if cfg_symbols:
+                    if isinstance(cfg_symbols, str):
+                        symbols_to_query = [cfg_symbols]
+                    else:
+                        try:
+                            symbols_to_query = [str(s) for s in cfg_symbols if s]
+                        except Exception:
+                            symbols_to_query = []
+            if not symbols_to_query:
+                symbol_filter = getattr(getattr(self.cfg, "g", object()), "pnl_reco_symbol", None)
+                if symbol_filter:
+                    symbols_to_query = [symbol_filter]
+            degrade_for_symbols = not symbols_to_query or provider is None
+
+        async def _fetch_binance(creds: dict, since_ms: int, until_ms: int, symbols: List[str]) -> List[dict]:
+            api_base = getattr(self.cfg, "binance_rest_base", getattr(self, "BINANCE_API", "https://api.binance.com"))
+            url = f"{api_base}/api/v3/myTrades"
+            headers = {"X-MBX-APIKEY": creds.get("api_key", "")}
+            trades: List[dict] = []
+            async with aiohttp.ClientSession() as sess:
+                for sym in symbols:
+                    cursor: Optional[int] = None
+                    while True:
+                        signed_params = {
+                            "symbol": sym,
+                            "startTime": since_ms,
+                            "endTime": until_ms,
+                            "timestamp": int(time.time() * 1000 + getattr(self, "_binance_time_offset_ms", 0)),
+                        }
+                        query = "&".join(f"{k}={v}" for k, v in signed_params.items())
+                        sig = hmac.new(creds.get("secret", "").encode(), query.encode(), hashlib.sha256).hexdigest()
+                        params = dict(signed_params)
+                        if cursor is not None:
+                            params["fromId"] = cursor
+                        params["signature"] = sig
+                        await self._rl.acquire(exu, "pnl_reco", timeout=2.0)
+                        async with sess.get(url, params=params, headers=headers, timeout=15) as resp:
+                            txt = await resp.text()
+                            if resp.status >= 400:
+                                raise RuntimeError(f"BINANCE myTrades error {resp.status}: {txt}")
+                            page = json.loads(txt)
+                            if not page:
+                                break
+                            trades.extend(page)
+                            cursor = page[-1].get("id")
+                            if cursor is None or len(page) < 500:
+                                break
+            return trades
+
+        async def _fetch_coinbase(creds: dict, since_ms: int, until_ms: int) -> List[dict]:
+            api_base = getattr(self.cfg, "coinbase_rest_base",
+                               getattr(self, "COINBASE_API", "https://api.coinbase.com"))
+            url = f"{api_base}/api/v3/brokerage/orders/historical/fills"
+            product_filter = getattr(getattr(self.cfg, "g", object()), "pnl_reco_product_ids", None)
+            cursor: Optional[str] = None
+            fills: List[dict] = []
+            async with aiohttp.ClientSession() as sess:
+                while True:
+                    params = {
+                        "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_ms / 1000.0)),
+                        "end": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until_ms / 1000.0)),
+                    }
+                    if product_filter:
+                        params["product_ids"] = ",".join(product_filter)
+                    if cursor:
+                        params["cursor"] = cursor
+                    headers = {
+                        "CB-ACCESS-KEY": creds.get("api_key", ""),
+                        "CB-ACCESS-SIGN": creds.get("signature", ""),
+                        "CB-ACCESS-TIMESTAMP": str(int(time.time())),
+                    }
+                    await self._rl.acquire(exu, "pnl_reco", timeout=2.0)
+                    async with sess.get(url, params=params, headers=headers, timeout=15) as resp:
+                        txt = await resp.text()
+                        if resp.status >= 400:
+                            raise RuntimeError(f"COINBASE fills error {resp.status}: {txt}")
+                        data = json.loads(txt) or {}
+                        page = data.get("fills") or []
+                        fills.extend(page)
+                        cursor = data.get("cursor")
+                        if not cursor:
+                            break
+            return fills
+
+        async def _fetch_bybit(creds: dict, since_ms: int, until_ms: int, symbols: List[str]) -> List[dict]:
+            api_base = getattr(self.cfg, "bybit_rest_base", getattr(self, "BYBIT_API", "https://api.bybit.com"))
+            url = f"{api_base}/v5/execution/list"
+            executions: List[dict] = []
+            async with aiohttp.ClientSession() as sess:
+                symbols_scope = symbols or [None]
+                for sym in symbols_scope:
+                    cursor: Optional[str] = None
+                    while True:
+                        params = {
+                            "category": "spot",
+                            "startTime": since_ms,
+                            "endTime": until_ms,
+                        }
+                        if sym:
+                            params["symbol"] = sym
+                        if cursor:
+                            params["cursor"] = cursor
+                        headers = {}
+                        await self._rl.acquire(exu, "pnl_reco", timeout=2.0)
+                        async with sess.get(url, params=params, headers=headers, timeout=15) as resp:
+                            txt = await resp.text()
+                            if resp.status >= 400:
+                                raise RuntimeError(f"BYBIT execution list error {resp.status}: {txt}")
+                            data = json.loads(txt) or {}
+                            result = (data.get("result") or {})
+                            page = result.get("list") or []
+                            executions.extend(page)
+                            cursor = result.get("nextPageCursor")
+                            if not cursor:
+                                break
+            return executions
+
+        def _normalize_trades(raw: List[dict], venue: str) -> tuple[List[dict], bool, list]:
+            normalized: List[dict] = []
+            unconverted: list = []
+            degrade = False
+            for t in raw:
+                try:
+                    if venue == "BINANCE":
+                        fee_ccy = t.get("commissionAsset")
+                        fee = float(t.get("commission", 0.0) or 0.0)
+                        quote_val = float(t.get("quoteQty", 0.0) or 0.0)
+                        side = "BUY" if t.get("isBuyer") else "SELL"
+                        qty = float(t.get("qty", 0.0) or 0.0)
+                        norm = {
+                            "id": str(t.get("id")),
+                            "symbol": t.get("symbol"),
+                            "side": side,
+                            "price": float(t.get("price", 0.0) or 0.0),
+                            "qty": qty,
+                            "quote_value": quote_val,
+                            "fee": fee,
+                            "fee_ccy": fee_ccy,
+                            "ts": int(t.get("time", 0)),
+                        }
+                    elif venue == "COINBASE":
+                        fee_ccy = t.get("fee", {}).get("currency") if isinstance(t.get("fee"), dict) else t.get(
+                            "fee_currency")
+                        fee_val = t.get("fee", {})
+                        fee_amt = float(fee_val.get("amount") if isinstance(fee_val, dict) else (fee_val or 0.0))
+                        price = float(t.get("price", 0.0) or 0.0)
+                        qty = float(t.get("size", 0.0) or 0.0)
+                        norm = {
+                            "id": str(t.get("trade_id") or t.get("order_id")),
+                            "symbol": t.get("product_id"),
+                            "side": str(t.get("side", "")).upper() or "BUY",
+                            "price": price,
+                            "qty": qty,
+                            "quote_value": price * qty,
+                            "fee": fee_amt,
+                            "fee_ccy": fee_ccy,
+                            "ts": int(float(t.get("created_at", 0)) * 1000) if "created_at" in t else int(
+                                time.time() * 1000),
+                        }
+                    else:
+                        fee_ccy = t.get("feeCurrency")
+                        fee = float(t.get("execFee", 0.0) or 0.0)
+                        quote_val = float(t.get("execValue", 0.0) or 0.0)
+                        side = str(t.get("side", "")).upper()
+                        qty = float(t.get("execQty", 0.0) or 0.0)
+                        norm = {
+                            "id": str(t.get("execId")),
+                            "symbol": t.get("symbol"),
+                            "side": side,
+                            "price": float(t.get("execPrice", 0.0) or 0.0),
+                            "qty": qty,
+                            "quote_value": quote_val,
+                            "fee": fee,
+                            "fee_ccy": fee_ccy,
+                            "ts": int(t.get("execTime", 0)),
+                        }
+                    if norm.get("fee_ccy") and norm.get("fee_ccy") != quote_ccy:
+                        unconverted.append(
+                            {"id": norm.get("id"), "fee": norm.get("fee"), "fee_ccy": norm.get("fee_ccy")})
+                        degrade = True
+                    normalized.append(norm)
+                except Exception:
+                    degrade = True
+            normalized.sort(key=lambda x: (x.get("ts", 0), str(x.get("id")), x.get("symbol", "")))
+            return normalized, degrade, unconverted
 
         async def _do_fetch() -> dict:
-            return await self._fetch_empty_pnl(exu)
+            creds_map = {
+                "BINANCE": getattr(self.cfg, "binance_accounts", None) or {},
+                "COINBASE": getattr(self.cfg, "coinbase_at_accounts", None) or {},
+                "BYBIT": getattr(self.cfg, "bybit_accounts", None) or {},
+            }
+            if alias_u not in creds_map.get(exu, {}):
+                raise RuntimeError("Missing credentials")
+            creds = creds_map[exu][alias_u]
+            if exu in {"BINANCE", "BYBIT"} and not symbols_to_query:
+                return {
+                    "net_profit_quote": 0.0,
+                    "fees_quote": 0.0,
+                    "turnover_quote": 0.0,
+                    "trades": 0,
+                    "fills": [],
+                    "trades_list": [],
+                    "degraded": True,
+                    "reason_code": "PNL_RECO_EXCEPTION",
+                    "since_ms": window_since_ms,
+                    "until_ms": window_until_ms,
+                    "local_day": local_day,
+                    "region": region_u,
+                    "account_alias": alias_u,
+                    "exchange": exu,
+                }
+            if exu == "BINANCE":
+                raw_trades = await _fetch_binance(creds, window_since_ms, window_until_ms, symbols_to_query or [])
+            elif exu == "COINBASE":
+                raw_trades = await _fetch_coinbase(creds, window_since_ms, window_until_ms)
+            else:
+                raw_trades = await _fetch_bybit(creds, window_since_ms, window_until_ms, symbols_to_query or [])
+            norm_trades, degrade_flag, unconverted_fees = _normalize_trades(raw_trades, exu)
+            turnover_quote = sum(abs(t.get("quote_value", 0.0) or 0.0) for t in norm_trades)
+            fees_quote = sum(t.get("fee", 0.0) or 0.0 for t in norm_trades if (t.get("fee_ccy") == quote_ccy))
+            base_delta = sum((t.get("qty", 0.0) or 0.0) * (1 if t.get("side") == "BUY" else -1) for t in norm_trades)
+            pnl = sum((t.get("quote_value", 0.0) or 0.0) * (1 if t.get("side") == "SELL" else -1) for t in
+                      norm_trades) - fees_quote
+            degraded = degrade_flag or abs(base_delta) > 1e-9 or bool(unconverted_fees) or degrade_for_symbols
+            payload = {
+                "net_profit_quote": float(pnl),
+                "fees_quote": float(fees_quote),
+                "turnover_quote": float(turnover_quote),
+                "trades": len(norm_trades),
+                "trades_count": len(norm_trades),
+                "fills": norm_trades,
+                "trades_list": norm_trades,
+                "degraded": degraded,
+                "reason_code": "PNL_RECO_EXCEPTION" if degraded else "",
+                "since_ms": window_since_ms,
+                "until_ms": window_until_ms,
+                "local_day": local_day,
+                "region": region_u,
+                "account_alias": alias_u,
+                "exchange": exu,
+            }
+            if unconverted_fees:
+                payload["unconverted_fees"] = unconverted_fees
+            payload["trades_detail"] = norm_trades
+            payload["trades_sorted"] = True
+            payload["trades"] = norm_trades
+            payload["base_ccy"] = None
+            payload["quote_ccy"] = quote_ccy
+            return payload
 
         outcome = await awith_retry(
             _do_fetch,
@@ -2024,24 +2293,16 @@ class PnlRecoCexAdapter:
                 "reason_code": reason_code,
                 "window_since_ms": window_since_ms,
                 "window_until_ms": window_until_ms,
+                "since_ms": window_since_ms,
+                "until_ms": window_until_ms,
+                "local_day": local_day,
+                "region": region_u,
+                "account_alias": alias_u,
+                "exchange": exu,
             }
 
         payload = outcome.result if isinstance(outcome.result, dict) else {}
-        return {
-            "net_profit_quote": 0.0,
-            "fees_quote": 0.0,
-            "turnover_quote": 0.0,
-            "trades": 0,
-            "fills": payload.get("fills") or [],
-            "fees": payload.get("fees") or [],
-            "transfers": payload.get("transfers") or [],
-            "base_ccy": None,
-            "quote_ccy": quote_ccy,
-            "degraded": True,
-            "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
-            "window_since_ms": window_since_ms,
-            "window_until_ms": window_until_ms,
-        }
+        return payload
 
 
 

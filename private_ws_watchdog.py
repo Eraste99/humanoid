@@ -131,6 +131,8 @@ class PrivateWSHubWatchdog(BaseWatchdogV2):
             escalate_after_cycles=bot_cfg.wd.private_ws_escalate_after_cycles,
         )
         cfg = config or PrivateWSWatchdogConfig(check_interval=bot_cfg.wd.private_ws_interval_s, thresholds=th)
+        if config is None:
+            cfg.tuning.mode = str(getattr(bot_cfg.g, "deployment_mode", cfg.tuning.mode))
         applied = cfg.tuning.apply(cfg.thresholds)
         super().__init__(
             name=name,

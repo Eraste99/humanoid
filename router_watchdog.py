@@ -96,16 +96,27 @@ class MarketDataRouterWatchdog(BaseWatchdogV2):
         router: Optional[Any] = None,
         bot_config: Optional[BotConfig] = None,
         name: str = "MarketDataRouterWatchdog",
-        config: Optional[RouterWatchdogConfig] = None,
-        notify_only: bool = True,
-        verbose: bool = True,
+            config: Optional[RouterWatchdogConfig] = None,
+            notify_only: bool = True,
+            verbose: bool = True,
     ) -> None:
-        cfg = config or RouterWatchdogConfig()
         bot_cfg = bot_config
         if bot_cfg is None:
             bot_cfg = BotConfig.from_env()
             self.record_fallback("bot_config")
         wd_cfg = bot_cfg.wd
+        cfg = config
+        if cfg is None:
+            thresholds = RouterThresholds(
+                r2s_warn_ms=int(wd_cfg.router_r2s_warn_ms),
+                r2s_crit_ms=int(wd_cfg.router_r2s_crit_ms),
+                q_warn_ratio=float(wd_cfg.router_backlog_warn),
+                q_crit_ratio=float(wd_cfg.router_backlog_crit),
+                escalate_after_cycles=int(wd_cfg.router_escalate_after_cycles),
+            )
+            cfg = RouterWatchdogConfig(thresholds=thresholds)
+            cfg.tuning.mode = getattr(bot_cfg.g, "deployment_mode", cfg.tuning.mode)
+            cfg.thresholds = cfg.tuning.apply(cfg.thresholds)
         super().__init__(
             name=name,
             check_interval=wd_cfg.router_interval_s,

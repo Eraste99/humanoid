@@ -2441,7 +2441,11 @@ class LoggerHistoriqueManager:
                         pnl_meta["status"] = "SKIPPED"
                     elif state == "ERROR":
                         pnl_meta["status"] = "ERROR"
-                    elif state == "ERROR":
+                    elif state == "SKIPPED":
+                        pnl_meta["status"] = "SKIPPED"
+                    elif state == "PARTIAL":
+                        pnl_meta["status"] = "PARTIAL"
+                    elif state == "MISMATCH":
                         pnl_meta["status"] = "WARN"
                     else:
                         pnl_meta["status"] = "OK"
@@ -2473,7 +2477,18 @@ class LoggerHistoriqueManager:
 
         if isinstance(pnl_meta, dict):
             meta["pnl_reconciliation"] = pnl_meta
-
+            pnl_state = pnl_meta.get("state")
+            if pnl_state == "ERROR":
+                meta["status"] = "ERROR"
+            elif pnl_state == "SKIPPED":
+                if meta.get("status") != "ERROR":
+                    meta["status"] = "PARTIAL"
+            elif pnl_state == "MISMATCH":
+                if meta.get("status") != "ERROR":
+                    meta["status"] = "PARTIAL"
+            elif pnl_state == "PARTIAL":
+                if meta.get("status") == "OK":
+                    meta["status"] = "PARTIAL"
             # Finalize DB (writer)
             finalize_meta: dict[str, Any] | None = None
             if skip_finalize:
@@ -3242,6 +3257,9 @@ class LoggerHistoriqueManager:
             error_kind: str | None = None
             pnl_cex: dict | None = None
             error_stage: str | None = None
+            abs_diff: float | None = None
+            ratio_diff: float | None = None
+            trades_diff: int | None = None
 
             # 5.a) Fetch PnL côté CEX
             try:
@@ -3280,11 +3298,20 @@ class LoggerHistoriqueManager:
                 ratio_diff = 0.0
                 trades_diff = 0
             else:
-                # 5.b) Classification mismatch
-                state, reason_code, abs_diff, ratio_diff, trades_diff = self._classify_pnl_mismatch(
-                    pnl_db=pnl_db,
-                    pnl_cex=pnl_cex,
-                )
+                degraded = bool(pnl_cex.get("degraded"))
+                reason_code = str(pnl_cex.get("reason_code") or "PNL_RECO_EXCEPTION")
+
+                if degraded:
+                    state = "SKIPPED" if reason_code == "PNL_RECO_SKIPPED_FLAG" else "ERROR"
+                    abs_diff = None
+                    ratio_diff = None
+                    trades_diff = None
+                else:
+                    # 5.b) Classification mismatch
+                    state, reason_code, abs_diff, ratio_diff, trades_diff = self._classify_pnl_mismatch(
+                        pnl_db=pnl_db,
+                        pnl_cex=pnl_cex,
+                    )
 
             if state_rank.get(state, 0) > state_rank.get(global_state, 0):
                 global_state = state
@@ -3297,9 +3324,17 @@ class LoggerHistoriqueManager:
                     account_alias=alias,
                     state=str(state),
                     reason_code=str(reason_code),
-                    abs_diff_quote=float(abs_diff),
+                    abs_diff_quote=float(abs_diff or 0.0),
                     error_stage=error_stage,
                 )
+            row_abs_diff = float(abs_diff) if abs_diff is not None else None
+            row_ratio_diff = float(ratio_diff) if ratio_diff is not None else None
+            row_trades_diff = int(trades_diff) if trades_diff is not None else None
+            signed_diff = (
+                float(pnl_cex["net_profit_quote"]) - float(pnl_db["net_profit_quote"])
+                if pnl_cex is not None and row_abs_diff is not None
+                else None
+            )
 
             rows_out.append(
                 {
@@ -3317,16 +3352,14 @@ class LoggerHistoriqueManager:
                     },
                     "pnl_cex": pnl_cex,
                     "delta": {
-                        "net_profit_abs_diff": float(abs_diff),
-                        "net_profit_signed_diff": (
-                            float(pnl_cex["net_profit_quote"]) - float(pnl_db["net_profit_quote"])
-                        ) if pnl_cex is not None else 0.0,
-                        "trades_diff": int(trades_diff),
+                        "net_profit_abs_diff": row_abs_diff,
+                        "net_profit_signed_diff": signed_diff,
+                        "trades_diff": row_trades_diff,
                     },
                     "state": str(state),
                     "reason_code": str(reason_code),
-                    "abs_diff_quote": float(abs_diff),
-                    "ratio_diff": float(ratio_diff),
+                    "abs_diff_quote": row_abs_diff,
+                    "ratio_diff": row_ratio_diff,
                     "trades_internal_count": int(pnl_db.get("trades") or 0),
                     "trades_cex_count": int(pnl_cex.get("trades") or 0) if pnl_cex else None,
                     "window_since_ms": window_since_ms,
@@ -3361,7 +3394,7 @@ class LoggerHistoriqueManager:
         *,
         pnl_db: dict,
         pnl_cex: dict,
-    ) -> tuple[int, str, float, float, int]:
+    ) -> tuple[str, str, float, float, int]:
         """
         Applique la tolérance PnL Reco pour classifier un écart DB ↔ CEX.
 

@@ -176,9 +176,9 @@ async def run_eod(
 
             adapter = PnlRecoCexAdapter(cfg)
             fetch_pnl_cex_fn = adapter.fetch_pnl_for_day
-        except Exception:
-            logger.error("PnlRecoCexAdapter unavailable; cannot run CEX reconciliation")
-            skip_cex = False
+        except Exception as exc:
+            logger.error("PnlRecoCexAdapter unavailable; cannot run CEX reconciliation", exc_info=True)
+            raise RuntimeError("PNL_RECO_ADAPTER_UNAVAILABLE") from exc
     await lhm.start()
     try:
         if fetch_pnl_cex_fn is None and not skip_cex:
@@ -295,7 +295,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--skip-cex",
         action="store_true",
-        help="Ne pas tenter la réconciliation PnL CEX ↔ DB (reco marquée SKIPPED).",
+        help=(
+            "Ne pas tenter la réconciliation PnL CEX ↔ DB (rapport partiel, reco marquée SKIPPED,"
+            " non acceptable pour un GO institutionnel)."
+        ),
     )
     parser.add_argument(
         "--dry-run",

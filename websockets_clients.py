@@ -182,6 +182,7 @@ class WebSocketExchangeClient:
         jitter: bool | None = None,
         # config optionnelle annexe (ex: seed tests)
         config: object | None = None,
+        shard_id: str = "S0",
     ):
         """
         Client WS public, **config-driven** par cfg.ws_public + paramètres runtime.
@@ -197,6 +198,7 @@ class WebSocketExchangeClient:
         self.url = url
         self.loop = loop
         self.verbose = bool(verbose)
+        self.shard_id = str(shard_id)
 
         # --- contexte région / mode (pod) ---
         # Source: BotConfig / Boot (pas de heuristique locale ici)
@@ -855,6 +857,7 @@ class WebSocketExchangeClient:
                 latency_ms=lat,
                 active=True,
             ).model_dump(exclude_none=True)
+            event["shard"] = self.shard_id
         except Exception:
             logger.exception("[WS] market event validation failed", extra={"exchange": ex, "symbol": ex_symbol})
             self._note_drop(ex, reason="schema_mismatch", kind="emit")
@@ -944,6 +947,7 @@ class WebSocketExchangeClient:
             self._queue_control_event(payload)
 
     def _queue_control_event(self, payload: Dict[str, Any]) -> None:
+        payload.setdefault("shard", self.shard_id)
         self._control_events_pending.append(payload)
         self._flush_control_events()
 

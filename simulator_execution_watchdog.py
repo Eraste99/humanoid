@@ -102,7 +102,7 @@ class EngineWatchdogConfig:
     thresholds: EngineThresholds = field(default_factory=EngineThresholds)
     tuning: EngineModeTuning = field(default_factory=EngineModeTuning)
 
-
+class SimulatorExecutionWatchdog(BaseWatchdogV2):
     def __init__(
             self,
             state_fn: Optional[StateFn] = None,
@@ -117,7 +117,7 @@ class EngineWatchdogConfig:
         bot_cfg = bot_config or BotConfig.from_env()
         if bot_config is None:
             self.record_fallback("bot_config")
-        th = EngineThresholds(
+        thresholds = EngineThresholds(
             submit_ack_warn_ms=bot_cfg.wd.engine_submit_ack_warn_ms,
             submit_ack_crit_ms=bot_cfg.wd.engine_submit_ack_crit_ms,
             ack_fill_warn_ms=bot_cfg.wd.engine_ack_fill_warn_ms,
@@ -132,7 +132,13 @@ class EngineWatchdogConfig:
             queuepos_blocked_crit_per_min=bot_cfg.wd.engine_queuepos_blocked_crit_per_min,
             escalate_after_cycles=bot_cfg.wd.engine_escalate_after_cycles,
         )
-        cfg = config or EngineWatchdogConfig(check_interval=bot_cfg.wd.engine_interval_s, thresholds=th)
+        cfg = config or EngineWatchdogConfig(
+            check_interval=bot_cfg.wd.engine_interval_s,
+            thresholds=thresholds,
+            tuning=EngineModeTuning(mode=str(getattr(bot_cfg.g, "deployment_mode", "EU_ONLY"))),
+        )
+        if config is None:
+            cfg.tuning.mode = str(getattr(bot_cfg.g, "deployment_mode", cfg.tuning.mode))
         super().__init__(
             name=name,
             check_interval=cfg.check_interval,

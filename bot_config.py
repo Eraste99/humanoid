@@ -321,6 +321,9 @@ class RouterCfg:
     stale_ms: int = 1200
     # shards_per_exchange = (BINANCE, BYBIT, COINBASE)
     shards_per_exchange: Tuple[int, int, int] = (2, 1, 1)
+    ws_shards_by_exchange: Dict[str, int] = field(
+        default_factory=lambda: {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1}
+    )
     staleness_mode: str = "WALLCLOCK"  # WALLCLOCK | EVENT_TIME
     deterministic_backpressure: bool = False
     out_queues_maxlen: int = 20000
@@ -385,6 +388,11 @@ class WatchdogCfg:
     router_health_stale_ms: int = 1300
     router_health_min_coverage_ratio: float = 0.80
     router_health_queue_max: int = 2000
+    router_r2s_warn_ms: int = 13
+    router_r2s_crit_ms: int = 25
+    router_backlog_warn: float = 0.80
+    router_backlog_crit: float = 0.95
+    router_escalate_after_cycles: int = 3
 
     ws_public_interval_s: float = 2.0
     ws_public_stale_warn_ms: int = 900
@@ -1119,6 +1127,24 @@ class EngineCfg:
         },
     })
 
+    inflight_reserved_hedge_by_exchange_by_profile: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            "NANO": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "MICRO": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "SMALL": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "MID": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "LARGE": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+        }
+    )
+    inflight_reserved_cancel_by_exchange_by_profile: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            "NANO": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "MICRO": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "SMALL": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "MID": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+            "LARGE": {"BINANCE": 1, "BYBIT": 1, "COINBASE": 1},
+        }
+    )
 
     tt_max_skew_ms: int = 35
     order_timeout_s: int = 3
@@ -1771,6 +1797,9 @@ class BotConfig:
                     raise ConfigError("CONFIG_PARSE_ERROR", "router_shards_per_exchange") from None
             else:
                 raise ConfigError("CONFIG_PARSE_ERROR", "router_shards_per_exchange")
+        cfg.router.ws_shards_by_exchange = _Env.get_dict(
+            "ROUTER_WS_SHARDS", cfg.router.ws_shards_by_exchange
+        )
         # Quota global (fallback) + quotas stream-centrics optionnels
         cfg.router.out_queues_maxlen = _Env.get_int("ROUTER_OUT_QUEUES_MAXLEN", cfg.router.out_queues_maxlen)
         cfg.router.out_queues_maxlen_by_kind = _Env.get_dict(
@@ -1825,7 +1854,13 @@ class BotConfig:
             "ROUTER_HEALTH_MIN_COVERAGE_RATIO", cfg.wd.router_health_min_coverage_ratio
         )
         cfg.wd.router_health_queue_max = _Env.get_int("ROUTER_HEALTH_QUEUE_MAX", cfg.wd.router_health_queue_max)
-
+        cfg.wd.router_r2s_warn_ms = _Env.get_int("ROUTER_R2S_WARN_MS", cfg.wd.router_r2s_warn_ms)
+        cfg.wd.router_r2s_crit_ms = _Env.get_int("ROUTER_R2S_CRIT_MS", cfg.wd.router_r2s_crit_ms)
+        cfg.wd.router_backlog_warn = _Env.get_float("ROUTER_BACKLOG_WARN", cfg.wd.router_backlog_warn)
+        cfg.wd.router_backlog_crit = _Env.get_float("ROUTER_BACKLOG_CRIT", cfg.wd.router_backlog_crit)
+        cfg.wd.router_escalate_after_cycles = _Env.get_int(
+            "ROUTER_ESCALATE_AFTER_CYCLES", cfg.wd.router_escalate_after_cycles
+        )
         cfg.wd.ws_public_interval_s = _Env.get_float("WD_WS_PUBLIC_INTERVAL_S", cfg.wd.ws_public_interval_s)
         cfg.wd.ws_public_stale_warn_ms = _Env.get_int("WD_WS_PUBLIC_STALE_WARN_MS", cfg.wd.ws_public_stale_warn_ms)
         cfg.wd.ws_public_stale_crit_ms = _Env.get_int("WD_WS_PUBLIC_STALE_CRIT_MS", cfg.wd.ws_public_stale_crit_ms)
@@ -2795,7 +2830,14 @@ class BotConfig:
             "ENGINE_INFLIGHT_MAX_BY_EXCHANGE_BY_PROFILE",
             cfg.engine.inflight_max_by_exchange_by_profile,
         )
-
+        cfg.engine.inflight_reserved_hedge_by_exchange_by_profile = _Env.get_dict(
+            "ENGINE_INFLIGHT_RESERVED_HEDGE_BY_EXCHANGE_BY_PROFILE",
+            cfg.engine.inflight_reserved_hedge_by_exchange_by_profile,
+        )
+        cfg.engine.inflight_reserved_cancel_by_exchange_by_profile = _Env.get_dict(
+            "ENGINE_INFLIGHT_RESERVED_CANCEL_BY_EXCHANGE_BY_PROFILE",
+            cfg.engine.inflight_reserved_cancel_by_exchange_by_profile,
+        )
 
         cfg.engine.tt_max_skew_ms = _Env.get_int("ENGINE_TT_MAX_SKEW_MS", cfg.engine.tt_max_skew_ms)
         cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
@@ -3950,7 +3992,7 @@ class BotConfig:
 
             for ex in enabled_exchanges:
                 # Région d'exécution de l'exchange (EU / US / EU-CB…)
-                region = str(self.g.engine_pod_map.get(ex, self.g.pod_region)).upper()
+                region = str(self.g.exchange_region_map.get(ex, self.g.pod_region)).upper()
                 if region == "EU_CB" and ex == "COINBASE":
                     region_key = "EU-CB"
                 else:

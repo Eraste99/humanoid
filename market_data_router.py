@@ -1734,14 +1734,17 @@ class MarketDataRouter:
                         continue
                     if isinstance(item, dict) and item.get("__ws_error__"):
                         payload = item
+                        ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
+                        safe_inc(
+                            ROUTER_DROPPED_TOTAL,
+                            "router_dropped_total",
+                            "start",
+                            queue="health",
+                            reason="exception",
+                        )
+                        continue
                     ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
-                    safe_inc(
-                        ROUTER_DROPPED_TOTAL,
-                        "router_dropped_total",
-                        "start",
-                        queue="health",
-                        reason="exception",
-                    )
+
 
                     ev = self._validate_and_enrich(item)
                     if not ev:

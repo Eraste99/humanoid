@@ -2269,7 +2269,18 @@ class OpportunityScanner:
             self._public_ttl(buy_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
             self._public_ttl(sell_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
         )
-        slip_age = self._slip_age_seconds(pair)
+        def _leg_age(ex_name: str) -> float:
+            try:
+                ts_val = (self._slip_cache.get((_norm_ex(ex_name), _norm_pair(pair))) or {}).get("ts")
+                if ts_val:
+                    return max(0.0, now - float(ts_val))
+            except Exception:
+                pass
+            return float("inf")
+
+        age_buy_ex = _leg_age(buy_ex)
+        age_sell_ex = _leg_age(sell_ex)
+        slip_age = max(age_buy_ex, age_sell_ex)
         if not math.isfinite(slip_age) or slip_age > slip_ttl:
             self.blocks["slip"] += 1
             self._record_rejection(

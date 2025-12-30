@@ -854,7 +854,7 @@ class PairHistoryTracker:
         """
         now = now or _now()
         self.last_rotation = now
-
+        prev_active = {k: list(v) for k, v in self.active_pairs_by_mode.items()}
         # 1) Recalcul des scores globaux
         self.refresh_pair_scores(now=now)
 
@@ -897,6 +897,7 @@ class PairHistoryTracker:
             rep[mode] = selected
 
         # Mise à jour des vues par mode (on garde l'ordre, donc des listes)
+        self._log_rotation_deltas(prev_active, new_active_by_mode)
         self.active_pairs_by_mode["TT"] = new_active_by_mode.get("TT", [])
         self.active_pairs_by_mode["TM"] = new_active_by_mode.get("TM", [])
         self.active_pairs_by_mode["REB"] = new_active_by_mode.get("REB", [])

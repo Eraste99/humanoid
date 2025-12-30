@@ -126,6 +126,8 @@ class WebSocketExchangeWatchdog(BaseWatchdogV2):
             escalate_after_cycles=bot_cfg.wd.ws_public_escalate_after_cycles,
         )
         cfg = config or WebSocketWatchdogConfig(check_interval=bot_cfg.wd.ws_public_interval_s, thresholds=th)
+        if config is None:
+            cfg.tuning.mode = str(getattr(bot_cfg.g, "deployment_mode", cfg.tuning.mode))
         applied = cfg.tuning.apply(cfg.thresholds)
         super().__init__(
             name=name,

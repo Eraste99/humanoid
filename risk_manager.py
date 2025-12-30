@@ -1035,24 +1035,36 @@ class TransferController:
         }
         if state in {"SUBMITTED", "REQUESTED", "PREPARED"} and expires is not None and int(expires) <= now_ms:
             op_id = self._op_id(transfer_id)
-            self._fail_stuck(transfer_id=transfer_id, op_id=op_id, payload=payload)
+            self._fail_stuck(transfer_id=transfer_id, op_id=op_id, payload=payload, now_ms=now_ms)
 
-        def _fail_stuck(self, *, transfer_id: str, op_id: str, payload: Optional[dict[str, Any]]) -> None:
+    def _fail_stuck(
+            self,
+            *,
+            transfer_id: str,
+            op_id: str,
+            payload: Optional[dict[str, Any]],
+            now_ms: Optional[int] = None,
+            reason: str = "XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+    ) -> None:
+        try:
             self._transition(
                 transfer_id=transfer_id,
                 new_state="FAILED",
                 payload=payload,
                 error="stuck_submitted_timeout",
-                reason="XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+                reason=reason,
+                expires_ts_ms=now_ms,
             )
+        except Exception:
+            logger.exception("[TransferController] failed to transition stuck transfer")
+        if not self._lhm:
+            return
         try:
-            if self._lhm:
-
-                self._lhm.activate_fail_closed_latch(
-                    op_id="TRANSFERS/XFER_STUCK_SUBMITTED_FAIL_CLOSED",
-                    reason="XFER_STUCK_SUBMITTED_FAIL_CLOSED",
-                    payload={"op_id": op_id},
-                )
+            self._lhm.activate_fail_closed_latch(
+                op_id="TRANSFERS/XFER_STUCK_SUBMITTED_FAIL_CLOSED",
+                reason=reason,
+                payload={"op_id": op_id, "transfer_id": transfer_id},
+            )
         except Exception:
             logger.exception("[TransferController] failed to mark stuck transfer")
 
@@ -1065,8 +1077,16 @@ class TransferController:
                 continue
             expires = state.get("expires_ts_ms")
             if expires is not None and int(expires) <= now_ms:
-                op_id = self._op_id(transfer_id)
-                self._fail_stuck(transfer_id=transfer_id, op_id=op_id, payload=state.get("payload"))
+                try:
+                    op_id = self._op_id(transfer_id)
+                    self._fail_stuck(
+                        transfer_id=transfer_id,
+                        op_id=op_id,
+                        payload=state.get("payload"),
+                        now_ms=now_ms,
+                    )
+                except Exception:
+                    logger.exception("[TransferController] failed to fail-close stuck transfer")
 
     def _persist_state(
         self,
@@ -1187,6 +1207,17 @@ class TransferController:
         payload["transfer_id"] = transfer_id
         op_id = self._op_id(transfer_id)
         state = self._states.get(transfer_id)
+        if self._state_is_in_progress(state):
+            try:
+                inc_transfer_fsm_event(state.get("state"), "TRANSFER_FSM_IN_PROGRESS_SKIP")
+            except Exception:
+                pass
+            return {
+                "status": state.get("state"),
+                "transfer_id": transfer_id,
+                "replayed": True,
+                "reason": "TRANSFER_FSM_IN_PROGRESS_SKIP",
+            }
         if state is None and self._lhm:
             existing = self._lhm.get_transfer_state(op_id)
             if existing:
@@ -10714,6 +10745,17 @@ class RiskManager:
         }
 
     async def _handle_rebalancing_op(self, op: Dict[str, Any]) -> None:
+        mode = str(getattr(self, "rm_mode", "NORMAL") or "NORMAL").upper()
+        if mode == "SEVERE":
+            try:
+                inc_rm_reject(reason=REB_DISABLED)
+            except Exception:
+                pass
+            logger.info(
+                "[RiskManager] rebalancing op skipped in SEVERE mode",
+                extra={"op_type": op.get("type"), "reason": REB_DISABLED},
+            )
+            return
         t = str(op.get("type", "")).lower()
         if self._rebalancing_cb:
             try:
@@ -10892,6 +10934,17 @@ class RiskManager:
             logger.exception("[RiskManager] overlay_compensation bundle dispatch failed")
 
     async def _handle_crypto_topup_hint(self, op: Dict[str, Any]) -> None:
+        mode = str(getattr(self, "rm_mode", "NORMAL") or "NORMAL").upper()
+        if mode == "SEVERE":
+            try:
+                inc_rm_reject(reason=REB_DISABLED)
+            except Exception:
+                pass
+            logger.info(
+                "[RiskManager] crypto_topup_hint skipped in SEVERE mode",
+                extra={"reason": REB_DISABLED, "exchange": op.get("exchange")},
+            )
+            return
         ex = str(
             op.get("exchange")
             or (op.get("to") or {}).get("exchange")
@@ -13771,21 +13824,24 @@ class RiskManager:
         for ex, pairs in (self._last_books or {}).items():
             for pk in (pairs or {}).keys():
                 sb = ss = recent = None
-                # 1) priorité SlippageHandler s'il est branché
-                if self.slippage_handler and hasattr(self.slippage_handler, "get_slippage"):
+                # 1) priorité SlippageHandler s'il est branché (TTL déjà appliqué)
+                if self.slippage_handler and hasattr(self.slippage_handler, "get_slippage_bps"):
                     try:
-                        sb = float(self.slippage_handler.get_slippage(ex, pk, "buy"))
-                        ss = float(self.slippage_handler.get_slippage(ex, pk, "sell"))
+                        sb_bps = self.slippage_handler.get_slippage_bps(ex, pk, "buy")
+                        ss_bps = self.slippage_handler.get_slippage_bps(ex, pk, "sell")
+                        if sb_bps is not None and ss_bps is not None:
+                            sb = float(sb_bps) / 1e4
+                            ss = float(ss_bps) / 1e4
                     except Exception:
                         logging.exception("Unhandled exception")
-                # 2) fallback collector “recent”
-                if (sb is None or ss is None) and self.slip_collector:
+                # 2) fallback collector “recent” uniquement si handler absent
+                elif self.slip_collector:
                     try:
                         recent = float(self.slip_collector.get_recent_slippage(pk))
                     except Exception:
                         recent = None
-                    if sb is None: sb = recent
-                    if ss is None: ss = recent
+                    if recent is not None:
+                        sb = ss = recent
 
                 if sb is None and ss is None and recent is None:
                     continue

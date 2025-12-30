@@ -43,6 +43,7 @@ try:
     from modules.watchdog.central_watchdog import CentralWatchdog  # signature: CentralWatchdog(config: Optional[...]=None, service_name="bot")
 except Exception:
     class CentralWatchdog:
+        _IS_FALLBACK_NOOP = True
         def __init__(self, *a, **kw): pass
         def attach_telegram_from_env(self): pass
         def attach_webhook_from_env(self): pass
@@ -708,16 +709,18 @@ def _init_cwd(ctx):
     cwd_task = asyncio.create_task(cwd.run(), name="cwd.run")
     return cwd, cwd_task
 
-def _wire_telegram_commands(alerts, cwd, boot):
+def _wire_telegram_commands(alerts, state: Dict[str, Any]):
     """
     Mappe /status et /restart vers le CWD/Boot.
     - /status  → snapshot Boot.get_status()
     - /restart → cwd.on_full_restart("manual-telegram")
+    Les callbacks lisent l'état courant à chaque invocation (pas de closure stale).
     """
     if not hasattr(alerts, "register_command"):
         return
 
     async def _cmd_status(ctx):
+        boot = state.get("boot")
         if hasattr(boot, "get_status"):
             s = boot.get_status()
         else:
@@ -728,6 +731,7 @@ def _wire_telegram_commands(alerts, cwd, boot):
             pass
 
     async def _cmd_restart(ctx):
+        cwd = state.get("cwd")
         if hasattr(cwd, "on_full_restart"):
             await cwd.on_full_restart("manual-telegram", ctx_hint={"via":"telegram","user_id":ctx.get("user_id")})
         else:
@@ -738,10 +742,9 @@ def _wire_telegram_commands(alerts, cwd, boot):
 
     # Raccourcis par défaut si implémentés
     if hasattr(alerts, "bind_status"):
-        alerts.bind_status(lambda: boot.get_status() if hasattr(boot,"get_status") else {})
+        alerts.bind_status(lambda: (state.get("boot").get_status() if hasattr(state.get("boot"), "get_status") else {}))
     if hasattr(alerts, "bind_restart"):
-        alerts.bind_restart(lambda reason: cwd.on_full_restart(reason) if hasattr(cwd,"on_full_restart") else None)
-
+        alerts.bind_restart(lambda reason: (state.get("cwd").on_full_restart(reason) if hasattr(state.get("cwd"), "on_full_restart") else None))
 
 # -----------------------------------------------------------------------------
 # Entrée principale
@@ -750,7 +753,6 @@ async def main() -> None:
 
     from modules.obs_metrics import StatusHTTPServer, ObsServer, start_loop_lag_probe, start_time_skew_probe
 
-    _maybe_install_uvloop()
 
     # Config
     cfg = BotConfig.from_env()
@@ -758,10 +760,11 @@ async def main() -> None:
     dep_mode    = str(getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY")).upper()
     cap_profile = str(getattr(cfg, "CAPITAL_PROFILE", "NANO")).upper()
     restart_mode = str(getattr(cfg, "RESTART_MODE", "HYBRID")).upper()
+    mode_value = str(getattr(cfg, "MODE", "PROD")).upper()
     raw = getattr(cfg, "TELEGRAM_REQUIRE_ACK", 1)
 
     # DRY-RUN: ne pas bloquer sur ACK par défaut ; PROD: ACK requis par défaut
-    _default_ack = (str(getattr(cfg, "MODE", "PROD")).upper() != "DRY_RUN")
+    _default_ack = (mode_value != "DRY_RUN")
     telegram_ack_required = _cfg_bool(cfg, "TELEGRAM_REQUIRE_ACK", _default_ack)
 
     esc_after_fails = _cfg_int(cfg, "RESTART_ESCALATE_AFTER_FAILS", 2)
@@ -784,11 +787,37 @@ async def main() -> None:
     # Obs
     metrics = _metrics_factory()
     metrics.set_deployment_info(region, dep_mode, cap_profile)
-    status_bus = getattr(cfg, "status_bus", None)
-    cfg.status_sink = status_bus
+    # State supervisé unique
+    state: Dict[str, Any] = {
+        "boot": None,
+        "ctx": None,
+        "guard": None,
+        "guard_task": None,
+        "cwd": None,
+        "cwd_task": None,
+        "metrics": metrics,
+        "alerts": None,
+        "ws_budget": None,
+        "full_budget": None,
+        "restart_gen": 0,
+        "last_reason": None,
+        "restart_lock": asyncio.Lock(),
+        "consecutive_fail": 0,
+        "first_down_ts": None,
+    }
+
+    # Fail-fast si CWD fallback en PROD
+    if getattr(CentralWatchdog, "_IS_FALLBACK_NOOP", False):
+        if mode_value not in ("DRY_RUN", "DEV"):
+            log.critical("[Main] CentralWatchdog fallback/no-op en PROD — arrêt immédiat")
+            raise SystemExit(2)
+        else:
+            log.warning("[Main] CentralWatchdog fallback/no-op en mode %s", mode_value)
+            metrics.guard_trigger("degraded_supervisor")
 
     # Alertes
     alerts = _load_alert_dispatcher(cfg)
+    state["alerts"] = alerts
     await alerts.start()
 
     # Budgets
@@ -796,15 +825,26 @@ async def main() -> None:
     full_budget = RestartBudget.from_cfg(cfg, kind="full")
     metrics.set_budget_remaining("ws", ws_budget.remaining())
     metrics.set_budget_remaining("full", full_budget.remaining())
+    state["ws_budget"] = ws_budget
+    state["full_budget"] = full_budget
+
+    # Sink status → CWD courant
+    def status_sink(payload):
+        cwd = state.get("cwd")
+        if cwd and hasattr(cwd, "on_child_event"):
+            with contextlib.suppress(Exception):
+                return cwd.on_child_event(payload)
+        return None
 
     # Boot (barrière READY)
     boot = Boot(cfg)
+    boot._status_sink = status_sink
     # [OBS-SUPERVISEUR INIT] — Observabilité côté superviseur (pas dans Boot)
     # Contexte & probes (idempotentes)
-    region = getattr(cfg, "POD_REGION", "EU")
-    mode = getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY")
-    set_region(region)
-    set_deployment_mode(mode)
+    region_cfg = getattr(cfg, "POD_REGION", "EU")
+    mode_cfg = getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY")
+    set_region(region_cfg)
+    set_deployment_mode(mode_cfg)
     start_loop_lag_probe()
     start_time_skew_probe()
 
@@ -831,24 +871,25 @@ async def main() -> None:
     BOT_STATE.set(1)  # STARTING
     ctx = await boot.run()
     await boot.boot_complete.wait()
+    BOT_STATE.set(2)  # READY
     log.info("[Boot] READY — contexte en ligne")
-
+    state.update({
+        "boot": boot,
+        "ctx": ctx,
+    })
 
     # Supervision: Guard + CWD
     guard = ConnectivityGuard(getattr(ctx,"ws_client",None), getattr(ctx,"router",None), getattr(ctx,"engine",None), alerts, ws_budget, metrics)
     guard_task = asyncio.create_task(guard.run(), name="guard.run")
 
     cwd, cwd_task = _init_cwd(ctx)
-    # Commandes Telegram (si disponibles)
-    try:
-        _wire_telegram_commands(alerts, cwd, boot)
-    except Exception:
-        pass
+    state.update({
+        "guard": guard,
+        "guard_task": guard_task,
+        "cwd": cwd,
+        "cwd_task": cwd_task,
+    })
 
-    # Gouvernance restart
-    restart_lock = asyncio.Lock()
-    consecutive_fail = 0
-    first_down_ts: Optional[float] = None
 
     async def send_restart_webhook_hmac(reason: str, ctx_hint: dict | None = None) -> int:
         if not webhook_url or not webhook_key:
@@ -860,7 +901,7 @@ async def main() -> None:
             "region": region,
             "mode": dep_mode,
             "profile": cap_profile,
-            "fails": consecutive_fail,
+            "fails": state.get("consecutive_fail", 0),
             "ctx": (ctx_hint or {}),
         }
         headers = _hmac_headers(webhook_key, payload)
@@ -869,55 +910,78 @@ async def main() -> None:
         return status
 
     async def request_full_restart(reason: str) -> bool:
-        nonlocal ctx, boot, guard, guard_task, cwd, cwd_task, consecutive_fail, first_down_ts
-        async with restart_lock:
+        if state["restart_lock"].locked():
+            metrics.guard_trigger("full_restart_suppressed")
+            await alerts.notify_warn(f"[Main] Full restart SUPPRIMÉ (restart en cours) — {reason}")
+            return False
+        async with state["restart_lock"]:
             metrics.set_budget_remaining("full", full_budget.remaining())
             if not full_budget.allow():
                 metrics.guard_trigger("full_restart_suppressed")
                 await alerts.notify_warn(f"[Main] Full restart SUPPRIMÉ (budget épuisé). Raison: {reason}")
                 return False
+            state["restart_gen"] += 1
+            state["last_reason"] = reason
+            BOT_STATE.set(4)  # RESTARTING
 
             await alerts.notify_crit(f"[Main] Full restart DÉMARRÉ — {reason}")
 
-            # 1) Stop supervision
-            await _stop_supervision(guard, guard_task, cwd_task)
+            try:
+                # 1) Stop supervision
+                await _stop_supervision(state.get("guard"), state.get("guard_task"), state.get("cwd_task"))
 
-            # 2) Arrêt propre du contexte
-            await graceful_stop_ctx(ctx, alerts, boot=boot)
+                # 2) Arrêt propre du contexte
+                await graceful_stop_ctx(state.get("ctx"), alerts, boot=state.get("boot"))
 
+                # 3) Reboot → READY
+                new_boot = Boot(cfg)
+                new_boot._status_sink = status_sink
+                new_ctx = await new_boot.run()
+                await new_boot.boot_complete.wait()
+                log.info("[Main] Boot2 READY")
 
-            # 3) Reboot → READY
-            new_boot = Boot(cfg)
-            new_ctx  = await new_boot.run()
-            await new_boot.boot_complete.wait()
-            log.info("[Main] Boot2 READY")
+                with contextlib.suppress(Exception):
+                    status_http.set_boot(new_boot)
 
-            # 4) Re-câbler supervision
-            new_guard = ConnectivityGuard(
-                getattr(new_ctx, "ws_client", None),
-                getattr(new_ctx, "router",    None),
-                getattr(new_ctx, "engine",    None),
-                alerts, ws_budget, metrics
-            )
-            new_guard_task = asyncio.create_task(new_guard.run(), name="guard.run")
+                # 4) Re-câbler supervision
+                new_guard = ConnectivityGuard(
+                    getattr(new_ctx, "ws_client", None),
+                    getattr(new_ctx, "router", None),
+                    getattr(new_ctx, "engine", None),
+                    alerts, ws_budget, metrics
+                )
+                new_guard_task = asyncio.create_task(new_guard.run(), name="guard.run")
 
-            new_cwd, new_cwd_task = _init_cwd(new_ctx)
+                new_cwd, new_cwd_task = _init_cwd(new_ctx)
+                setattr(new_cwd, "on_full_restart", on_full_restart_intent)
 
-            # 5) Switch refs (après succès)
-            boot, ctx = new_boot, new_ctx
-            guard, guard_task = new_guard, new_guard_task
-            cwd,   cwd_task   = new_cwd,   new_cwd_task
+                # 5) Switch refs (après succès)
+                state.update({
+                    "boot": new_boot,
+                    "ctx": new_ctx,
+                    "guard": new_guard,
+                    "guard_task": new_guard_task,
+                    "cwd": new_cwd,
+                    "cwd_task": new_cwd_task,
+                })
 
-            consecutive_fail = 0
-            first_down_ts = None
-            await alerts.notify_info("[Main] Full restart OK")
-            return True
+                state["consecutive_fail"] = 0
+                state["first_down_ts"] = None
+                await alerts.notify_info("[Main] Full restart OK")
+                BOT_STATE.set(2)  # READY
+                return True
+            except Exception:
+                metrics.inc_full_restart_fail()
+                metrics.guard_trigger("full_restart_failed")
+                BOT_STATE.set(3)  # DEGRADED
+                log.exception("[Main] Full restart FAILED")
+                return False
+            finally:
+                metrics.set_budget_remaining("full", full_budget.remaining())
 
     async def on_full_restart_intent(reason: str, ctx_hint: dict | None = None):
-        nonlocal consecutive_fail, first_down_ts
-
-        if first_down_ts is None:
-            first_down_ts = time.time()
+        if state.get("first_down_ts") is None:
+            state["first_down_ts"] = time.time()
 
         # MANUAL/HYBRID avec ACK
         if restart_mode == "MANUAL" or (restart_mode == "HYBRID" and telegram_ack_required):
@@ -940,9 +1004,9 @@ async def main() -> None:
             return
 
         # Escalade orchestrateur si échecs/downtime
-        downtime = time.time() - (first_down_ts or time.time())
-        consecutive_fail += 1
-        if consecutive_fail >= esc_after_fails or downtime > max_downtime_s:
+        downtime = time.time() - (state.get("first_down_ts") or time.time())
+        state["consecutive_fail"] = state.get("consecutive_fail", 0) + 1
+        if state["consecutive_fail"] >= esc_after_fails or downtime > max_downtime_s:
             await alerts.notify_crit("[Main] Escalade orchestrateur (webhook) — auto-restart insuffisant")
             status = await send_restart_webhook_hmac(reason, ctx_hint)
             if not (200 <= status < 300):
@@ -950,6 +1014,11 @@ async def main() -> None:
 
     # callback CW
     setattr(cwd, "on_full_restart", on_full_restart_intent)
+    # Commandes Telegram (si disponibles)
+    try:
+        _wire_telegram_commands(alerts, state)
+    except Exception:
+        pass
 
     # -------------------------------------------------------------------------
     # Signaux & shutdown
@@ -968,10 +1037,11 @@ async def main() -> None:
     await stop_event.wait()
 
     # Shutdown propre
+    BOT_STATE.set(5)  # STOPPING
     log.info("[Main] Arrêt demandé — shutdown…")
     with contextlib.suppress(Exception):
-        await _stop_supervision(guard, guard_task, cwd_task)
-    await graceful_stop_ctx(ctx, alerts, boot=boot)
+        await _stop_supervision(state.get("guard"), state.get("guard_task"), state.get("cwd_task"))
+    await graceful_stop_ctx(state.get("ctx"), alerts, boot=state.get("boot"))
     # --- stop observability servers (dans l'ordre inverse du start) ---
     with contextlib.suppress(Exception):
         if status_http is not None:
@@ -983,6 +1053,7 @@ async def main() -> None:
 
     with contextlib.suppress(Exception):
         await alerts.stop()
+    BOT_STATE.set(6)  # STOPPED
     log.info("[Main] Bye.")
 
 # -----------------------------------------------------------------------------
@@ -990,6 +1061,7 @@ async def main() -> None:
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
+        _maybe_install_uvloop()
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
