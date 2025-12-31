@@ -205,6 +205,7 @@ class Globals:
     pair_regex: Optional[str] = None
 
     primary_quote: str = "USDC"                 # "USDC"|"EUR"
+    min_usdc: float = 1000.0
     wallet_alias_by_quote: Dict[str,str] = field(default_factory=lambda: {
         "USDC":"spot_usdc", "EUR":"spot_eur"
     })
@@ -809,11 +810,15 @@ class RiskManagerCfg:
             "allow_auto_downgrade": True,
         },
     })
-    # Expo TT/TM globale (VaR-lite)
+    # TT/TM delta (VaR-lite P0)
     tttm_exposure_soft_usd: float = 2000.0
     tttm_exposure_hard_usd: float = 5000.0
-    # Overrides optionnels par asset: "BTC", "ETH", etc.
-    tttm_exposure_by_asset: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    tttm_exposure_by_asset: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {
+            "BTC": {"soft_usd": 5000.0, "hard_usd": 15000.0},
+            "ETH": {"soft_usd": 3000.0, "hard_usd": 10000.0},
+        }
+    )
 
     # Gestion des stuck legs TT
     tt_stuck_soft_usd: float = 1000.0
@@ -884,19 +889,7 @@ class RiskManagerCfg:
     mm_hedge_cooldown_s: float = 10.0
     mm_hedge_allowed_exchanges: List[str] = field(default_factory=list)
 
-    # TT/TM delta (VaR-lite P0)
-    tttm_exposure_soft_usd: float = 2000.0
-    tttm_exposure_hard_usd: float = 5000.0
-    tttm_exposure_by_asset: Dict[str, Dict[str, float]] = field(
-        default_factory=lambda: {
-            "BTC": {"soft_usd": 5000.0, "hard_usd": 15000.0},
-            "ETH": {"soft_usd": 3000.0, "hard_usd": 10000.0},
-        }
-    )
 
-    tt_stuck_soft_usd: float = 1000.0
-    tt_stuck_hard_usd: float = 3000.0
-    tt_stuck_max_age_s: float = 10.0
 
     tt_hedge_enabled: bool = True
     tt_hedge_max_step_usd: float = 5000.0
@@ -953,6 +946,9 @@ class RiskManagerCfg:
     balance_ttl_s_normal: float = 60.0
     balance_ttl_s_degraded: float = 180.0
     balance_ttl_s_block: float = 600.0
+    balance_unknown_policy: str = "DEGRADED"
+    transfer_submitted_timeout_s: float = 300.0
+    transfer_retry_policy: Dict[str, Any] = field(default_factory=dict)
     daily_strategy_budget_quote: Dict[str, float] = field(default_factory=dict)
     daily_budget_reset_interval_s: float = 86400.0
     decision_log_path: str = ""
@@ -1689,8 +1685,12 @@ class BotConfig:
 
         # --- Charger Globaux ---
         g = cfg.g
-        g.deployment_mode = _Env.get("DEPLOYMENT_MODE", g.deployment_mode)
-        g.pod_region = _Env.get("POD_REGION", g.pod_region)
+        _pod_region_env = _Env.get("POD_REGION", None)
+        _region_alias_env = _Env.get("REGION", None)
+        _deployment_mode_env = _Env.get("DEPLOYMENT_MODE", None)
+
+        g.deployment_mode = _deployment_mode_env or g.deployment_mode
+        g.pod_region = _pod_region_env or g.pod_region
         g.enable_jp = _Env.get_bool("ENABLE_JP", g.enable_jp)
         g.pacer_mode = _Env.get("PACER_MODE", g.pacer_mode)
         g.engine_pod_map = _Env.get_dict("ENGINE_POD_MAP", g.engine_pod_map)
@@ -1705,9 +1705,10 @@ class BotConfig:
         g.pair_regex = _Env.get("PAIR_REGEX", g.pair_regex)
 
         g.primary_quote = _Env.get("PRIMARY_QUOTE", g.primary_quote)
+        g.min_usdc = _Env.get_float("MIN_USDC", g.min_usdc)
         g.wallet_alias_by_quote = _Env.get_dict("WALLET_ALIAS_BY_QUOTE", g.wallet_alias_by_quote)
         g.min_notional_by_exchange_quote = _Env.get_dict("MIN_NOTIONAL_BY_EXCHANGE_QUOTE", g.min_notional_by_exchange_quote)
-
+        _enable_branches_env = _Env.get("ENABLE_BRANCHES", None)
         g.enable_branches = _Env.get_dict("ENABLE_BRANCHES", g.enable_branches)
         g.branch_priority = _Env.get_list("BRANCH_PRIORITY", g.branch_priority)
         g.branch_budgets_quote = _Env.get_dict("BRANCH_BUDGETS_QUOTE", g.branch_budgets_quote)
@@ -1715,7 +1716,26 @@ class BotConfig:
         g.frontload_weights = [float(x) for x in _Env.get_list("FRONTLOAD_WEIGHTS", g.frontload_weights)]
         g.min_fragment_quote = {k: float(v) for k,v in _Env.get_dict("MIN_FRAGMENT_QUOTE", g.min_fragment_quote).items()}
         g.guards = _Env.get_dict("GUARDS", g.guards)
+        _vol_slip_ttl_env = _Env.get("VOL_SLIP_TTL", None)
         g.vol_slip_ttl = _Env.get_dict("VOL_SLIP_TTL", g.vol_slip_ttl)
+        _slip_ttl_env = _Env.get("SLIP_TTL_S", None)
+        _vol_ttl_env = _Env.get("VOL_TTL_S", None)
+        _legacy_ttl_present = _slip_ttl_env is not None or _vol_ttl_env is not None
+        if _legacy_ttl_present:
+            cfg._note_config_error("CONFIG_SCHEMA_INVALID", "vol_slip_ttl")
+            logging.getLogger(__name__).warning(
+                "Legacy SLIP_TTL_S/VOL_TTL_S détectés; VOL_SLIP_TTL reste la source canonique",
+            )
+            if _vol_slip_ttl_env is None:
+                g.vol_slip_ttl = dict(g.vol_slip_ttl)
+                if _slip_ttl_env is not None:
+                    g.vol_slip_ttl["slip_s"] = _Env.get_int(
+                        "SLIP_TTL_S", g.vol_slip_ttl.get("slip_s", cfg.slip.ttl_s)
+                    )
+                if _vol_ttl_env is not None:
+                    g.vol_slip_ttl["vol_s"] = _Env.get_int(
+                        "VOL_TTL_S", g.vol_slip_ttl.get("vol_s", cfg.vol.ttl_s)
+                    )
         cfg.pws.ff_pws_strict_dedup_enforced = _Env.get_bool(
             "PWS_STRICT_DEDUP_ENFORCED",
             cfg.pws.ff_pws_strict_dedup_enforced,
@@ -1726,6 +1746,23 @@ class BotConfig:
         # 👇 Ajoute ce bloc de compat
         if str(g.mode).upper() in ("DEV", "DEVELOPMENT"):
             g.mode = "DRY_RUN"
+        if _pod_region_env is None and _region_alias_env is not None:
+            logging.getLogger(__name__).warning(
+                "REGION (legacy) utilisé faute de POD_REGION; privilégier POD_REGION",
+            )
+            g.pod_region = _region_alias_env
+        if (
+                _pod_region_env is not None
+                and _region_alias_env is not None
+                and str(_pod_region_env).upper() != str(_region_alias_env).upper()
+        ):
+            msg = f"POD_REGION={_pod_region_env} ≠ REGION={_region_alias_env}"
+            logging.getLogger(__name__).error(msg)
+            if str(g.mode).upper() == "PROD":
+                raise ConfigError("CONFIG_SCHEMA_INVALID", "pod_region")
+            cfg._note_config_error("CONFIG_SCHEMA_INVALID", "pod_region")
+        g.pod_region = str(g.pod_region or "EU").upper()
+        g.deployment_mode = str(g.deployment_mode or "SPLIT").upper()
         g.feature_switches = _Env.get_dict("FEATURE_SWITCHES", g.feature_switches)
         # --- Observabilité / Alerting ---
         cfg.obs.strict_obs = _Env.get_bool("STRICT_OBS", cfg.obs.strict_obs)
@@ -2164,13 +2201,38 @@ class BotConfig:
             "RM_BALANCE_TTL_S_BLOCK",
             getattr(cfg.rm, "balance_ttl_s_block", 600.0),
         )
+        policy_raw = _Env.get(
+            "RM_BALANCE_UNKNOWN_POLICY",
+            getattr(cfg.rm, "balance_unknown_policy", "DEGRADED"),
+        )
+        policy_val = str(policy_raw or "DEGRADED").upper()
+        if policy_val not in {"NEUTRAL", "DEGRADED", "BLOCKED"}:
+            raise ConfigError("CONFIG_SCHEMA_INVALID", "rm.balance_unknown_policy")
+        cfg.rm.balance_unknown_policy = policy_val
+        cfg.rm.transfer_submitted_timeout_s = _Env.get_float(
+            "TRANSFER_SUBMITTED_TIMEOUT_S",
+            getattr(cfg.rm, "transfer_submitted_timeout_s", 300.0),
+        )
+        retry_policy = _Env.get_dict(
+            "TRANSFER_RETRY_POLICY",
+            getattr(cfg.rm, "transfer_retry_policy", {}),
+        )
+        if isinstance(retry_policy, dict):
+            cfg.rm.transfer_retry_policy = retry_policy
         # Compat racine + aliases legacy
         cfg.RM_BALANCE_TTL_S_NORMAL = cfg.rm.balance_ttl_s_normal
         cfg.RM_BALANCE_TTL_S_DEGRADED = cfg.rm.balance_ttl_s_degraded
         cfg.RM_BALANCE_TTL_S_BLOCK = cfg.rm.balance_ttl_s_block
+        cfg.RM_BALANCE_UNKNOWN_POLICY = cfg.rm.balance_unknown_policy
+        cfg.TRANSFER_SUBMITTED_TIMEOUT_S = cfg.rm.transfer_submitted_timeout_s
+        cfg.TRANSFER_RETRY_POLICY = cfg.rm.transfer_retry_policy
         setattr(cfg.rm, "RM_BALANCE_TTL_S_NORMAL", cfg.rm.balance_ttl_s_normal)
         setattr(cfg.rm, "RM_BALANCE_TTL_S_DEGRADED", cfg.rm.balance_ttl_s_degraded)
         setattr(cfg.rm, "RM_BALANCE_TTL_S_BLOCK", cfg.rm.balance_ttl_s_block)
+        setattr(cfg.rm, "RM_BALANCE_UNKNOWN_POLICY", cfg.rm.balance_unknown_policy)
+        setattr(cfg.rm, "TRANSFER_SUBMITTED_TIMEOUT_S", cfg.rm.transfer_submitted_timeout_s)
+        setattr(cfg.rm, "TRANSFER_RETRY_POLICY", cfg.rm.transfer_retry_policy)
+
 
         # Alias critiques (accélération des modes SEVERE)
         crit_aliases = _Env.get_list(
@@ -2369,7 +2431,17 @@ class BotConfig:
         cfg.rm.fallback_on_tick_exception = str(
             _Env.get("RM_FALLBACK_ON_TICK_EXCEPTION", cfg.rm.fallback_on_tick_exception)
         ).upper()
-        cfg.engine.pacer_targets = _Env.get_dict("ENGINE_PACER_TARGETS", cfg.engine.pacer_targets)
+        pacer_targets_raw = _Env.get_dict("ENGINE_PACER_TARGETS", cfg.engine.pacer_targets)
+        pacer_targets_canon: Dict[str, Any] = {}
+        for region, target in (pacer_targets_raw or {}).items():
+            region_norm = str(region).upper().replace("_", "-")
+            if region_norm in {"EU", "US", "JP", "EU-CB"}:
+                pacer_targets_canon[region_norm] = target
+            else:
+                logging.getLogger(__name__).warning(
+                    "ENGINE_PACER_TARGETS region %s ignored (unknown tag)", region
+                )
+        cfg.engine.pacer_targets = pacer_targets_canon
         cfg.rm.split_breach_thr_base_ms = _Env.get_float(
             "RM_SPLIT_BREACH_THR_BASE_MS", cfg.rm.split_breach_thr_base_ms
         )
@@ -2582,12 +2654,40 @@ class BotConfig:
                 except Exception:
                     pass
 
-
-        cfg.rm.enable_tt = _Env.get_bool("ENABLE_TT", cfg.rm.enable_tt)
-        cfg.rm.enable_tm = _Env.get_bool("ENABLE_TM", cfg.rm.enable_tm)
-        cfg.rm.enable_mm = _Env.get_bool("ENABLE_MM", cfg.rm.enable_mm)
-        cfg.rm.enable_reb = _Env.get_bool("ENABLE_REB", cfg.rm.enable_reb)
+        _legacy_branches = {
+            "tt": _Env.get("ENABLE_TT", None),
+            "tm": _Env.get("ENABLE_TM", None),
+            "mm": _Env.get("ENABLE_MM", None),
+            "reb": _Env.get("ENABLE_REB", None),
+        }
+        if any(v is not None for v in _legacy_branches.values()):
+            cfg._note_config_error("CONFIG_SCHEMA_INVALID", "enable_branches")
+            logging.getLogger(__name__).warning(
+                "Legacy ENABLE_TT/TM/MM/REB détectés; ENABLE_BRANCHES reste la source canonique",
+            )
+            if _enable_branches_env is None:
+                g.enable_branches = dict(g.enable_branches)
+                if _legacy_branches["tt"] is not None:
+                    g.enable_branches["tt"] = _Env.get_bool(
+                        "ENABLE_TT", g.enable_branches.get("tt", cfg.rm.enable_tt)
+                    )
+                if _legacy_branches["tm"] is not None:
+                    g.enable_branches["tm"] = _Env.get_bool(
+                        "ENABLE_TM", g.enable_branches.get("tm", cfg.rm.enable_tm)
+                    )
+                if _legacy_branches["mm"] is not None:
+                    g.enable_branches["mm"] = _Env.get_bool(
+                        "ENABLE_MM", g.enable_branches.get("mm", cfg.rm.enable_mm)
+                    )
+                if _legacy_branches["reb"] is not None:
+                    g.enable_branches["reb"] = _Env.get_bool(
+                        "ENABLE_REB", g.enable_branches.get("reb", cfg.rm.enable_reb)
+                    )
         cfg.rm.enable_maker_maker = _Env.get_bool("ENABLE_MAKER_MAKER", cfg.rm.enable_maker_maker)
+        cfg.rm.ff_fail_closed_caps = _Env.get_bool(
+            "RM_FF_FAIL_CLOSED_CAPS",
+            cfg.rm.ff_fail_closed_caps,
+        )
         cfg.rm.ff_trading_state_unified = _Env.get_bool(
             "FF_TRADING_STATE_UNIFIED",
             cfg.rm.ff_trading_state_unified,
@@ -2625,6 +2725,14 @@ class BotConfig:
         cfg.rm.branch_budgets_quote = _Env.get_dict(
             "RM_BRANCH_BUDGETS_QUOTE",
             cfg.rm.branch_budgets_quote or cfg.g.branch_budgets_quote,
+        )
+        cfg.rm.tm_queuepos_max_ahead_usd = _Env.get_float(
+            "TM_QUEUEPOS_MAX_AHEAD_USD",
+            cfg.rm.tm_queuepos_max_ahead_usd,
+        )
+        cfg.rm.tm_queuepos_max_eta_ms = _Env.get_int(
+            "TM_QUEUEPOS_MAX_ETA_MS",
+            cfg.rm.tm_queuepos_max_eta_ms,
         )
         cfg.rm.default_notional = _Env.get_float("RM_DEFAULT_NOTIONAL", cfg.rm.default_notional)
         cfg.rm.max_fragments = _Env.get_int("RM_MAX_FRAGMENTS", cfg.rm.max_fragments)
@@ -2956,15 +3064,28 @@ class BotConfig:
         cfg.pws.PWS_POOL_SIZE_EU = _Env.get_int("PWS_POOL_SIZE_EU", cfg.pws.PWS_POOL_SIZE_EU)
         cfg.pws.PWS_POOL_SIZE_US = _Env.get_int("PWS_POOL_SIZE_US", cfg.pws.PWS_POOL_SIZE_US)
         cfg.pws.PWS_QUEUE_MAXLEN = _Env.get_int("PWS_QUEUE_MAXLEN", cfg.pws.PWS_QUEUE_MAXLEN)
+        cfg.pws.PWS_QUEUE_SATURATION_RATIO = _Env.get_float(
+            "PWS_QUEUE_SATURATION_RATIO", cfg.pws.PWS_QUEUE_SATURATION_RATIO
+        )
         cfg.pws.ff_pws_no_drop_critical_enforced = _Env.get_bool(
             "PWS_NO_DROP_CRITICAL_ENFORCED",
             cfg.pws.ff_pws_no_drop_critical_enforced,
+        )
+        cfg.pws.ff_pws_strict_dedup_enforced = _Env.get_bool(
+            "PWS_STRICT_DEDUP_ENFORCED", cfg.pws.ff_pws_strict_dedup_enforced
         )
         cfg.pws.ff_pws_disable_auto_wiring_prod = _Env.get_bool(
             "PWS_DISABLE_AUTO_WIRING_PROD",
             cfg.pws.ff_pws_disable_auto_wiring_prod,
         )
         cfg.pws.pws_drop_policy = _Env.get("PWS_DROP_POLICY", cfg.pws.pws_drop_policy)
+        cfg.pws.PWS_PING_INTERVAL_S = _Env.get_int("PWS_PING_INTERVAL_S", cfg.pws.PWS_PING_INTERVAL_S)
+        cfg.pws.PWS_PONG_TIMEOUT_S = _Env.get_int("PWS_PONG_TIMEOUT_S", cfg.pws.PWS_PONG_TIMEOUT_S)
+        cfg.pws.PWS_HEARTBEAT_MAX_GAP_S = _Env.get_int("PWS_HEARTBEAT_MAX_GAP_S", cfg.pws.PWS_HEARTBEAT_MAX_GAP_S)
+        cfg.pws.PWS_STABLE_RESET_S = _Env.get_int("PWS_STABLE_RESET_S", cfg.pws.PWS_STABLE_RESET_S)
+        cfg.pws.PWS_JITTER_MS = _Env.get_int("PWS_JITTER_MS", cfg.pws.PWS_JITTER_MS)
+        cfg.pws.PWS_BACKOFF_BASE_MS = _Env.get_int("PWS_BACKOFF_BASE_MS", cfg.pws.PWS_BACKOFF_BASE_MS)
+        cfg.pws.PWS_BACKOFF_MAX_MS = _Env.get_int("PWS_BACKOFF_MAX_MS", cfg.pws.PWS_BACKOFF_MAX_MS)
         cfg.pws.PWS_PACER_EU = _Env.get("PWS_PACER_EU", cfg.pws.PWS_PACER_EU)
         cfg.pws.PWS_PACER_US = _Env.get("PWS_PACER_US", cfg.pws.PWS_PACER_US)
         cfg.pws.PWS_ALERT_PERIOD_S = _Env.get_int("PWS_ALERT_PERIOD_S", cfg.pws.PWS_ALERT_PERIOD_S)
@@ -2996,11 +3117,19 @@ class BotConfig:
         cfg.balances.BF_PACER_EU = _Env.get("BF_PACER_EU", cfg.balances.BF_PACER_EU)
         cfg.balances.BF_PACER_US = _Env.get("BF_PACER_US", cfg.balances.BF_PACER_US)
 
-        cfg.slip.ttl_s = _Env.get_int("SLIP_TTL_S", cfg.slip.ttl_s)  # alias historique
-        cfg.vol.ttl_s = _Env.get_int("VOL_TTL_S", cfg.vol.ttl_s)  # alias historique
+
         cfg.vol.midprice_to_bps = _Env.get_float("VOL_MIDPRICE_TO_BPS", cfg.vol.midprice_to_bps)
         cfg.vol.to_bps_floor = _Env.get_float("VOL_TO_BPS_FLOOR", cfg.vol.to_bps_floor)
         cfg.vol.to_bps_cap = _Env.get_float("VOL_TO_BPS_CAP", cfg.vol.to_bps_cap)
+        cfg.vol.ema_alpha = _Env.get_float("VOL_EMA_ALPHA", cfg.vol.ema_alpha)
+        cfg.vol.soft_cap_bps = _Env.get_float("VOL_SOFT_CAP_BPS", cfg.vol.soft_cap_bps)
+        cfg.vol.chaos_cap_bps = _Env.get_float("VOL_CHAOS_CAP_BPS", cfg.vol.chaos_cap_bps)
+        cfg.vol.hysteresis = _Env.get_float("VOL_HYSTERESIS", cfg.vol.hysteresis)
+        cfg.vol.vol_min_delta_bps = _Env.get_float("VOL_MIN_DELTA_BPS", cfg.vol.vol_min_delta_bps)
+        cfg.vol.max_silence_s = _Env.get_float("VOL_MAX_SILENCE_S", cfg.vol.max_silence_s)
+        cfg.vol.window_long_m = _Env.get_int("VOL_WINDOW_LONG_M", cfg.vol.window_long_m)
+        cfg.vol.window_micro_m = _Env.get_int("VOL_WINDOW_MICRO_M", cfg.vol.window_micro_m)
+        cfg.vol.winsor_pct = _Env.get_float("VOL_WINSOR_PCT", cfg.vol.winsor_pct)
         cfg.rm.mm_ttl_ms = _Env.get_int("MM_TTL_MS", cfg.rm.mm_ttl_ms)
         cfg.vol.vm_size_factor_map = _Env.get_dict("VM_SIZE_FACTOR_MAP", cfg.vol.vm_size_factor_map)
         cfg.vol.vm_min_bps_boost_map = _Env.get_dict("VM_MIN_BPS_BOOST_MAP", cfg.vol.vm_min_bps_boost_map)
@@ -3009,6 +3138,11 @@ class BotConfig:
         cfg.vol.vm_prudence_thresholds_bps = _Env.get_dict("VM_PRUDENCE_THRESHOLDS_BPS",
                                                            cfg.vol.vm_prudence_thresholds_bps)
         cfg.vol.vm_maker_pad_ticks_map = _Env.get_dict("VM_MAKER_PAD_TICKS_MAP", cfg.vol.vm_maker_pad_ticks_map)
+        cfg.slip.heartbeat_s = _Env.get_int("SLIP_HEARTBEAT_S", cfg.slip.heartbeat_s)
+        cfg.slip.use_vwap_depth = _Env.get_bool("SLIP_USE_VWAP_DEPTH", cfg.slip.use_vwap_depth)
+        cfg.slip.max_bps_by_quote = {
+            k: float(v) for k, v in _Env.get_dict("SLIP_MAX_BPS_BY_QUOTE", cfg.slip.max_bps_by_quote).items()
+        }
         cfg.slip.fee_sync_max_concurrency = _Env.get_int("FEE_SYNC_MAX_CONCURRENCY", cfg.slip.fee_sync_max_concurrency)
         cfg.slip.fee_sync_backoff_initial_s = _Env.get_float("FEE_SYNC_BACKOFF_INITIAL_S",
                                                              cfg.slip.fee_sync_backoff_initial_s)
@@ -3019,12 +3153,33 @@ class BotConfig:
                                                                   cfg.slip.fee_reality_check_threshold_bps)
 
         # --- Rate Limiter (optionnel) ---
-        cfg.rl.hard_caps_rps_by_exchange = _Env.get_dict("RL_HARD_CAPS_RPS", cfg.rl.hard_caps_rps_by_exchange)
-        cfg.rl.hard_caps_rps_by_exchange_kind = _Env.get_dict("RL_HARD_CAPS_RPS_BY_EXCHANGE_KIND",
-                                                              cfg.rl.hard_caps_rps_by_exchange_kind)
+        rl_caps_ex_by = _Env.get_dict("RL_HARD_CAPS_RPS_BY_EXCHANGE", cfg.rl.hard_caps_rps_by_exchange)
+        rl_caps_ex_legacy = _Env.get_dict("RL_HARD_CAPS_RPS", rl_caps_ex_by)
+        if os.getenv("RL_HARD_CAPS_RPS") and os.getenv(
+                "RL_HARD_CAPS_RPS_BY_EXCHANGE") and rl_caps_ex_by != rl_caps_ex_legacy:
+            logging.getLogger(__name__).warning(
+                "env collision on RL_HARD_CAPS_RPS vs RL_HARD_CAPS_RPS_BY_EXCHANGE; using canonical BY_EXCHANGE"
+            )
+        cfg.rl.hard_caps_rps_by_exchange = rl_caps_ex_by if os.getenv(
+            "RL_HARD_CAPS_RPS_BY_EXCHANGE") else rl_caps_ex_legacy
+
+        cfg.rl.hard_caps_rps_by_exchange_kind = _Env.get_dict(
+            "RL_HARD_CAPS_RPS_BY_EXCHANGE_KIND",
+            cfg.rl.hard_caps_rps_by_exchange_kind,
+        )
         cfg.rl.hard_caps_rps_by_kind = _Env.get_dict("RL_HARD_CAPS_RPS_BY_KIND", cfg.rl.hard_caps_rps_by_kind)
-        cfg.rl.bursts_by_exchange = _Env.get_dict("RL_BURSTS", cfg.rl.bursts_by_exchange)
-        cfg.rl.bursts_by_exchange_kind = _Env.get_dict("RL_BURSTS_BY_EXCHANGE_KIND", cfg.rl.bursts_by_exchange_kind)
+        rl_bursts_ex_by = _Env.get_dict("RL_BURSTS_BY_EXCHANGE", cfg.rl.bursts_by_exchange)
+        rl_bursts_ex_legacy = _Env.get_dict("RL_BURSTS", rl_bursts_ex_by)
+        if os.getenv("RL_BURSTS") and os.getenv("RL_BURSTS_BY_EXCHANGE") and rl_bursts_ex_by != rl_bursts_ex_legacy:
+            logging.getLogger(__name__).warning(
+                "env collision on RL_BURSTS vs RL_BURSTS_BY_EXCHANGE; using canonical BY_EXCHANGE"
+            )
+        cfg.rl.bursts_by_exchange = rl_bursts_ex_by if os.getenv("RL_BURSTS_BY_EXCHANGE") else rl_bursts_ex_legacy
+
+        cfg.rl.bursts_by_exchange_kind = _Env.get_dict(
+            "RL_BURSTS_BY_EXCHANGE_KIND",
+            cfg.rl.bursts_by_exchange_kind,
+        )
         cfg.rl.bursts_by_kind = _Env.get_dict("RL_BURSTS_BY_KIND", cfg.rl.bursts_by_kind)
         cfg.rl.priorities = _Env.get_list("RL_PRIORITIES", cfg.rl.priorities)
         cfg.rl.fair = _Env.get_bool("RL_FAIR", cfg.rl.fair)
@@ -3033,39 +3188,6 @@ class BotConfig:
         cfg.rl.max_sleep_s = _Env.get_float("RL_MAX_SLEEP_S", cfg.rl.max_sleep_s)
         cfg.rl.default_rate_per_s = _Env.get_float("RL_DEFAULT_RATE_PER_S", cfg.rl.default_rate_per_s)
         cfg.rl.default_burst = _Env.get_int("RL_DEFAULT_BURST", cfg.rl.default_burst)
-        # --- Rate Limiter global (déjà présent) ---
-        cfg.rl.hard_caps_rps_by_exchange = _Env.get_dict(
-            "RL_HARD_CAPS_RPS_BY_EXCHANGE",
-            cfg.rl.hard_caps_rps_by_exchange,
-        )
-        cfg.rl.hard_caps_rps_by_exchange_kind = _Env.get_dict(
-            "RL_HARD_CAPS_RPS_BY_EXCHANGE_KIND",
-            cfg.rl.hard_caps_rps_by_exchange_kind,
-        )
-        cfg.rl.hard_caps_rps_by_kind = _Env.get_dict(
-            "RL_HARD_CAPS_RPS_BY_KIND",
-            cfg.rl.hard_caps_rps_by_kind,
-        )
-        cfg.rl.bursts_by_exchange = _Env.get_dict(
-            "RL_BURSTS_BY_EXCHANGE",
-            cfg.rl.bursts_by_exchange,
-        )
-        cfg.rl.bursts_by_exchange_kind = _Env.get_dict(
-            "RL_BURSTS_BY_EXCHANGE_KIND",
-            cfg.rl.bursts_by_exchange_kind,
-        )
-        cfg.rl.bursts_by_kind = _Env.get_dict(
-            "RL_BURSTS_BY_KIND",
-            cfg.rl.bursts_by_kind,
-        )
-        cfg.rl.default_rate_per_s = _Env.get_float(
-            "RL_DEFAULT_RATE_PER_S",
-            cfg.rl.default_rate_per_s,
-        )
-        cfg.rl.default_burst = _Env.get_float(
-            "RL_DEFAULT_BURST",
-            cfg.rl.default_burst,
-        )
 
         # 🔹 Nouveau : configuration SC (sub-account) en JSON
         cfg.rl.sc = _Env.get_dict("RL_SC", cfg.rl.sc)
@@ -3099,8 +3221,7 @@ class BotConfig:
 
         # --- Regions / Split routing ---
         g = getattr(cfg, "g", cfg)
-        g.pod_region = _Env.get("REGION", getattr(g, "pod_region", "EU"))
-        g.deployment_mode = _Env.get("DEPLOYMENT_MODE", getattr(g, "deployment_mode", "SPLIT"))
+
         g.exchange_region_map = {
             str(k).upper(): str(v).upper() for k, v in
             (_Env.get_dict("EXCHANGE_REGION_MAP", getattr(g, "exchange_region_map", {})) or {}).items()
@@ -3623,6 +3744,9 @@ class BotConfig:
                 "simulator": False,
             })
             self.rm.dry_run = False
+            policy = str(getattr(self.rm, "balance_unknown_policy", "DEGRADED") or "DEGRADED").upper()
+            if policy == "NEUTRAL":
+                raise ConfigError("CONFIG_SCHEMA_INVALID", "rm.balance_unknown_policy")
         else:
             # valeur inattendue -> fallback DRY_RUN
             self.g.mode = "DRY_RUN"
@@ -3709,6 +3833,11 @@ class BotConfig:
         # TTL slip/vol aux sections dédiées
         self.slip.ttl_s = int(self.g.vol_slip_ttl.get("slip_s", self.slip.ttl_s))
         self.vol.ttl_s = int(self.g.vol_slip_ttl.get("vol_s", self.vol.ttl_s))
+        logging.getLogger(__name__).info(
+            "VOL_SLIP_TTL appliqué -> slip_ttl_s=%s vol_ttl_s=%s",
+            self.slip.ttl_s,
+            self.vol.ttl_s,
+        )
 
     def _apply_branches_routes_overlay(self) -> None:
         # Branches
@@ -3738,12 +3867,19 @@ class BotConfig:
             "FF_HEDGE_FAST_LANE": "rm.ff_hedge_fast_lane",
             "ff_tm_enabled": "rm.ff_tm_enabled",
             "FF_TM_ENABLED": "rm.ff_tm_enabled",
+            "ff_fail_closed_caps": "rm.ff_fail_closed_caps",
+            "FF_FAIL_CLOSED_CAPS": "rm.ff_fail_closed_caps",
+            "RM_FF_FAIL_CLOSED_CAPS": "rm.ff_fail_closed_caps",
             "ff_mm_enabled": "rm.ff_mm_enabled",
             "FF_MM_ENABLED": "rm.ff_mm_enabled",
             "ff_mm_opportunistic_gating_enforced": "rm.ff_mm_opportunistic_gating_enforced",
             "FF_MM_OPPORTUNISTIC_GATING_ENFORCED": "rm.ff_mm_opportunistic_gating_enforced",
             "ff_reb_enabled": "rm.ff_reb_enabled",
             "FF_REB_ENABLED": "rm.ff_reb_enabled",
+            "TM_QUEUEPOS_MAX_AHEAD_USD": "rm.tm_queuepos_max_ahead_usd",
+            "tm_queuepos_max_ahead_usd": "rm.tm_queuepos_max_ahead_usd",
+            "TM_QUEUEPOS_MAX_ETA_MS": "rm.tm_queuepos_max_eta_ms",
+            "tm_queuepos_max_eta_ms": "rm.tm_queuepos_max_eta_ms",
             "per_strategy_notional_cap": "rm.per_strategy_notional_cap",
             "PER_STRATEGY_NOTIONAL_CAP": "rm.per_strategy_notional_cap",
             "rebal_allow_loss_bps": "rm.rebal_allow_loss_bps",
@@ -3778,6 +3914,8 @@ class BotConfig:
             # Globals commonly read flat
             "CAPITAL_PROFILE": "g.capital_profile",
             "PRIMARY_QUOTE": "g.primary_quote",
+            "min_usdc": "g.min_usdc",
+            "MIN_USDC": "g.min_usdc",
             "DEPLOYMENT_MODE": "g.deployment_mode",
             "POD_REGION": "g.pod_region",
             # RM inventory/buffer
@@ -3789,6 +3927,12 @@ class BotConfig:
             "MIN_BUFFER_QUOTE": "rm.min_buffer_quote",
             "min_buffer_usd": "rm.min_buffer_quote",
             "MIN_BUFFER_USD": "rm.min_buffer_quote",
+            "balance_unknown_policy": "rm.balance_unknown_policy",
+            "BALANCE_UNKNOWN_POLICY": "rm.balance_unknown_policy",
+            "transfer_submitted_timeout_s": "rm.transfer_submitted_timeout_s",
+            "TRANSFER_SUBMITTED_TIMEOUT_S": "rm.transfer_submitted_timeout_s",
+            "transfer_retry_policy": "rm.transfer_retry_policy",
+            "TRANSFER_RETRY_POLICY": "rm.transfer_retry_policy",
             # Balance fetcher / fees
             "binance_rest_base": "balances.binance_rest_base",
             "BINANCE_REST_BASE": "balances.binance_rest_base",
@@ -3821,6 +3965,31 @@ class BotConfig:
             "FEE_SYNC_MAX_RETRIES": "slip.fee_sync_max_retries",
             "FEE_SYNC_JITTER_S": "slip.fee_sync_jitter_s",
             "FEE_REALITY_CHECK_THRESHOLD_BPS": "slip.fee_reality_check_threshold_bps",
+            "slip_heartbeat_s": "slip.heartbeat_s",
+            "SLIP_HEARTBEAT_S": "slip.heartbeat_s",
+            "slip_use_vwap_depth": "slip.use_vwap_depth",
+            "SLIP_USE_VWAP_DEPTH": "slip.use_vwap_depth",
+            "slip_max_bps_by_quote": "slip.max_bps_by_quote",
+            "SLIP_MAX_BPS_BY_QUOTE": "slip.max_bps_by_quote",
+            # Volatility monitor knobs
+            "vol_ema_alpha": "vol.ema_alpha",
+            "VOL_EMA_ALPHA": "vol.ema_alpha",
+            "vol_soft_cap_bps": "vol.soft_cap_bps",
+            "VOL_SOFT_CAP_BPS": "vol.soft_cap_bps",
+            "vol_chaos_cap_bps": "vol.chaos_cap_bps",
+            "VOL_CHAOS_CAP_BPS": "vol.chaos_cap_bps",
+            "vol_hysteresis": "vol.hysteresis",
+            "VOL_HYSTERESIS": "vol.hysteresis",
+            "vol_min_delta_bps": "vol.vol_min_delta_bps",
+            "VOL_MIN_DELTA_BPS": "vol.vol_min_delta_bps",
+            "vol_max_silence_s": "vol.max_silence_s",
+            "VOL_MAX_SILENCE_S": "vol.max_silence_s",
+            "vol_window_long_m": "vol.window_long_m",
+            "VOL_WINDOW_LONG_M": "vol.window_long_m",
+            "vol_window_micro_m": "vol.window_micro_m",
+            "VOL_WINDOW_MICRO_M": "vol.window_micro_m",
+            "vol_winsor_pct": "vol.winsor_pct",
+            "VOL_WINSOR_PCT": "vol.winsor_pct",
             # Volatility manager maps
             "vm_size_factor_map": "vol.vm_size_factor_map",
             "VM_SIZE_FACTOR_MAP": "vol.vm_size_factor_map",
@@ -3855,9 +4024,36 @@ class BotConfig:
             "PWS_PACER_EU": "pws.PWS_PACER_EU",
             "PWS_PACER_US": "pws.PWS_PACER_US",
             "PWS_ALERT_PERIOD_S": "pws.PWS_ALERT_PERIOD_S",
+            "PWS_QUEUE_MAXLEN": "pws.PWS_QUEUE_MAXLEN",
+            "pws_queue_maxlen": "pws.PWS_QUEUE_MAXLEN",
+            "PWS_POOL_SIZE_EU": "pws.PWS_POOL_SIZE_EU",
+            "pws_pool_size_eu": "pws.PWS_POOL_SIZE_EU",
+            "PWS_POOL_SIZE_US": "pws.PWS_POOL_SIZE_US",
+            "pws_pool_size_us": "pws.PWS_POOL_SIZE_US",
+            "PWS_DROP_POLICY": "pws.pws_drop_policy",
+            "pws_drop_policy": "pws.pws_drop_policy",
+            "PWS_NO_DROP_CRITICAL_ENFORCED": "pws.ff_pws_no_drop_critical_enforced",
+            "pws_no_drop_critical_enforced": "pws.ff_pws_no_drop_critical_enforced",
+            "PWS_STRICT_DEDUP_ENFORCED": "pws.ff_pws_strict_dedup_enforced",
+            "pws_strict_dedup_enforced": "pws.ff_pws_strict_dedup_enforced",
+            "PWS_QUEUE_SATURATION_RATIO": "pws.PWS_QUEUE_SATURATION_RATIO",
+            "pws_queue_saturation_ratio": "pws.PWS_QUEUE_SATURATION_RATIO",
+            "PWS_PING_INTERVAL_S": "pws.PWS_PING_INTERVAL_S",
+            "PWS_PONG_TIMEOUT_S": "pws.PWS_PONG_TIMEOUT_S",
+            "PWS_HEARTBEAT_MAX_GAP_S": "pws.PWS_HEARTBEAT_MAX_GAP_S",
+            "PWS_STABLE_RESET_S": "pws.PWS_STABLE_RESET_S",
+            "PWS_JITTER_MS": "pws.PWS_JITTER_MS",
+            "PWS_BACKOFF_BASE_MS": "pws.PWS_BACKOFF_BASE_MS",
+            "PWS_BACKOFF_MAX_MS": "pws.PWS_BACKOFF_MAX_MS",
             # Balance fetcher pacers (string states)
             "BF_PACER_EU_STR": "balances.BF_PACER_EU",
             "BF_PACER_US_STR": "balances.BF_PACER_US",
+            "BALANCES_TTL_S_NORMAL": "rm.balance_ttl_s_normal",
+            "BALANCES_TTL_S_DEGRADED": "rm.balance_ttl_s_degraded",
+            "BALANCES_TTL_S_BLOCK": "rm.balance_ttl_s_block",
+            "balances_ttl_s_normal": "rm.balance_ttl_s_normal",
+            "balances_ttl_s_degraded": "rm.balance_ttl_s_degraded",
+            "balances_ttl_s_block": "rm.balance_ttl_s_block",
         }
 
     def _rebuild_flat_cache(self) -> None:
@@ -3908,7 +4104,11 @@ class BotConfig:
             return self._flat_cache[key]
         alias = self._resolve_alias(item)
         if alias:
-            return self.get_by_dotpath(alias)
+            sentinel = object()
+            value = self.get_by_dotpath(alias, sentinel)
+            if value is not sentinel:
+                return value
+            raise AttributeError(item)
         raise AttributeError(item)
 
     @property

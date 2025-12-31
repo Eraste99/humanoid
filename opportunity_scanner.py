@@ -344,8 +344,13 @@ class OpportunityScanner:
         self._audition_ttl_min = int(getattr(s, "audition_ttl_min", 5))
         self._ban_ttl_min = int(getattr(s, "ban_ttl_min", 3))
         self._hysteresis_min = int(getattr(s, "hysteresis_min", 2))
-        # Kill-switch MM unifié : alias direct de cfg.enable_maker_maker
-        self._enable_mm_hints = bool(getattr(self.cfg, "enable_maker_maker", False))
+        # Kill-switch MM unifié : global (rm) puis opt-in scanner
+        rm_cfg = getattr(self.cfg, "rm", None)
+        global_mm_enabled = bool(getattr(rm_cfg, "enable_maker_maker", getattr(self.cfg, "enable_maker_maker", False)))
+        scanner_mm_enabled = bool(getattr(s, "enable_mm_hints", False))
+        if scanner_mm_enabled and not global_mm_enabled:
+            self.logger.warning("SCANNER_ENABLE_MM_HINTS=1 ignored because ENABLE_MAKER_MAKER=0")
+        self._enable_mm_hints = global_mm_enabled and scanner_mm_enabled
         self.mm_mode = str(getattr(s, "mm_mode", "OFF") or "OFF").upper()
         self._binance_depth_level = int(getattr(s, "binance_depth_level", 10))
 
@@ -3064,7 +3069,7 @@ class OpportunityScanner:
             pass
 
         # Aliases / compat existante (vous les gardez)
-        SCANNER_DECISION_MS.labels(pair, route_combo).observe(dt_ms)
+        SCANNER_DECISION_MS.observe(dt_ms)
         SCANNER_EVAL_MS.labels(pair, route_combo).observe(dt_ms)
 
     # ---------------- Pull mode: tick ----------------

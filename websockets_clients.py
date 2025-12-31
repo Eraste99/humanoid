@@ -360,14 +360,13 @@ class WebSocketExchangeClient:
             # fallback simple si non présente
             self._inv_map = {}
 
-            def _ws_connect_kwargs(self) -> Dict[str, float]:
-                return {
-                    "ping_interval": self._ping_interval_s,
-                    "ping_timeout": self._pong_timeout_s,
-                    "close_timeout": self._read_timeout_s,
-                    "open_timeout": self._connect_timeout_s,
-                }
-
+    def _ws_connect_kwargs(self) -> Dict[str, float]:
+        return {
+            "ping_interval": self._ping_interval_s,
+            "ping_timeout": self._pong_timeout_s,
+            "close_timeout": self._read_timeout_s,
+            "open_timeout": self._connect_timeout_s,
+        }
     def _unsubscribe_impl(self, batch: List[str]) -> None:
         # Hook d’implémentation spécifique CEX si nécessaire.
         # Par défaut, les listeners reconstruisent la souscription côté serveur → no-op ici.

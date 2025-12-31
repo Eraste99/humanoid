@@ -214,10 +214,17 @@ class MultiBalanceFetcher:
         self.BYBIT_API    = getattr(self.cfg, "bybit_api_base", self.BYBIT_API_DEFAULT)
 
         # TTL balances par défaut (fallback BF) + cache SLO par exchange
-        bf_cfg = getattr(self, "_bf_cfg", self.cfg)
-        self._bal_ttl_default_normal = float(getattr(bf_cfg, "BALANCES_TTL_S_NORMAL", 10.0))
-        self._bal_ttl_default_degraded = float(getattr(bf_cfg, "BALANCES_TTL_S_DEGRADED", 30.0))
-        self._bal_ttl_default_block = float(getattr(bf_cfg, "BALANCES_TTL_S_BLOCK", 120.0))
+        bf_cfg = getattr(self, "_bf_cfg", getattr(self.cfg, "balances", self.cfg))
+        rm_cfg = getattr(self.cfg, "rm", self.cfg)
+        self._bal_ttl_default_normal = float(
+            getattr(rm_cfg, "balance_ttl_s_normal", getattr(rm_cfg, "BALANCES_TTL_S_NORMAL", 10.0))
+        )
+        self._bal_ttl_default_degraded = float(
+            getattr(rm_cfg, "balance_ttl_s_degraded", getattr(rm_cfg, "BALANCES_TTL_S_DEGRADED", 30.0))
+        )
+        self._bal_ttl_default_block = float(
+            getattr(rm_cfg, "balance_ttl_s_block", getattr(rm_cfg, "BALANCES_TTL_S_BLOCK", 120.0))
+        )
         self._bal_ttl_by_ex: Dict[str, Dict[str, float]] = {}
         self._balances_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._balances_freshness_status: Dict[str, Any] = {"status": "UNKNOWN", "ready": False, "reason_code": None}
@@ -497,7 +504,7 @@ class MultiBalanceFetcher:
         else:
             worst_state = "NORMAL"
 
-        bf_cfg = getattr(self, "_bf_cfg", self.cfg)
+        bf_cfg = getattr(self, "_bf_cfg", getattr(self.cfg, "balances", self.cfg))
         ready_min = str(getattr(bf_cfg, "balances_ready_min_state", "NORMAL") or "NORMAL").upper()
         severity = {"NORMAL": 0, "DEGRADED": 1, "BLOCK": 2}
         min_rank = severity.get(ready_min, 0)

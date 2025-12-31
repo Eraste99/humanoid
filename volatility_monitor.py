@@ -375,11 +375,10 @@ class VolatilityMonitor:
         """
         P1/P2: retourne la volatilité *relative* si mesure fraîche (TTL), sinon None.
 
-        Priorité TTL :
-          1) ttl_s explicite passé à l'appel.
-          2) Contrat SLO public :
-                cfg.slo[deployment_mode][exchange].public.vol_ttl_s
-          3) Fallback legacy : cfg.vol.ttl_s (injecté dans self._ttl_s).
+        TTL effectif :
+          - ttl_s explicite peut durcir la fraîcheur,
+          - SLO public plafonne toujours : cfg.slo[deployment_mode][exchange].public.vol_ttl_s,
+          - sinon fallback legacy : cfg.vol.ttl_s (injecté dans self._ttl_s).
         """
         ex = str(exchange or "").upper()
         pk = _norm_pair(pair_key)
@@ -387,37 +386,44 @@ class VolatilityMonitor:
         if not rec:
             return None
 
-        # --- Résolution du TTL (SLO public → fallback cfg.vol.ttl_s) ------------
-        if ttl_s is not None:
-            ttl = float(ttl_s)
-        else:
-            ttl = None
-            try:
-                cfg = getattr(self, "cfg", None)
-                slo_map = getattr(cfg, "slo", None) if cfg is not None else None
-                if slo_map:
-                    g_cfg = getattr(cfg, "g", None)
-                    mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
-                    per_ex = slo_map.get(mode_key) or {}
-                    path_slo = per_ex.get(ex)
-                    if path_slo is not None and getattr(path_slo, "public", None) is not None:
-                        vol_ttl_s = float(
-                            getattr(path_slo.public, "vol_ttl_s", 0.0) or 0.0
-                        )
-                        if vol_ttl_s > 0.0:
-                            ttl = vol_ttl_s
-            except Exception:
-                logger.warning(
-                    "[VolatilityMonitor] unable to resolve SLO-based vol TTL, "
-                    "falling back to cfg.vol.ttl_s",
-                    exc_info=False,
-                )
-                ttl = None
+        # --- Résolution du TTL (SLO public plafonne) -----------------------------
+        legacy_ttl = float(getattr(self, "_ttl_s", 5.0))
+        requested_ttl = float(ttl_s) if ttl_s is not None else None
+        slo_ttl = None
+        try:
+            cfg = getattr(self, "cfg", None)
+            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+            if slo_map:
+                g_cfg = getattr(cfg, "g", None)
+                mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                per_ex = slo_map.get(mode_key) or {}
+                path_slo = per_ex.get(ex)
+                if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                    vol_ttl_s = float(getattr(path_slo.public, "vol_ttl_s", 0.0) or 0.0)
+                    if vol_ttl_s > 0.0:
+                        slo_ttl = vol_ttl_s
+        except Exception:
+            logger.warning(
+                "[VolatilityMonitor] unable to resolve SLO-based vol TTL, "
+                "falling back to cfg.vol.ttl_s",
+                exc_info=False,
+            )
 
-            if ttl is None:
-                # Source legacy : cfg.vol.ttl_s injecté dans self._ttl_s au __init__
-                ttl = float(getattr(self, "_ttl_s", 5.0))
-
+        base_ttl = (
+            requested_ttl
+            if requested_ttl is not None
+            else (slo_ttl if slo_ttl is not None else legacy_ttl)
+        )
+        ttl = min(base_ttl, slo_ttl) if slo_ttl is not None else base_ttl
+        if (
+                requested_ttl is not None
+                and slo_ttl is not None
+                and requested_ttl > ttl
+        ):
+            logger.debug(
+                "[VolatilityMonitor] requested vol TTL clamped by SLO",
+                extra={"requested_ttl": requested_ttl, "slo_ttl": slo_ttl, "effective_ttl": ttl},
+            )
         # --- Application du TTL sur la dernière mesure --------------------------
         age_s = max(0.0, time.time() - float(rec.get("ts_recv_s", 0.0)))
         if age_s > ttl:

@@ -2073,6 +2073,7 @@ class RiskManager:
         # Cache local des fenêtres "capital en mouvement" par (EXCHANGE, ALIAS)
         # Clés en UPPER, valeurs = dict(state) avec start_ts / deadline_ts / last_notional_usdc.
         self._alias_capital_move_state: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._transfer_alias_index: Dict[str, Set[Tuple[str, str]]] = {}
 
     # ------------------------------------------------------------------
     # Hooks d'observabilité / mute de routes (callbacks injectés par Boot)
@@ -6283,6 +6284,13 @@ class RiskManager:
     # Balances TTL (MBF → RM)                                            #
     # ------------------------------------------------------------------ #
 
+    def _balance_unknown_policy(self) -> str:
+        rm_cfg = getattr(getattr(self, "cfg", None), "rm", None)
+        policy = str(getattr(rm_cfg, "balance_unknown_policy", "DEGRADED")).upper()
+        if policy not in {"NEUTRAL", "DEGRADED", "BLOCKED"}:
+            return "DEGRADED"
+        return policy
+
     def _classify_balance_age(self, age_s: float) -> str:
         """
         Classe un âge de balance en statut métier.
@@ -6290,12 +6298,20 @@ class RiskManager:
         - OK        : age <= RM_BALANCE_TTL_S_NORMAL
         - DEGRADED  : RM_BALANCE_TTL_S_NORMAL < age <= RM_BALANCE_TTL_S_BLOCK
         - BLOCKED   : age > RM_BALANCE_TTL_S_BLOCK
+        Policy UNKNOWN (age<=0) configurable via cfg.rm.balance_unknown_policy :
+        - BLOCKED  : retour BLOCKED (fail-closed)
+        - DEGRADED : retour DEGRADED (down-clamp)
+        - NEUTRAL  : retour UNKNOWN (compat)
 
         NB: RM_BALANCE_TTL_S_DEGRADED est là pour affiner la zone "DEGRADED"
         si tu veux plus tard (par ex. modes intermédiaires).
         """
         if age_s <= 0:
-            # On ne bloque pas sur une info manquante/invalide, on reste neutre.
+            policy = self._balance_unknown_policy()
+            if policy == "BLOCKED":
+                return "BLOCKED"
+            if policy == "DEGRADED":
+                return "DEGRADED"
             return "UNKNOWN"
 
         if age_s <= self._balance_ttl_s_normal:
@@ -6334,7 +6350,16 @@ class RiskManager:
 
         # Cas neutres
         if status in ("UNKNOWN", "OK"):
-            return 1.0
+            policy = self._balance_unknown_policy()
+            if status == "UNKNOWN":
+                if policy == "BLOCKED":
+                    return 0.0
+                if policy == "DEGRADED":
+                    status = "DEGRADED"
+                else:
+                    return 1.0
+            else:
+                return 1.0
         if status == "BLOCKED":
             return 0.0
 
@@ -6530,6 +6555,32 @@ class RiskManager:
         # cette information vers la surcouche "capital en mouvement".
         self._update_capital_move_state_from_ttl()
 
+    def _prune_transfer_tracking(self, transfer_id: Optional[str]) -> None:
+        if not transfer_id:
+            return
+        tid = str(transfer_id)
+        keys = self._transfer_alias_index.pop(tid, set()) if hasattr(self, "_transfer_alias_index") else set()
+        for key in list(keys):
+            state = self._alias_capital_move_state.get(key)
+            if not isinstance(state, dict):
+                continue
+            transfers = set(state.get("transfer_ids") or [])
+            transfers.discard(tid)
+            payloads = state.get("transfer_payloads") or {}
+            if isinstance(payloads, dict):
+                payloads.pop(tid, None)
+            if transfers:
+                state["transfer_ids"] = list(transfers)
+            else:
+                state.pop("transfer_ids", None)
+            if isinstance(payloads, dict) and payloads:
+                state["transfer_payloads"] = payloads
+            else:
+                state.pop("transfer_payloads", None)
+            if state:
+                self._alias_capital_move_state[key] = state
+            else:
+                self._alias_capital_move_state.pop(key, None)
     def _update_capital_move_state_from_ttl(self) -> None:
         """Met à jour l'état "capital en mouvement" à partir du cache TTL MBF.
 
@@ -6555,6 +6606,8 @@ class RiskManager:
 
             start_ts = float(state.get("start_ts") or 0.0)
             deadline_ts = float(state.get("deadline_ts") or 0.0)
+            transfer_ids = state.get("transfer_ids") or []
+            payloads = state.get("transfer_payloads") or {}
 
             # Condition 1: balance fraîche -> transfert visible.
             if age_s > 0.0 and age_s <= self._balance_ttl_s_normal:
@@ -6562,6 +6615,15 @@ class RiskManager:
                 # première balance fraîche.
                 latency_s = max(0.0, now - start_ts) if start_ts > 0.0 else 0.0
                 self._obs_capital_move_visibility(ex_u, alias_u, latency_s, status="OK")
+                for transfer_id in transfer_ids:
+                    try:
+                        payload = payloads.get(str(transfer_id)) if isinstance(payloads, dict) else None
+                        self._transfer_controller.mark_settled(transfer_id, payload=payload)
+                        if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
+                            self.rebalancing.mark_transfer_status(transfer_id, "SETTLED")
+                    except Exception:
+                        logger.exception("[RiskManager] failed to mark transfer settled for %s", transfer_id)
+                    self._prune_transfer_tracking(transfer_id)
                 done.append(key)
                 continue
 
@@ -6577,7 +6639,15 @@ class RiskManager:
                 done.append(key)
 
         for key in done:
-            self._alias_capital_move_state.pop(key, None)
+            state = self._alias_capital_move_state.pop(key, None)
+            transfer_ids = set((state or {}).get("transfer_ids") or [])
+            for transfer_id in transfer_ids:
+                aliases = self._transfer_alias_index.get(str(transfer_id))
+                if not aliases:
+                    continue
+                aliases.discard(key)
+                if not aliases:
+                    self._transfer_alias_index.pop(str(transfer_id), None)
 
     def _get_private_path_health(self, exchange: str, alias: str) -> Dict[str, Any]:
         ex_u = str(exchange or "").upper()
@@ -11401,10 +11471,31 @@ class RiskManager:
             transfer_id = payload.get("transfer_id") or ev.get("transfer_id")
             if not transfer_id:
                 transfer_id = self._transfer_controller.canonical_transfer_id(payload)
-            if status in ("OK", "SUCCESS"):
+            existing_state = {}
+            try:
+                existing_state = self._transfer_controller._states.get(transfer_id) or {}
+            except Exception:
+                existing_state = {}
+            expires_ts_ms = existing_state.get("expires_ts_ms")
+            if expires_ts_ms is None:
+                try:
+                    expires_ts_ms = int(time.time() * 1000 + (self._transfer_controller._submitted_timeout_s * 1000.0))
+                except Exception:
+                    expires_ts_ms = None
+            if status in ("SETTLED", "COMPLETED"):
                 self._transfer_controller.mark_settled(transfer_id, payload=payload)
                 if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
                     self.rebalancing.mark_transfer_status(transfer_id, "SETTLED")
+                self._prune_transfer_tracking(transfer_id)
+            elif status in ("OK", "SUCCESS"):
+                self._transfer_controller.mark_submitted(
+                    transfer_id,
+                    payload=payload,
+                    expires_ts_ms=expires_ts_ms,
+                )
+                if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
+                    self.rebalancing.mark_transfer_status(transfer_id, "SUBMITTED")
+                self._prune_transfer_tracking(transfer_id)
             elif status in ("ERROR", "FAILED", "REJECTED"):
                 self._transfer_controller.mark_failed(transfer_id, payload=payload, error=str(ev.get("error")))
                 if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
@@ -11413,7 +11504,7 @@ class RiskManager:
             pass
 
         # On ne traite que les transferts effectivement exécutés côté CEX.
-        if status not in ("OK", "SUCCESS"):
+        if status not in ("OK", "SUCCESS", "SETTLED", "COMPLETED"):
             return
 
         try:
@@ -11501,6 +11592,16 @@ class RiskManager:
                     "source": "pws_transfer",
                 }
             )
+            transfer_ids = set(state.get("transfer_ids") or [])
+            if transfer_id:
+                transfer_ids.add(str(transfer_id))
+            if transfer_ids:
+                state["transfer_ids"] = list(transfer_ids)
+            payloads = state.get("transfer_payloads") or {}
+            if transfer_id:
+                payloads[str(transfer_id)] = payload
+            if payloads:
+                state["transfer_payloads"] = payloads
             try:
                 # Enregistre/écrase l'état pour cet alias.
                 self._alias_capital_move_state[key] = state  # type: ignore[attr-defined]
@@ -11508,6 +11609,11 @@ class RiskManager:
                 # En cas d'erreur inattendue sur le cache interne, on ne casse
                 # pas le flux RM mais on loggue.
                 logging.exception("RM: échec maj _alias_capital_move_state")
+            if transfer_id:
+                try:
+                    self._transfer_alias_index.setdefault(str(transfer_id), set()).add(key)
+                except Exception:
+                    logging.exception("RM: échec maj _transfer_alias_index")
 
             # Demande explicite de resync MBF sur (exchange, alias).
             try:
@@ -12271,6 +12377,7 @@ class RiskManager:
         """
         now = time.time()
         cfg = getattr(self, "bot_cfg", self.cfg)
+        rm_cfg = getattr(cfg, "rm", cfg)
 
         # Fees freshness (SFC = sorgente primaria)
         if not self.slip_collector:
@@ -12299,8 +12406,34 @@ class RiskManager:
 
         # Giallo (attività degradata esplicita, nessun valore inventato)
         if fee_age <= fee_ttl_tol and vol_age <= vol_ttl_tol:
-            qpos_usd = int(getattr(cfg, "TM_QUEUEPOS_MAX_AHEAD_USD", 25000))
-            qpos_eta_ms = int(getattr(cfg, "TM_QUEUEPOS_MAX_ETA_MS", 0))
+            qpos_usd = int(
+                getattr(
+                    rm_cfg,
+                    "tm_queuepos_max_ahead_usd",
+                    getattr(cfg, "TM_QUEUEPOS_MAX_AHEAD_USD", 25000),
+                )
+            )
+            qpos_eta_ms = int(
+                getattr(
+                    rm_cfg,
+                    "tm_queuepos_max_eta_ms",
+                    getattr(cfg, "TM_QUEUEPOS_MAX_ETA_MS", 0),
+                )
+            )
+            legacy_qpos_usd = getattr(cfg, "TM_QUEUEPOS_MAX_AHEAD_USD", None)
+            legacy_qpos_eta = getattr(cfg, "TM_QUEUEPOS_MAX_ETA_MS", None)
+            if (legacy_qpos_usd is not None or legacy_qpos_eta is not None) and not getattr(self,
+                                                                                            "_tm_queuepos_legacy_warned",
+                                                                                            False):
+                try:
+                    if (legacy_qpos_usd is not None and float(legacy_qpos_usd) != float(qpos_usd)) or (
+                            legacy_qpos_eta is not None and int(legacy_qpos_eta) != int(qpos_eta_ms)
+                    ):
+                        logging.getLogger(__name__).warning(
+                            "Legacy TM queuepos keys differ from rm.* values; rm.* treated as canonical"
+                        )
+                finally:
+                    self._tm_queuepos_legacy_warned = True
 
             return {
                 "reason": "JAUNE_FEE" if fee_age > fee_ttl_strict else "JAUNE_VOL",
@@ -12308,7 +12441,13 @@ class RiskManager:
                     "hedge_ratio": float(
                         getattr(cfg, "DEGRADED_HEDGE_RATIO", 0.75)
                     ) if vol_age > fee_ttl_strict else None,
-                    "ttl_ms": int(getattr(cfg, "TM_EXPOSURE_TTL_MS", 2500)),
+                    "ttl_ms": int(
+                        getattr(
+                            rm_cfg,
+                            "tm_exposure_ttl_ms",
+                            getattr(cfg, "TM_EXPOSURE_TTL_MS", 2500),
+                        )
+                    ),
                     # Canon : ahead_usd ; alias queuepos_max_usd pour compat Engine
                     "queuepos_max_ahead_usd": qpos_usd,
                     "queuepos_max_usd": qpos_usd,
@@ -16157,24 +16296,54 @@ try:
                           "_route_to_engine", "_submit_with_pairlocks"):
             if hasattr(RMClass, meth_name):
                 _orig = getattr(RMClass, meth_name)
+
+
+                def _labels_from_args(_args: Tuple[Any, ...], _kwargs: Dict[str, Any]) -> Dict[str, str]:
+                    try:
+                        bundle = _kwargs.get("order_bundle") if "order_bundle" in _kwargs else (
+                            _args[0] if _args else None)
+                        meta = bundle.get("meta") if isinstance(bundle, dict) else None
+                        route = bundle.get("route") if isinstance(bundle, dict) else None
+                        branch = None
+                        if isinstance(meta, dict):
+                            branch = meta.get("branch") or meta.get("strategy")
+                        if branch is None and isinstance(bundle, dict):
+                            branch = bundle.get("branch") or bundle.get("strategy")
+                        route_label = None
+                        if isinstance(route, dict):
+                            route_label = route.get("strategy") or route.get("branch") or route.get(
+                                "kind") or route.get("route")
+                        return {"route": route_label or "", "branch": branch or ""}
+                    except Exception:
+                        return {"route": "", "branch": ""}
                 if inspect.iscoroutinefunction(_orig):
                     async def _wrapped(self, *args, __orig=_orig, **kwargs):
                         ts = time.perf_counter_ns()
+                        ok = True
                         try:
                             return await __orig(self, *args, **kwargs)
+                        except Exception:
+                            ok = False
+                            raise
                         finally:
                             try:
-                                mark_rm_to_engine(ts)
+                                dt_ms = max(0.0, (time.perf_counter_ns() - ts) / 1_000_000.0)
+                                mark_rm_to_engine(ok, dt_ms, **_labels_from_args(args, kwargs))
                             except Exception:
                                 logging.exception("Unhandled exception")
                 else:
                     def _wrapped(self, *args, __orig=_orig, **kwargs):
                         ts = time.perf_counter_ns()
+                        ok = True
                         try:
                             return __orig(self, *args, **kwargs)
+                        except Exception:
+                            ok = False
+                            raise
                         finally:
                             try:
-                                mark_rm_to_engine(ts)
+                                dt_ms = max(0.0, (time.perf_counter_ns() - ts) / 1_000_000.0)
+                                mark_rm_to_engine(ok, dt_ms, **_labels_from_args(args, kwargs))
                             except Exception:
                                 logging.exception("Unhandled exception")
                 setattr(RMClass, meth_name, _wrapped)

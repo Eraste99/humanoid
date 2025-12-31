@@ -333,10 +333,16 @@ class RebalancingManager:
         existing = op.get("transfer_id")
         if existing:
             return str(existing)
+        from_alias = op.get("from_alias") or (op.get("from") or {}).get("alias") or op.get("alias")
+        to_alias = op.get("to_alias") or (op.get("to") or {}).get("alias") or op.get("alias")
+        if from_alias:
+            op.setdefault("from_alias", from_alias)
+        if to_alias:
+            op.setdefault("to_alias", to_alias)
         payload = {
             "exchange": op.get("exchange"),
-            "from_alias": op.get("from_alias") or (op.get("from") or {}).get("alias"),
-            "to_alias": op.get("to_alias") or (op.get("to") or {}).get("alias"),
+            "from_alias": from_alias,
+            "to_alias": to_alias,
             "from_wallet": op.get("from_wallet"),
             "to_wallet": op.get("to_wallet"),
             "ccy": op.get("ccy"),
@@ -778,7 +784,10 @@ class RebalancingManager:
                         if amt <= 0:
                             continue
                         plans.append({
-                            "exchange": ex, "alias": alias,
+                            "exchange": ex,
+                            "alias": alias,
+                            "from_alias": alias,
+                            "to_alias": alias,
                             "from_wallet": w, "to_wallet": target_wallet,
                             "amount": amt, "ccy": q,
                             "type": "transfer", "scope": "intra_cex",

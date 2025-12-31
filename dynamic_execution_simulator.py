@@ -1684,8 +1684,14 @@ class DynamicExecutionSimulator:
         return (str(branch).upper(), str(route_combo), str(pair).upper(), str(quote).upper(), float(bucket), fingerprint)
 
     def _book_fingerprint(self, book_snapshot: Dict[str, Any]) -> Any:
-        mode = str(getattr(self.config, "sim_book_fingerprint_mode", "TOP_AND_SUMMARY") or "TOP_AND_SUMMARY").upper()
-        levels = int(getattr(self.config, "sim_book_fingerprint_levels", 5) or 5)
+        sim_cfg = getattr(self.config, "sim", self.config)
+        mode = str(
+            getattr(sim_cfg, "sim_book_fingerprint_mode",
+                    getattr(self.config, "sim_book_fingerprint_mode", "TOP_AND_SUMMARY"))
+            or "TOP_AND_SUMMARY"
+        ).upper()
+        levels = int(getattr(sim_cfg, "sim_book_fingerprint_levels",
+                             getattr(self.config, "sim_book_fingerprint_levels", 5)) or 5)
         def _top_levels(side: List[Tuple[Any, Any]], reverse: bool = False) -> List[Tuple[float, float]]:
             cleaned = []
             for p, q in (side or [])[: levels]:
@@ -1721,20 +1727,26 @@ class DynamicExecutionSimulator:
         return [float(x) for x in str(text).split(',') if str(x).strip()]
 
     def _candidate_buckets(self, notional: float, *, profile: Optional[str] = None, vol_size_factor: Optional[float] = None) -> List[float]:
-        base = self._parse_buckets(getattr(self.config, "sim_notional_buckets_base", "250,500,1000,2000,4000"))
+        sim_cfg = getattr(self.config, "sim", self.config)
+        base = self._parse_buckets(
+            getattr(sim_cfg, "sim_notional_buckets_base",
+                    getattr(self.config, "sim_notional_buckets_base", "250,500,1000,2000,4000"))
+        )
         profile_key = str(profile or getattr(getattr(self.config, "g", object()), "capital_profile", "")).upper()
-        per_profile = getattr(self.config, "sim_buckets_per_profile", {}) or {}
+        per_profile = getattr(sim_cfg, "sim_buckets_per_profile", getattr(self.config, "sim_buckets_per_profile", {})) or {}
         if profile_key and profile_key in per_profile:
             try:
                 base = self._parse_buckets(per_profile[profile_key])
             except Exception:
                 pass
         factor = vol_size_factor
-        if getattr(self.config, "sim_buckets_adapt_with_vol", True):
+        if getattr(sim_cfg, "sim_buckets_adapt_with_vol", getattr(self.config, "sim_buckets_adapt_with_vol", True)):
             if factor is None:
                 factor = 1.0
-            floor = float(getattr(self.config, "sim_vol_size_factor_floor", 0.6))
-            ceil = float(getattr(self.config, "sim_vol_size_factor_ceil", 1.0))
+            floor = float(
+                getattr(sim_cfg, "sim_vol_size_factor_floor", getattr(self.config, "sim_vol_size_factor_floor", 0.6)))
+            ceil = float(
+                getattr(sim_cfg, "sim_vol_size_factor_ceil", getattr(self.config, "sim_vol_size_factor_ceil", 1.0)))
             factor = max(floor, min(ceil, float(factor)))
         else:
             factor = 1.0
@@ -1766,7 +1778,9 @@ class DynamicExecutionSimulator:
         vol_size_factor: Optional[float] = None,
     ) -> None:
         try:
-            k = int(getattr(self.config, "sim_prime_multibucket_k", 3) or 3)
+            sim_cfg = getattr(self.config, "sim", self.config)
+            k = int(
+                getattr(sim_cfg, "sim_prime_multibucket_k", getattr(self.config, "sim_prime_multibucket_k", 3)) or 3)
             buckets = self._candidate_buckets(float(notional_quote), profile=getattr(getattr(self.config, "g", object()), "capital_profile", None), vol_size_factor=vol_size_factor)
             buckets = self._nearest_buckets(float(notional_quote), buckets or [float(notional_quote)], k)
             fingerprint = self._book_fingerprint(book_snapshot or {})
@@ -1794,7 +1808,8 @@ class DynamicExecutionSimulator:
             report_nonfatal("DynamicExecutionSimulator", "prime_failed", None, pair=pair)
 
     def peek_plan(self, key: tuple) -> Optional[Dict[str, Any]]:
-        ttl_ms = int(getattr(self.config, "sim_cache_ttl_ms", 300) or 300)
+        sim_cfg = getattr(self.config, "sim", self.config)
+        ttl_ms = int(getattr(sim_cfg, "sim_cache_ttl_ms", getattr(self.config, "sim_cache_ttl_ms", 300)) or 300)
         entry = self._plan_cache.get(key)
         if not entry:
             return None
@@ -1822,7 +1837,9 @@ class DynamicExecutionSimulator:
         return self.peek_plan(key)
 
     async def _plan_worker(self) -> None:
-        max_jobs = int(getattr(self.config, "sim_max_inflight_jobs", 32) or 32)
+        sim_cfg = getattr(self.config, "sim", self.config)
+        max_jobs = int(
+            getattr(sim_cfg, "sim_max_inflight_jobs", getattr(self.config, "sim_max_inflight_jobs", 32)) or 32)
         while True:
             key = await self._jobs_queue.get()
             job = self._latest_job_by_key.pop(key, None)
@@ -1849,8 +1866,11 @@ class DynamicExecutionSimulator:
     def _compute_fragmentation_plan(self, job: Dict[str, Any]) -> Dict[str, Any]:
         asks = (job.get("book_snapshot") or {}).get("asks") or []
         bids = (job.get("book_snapshot") or {}).get("bids") or []
-        asks = asks[: int(getattr(self.config, "sim_prime_depth_levels", self.depth_limit))]
-        bids = bids[: int(getattr(self.config, "sim_prime_depth_levels", self.depth_limit))]
+        sim_cfg = getattr(self.config, "sim", self.config)
+        asks = asks[: int(getattr(sim_cfg, "sim_prime_depth_levels",
+                                  getattr(self.config, "sim_prime_depth_levels", self.depth_limit)))]
+        bids = bids[: int(getattr(sim_cfg, "sim_prime_depth_levels",
+                                  getattr(self.config, "sim_prime_depth_levels", self.depth_limit)))]
         plan = self.suggest_slices(
             budget_usdc=float(job.get("bucket") or 0.0),
             asks=asks,
@@ -1860,8 +1880,10 @@ class DynamicExecutionSimulator:
         return plan
 
     async def _mm_hints_worker(self) -> None:
-        interval_ms = int(getattr(self.config, "sim_mm_hints_interval_ms", 0) or 0)
-        levels = int(getattr(self.config, "sim_mm_hints_levels", 5) or 5)
+        sim_cfg = getattr(self.config, "sim", self.config)
+        interval_ms = int(
+            getattr(sim_cfg, "sim_mm_hints_interval_ms", getattr(self.config, "sim_mm_hints_interval_ms", 0)) or 0)
+        levels = int(getattr(sim_cfg, "sim_mm_hints_levels", getattr(self.config, "sim_mm_hints_levels", 5)) or 5)
         if interval_ms <= 0:
             return
         while True:
@@ -1898,7 +1920,16 @@ class DynamicExecutionSimulator:
         pair = opp.get("pair_key") or opp.get("pair")
         quote = (opp.get("quote_ccy") or opp.get("quote") or "USDC").upper()
         fingerprint = self._book_fingerprint(snap)
-        candidates = self._nearest_buckets(bucket, self._candidate_buckets(bucket, profile=getattr(getattr(self.config, "g", object()), "capital_profile", None), vol_size_factor=opp.get("vol_size_factor")), int(getattr(self.config, "sim_prime_multibucket_k", 3) or 3))
+        sim_cfg = getattr(self.config, "sim", self.config)
+        candidates = self._nearest_buckets(
+            bucket,
+            self._candidate_buckets(
+                bucket,
+                profile=getattr(getattr(self.config, "g", object()), "capital_profile", None),
+                vol_size_factor=opp.get("vol_size_factor"),
+            ),
+            int(getattr(sim_cfg, "sim_prime_multibucket_k", getattr(self.config, "sim_prime_multibucket_k", 3)) or 3),
+        )
         if not candidates:
             return None
         target = min(candidates, key=lambda b: abs(b - bucket))

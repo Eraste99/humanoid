@@ -258,6 +258,7 @@ class Boot:
         self._router_health_warned: bool = False
         self._public_pipeline_started: bool = False
         self._obs_inc_cb: Optional[Any] = None
+        self._transfer_clients_cache: Optional[Dict[str, Any]] = None
         self._router_drop_events: Dict[str, deque] = {}
         self._router_drop_latch_emitted: bool = False
         self._obs_counter_cache: Dict[Tuple[str, tuple[str, ...]], Any] = {}
@@ -329,6 +330,49 @@ class Boot:
         boot_cfg = getattr(self.cfg, "boot", None)
         return str(getattr(boot_cfg, "scanner_proxy_mode", "REJECT") or "REJECT").upper()
 
+    def _resolve_transfer_clients(self) -> Optional[Dict[str, Any]]:
+        """Retourne un mapping {exchange: client} pour les transferts internes.
+
+        Une seule source : on agrège la config statique (cfg.transfer_clients),
+        puis les instances déjà présentes côté RM si disponibles, et on cache
+        le résultat pour l'utiliser dans le Hub privé et le RiskManager.
+        """
+
+        base = dict(self._transfer_clients_cache or {})
+
+        cfg = getattr(self, "cfg", None)
+        raw_cfg = getattr(cfg, "transfer_clients", None)
+        if callable(raw_cfg):
+            try:
+                raw_cfg = raw_cfg()
+            except Exception:
+                self.log.exception("[Boot] transfer_clients factory failed")
+                raw_cfg = None
+        if isinstance(raw_cfg, dict):
+            base.update({str(k).upper(): v for k, v in raw_cfg.items() if v})
+
+        rm = getattr(self.ctx, "rm", None)
+        rm_mapping = getattr(rm, "transfer_clients", None)
+        if rm_mapping:
+            base.update({str(k).upper(): v for k, v in rm_mapping.items() if v})
+
+        self._transfer_clients_cache = base
+
+        g_cfg = getattr(cfg, "g", None)
+        enabled = getattr(g_cfg, "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"]) or []
+        enabled_norm = [str(ex).upper() for ex in enabled]
+        available = sorted(base.keys()) if base else []
+        missing = sorted({ex for ex in enabled_norm if ex not in base})
+
+        if available:
+            try:
+                self.log.info("[Boot] transfer clients available", extra={"exchanges": available})
+            except Exception:
+                self.log.info("[Boot] transfer clients available: %s", available)
+        if missing:
+            self.log.warning("[Boot] missing transfer clients for exchanges: %s", missing)
+
+        return self._transfer_clients_cache if self._transfer_clients_cache else None
     def _check_obs_preflight(self) -> None:
         obs_cfg = getattr(self.cfg, "obs", None) or getattr(self.cfg, "observability", None)
         strict = bool(getattr(obs_cfg, "strict_obs", False))
@@ -359,22 +403,26 @@ class Boot:
     async def start(self) -> BootContext:
         self._check_obs_preflight()
         # boot.py — dans async def start(self): juste au début
-        mode = (
-                getattr(self.cfg, "DEPLOYMENT_MODE", None)
-                or getattr(self.cfg, "deployment_mode", None)
-                or getattr(getattr(self.cfg, "bot_cfg", None), "deployment_mode", None)
-                or "EU_ONLY"
-        )
-        try:
-            snapshot_hash = getattr(self.cfg, "snapshot_hash", None)
-            snapshot_dict = getattr(self.cfg, "snapshot_dict", None)
-            if callable(snapshot_hash):
-                cfg_hash = snapshot_hash()
-                self.log.info("[Boot] config snapshot hash=%s", cfg_hash)
-            if callable(snapshot_dict):
-                self.log.debug("[Boot] config snapshot=%s", snapshot_dict())
-        except Exception:
-            self.log.warning("[Boot] failed to log config snapshot", exc_info=True)
+        mode = getattr(self.cfg, "DEPLOYMENT_MODE", None)
+        if mode is None:
+            self.log.error("[Boot] cfg.DEPLOYMENT_MODE manquant; arrêt")
+            raise RuntimeError("missing DEPLOYMENT_MODE")
+        snapshot_hash = getattr(self.cfg, "snapshot_hash", None)
+        snapshot_dict = getattr(self.cfg, "snapshot_dict", None)
+        if not callable(snapshot_hash) or not callable(snapshot_dict):
+            self.log.error("[Boot] cfg.snapshot_hash/snapshot_dict manquants ou non callables; arrêt")
+            raise RuntimeError("invalid config snapshot helpers")
+        cfg_hash = snapshot_hash()
+        self.log.info("[Boot] config snapshot hash=%s", cfg_hash)
+        self.log.debug("[Boot] config snapshot=%s", snapshot_dict())
+
+        overrides = getattr(self.cfg, "overrides", None) or []
+        if overrides:
+            mode_str = str(mode).upper()
+            if mode_str == "PROD":
+                self.log.error("[Boot] CONFIG_OVERRIDES présents mais non supportés en PROD; arrêt")
+                raise RuntimeError("CONFIG_OVERRIDES unsupported in PROD")
+            self.log.warning("[Boot] CONFIG_OVERRIDES ignorés (mode=%s)", mode_str)
 
         region = str(getattr(getattr(self.cfg, "g", object()), "pod_region", "EU")).upper()
         enable_jp = False
@@ -1251,6 +1299,9 @@ class Boot:
             cfg = getattr(self, "cfg", None)
             dry_run = bool(getattr(getattr(cfg, "g", object()), "dry_run", False))
             verbose = bool(getattr(getattr(cfg, "g", object()), "verbose", True))
+            balances_cfg = getattr(cfg, "balances", None)
+            bf_poll_interval_s = getattr(balances_cfg, "refresh_interval_s", None)
+            cache_ttl = getattr(balances_cfg, "ttl_cache_s", None)
             mbf_kwargs = {
                 "binance_accounts": getattr(cfg, "binance_accounts", None),
                 "coinbase_at_accounts": getattr(cfg, "coinbase_at_accounts", None),
@@ -1259,6 +1310,10 @@ class Boot:
                 "dry_run": dry_run,
                 "verbose": verbose,
             }
+            if bf_poll_interval_s is not None:
+                mbf_kwargs["bf_poll_interval_s"] = bf_poll_interval_s
+            if cache_ttl is not None:
+                mbf_kwargs["cache_ttl"] = cache_ttl
             self.ctx.balances = MultiBalanceFetcher(**mbf_kwargs)
 
         mbf = getattr(self.ctx, "balances", None)
@@ -1330,6 +1385,7 @@ class Boot:
             "simulator": simulator,
             "execution_engine": getattr(self.ctx, "engine", None),
             "history_logger": getattr(self.ctx, "lhm", None),
+            "transfer_clients": self._resolve_transfer_clients(),
         }
         lhm = getattr(self.ctx, "lhm", None)
         if lhm is not None and hasattr(lhm, "record_alert"):
@@ -1419,8 +1475,46 @@ class Boot:
     async def _start_scanner(self) -> None:
 
         self.ctx.scanner = OpportunityScanner(self.cfg, self.ctx.rm, self.ctx.router, history_logger=self.ctx.lhm, simulator=getattr(self.ctx, "simulator", None))
-        dry_run = bool(getattr(getattr(self.cfg, "g", object()), "dry_run", False))
-        live = not dry_run
+        g_cfg = getattr(self.cfg, "g", object())
+        rm_cfg = getattr(self.cfg, "rm", object())
+        feature_switches = getattr(g_cfg, "feature_switches", {}) or {}
+        engine_real = bool(feature_switches.get("engine_real", False))
+        rm_dry_run = bool(getattr(rm_cfg, "dry_run", False))
+        mode = str(getattr(g_cfg, "mode", "")) or ""
+        mode_upper = mode.upper()
+        strict_cfg = bool(getattr(rm_cfg, "strict_config", False))
+
+        if mode_upper == "DRY_RUN":
+            if engine_real or not rm_dry_run:
+                msg = (
+                    f"[Boot] Mode={mode_upper} but engine_real={engine_real} rm.dry_run={rm_dry_run};"
+                    " enforcing DRY_RUN invariants"
+                )
+                if strict_cfg:
+                    raise RuntimeError(msg)
+                self.log.warning(msg)
+                engine_real = False
+                rm_dry_run = True
+        elif mode_upper == "PROD":
+            if not engine_real or rm_dry_run:
+                msg = (
+                    f"[Boot] Mode={mode_upper} but engine_real={engine_real} rm.dry_run={rm_dry_run};"
+                    " enforcing PROD invariants"
+                )
+                if strict_cfg:
+                    raise RuntimeError(msg)
+                self.log.warning(msg)
+                engine_real = True
+                rm_dry_run = False
+
+        live = bool(engine_real)
+        self.log.info(
+            "[Boot] Scanner live=%s (mode=%s engine_real=%s rm.dry_run=%s)",
+            live,
+            mode_upper or mode,
+            engine_real,
+            rm_dry_run,
+        )
         if live:
             rm = getattr(self.ctx, "rm", None)
             cb = getattr(rm, "on_scanner_opportunity", None) if rm else None
@@ -1502,12 +1596,7 @@ class Boot:
             binance_accounts = getattr(cfg, "binance_accounts", None) or None
             bybit_accounts = getattr(cfg, "bybit_accounts", None) or None
             coinbase_accounts = getattr(cfg, "coinbase_at_accounts", None) or None
-            transfer_clients = None
-            rm = getattr(self.ctx, "rm", None)
-            if rm:
-                tc = getattr(rm, "transfer_clients", None)
-                if tc:
-                    transfer_clients = dict(tc)
+            transfer_clients = self._resolve_transfer_clients()
 
             hub_kwargs = {
                 "config": cfg,

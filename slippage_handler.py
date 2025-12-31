@@ -951,10 +951,10 @@ class SlippageHandler:
         Unité interne stockée en fraction; conversion bps effectuée à l'ingestion.
 
         TTL:
-          - si `ttl_s` est fourni à l'appel, on l'utilise directement,
-          - sinon on s'appuie d'abord sur le contrat SLO public :
-                cfg.slo[deployment_mode][exchange].public.slip_ttl_s
-            avec fallback sur self._ttl_s (cfg.slip.ttl_s, donc pilotée par BotConfig).
+          - si `ttl_s` est fourni à l'appel, il peut durcir le TTL,
+          - le contrat SLO public (cfg.slo[deployment_mode][exchange].public.slip_ttl_s)
+            reste un plafond : effective_ttl = min(base, slo) si slo > 0,
+          - base = ttl_s explicite sinon self._ttl_s (cfg.slip.ttl_s, donc pilotée par BotConfig).
 
         side: "buy" | "sell" | None (None => max des deux si disponibles).
         """
@@ -966,36 +966,37 @@ class SlippageHandler:
         now = time.time()
 
         # --- Résolution du TTL (SLO public → fallback cfg.slip.ttl_s) ------------
-        if ttl_s is not None:
-            ttl = float(ttl_s)
-        else:
-            ttl = None
-            try:
-                cfg = getattr(self, "cfg", None)
-                slo_map = getattr(cfg, "slo", None) if cfg is not None else None
-                if slo_map:
-                    g_cfg = getattr(cfg, "g", None)
-                    mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
-                    per_ex = slo_map.get(mode_key) or {}
-                    path_slo = per_ex.get(ex)
-                    if path_slo is not None and getattr(path_slo, "public", None) is not None:
-                        slip_ttl_s = float(
-                            getattr(path_slo.public, "slip_ttl_s", 0.0) or 0.0
-                        )
-                        if slip_ttl_s > 0.0:
-                            ttl = slip_ttl_s
-            except Exception:
-                # En cas de problème sur le contrat SLO, on retombe sur le TTL legacy.
-                logger.warning(
-                    "[SlippageHandler] unable to resolve SLO-based slip TTL, "
-                    "falling back to cfg.slip.ttl_s",
-                    exc_info=False,
-                )
-                ttl = None
-
-            if ttl is None:
-                # Source legacy : cfg.slip.ttl_s injecté dans self._ttl_s au __init__
-                ttl = float(getattr(self, "_ttl_s", 2.0))
+        requested_ttl = float(ttl_s) if ttl_s is not None else None
+        legacy_ttl = float(getattr(self, "_ttl_s", 2.0))
+        base_ttl = requested_ttl if requested_ttl is not None else legacy_ttl
+        ttl = base_ttl
+        try:
+            cfg = getattr(self, "cfg", None)
+            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+            if slo_map:
+                g_cfg = getattr(cfg, "g", None)
+                mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+                per_ex = slo_map.get(mode_key) or {}
+                path_slo = per_ex.get(ex)
+                if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                    slo_ttl_s = float(getattr(path_slo.public, "slip_ttl_s", 0.0) or 0.0)
+                    if slo_ttl_s > 0.0:
+                        if ttl is None or ttl > slo_ttl_s:
+                            if ttl is not None:
+                                logger.debug(
+                                    "[SlippageHandler] ttl_s=%.3f clamped by SLO=%.3f",
+                                    ttl,
+                                    slo_ttl_s,
+                                )
+                            ttl = slo_ttl_s if ttl is None else min(ttl, slo_ttl_s)
+        except Exception:
+            # En cas de problème sur le contrat SLO, on retombe sur le TTL legacy.
+            logger.warning(
+                "[SlippageHandler] unable to resolve SLO-based slip TTL, "
+                "falling back to cfg.slip.ttl_s",
+                exc_info=False,
+            )
+            ttl = base_ttl
 
         # --- Application du TTL sur les snapshots -------------------------------
         if side is None:

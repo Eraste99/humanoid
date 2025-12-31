@@ -1328,23 +1328,23 @@ class PrivateWSHub:
         # Priorités QoS (plus petit = plus prioritaire)
         if not hasattr(self, "_priority_map"):
             self._priority_map = {"fill": 0, "ack": 1, "reject": 2, "other": 3}
-
+        pws = getattr(self, "_pws_cfg", self.cfg)
         # Files par (exchange, alias)
         if not hasattr(self, "_queues"):
             from collections import defaultdict, deque
-            qmax = int(getattr(self.cfg, "PWS_QUEUE_MAXLEN", 1000))
+            qmax = int(getattr(pws, "PWS_QUEUE_MAXLEN", 1000))
             self._queue_max = qmax
             self._queues = defaultdict(deque)
 
         if not hasattr(self, "_queue_max"):
-            self._queue_max = int(getattr(self.cfg, "PWS_QUEUE_MAXLEN", 1000))
+            self._queue_max = int(getattr(pws, "PWS_QUEUE_MAXLEN", 1000))
 
         # Heartbeats
         if not hasattr(self, "_last_hb"):
             self._last_hb = {}
 
         # Paramètres ping/backoff (défauts sûrs)
-        pws = getattr(self, "_pws_cfg", self.cfg)
+
         self._ping_interval_s = float(getattr(pws, "PWS_PING_INTERVAL_S", 10.0))
         self._pong_timeout_s = float(getattr(pws, "PWS_PONG_TIMEOUT_S", 3.0))
         self._backoff_base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 200))
@@ -1367,34 +1367,39 @@ class PrivateWSHub:
         # Pools WS par région (optionnel, valeur non bloquante si métrique absente)
         try:
             from modules.obs_metrics import PWS_POOL_SIZE
-            PWS_POOL_SIZE.labels(region="EU").set(float(getattr(self.cfg, "PWS_POOL_SIZE_EU", 1)))
-            PWS_POOL_SIZE.labels(region="US").set(float(getattr(self.cfg, "PWS_POOL_SIZE_US", 1)))
+            PWS_POOL_SIZE.labels(region="EU").set(float(getattr(pws, "PWS_POOL_SIZE_EU", 1)))
+            PWS_POOL_SIZE.labels(region="US").set(float(getattr(pws, "PWS_POOL_SIZE_US", 1)))
         except Exception:
-            pass
-            # Pools de connexion par région (EU/US) — sharding réel
-            try:
-                eu_size = int(getattr(self.cfg, "PWS_POOL_SIZE_EU", 1))
-                us_size = int(getattr(self.cfg, "PWS_POOL_SIZE_US", 1))
-            except Exception:
-                eu_size, us_size = 1, 1
-            self._pools: Dict[str, asyncio.Semaphore] = {
-                "EU": asyncio.Semaphore(max(1, eu_size)),
-                "US": asyncio.Semaphore(max(1, us_size)),
-            }
-            # Alias compat
-            self._pools_by_region = self._pools
+          pass
 
-            # Mapping région (clé "EX:ALIAS" > "EX" > défaut "EU")
-            self._region_map: Dict[str, str] = dict(getattr(self.cfg, "PWS_REGION_MAP", {}) or {})
+        try:
+            eu_size = int(getattr(pws, "PWS_POOL_SIZE_EU", 1))
+            us_size = int(getattr(pws, "PWS_POOL_SIZE_US", 1))
+        except Exception:
+            eu_size, us_size = 1, 1
 
-            # Gap heartbeat PWS (SLO privé par exchange + fallback global)
-            self._pws_gap_slo_by_ex: Dict[str, float] = {}
-            pws = getattr(self, "_pws_cfg", self.cfg)
-            self._pws_gap_slo_default: float = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
-            self._refresh_pws_gap_slo_from_slo()
+        if eu_size <= 0 or us_size <= 0:
+            raise RuntimeError(
+                "Invalid PWS pool size: PWS_POOL_SIZE_EU and PWS_POOL_SIZE_US must be > 0"
+            )
 
-            # Health state par (exchange, alias)
-            self._pws_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._pools: Dict[str, asyncio.Semaphore] = {
+            "EU": asyncio.Semaphore(max(1, eu_size)),
+            "US": asyncio.Semaphore(max(1, us_size)),
+        }
+        # Alias compat
+        self._pools_by_region = self._pools
+
+        # Mapping région (clé "EX:ALIAS" > "EX" > défaut "EU")
+        self._region_map: Dict[str, str] = dict(getattr(pws, "PWS_REGION_MAP", {}) or {})
+
+        # Gap heartbeat PWS (SLO privé par exchange + fallback global)
+        self._pws_gap_slo_by_ex: Dict[str, float] = {}
+        self._pws_gap_slo_default: float = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
+        self._refresh_pws_gap_slo_from_slo()
+
+        # Health state par (exchange, alias)
+        self._pws_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         # ------------------------- QoS / métriques / drain -------------------------
         
@@ -2438,14 +2443,7 @@ class PrivateWSHub:
             amount = float(base_payload.get("amount") or 0.0)
         except Exception:
             amount = 0.0
-        try:
-            transfer_id = base_payload.get("transfer_id")
-            if not transfer_id:
-                base_payload["exchange"] = exu
-                transfer_id = canonical_transfer_id(base_payload)
-                base_payload["transfer_id"] = transfer_id
-        except Exception:
-            transfer_id = None
+
 
         from_alias: Optional[str] = None
         to_alias: Optional[str] = None
@@ -2468,8 +2466,12 @@ class PrivateWSHub:
                     alias_u = _upper(base_payload.get("alias")) if base_payload.get("alias") else None
                 except Exception:
                     alias_u = None
-            from_alias = alias_u
-            to_alias = alias_u
+            from_alias = _upper(base_payload.get("from_alias")) if base_payload.get("from_alias") else alias_u
+            to_alias = _upper(base_payload.get("to_alias")) if base_payload.get("to_alias") else alias_u
+            if from_alias:
+                base_payload["from_alias"] = from_alias
+            if to_alias:
+                base_payload["to_alias"] = to_alias
 
         elif subtype_norm == "subaccount":
             # Transfert entre alias (TT ↔ TM) sur un même exchange.
@@ -2483,6 +2485,24 @@ class PrivateWSHub:
                 to_alias = None
             if alias_u is None:
                 alias_u = to_alias or from_alias
+        try:
+            transfer_id = base_payload.get("transfer_id")
+            if not transfer_id:
+                base_payload["exchange"] = exu
+                if alias_u and not base_payload.get("alias"):
+                    base_payload["alias"] = alias_u
+                if from_alias and not base_payload.get("from_alias"):
+                    base_payload["from_alias"] = from_alias
+                if to_alias and not base_payload.get("to_alias"):
+                    base_payload["to_alias"] = to_alias
+                if from_wallet and not base_payload.get("from_wallet"):
+                    base_payload["from_wallet"] = from_wallet
+                if to_wallet and not base_payload.get("to_wallet"):
+                    base_payload["to_wallet"] = to_wallet
+                transfer_id = canonical_transfer_id(base_payload)
+                base_payload["transfer_id"] = transfer_id
+        except Exception:
+            transfer_id = None
 
         ev = {
             "type": "transfer",
@@ -2534,7 +2554,16 @@ class PrivateWSHub:
             )
         except Exception:
             pass
-
+        rm_cb = getattr(self, "_rm_callback", None)
+        if rm_cb:
+            try:
+                import inspect, asyncio
+                if inspect.iscoroutinefunction(rm_cb):
+                    asyncio.create_task(rm_cb(ev))
+                else:
+                    rm_cb(ev)
+            except Exception:
+                log.exception("[PrivateWSHub] transfer RM callback error")
         if self._callback:
             try:
                 self._callback(ev)
@@ -2562,6 +2591,7 @@ class PrivateWSHub:
         exu, alu = _upper(ex), _upper(alias)
         payload = {
             "ex": exu, "alias": alu,
+            "from_alias": alu, "to_alias": alu,
             "from_wallet": _upper(from_wallet), "to_wallet": _upper(to_wallet),
             "ccy": _upper(ccy), "amount": float(amount),
         }

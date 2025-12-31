@@ -148,7 +148,7 @@ class PnLAggregator:
 
     def _ensure_resets(self):
         try:
-            from obs_metrics import PNL_LIVE_DAY_USD
+            from modules.obs_metrics import PNL_LIVE_DAY_USD
             for reg in ("EU", "US", "JP", "UTC"):
                 day = self._now_local_day(reg if reg != "UTC" else "UTC")
                 if self._last_local_day.get(reg) != day:
@@ -186,7 +186,7 @@ class PnLAggregator:
                 """
         self._ensure_resets()
         try:
-            from obs_metrics import PNL_LIVE_DAY_USD, TRADES_LIVE_DAY_TOTAL, DERIVED_NET_PROFIT_SIGN_TOTAL, MISSING_NET_PROFIT_TOTAL
+            from modules.obs_metrics import PNL_LIVE_DAY_USD, TRADES_LIVE_DAY_TOTAL, DERIVED_NET_PROFIT_SIGN_TOTAL, MISSING_NET_PROFIT_TOTAL
         except Exception:
             return  # no-ops si non dispo
 
@@ -5369,9 +5369,8 @@ class ExecutionEngine:
                     now_ns = time.perf_counter_ns()
                     latency_ms = max(0, int((now_ns - ts_ns) / 1_000_000))
 
-                    ex_lab = (self._client_symbol_map.get(clid, ("?", "?"))[0] or "?")
-                    ENGINE_SUBMIT_TO_ACK_MS.labels(exchange=str(ex_lab)).observe(latency_ms)
-                    mark_engine_ack(latency_ms)  # wrapper tolérant: reçoit un delta en ms
+                    ENGINE_SUBMIT_TO_ACK_MS.observe(latency_ms)
+                    mark_engine_ack(ts_ns)
                 except Exception:
                     logging.exception("Unhandled exception")
                 try:
@@ -6375,7 +6374,7 @@ class ExecutionEngine:
             window.pop(0)
         if limit > 0 and len(window) >= limit:
             try:
-                from obs_metrics import MM_THROTTLED_TOTAL
+                from modules.obs_metrics import MM_THROTTLED_TOTAL
 
                 MM_THROTTLED_TOTAL.labels(reason=kind, exchange=exchange.upper(), pair=pair_key.upper()).inc()
             except Exception:
@@ -6425,7 +6424,7 @@ class ExecutionEngine:
         # cancel if still active
         await self._mm_cancel_open_makers([client_id], reason="ttl")
         try:
-            from obs_metrics import MM_MAKERS_EXPIRED_TTL_TOTAL
+            from modules.obs_metrics import MM_MAKERS_EXPIRED_TTL_TOTAL
 
             MM_MAKERS_EXPIRED_TTL_TOTAL.labels(exchange=ex, pair=pair_key).inc()
         except Exception:
@@ -6656,7 +6655,7 @@ class ExecutionEngine:
                 try:
                     await self._cancel_order(ex, sym, cid, reason=reason)
                     try:
-                        from obs_metrics import MM_MAKERS_CANCELED_TOTAL
+                        from modules.obs_metrics import MM_MAKERS_CANCELED_TOTAL
 
                         MM_MAKERS_CANCELED_TOTAL.labels(reason=reason, exchange=ex, pair=sym).inc()
                     except Exception:
@@ -7236,7 +7235,7 @@ class ExecutionEngine:
 
         # --- observabilité (optionnelle) ---
         try:
-            from obs_metrics import ENGINE_MUTE_TOTAL  # gauge/counter si dispo
+            from modules.obs_metrics import ENGINE_MUTE_TOTAL  # gauge/counter si dispo
             ENGINE_MUTE_TOTAL.labels(br, pk, reason).inc()
         except Exception:
             pass

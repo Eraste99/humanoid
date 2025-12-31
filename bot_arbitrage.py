@@ -30,7 +30,7 @@ def _maybe_install_uvloop() -> None:
 # Imports projet (avec fallbacks)
 # -----------------------------------------------------------------------------
 try:
-    from modules.bot_config import BotConfig
+    from modules.bot_config import BotConfig, ConfigError
 except Exception as e:
     raise RuntimeError("BotConfig introuvable (bot_config.py).") from e
 
@@ -346,17 +346,20 @@ class TelegramAlerts(_NoopAlerts):
 # Logging
 # -----------------------------------------------------------------------------
 log = logging.getLogger("arbitrage.main")
-try:
-    from modules.bot_config import BotConfig as _GlobalBotCfg
+_DEFAULT_LOG_LEVEL = "INFO"
 
-    _LOG_LEVEL = getattr(_GlobalBotCfg.from_env().obs, "log_level", "INFO")
-except Exception:
-    _LOG_LEVEL = "INFO"
 
-logging.basicConfig(
-    level=_LOG_LEVEL,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+def _configure_logging(cfg: Any) -> None:
+    level = _DEFAULT_LOG_LEVEL
+    try:
+        level = getattr(cfg.obs, "log_level", _DEFAULT_LOG_LEVEL) or _DEFAULT_LOG_LEVEL
+    except Exception:
+        level = _DEFAULT_LOG_LEVEL
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
 
 
 
@@ -756,12 +759,18 @@ async def main() -> None:
 
     # Config
     cfg = BotConfig.from_env()
+    _configure_logging(cfg)
     region      = str(getattr(cfg, "POD_REGION", "EU")).upper()
     dep_mode    = str(getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY")).upper()
     cap_profile = str(getattr(cfg, "CAPITAL_PROFILE", "NANO")).upper()
     restart_mode = str(getattr(cfg, "RESTART_MODE", "HYBRID")).upper()
     mode_value = str(getattr(cfg, "MODE", "PROD")).upper()
+    live_trading_armed = _cfg_bool(cfg, "LIVE_TRADING_ARMED", False)
     raw = getattr(cfg, "TELEGRAM_REQUIRE_ACK", 1)
+
+    if mode_value == "PROD" and not live_trading_armed:
+        log.error("[Main] MODE=PROD sans LIVE_TRADING_ARMED — arrêt immédiat")
+        raise ConfigError("CONFIG_SCHEMA_INVALID", "mode")
 
     # DRY-RUN: ne pas bloquer sur ACK par défaut ; PROD: ACK requis par défaut
     _default_ack = (mode_value != "DRY_RUN")

@@ -1743,7 +1743,7 @@ class MarketDataRouter:
                             reason="exception",
                         )
                         continue
-                    ex = payload.get("exchange") or payload.get("ex") or "UNKNOWN"
+
 
 
                     ev = self._validate_and_enrich(item)

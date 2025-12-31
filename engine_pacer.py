@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # --------- Metrics (Prometheus) optional import ---------
 try:
     # Essaie d'importer des métriques standard du projet (fallback si absent)
-    from obs_metrics import (
+    from modules.obs_metrics import (
         ENGINE_PACING_BACKPRESSURE_TOTAL,
         ENGINE_DRAIN_LATENCY_MS,
         ENGINE_PACER_DELAY_MS,

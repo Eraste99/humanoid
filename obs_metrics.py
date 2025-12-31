@@ -4,13 +4,40 @@ import json
 import logging
 import threading
 import time
+import sys
+import types
 
 from typing import Any, Dict,List, Optional
 from dataclasses import dataclass, asdict
 log = logging.getLogger('obs_metrics')
 _obs_shim_log = logging.getLogger('observability_shim')
 
+def _register_singleton_aliases() -> None:
+    """Enforce a single obs_metrics module reference across import paths."""
+    this_module = sys.modules[__name__]
+    canonical = "modules.obs_metrics"
+    alt = "obs_metrics"
 
+    existing_canonical = sys.modules.get(canonical)
+    if existing_canonical is not None and existing_canonical is not this_module:
+        raise RuntimeError(
+            f"obs_metrics double import detected: {existing_canonical.__name__} vs {__name__}"
+        )
+    sys.modules[canonical] = this_module
+
+    pkg = sys.modules.setdefault("modules", types.ModuleType("modules"))
+    setattr(pkg, "obs_metrics", this_module)
+
+    existing_alt = sys.modules.get(alt)
+    if existing_alt is not None and existing_alt is not this_module:
+        raise RuntimeError(
+            f"obs_metrics alias mismatch: {existing_alt.__name__} vs {__name__}"
+        )
+    sys.modules[alt] = this_module
+    log.info("obs_metrics loaded via %s", __name__)
+
+
+_register_singleton_aliases()
 
 class _AlertCounter:
     def __init__(self):
