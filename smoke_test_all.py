@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
 
+from modules import market_data_router
 
 # --------------------------------------------------------------------------------------
 # Bootstrap imports: support both layouts:
@@ -155,9 +156,10 @@ import modules.dynamic_execution_simulator as des_mod  # noqa: E402
 import modules.execution_engine as engine_mod  # noqa: E402
 import modules.engine_pacer as pacer_mod  # noqa: E402
 import modules.private_ws_reconciler as pwsr_mod  # noqa: E402
-import modules.risk_manager as rm_mod  # noqa: E402
+import modules.risk_manager.risk_manager as rm_mod  # noqa: E402
 import modules.logger_historique.log_writer as log_writer_mod  # noqa: E402
 import contracts.errors as errors_mod  # noqa: E402
+
 
 # --------------------------------------------------------------------------------------
 # Local imports
@@ -341,6 +343,34 @@ def _make_router_event(
 # --------------------------------------------------------------------------------------
 
 class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
+    async def test_00_import_surface(self) -> None:
+        """Scénario 0 — preuve mécanique que les compartiments chargent."""
+
+        if payloads_mod is None:
+            self.fail("payloads module missing")
+
+        try:
+            _ = importlib.import_module("modules.bot_config")
+        except Exception as e:
+            self.fail(f"modules.bot_config import failed: {e}")
+
+        required_modules = [
+            "market_data_router",
+            "volatility_monitor",
+            "slippage_handler",
+            "opportunity_scanner",
+            "modules.risk_manager",
+            "execution_engine",
+            "private_ws_reconciler",
+            "logger_historique.log_writer",
+        ]
+
+        for name in required_modules:
+            with self.subTest(module=name):
+                try:
+                    _ = importlib.import_module(name)
+                except Exception as e:
+                    self.fail(f"import failed for {name}: {e}")
     async def test_01_dry_run_start_ready_status_metrics_stop(self) -> None:
         """Scénario 1 — DRY_RUN E2E (superviseur HTTP)."""
         cfg = modules.bot_config.BotConfig()
@@ -745,7 +775,136 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         # Engine flags “institutionnels” pour le test
         cfg.engine.ff_enforce_client_oid_deterministic = True
         cfg.engine.ff_fail_closed_idempotence = True
+        # --- RiskManager lifecycle + readiness + decision record emission
+        RiskManager = getattr(rm_mod, "RiskManager", None)
+        if RiskManager is None:
+            self.skipTest("RiskManager absent")
 
+        class _StubBalanceFetcher:
+            async def get_all_balances(self, force_refresh: bool = False):
+                return {"BINANCE": {"TT": {"USDC": 1000.0}}}
+
+        class _StubVolMonitor:
+            def get_current_metrics(self, _pair):
+                return {}
+
+            def get_current_thresholds(self, _pair):
+                return {}
+
+        class _StubSimulator:
+            def set_event_sink(self, *_args, **_kwargs):
+                return None
+
+        get_orderbooks_callback = lambda: {}
+        history_events = []
+        history_logger = lambda ev: history_events.append(ev)
+        ready_event = asyncio.Event()
+        loops_config = {
+            "orderbooks_interval": 10.0,
+            "balances_interval": 10.0,
+            "rebal_interval": 10.0,
+            "volatility_interval": 10.0,
+            "fee_sync_interval": 120.0,
+        }
+
+        rm = RiskManager(
+            bot_cfg=cfg,
+            config=cfg,
+            exchanges=cfg.g.enabled_exchanges,
+            symbols=["BTCUSDC"],
+            balance_fetcher=_StubBalanceFetcher(),
+            volatility_monitor=_StubVolMonitor(),
+            simulator=_StubSimulator(),
+            get_orderbooks_callback=get_orderbooks_callback,
+            history_logger=history_logger,
+            execution_engine=None,
+            loops_config=loops_config,
+            ready_event=ready_event,
+        )
+
+        try:
+            await rm.start()
+            self.assertTrue(rm.ready_event.is_set())
+
+            snapshot_ts = int(time.time() * 1000)
+            snapshot = {
+                "BINANCE": {
+                    "BTCUSDC": {
+                        "best_bid": 100.0,
+                        "best_ask": 101.0,
+                        "recv_ts_ms": snapshot_ts,
+                    }
+                },
+                "BYBIT": {
+                    "BTCUSDC": {
+                        "best_bid": 100.1,
+                        "best_ask": 101.2,
+                        "recv_ts_ms": snapshot_ts,
+                    }
+                },
+            }
+            if hasattr(rm, "set_orderbooks_source"):
+                rm.set_orderbooks_source(lambda: snapshot)
+            else:
+                rm.get_orderbooks_callback = lambda: snapshot
+
+            if hasattr(rm, "_best_bid_ask"):
+                bid, ask, ts = rm._best_bid_ask("BINANCE", "BTCUSDC")
+                self.assertTrue(bid > 0 and ask > 0 and ts > 0)
+
+            await rm.handle_opportunity({})
+            await asyncio.sleep(0.05)
+            self.assertGreaterEqual(len(history_events), 1)
+            last_event = history_events[-1]
+            reason = ""
+            for key in ("reason", "reasons", "status_reason"):
+                val = last_event.get(key)
+                if isinstance(val, (list, tuple)):
+                    reason = next((str(v) for v in val if v), "")
+                else:
+                    reason = str(val or "")
+                if reason:
+                    break
+            self.assertTrue(reason, f"no reason in history event: {last_event}")
+
+            if hasattr(rm, "on_scanner_opportunity"):
+                rm.on_scanner_opportunity = lambda opp, decision_ctx=None: {
+                    **(decision_ctx or {}),
+                    "submitted": True,
+                }
+                opp = {
+                    "pair": "BTCUSDC",
+                    "symbol": "BTCUSDC",
+                    "pair_key": "BINANCE-BYBIT-BTCUSDC",
+                    "buy_exchange": "BINANCE",
+                    "sell_exchange": "BYBIT",
+                    "ts_ms": snapshot_ts,
+                    "type": "TT",
+                    "expected_net_bps": {"best": "TT", "TT": 1.0},
+                    "notional_quote": 25.0,
+                }
+                prev_len = len(history_events)
+                await rm.handle_opportunity(opp)
+                await asyncio.sleep(0.05)
+                new_events = history_events[prev_len:]
+                submitted_event = next(
+                    (
+                        ev
+                        for ev in reversed(new_events)
+                        if (
+                            str(ev.get("status") or "").lower() == "submitted"
+                            or ev.get("submitted") is True
+                    )
+                    ),
+                    None,
+                )
+                self.assertIsNotNone(
+                    submitted_event,
+                    f"no submitted decision record in new events: {new_events}",
+                )
+        finally:
+            if hasattr(rm, "stop"):
+                await rm.stop()
         # --- Simulator sanity
         sim = des_mod.DynamicExecutionSimulator(cfg)
         buy_levels = [(100.0, 0.50), (99.9, 1.0)]
@@ -1162,6 +1321,112 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
         # Les makers peuvent échouer (timeout) mais la majorité doivent avoir tenté
         self.assertEqual(len(maker_results), maker_n)
 
+    @unittest.skipUnless(os.environ.get("SMOKE_STRESS_VOL") == "1", "SMOKE_STRESS_VOL=1 required")
+    async def test_stress_volatility_monitor(self) -> None:
+        """Stress léger: VolatilityMonitor supporte des snapshots répétés."""
+
+        vol_mod = importlib.import_module("volatility_monitor")
+        VolatilityMonitor = getattr(vol_mod, "VolatilityMonitor", None)
+        if VolatilityMonitor is None:
+            self.skipTest("VolatilityMonitor absent")
+
+        cfg = modules.bot_config.BotConfig()
+        vm = VolatilityMonitor(cfg)
+        updates_n = _stress_int("SMOKE_STRESS_VOL_N", 200)
+
+        for i in range(updates_n):
+            payload = {
+                "exchange": "BINANCE",
+                "pair_key": "BTCUSDC",
+                "best_bid": 100.0 + i * 0.0001,
+                "best_ask": 100.1 + i * 0.0001,
+                "recv_ts_ms": int(time.time() * 1000),
+            }
+            if i % 2 == 0:
+                vm.update_from_orderbook(payload)
+            else:
+                vm.ingest_snapshot(payload)
+
+        vol = vm.get_volatility("BINANCE", "BTCUSDC")
+        self.assertIsNotNone(vol)
+        self.assertIsInstance(vol, (int, float, dict))
+
+    @unittest.skipUnless(os.environ.get("SMOKE_STRESS_SLIP") == "1", "SMOKE_STRESS_SLIP=1 required")
+    async def test_stress_slippage_handler(self) -> None:
+        """Stress léger: SlippageHandler digère des snapshots et expose une mesure."""
+
+        slip_mod = importlib.import_module("slippage_handler")
+        SlippageHandler = getattr(slip_mod, "SlippageHandler", None)
+        if SlippageHandler is None:
+            self.skipTest("SlippageHandler absent")
+
+        cfg = modules.bot_config.BotConfig()
+        sh = SlippageHandler(cfg)
+        updates_n = _stress_int("SMOKE_STRESS_SLIP_N", 200)
+
+        for i in range(updates_n):
+            snapshot = {
+                "exchange": "BINANCE",
+                "pair_key": "BTCUSDC",
+                "orderbook": {"bids": [[100.0, 1.0]], "asks": [[100.1, 1.2]]},
+                "slip_metric_bps": 10.0 + (i % 3),
+                "top_bid_vol": 1.0,
+                "top_ask_vol": 1.0,
+                "recv_ts_ms": int(time.time() * 1000),
+            }
+            sh.ingest_snapshot(snapshot)
+
+        slip = sh.get_slippage_bps("BINANCE", "BTCUSDC")
+        self.assertTrue(slip is None or isinstance(slip, (int, float)))
+
+    @unittest.skipUnless(os.environ.get("SMOKE_STRESS_SCANNER") == "1", "SMOKE_STRESS_SCANNER=1 required")
+    async def test_stress_opportunity_scanner(self) -> None:
+        """Stress léger: Scanner boucle start/stop + ingestion orderbooks."""
+
+        scan_mod = importlib.import_module("opportunity_scanner")
+        OpportunityScanner = getattr(scan_mod, "OpportunityScanner", None)
+        if OpportunityScanner is None:
+            self.skipTest("OpportunityScanner absent")
+
+        cfg = modules.bot_config.BotConfig()
+
+        class _StubRM:
+            def __init__(self, cfg):
+                self.cfg = cfg
+
+            def get_fee_pct(self, *_args, **_kwargs):
+                return 0.0
+
+        class _StubRouter:
+            pass
+
+        class _StubSimulator:
+            def set_event_sink(self, *_args, **_kwargs):
+                return None
+
+        scanner = OpportunityScanner(
+            cfg, risk_manager=_StubRM(cfg), market_router=_StubRouter(), simulator=_StubSimulator()
+        )
+
+        async def _noop_loop(self):
+            while getattr(self, "_running", False):
+                await asyncio.sleep(0.001)
+
+        scanner._scan_loop = types.MethodType(_noop_loop, scanner)
+        await scanner.start()
+
+        updates_n = _stress_int("SMOKE_STRESS_SCANNER_UPDATES", 200)
+        for i in range(updates_n):
+            data = {
+                "exchange": "BINANCE",
+                "pair_key": "BTCUSDC",
+                "best_bid": 100.0 + i * 0.0001,
+                "best_ask": 100.1 + i * 0.0001,
+                "recv_ts_ms": int(time.time() * 1000),
+            }
+            scanner.update_orderbook(data)
+
+        await scanner.stop()
     async def test_stress_restart_cycles(self) -> None:
         """Démarre/stoppe Boot en boucle avec ports dynamiques (détecter leaks grossiers)."""
 
