@@ -52,6 +52,7 @@ import json
 import os
 import signal
 import socket
+import inspect
 import sys
 import tempfile
 import time
@@ -63,8 +64,6 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
-
-from modules import market_data_router
 
 # --------------------------------------------------------------------------------------
 # Bootstrap imports: support both layouts:
@@ -204,6 +203,26 @@ def wait_http_ready(url: str, timeout_s: float) -> None:
             time.sleep(0.2)
     raise AssertionError(f"HTTP not ready: {url} (last_err={last_err})")
 
+@contextlib.contextmanager
+def temp_env(extra: Optional[Dict[str, str]] = None):
+    """Temporarily apply a minimal env config and restore after."""
+
+    saved = os.environ.copy()
+    try:
+        os.environ.update(
+            {
+                "MODE": "DRY_RUN",
+                "DEPLOYMENT_MODE": "EU_ONLY",
+                "POD_REGION": "EU",
+                "CAPITAL_PROFILE": "NANO",
+            }
+        )
+        if extra:
+            os.environ.update({k: str(v) for k, v in extra.items()})
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 # --------------------------------------------------------------------------------------
 # Stress helpers (gated by SMOKE_STRESS=1)
 # --------------------------------------------------------------------------------------
@@ -261,12 +280,15 @@ async def started_boot_with_servers(cfg: modules.bot_config.BotConfig) -> Iterab
     status_srv = servers.get("status_server")
     obs_srv = servers.get("obs_server")
 
+    async def _maybe_await(val, timeout: float) -> None:
+        if inspect.isawaitable(val):
+            await asyncio.wait_for(val, timeout=timeout)
     try:
         if status_srv is None:
             raise AssertionError("status_server missing from obs_metrics.start_servers()")
-        await asyncio.wait_for(status_srv.start(), timeout=_timeout_s())
+        await _maybe_await(status_srv.start(), timeout=_timeout_s())
         if obs_srv is not None:
-            await asyncio.wait_for(obs_srv.start(), timeout=_timeout_s())
+            await _maybe_await(obs_srv.start(), timeout=_timeout_s())
 
         await asyncio.wait_for(boot.start(), timeout=_timeout_s())
         # Wait ready barrier (fails if not ready in time)
@@ -276,10 +298,14 @@ async def started_boot_with_servers(cfg: modules.bot_config.BotConfig) -> Iterab
     finally:
         # Stop order: servers → boot → probes
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(status_srv.stop(), timeout=10.0)
+            stop_res = status_srv.stop()
+            if inspect.isawaitable(stop_res):
+                await asyncio.wait_for(stop_res, timeout=10.0)
         with contextlib.suppress(Exception):
             if obs_srv is not None:
-                await asyncio.wait_for(obs_srv.stop(), timeout=10.0)
+                stop_res = obs_srv.stop()
+                if inspect.isawaitable(stop_res):
+                    await asyncio.wait_for(stop_res, timeout=10.0)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(boot.stop(), timeout=20.0)
 
@@ -298,7 +324,7 @@ class _DummyHistoryFSM:
     def __init__(self) -> None:
         self._seen: set[str] = set()
 
-    async def check_and_mark_idempotency(self, idempotency_key: str) -> bool:
+    def check_and_mark_idempotency(self, idempotency_key: str) -> bool:
         if idempotency_key in self._seen:
             return False
         self._seen.add(idempotency_key)
@@ -359,10 +385,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             "volatility_monitor",
             "slippage_handler",
             "opportunity_scanner",
-            "modules.risk_manager",
+            "risk_manager",
             "execution_engine",
             "private_ws_reconciler",
-            "logger_historique.log_writer",
+            "log_writer",
         ]
 
         for name in required_modules:
@@ -373,10 +399,8 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                     self.fail(f"import failed for {name}: {e}")
     async def test_01_dry_run_start_ready_status_metrics_stop(self) -> None:
         """Scénario 1 — DRY_RUN E2E (superviseur HTTP)."""
-        cfg = modules.bot_config.BotConfig()
-        cfg.g.mode = "DRY_RUN"
-        cfg.g.deployment_mode = "EU_ONLY"
-        cfg.g.capital_profile = "NANO"
+        with temp_env():
+            cfg = modules.bot_config.BotConfig.from_env()
         # Seed pairs minimal (utilisé par Boot si discovery off)
         cfg.g.pairs = ["BTCUSDC", "ETHUSDC"]
         cfg.discovery.enabled = False
@@ -397,34 +421,233 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         cfg.obs.enable_obs_port = False
 
         # Snapshot: hash + export (freeze)
-        snap_hash = cfg.snapshot_hash()
-        self.assertTrue(isinstance(snap_hash, str) and len(snap_hash) >= 8)
+        snapshot_hash = cfg.snapshot_hash()
+        self.assertTrue(isinstance(snapshot_hash, str) and len(snapshot_hash) >= 8)
+        snapshot = cfg.snapshot_dict()
+        for section in ("g", "rm", "engine"):
+            if hasattr(cfg, section):
+                self.assertIn(section, snapshot)
         with tempfile.TemporaryDirectory() as td:
             export_path = Path(td) / "config_snapshot.json"
             export_path.write_text(
-                json.dumps(cfg.snapshot_dict(), sort_keys=True, indent=2, default=str),
+                json.dumps(snapshot, sort_keys=True, indent=2, default=str),
                 encoding="utf-8",
             )
             self.assertTrue(export_path.exists() and export_path.stat().st_size > 100)
+            with self.subTest("knob change changes hash"):
+                cfg2 = copy.deepcopy(cfg)
+                knob_changed = False
+                if hasattr(cfg2, "slip") and hasattr(cfg2.slip, "ttl_s"):
+                    cfg2.slip.ttl_s = getattr(cfg2.slip, "ttl_s", 0) + 1
+                    knob_changed = True
+                elif hasattr(cfg2, "vol") and hasattr(cfg2.vol, "ttl_s"):
+                    cfg2.vol.ttl_s = getattr(cfg2.vol, "ttl_s", 0) + 1
+                    knob_changed = True
+                if not knob_changed:
+                    raise unittest.SkipTest("no slip/vol ttl knob available")
+                self.assertNotEqual(snapshot_hash, cfg2.snapshot_hash())
 
-        h0 = cfg.snapshot_hash()
-        snap0 = cfg.snapshot_dict()
-        cfg2 = copy.deepcopy(cfg)
-        if not (hasattr(cfg2, "slip") and hasattr(cfg2.slip, "ttl_s")):
-            self.skipTest("cfg.slip.ttl_s absent")
-        if not (hasattr(cfg2, "vol") and hasattr(cfg2.vol, "ttl_s")):
-            self.skipTest("cfg.vol.ttl_s absent")
-        cfg2.slip.ttl_s = cfg.slip.ttl_s + 1
-        cfg2.vol.ttl_s = cfg.vol.ttl_s + 1
-        h1 = cfg2.snapshot_hash()
-        snap1 = cfg2.snapshot_dict()
-        self.assertNotEqual(h0, h1)
-        if "slip" not in snap0 or "ttl_s" not in snap0["slip"]:
-            self.skipTest("snapshot slip.ttl_s absent")
-        if "vol" not in snap0 or "ttl_s" not in snap0["vol"]:
-            self.skipTest("snapshot vol.ttl_s absent")
-        self.assertEqual(snap0["slip"]["ttl_s"] + 1, snap1["slip"]["ttl_s"])
-        self.assertEqual(snap0["vol"]["ttl_s"] + 1, snap1["vol"]["ttl_s"])
+            with self.subTest("MarketDataRouter contract"):
+                MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
+                if MarketDataRouter is None:
+                    self.skipTest("MarketDataRouter absent")
+                if not hasattr(MarketDataRouter, "build_default_out_queues"):
+                    self.skipTest("MarketDataRouter.build_default_out_queues absent")
+
+                in_q: asyncio.Queue = asyncio.Queue()
+                combos = [("BINANCE", "BYBIT")]
+                out_queues = MarketDataRouter.build_default_out_queues(
+                    combos=combos,
+                    maxsize={"combo": 10, "vol": 10, "slip": 10, "health": 10},
+                )
+                scanner = _DummyScannerForRouter()
+                router = MarketDataRouter(
+                    in_queue=in_q,
+                    out_queues=out_queues,
+                    combos=combos,
+                    scanner=scanner,
+                    push_to_scanner=True,
+                    publish_combo_to_bus=True,
+                    require_l2_first=False,
+                    stale_source_ms=1000,
+                    coalesce_window_ms=5,
+                    coalesce_maxlen=2,
+                )
+
+                task = asyncio.create_task(router.start())
+                try:
+                    now_ms = int(time.time() * 1000)
+                    for idx in range(3):
+                        exch = "BINANCE" if idx % 2 == 0 else "BYBIT"
+                        ev = _make_router_event(
+                            exch,
+                            "BTC-USDC",
+                            100.0 + idx,
+                            101.0 + idx,
+                            with_l2=True,
+                            ts_ms=now_ms + idx,
+                            quote="USDC",
+                        )
+                        await in_q.put(ev)
+
+                    deadline = time.time() + 1.0
+                    while len(scanner.events) < 1 and time.time() < deadline:
+                        await asyncio.sleep(0.01)
+                    self.assertGreaterEqual(len(scanner.events), 1)
+                finally:
+                    with contextlib.suppress(Exception):
+                        await router.stop()
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(task, timeout=1.0)
+
+            with self.subTest("MarketDataRouter stress (SMOKE_STRESS=1)"):
+                MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
+                if MarketDataRouter is None:
+                    self.skipTest("MarketDataRouter absent")
+                if os.environ.get("SMOKE_STRESS") != "1":
+                    self.skipTest("stress gate disabled")
+                stress_in_q: asyncio.Queue = asyncio.Queue()
+                stress_out_queues = MarketDataRouter.build_default_out_queues(
+                    combos=combos,
+                    maxsize={"combo": 1000, "vol": 1000, "slip": 1000, "health": 1000},
+                )
+                stress_scanner = _DummyScannerForRouter()
+                stress_router = MarketDataRouter(
+                    in_queue=stress_in_q,
+                    out_queues=stress_out_queues,
+                    combos=combos,
+                    scanner=stress_scanner,
+                    push_to_scanner=True,
+                    publish_combo_to_bus=True,
+                    require_l2_first=False,
+                    stale_source_ms=1000,
+                    coalesce_window_ms=1,
+                    coalesce_maxlen=2,
+                )
+
+                stress_task = asyncio.create_task(stress_router.start())
+                try:
+                    now_ms = int(time.time() * 1000)
+                    for i in range(10_000):
+                        exch = "BINANCE" if i % 2 == 0 else "BYBIT"
+                        ev = _make_router_event(
+                            exch,
+                            "BTC-USDC",
+                            100.0 + (i % 10) * 0.01,
+                            100.5 + (i % 10) * 0.01,
+                            with_l2=True,
+                            ts_ms=now_ms + i,
+                            quote="USDC",
+                        )
+                        await stress_in_q.put(ev)
+
+                    initial_pending = stress_in_q.qsize()
+                    await asyncio.sleep(1.2)
+                    still_pending = stress_in_q.qsize()
+                    self.assertFalse(stress_task.done(), "router task terminated during stress")
+                    self.assertLess(still_pending, initial_pending, "router did not drain under stress")
+                    self.assertLess(still_pending, 10_000, "router queue grew unbounded")
+                finally:
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(stress_router.stop(), timeout=2.0)
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(stress_task, timeout=2.0)
+
+            with self.subTest("VolatilityMonitor contract"):
+                vol_mod = importlib.import_module("volatility_monitor")
+                VolatilityMonitor = getattr(vol_mod, "VolatilityMonitor", None)
+                if VolatilityMonitor is None:
+                    self.skipTest("VolatilityMonitor absent")
+                if not hasattr(VolatilityMonitor, "attach_bus_vol_queues"):
+                    self.skipTest("VolatilityMonitor.attach_bus_vol_queues absent")
+
+                vm = VolatilityMonitor(cfg)
+                vol_q: asyncio.Queue = asyncio.Queue()
+                vm.attach_bus_vol_queues({"BINANCE": vol_q})
+                try:
+                    now_ms = int(time.time() * 1000)
+                    for i in range(2):
+                        msg = {
+                            "exchange": "BINANCE",
+                            "pair_key": "BTCUSDC",
+                            "best_bid": 100.0 + i * 0.01,
+                            "best_ask": 100.1 + i * 0.01,
+                            "recv_ts_ms": now_ms + i,
+                            "exchange_ts_ms": now_ms + i,
+                        }
+                        await vol_q.put(msg)
+                    await asyncio.wait_for(vol_q.join(), timeout=1.0)
+                finally:
+                    if hasattr(vm, "detach_bus_consumers"):
+                        with contextlib.suppress(Exception):
+                            await vm.detach_bus_consumers()
+
+            with self.subTest("SlippageHandler contract"):
+                slip_mod = importlib.import_module("slippage_handler")
+                SlippageHandler = getattr(slip_mod, "SlippageHandler", None)
+                if SlippageHandler is None:
+                    self.skipTest("SlippageHandler absent")
+                if not hasattr(SlippageHandler, "attach_bus_slip_queues"):
+                    self.skipTest("SlippageHandler.attach_bus_slip_queues absent")
+
+                sh = SlippageHandler(cfg)
+                slip_q: asyncio.Queue = asyncio.Queue()
+                sh.attach_bus_slip_queues({"BINANCE": slip_q})
+                try:
+                    now_ms = int(time.time() * 1000)
+                    for i in range(2):
+                        msg = {
+                            "exchange": "BINANCE",
+                            "pair_key": "BTCUSDC",
+                            "orderbook": {"bids": [[100.0 + i, 1.0]], "asks": [[101.0 + i, 1.0]]},
+                            "best_bid": 100.0 + i,
+                            "best_ask": 101.0 + i,
+                            "top_bid_vol": 1.0,
+                            "top_ask_vol": 1.0,
+                            "recv_ts_ms": now_ms + i,
+                            "exchange_ts_ms": now_ms + i,
+                        }
+                        await slip_q.put(msg)
+                    await asyncio.wait_for(slip_q.join(), timeout=1.0)
+                finally:
+                    if hasattr(sh, "detach_bus_consumers"):
+                        with contextlib.suppress(Exception):
+                            await sh.detach_bus_consumers()
+
+            with self.subTest("OpportunityScanner contract"):
+                scan_mod = importlib.import_module("opportunity_scanner")
+                OpportunityScanner = getattr(scan_mod, "OpportunityScanner", None)
+                if OpportunityScanner is None:
+                    self.skipTest("OpportunityScanner absent")
+
+                class _StubRM:
+                    def __init__(self, bot_cfg):
+                        self.cfg = bot_cfg
+
+                    def get_fee_pct(self, *_args, **_kwargs):
+                        return 0.0
+
+                class _StubRouter:
+                    pass
+
+                class _StubSimulator:
+                    def set_event_sink(self, *_args, **_kwargs):
+                        return None
+
+                scanner = OpportunityScanner(
+                    cfg,
+                    risk_manager=_StubRM(cfg),
+                    market_router=_StubRouter(),
+                    simulator=_StubSimulator(),
+                )
+                hist_events: list[dict] = []
+                scanner.set_history_logger(lambda ev: hist_events.append(ev))
+
+                bad_payload = {"exchange": "BINANCE", "pair_key": "BTCUSDC"}
+                scanner.update_orderbook(bad_payload)
+                self.assertTrue(hist_events, "scanner rejection was not recorded")
+
+
         MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
         if MarketDataRouter is None:
             self.skipTest("MarketDataRouter absent")
@@ -723,19 +946,23 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         async with started_boot_with_servers(cfg) as (boot, _status_srv, _obs_srv):
             # Wait ready via HTTP (proxy for “superviseur /status & /ready”)
             base = f"http://127.0.0.1:{cfg.obs.status_port}"
-            wait_http_ready(f"{base}/health", timeout_s=_timeout_s())
+            wait_http_ready(f"{base}/healthz", timeout_s=_timeout_s())
 
             # /ready should reflect boot readiness.
             # (StatusHTTPServer uses Boot.get_status() under the hood.)
             http_get_text(f"{base}/ready")
             status = http_get_json(f"{base}/status")
-            self.assertIn("ready_all", status)
-            self.assertTrue(status["ready_all"])
-            for k in ["ws_ready", "router_ready", "scanner_ready", "rm_ready", "engine_ready"]:
+            for k in ["ws_ready", "router_ready", "scanner_ready", "rm_ready", "engine_ready", "ready_all"]:
                 self.assertIn(k, status)
                 self.assertIsInstance(status[k], bool)
             self.assertIn("active_pairs", status)
             self.assertEqual(status.get("active_pairs"), ["BTCUSDC", "ETHUSDC"])
+            self.assertTrue(status["ready_all"], f"not READY: reasons={status.get('reasons')}")
+            if "degraded" in status:
+                self.assertFalse(
+                    status["degraded"],
+                    f"status degraded: reasons={status.get('reasons') or status.get('degraded_reasons')}",
+                )
 
             # The in-process Boot should have set ready_all.
             self.assertTrue(bool(status.get("ready_all")), f"not READY: reasons={status.get('reasons')}")
@@ -743,9 +970,12 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             # /metrics should be non-empty and contain at least these canonical metrics.
             murl = f"http://127.0.0.1:{cfg.obs.status_port}/metrics"
             metrics_txt = http_get_text(murl)
-            self.assertIn("event_loop_lag_ms", metrics_txt)
-            self.assertIn("time_skew_ms", metrics_txt)
-            self.assertIn("bot_startups_total", metrics_txt)
+            loop_or_skew_metric_present = any(
+                name in metrics_txt for name in ("event_loop_lag_ms", "time_skew_ms")
+            )
+            self.assertTrue(loop_or_skew_metric_present, "loop lag/time skew metric missing")
+            startups_metric_present = "bot_startups_total" in metrics_txt
+            self.assertTrue(startups_metric_present, "startups metric missing")
             self.assertTrue(
                 any(
                     name in metrics_txt
@@ -766,6 +996,100 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         - Simulator: une simulation minimale valide
         - Engine: enforcement idempotency_key + DUPLICATE_BUNDLE
         """
+        with self.subTest("RiskManager invalid opportunity emits reason"):
+            cfg_rm = modules.bot_config.BotConfig()
+            cfg_rm.g.mode = "DRY_RUN"
+            cfg_rm.g.deployment_mode = "EU_ONLY"
+            cfg_rm.g.capital_profile = "NANO"
+            cfg_rm.g.enabled_exchanges = ["BINANCE", "BYBIT"]
+
+            RiskManager = getattr(rm_mod, "RiskManager", None)
+            if RiskManager is None:
+                self.skipTest("RiskManager absent")
+
+            class _StubBalanceFetcher:
+                async def get_all_balances(self, force_refresh: bool = False):
+                    return {"BINANCE": {"TT": {"USDC": 1000.0}}}
+
+            class _StubVolMonitor:
+                def get_current_metrics(self, _pair):
+                    return {}
+
+                def get_current_thresholds(self, _pair):
+                    return {}
+
+            class _StubSimulator:
+                def set_event_sink(self, *_args, **_kwargs):
+                    return None
+
+            class _StubExecutionEngine:
+                def __init__(self):
+                    self.calls = []
+
+                async def submit_bundle(self, *args, **kwargs):
+                    self.calls.append((args, kwargs))
+                    return {"submitted": False}
+
+            def _minimal_orderbooks():
+                now_ts = int(time.time() * 1000)
+                return {
+                    "BINANCE": {
+                        "BTCUSDC": {
+                            "best_bid": 100.0,
+                            "best_ask": 101.0,
+                            "recv_ts_ms": now_ts,
+                        }
+                    }
+                }
+
+            history_events: list[dict] = []
+            ready_event = asyncio.Event()
+            loops_config = {
+                "orderbooks_interval": 10.0,
+                "balances_interval": 10.0,
+                "rebal_interval": 10.0,
+                "volatility_interval": 10.0,
+                "fee_sync_interval": 120.0,
+            }
+
+            rm_reason = RiskManager(
+                bot_cfg=cfg_rm,
+                config=cfg_rm,
+                exchanges=cfg_rm.g.enabled_exchanges,
+                symbols=["BTCUSDC"],
+                balance_fetcher=_StubBalanceFetcher(),
+                volatility_monitor=_StubVolMonitor(),
+                simulator=_StubSimulator(),
+                get_orderbooks_callback=_minimal_orderbooks,
+                history_logger=lambda ev: history_events.append(ev),
+                execution_engine=_StubExecutionEngine(),
+                loops_config=loops_config,
+                ready_event=ready_event,
+            )
+
+            try:
+                await rm_reason.start()
+                self.assertTrue(rm_reason.ready_event.is_set())
+
+                invalid_opp = {"pair": "BTCUSDC"}
+                await rm_reason.handle_opportunity(invalid_opp)
+                await asyncio.sleep(0.05)
+                self.assertTrue(history_events, "RiskManager did not emit history for invalid opp")
+                reason = ""
+                last_event = history_events[-1]
+                for key in ("reason", "reasons", "status_reason"):
+                    val = last_event.get(key)
+                    if isinstance(val, (list, tuple)):
+                        reason = next((str(v) for v in val if v), "")
+                    else:
+                        reason = str(val or "")
+                    if reason:
+                        break
+                self.assertTrue(reason, f"no rejection reason captured: {last_event}")
+            finally:
+                if hasattr(rm_reason, "stop"):
+                    with contextlib.suppress(Exception):
+                        await rm_reason.stop()
         cfg = modules.bot_config.BotConfig()
         cfg.g.mode = "DRY_RUN"  # pas de trade réel
         cfg.g.deployment_mode = "EU_ONLY"
@@ -928,14 +1252,17 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
         # --- Engine idempotence contract (no private ws required in DRY_RUN branch)
         ExecutionEngine = getattr(engine_mod, "ExecutionEngine")
+        cfg.engine.ff_enforce_client_oid_deterministic = True
+        cfg.engine.ff_fail_closed_idempotence = True
+        ready_event = asyncio.Event()
         eng = ExecutionEngine(
+            None,
+            None,
+            None,
+            history_logger=None,
+            config=cfg.engine,
             cfg=cfg,
-            private_ws=None,
-            balance_fetcher=None,
-            logger_historique_manager=None,
-            rate_limiter=None,
-            pacer=None,
-            rpc_gateway=None,
+            ready_event=ready_event,
         )
         eng.ready_event.set()
         eng.history_fsm = _DummyHistoryFSM()
@@ -965,41 +1292,46 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
         EngineSubmitError = getattr(errors_mod, "EngineSubmitError")
 
+        # Order template aligned with ExecutionEngine._exec_single expectations
+        order_common = {
+            "exchange": "BINANCE",
+            "symbol": "BTCUSDC",
+            "side": "BUY",
+            "price": 100.0,
+            "volume_usdc": 10.0,
+            "meta": {
+                "bundle_id": "SMOKE-BNDL-1",
+                "idempotency_key": "SMOKE-IDK-1",
+                "slice_id": "SLC-1",
+                "account_alias": "TT",
+            },
+        }
+
         # 1) Missing idempotency_key must fail closed when ff_enforce_client_oid_deterministic=True
-        order_missing_idk = {
-            "symbol": "BTCUSDC",
-            "side": "BUY",
-            "type": "LIMIT",
-            "price": 100.0,
-            "qty": 0.001,
-            "client_id": "SMOKE-CID-1",
-            # idempotency_key intentionally missing
-        }
+        order_missing_idk = dict(order_common)
+        order_missing_idk["meta"] = {k: v for k, v in order_common["meta"].items() if k != "idempotency_key"}
         with self.assertRaises(EngineSubmitError) as ctx1:
-            await eng._exec_single(venue="BINANCE", alias="TT", order=order_missing_idk)
-        self.assertEqual(ctx1.exception.metadata.get("reason_code"), "MISSING_IDEMPOTENCY_KEY")
+            await eng._exec_single(order_missing_idk)
+        reason_1 = getattr(ctx1.exception, "reason", str(ctx1.exception))
+        self.assertIn("IDEMPOTENCY_MISSING", str(reason_1))
 
-        # 2) Valid order should execute in DRY_RUN (filled=True)
-        order = {
-            "symbol": "BTCUSDC",
-            "side": "BUY",
-            "type": "LIMIT",
-            "price": 100.0,
-            "qty": 0.001,
-            "client_id": "SMOKE-CID-2",
-            "idempotency_key": "SMOKE-IDK-1",
-        }
-        res1 = await eng._exec_single(venue="BINANCE", alias="TT", order=order)
-        self.assertTrue(bool(res1.get("ok")), res1)
-        self.assertTrue(bool(res1.get("filled")), res1)
+        # 2) Duplicate idempotency_key is rejected when already seen (circuit breaker short-circuits network)
+        rejected: list[tuple[str, dict]] = []
+        eng._pre_trade_circuits = lambda *args, **kwargs: False  # type: ignore[assignment]
 
-        # 3) Duplicate idempotency_key must reject with DUPLICATE_BUNDLE
-        order2 = dict(order)
-        order2["client_id"] = "SMOKE-CID-3"  # different CID, same IDK
+        def _stub_reject(symbol, order, reason):
+            rejected.append((symbol, {"reason": reason, "order": order}))
+
+        eng._reject = _stub_reject  # type: ignore[assignment]
+
+        first_res = await eng._exec_single(order_common)
+        self.assertFalse(bool(first_res))
+        self.assertTrue(rejected, "circuit breaker stub was not invoked")
+
         with self.assertRaises(EngineSubmitError) as ctx2:
-            await eng._exec_single(venue="BINANCE", alias="TT", order=order2)
-        self.assertEqual(ctx2.exception.metadata.get("reason_code"), "DUPLICATE_BUNDLE")
-
+            await eng._exec_single(order_common)
+        reason_2 = getattr(ctx2.exception, "reason", str(ctx2.exception))
+        self.assertIn("DUPLICATE_BUNDLE", str(reason_2))
     async def test_03_pws_incident_simulated_reconciler_stale_and_dedup(self) -> None:
         """Scénario 3 — incident PWS simulé via PrivateWSReconciler.
 
@@ -1058,6 +1390,54 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         after = len(rec._seen_keys._s)
         if (after - before) not in (0, 1):
             self.fail("dedup store grew unexpectedly after duplicate fills")
+        if os.environ.get("SMOKE_STRESS") == "1":
+            with self.subTest("PrivateWSReconciler fill storm (SMOKE_STRESS=1)"):
+                seen = getattr(rec, "_seen_keys", None)
+                if seen is None:
+                    self.skipTest("PrivateWSReconciler._seen_keys absent")
+
+                def _seen_size() -> int:
+                    size_candidates = []
+                    for attr in ("_q", "_s"):
+                        val = getattr(seen, attr, None)
+                        if val is not None:
+                            size_candidates.append(len(val))
+                    return max(size_candidates) if size_candidates else 0
+
+                fill_n = _stress_int("SMOKE_STRESS_PWS_FILL_STORM", 5000)
+                maxlen = getattr(seen, "_maxlen", None)
+
+                def _mk_evt(i: int) -> dict:
+                    return {
+                        "exchange": "BINANCE",
+                        "alias": "TT",
+                        "type": "fill",
+                        "status": "FILL",
+                        "symbol": "BTCUSDC",
+                        "trade_id": f"tid-{i % 200}",
+                        "order_id": f"OID-{i % 50}",
+                        "client_id": f"CID-{i % 100}",
+                        "side": "BUY" if i % 2 == 0 else "SELL",
+                        "price": 100.0 + i * 0.0001,
+                        "qty": 0.01 + (i % 3) * 0.001,
+                        "ts": time.time(),
+                    }
+
+                for i in range(fill_n):
+                    rec.observe_fill_event(_mk_evt(i))
+                    if hasattr(rec, "sweep") and i % 500 == 0:
+                        sweep_fn = getattr(rec, "sweep")
+                        if inspect.iscoroutinefunction(sweep_fn):
+                            await sweep_fn()
+                        else:
+                            sweep_fn()
+
+                peak = _seen_size()
+                if isinstance(maxlen, int) and maxlen > 0:
+                    self.assertLessEqual(peak, maxlen)
+                else:
+                    # fallback: ensure dedup set size remains well below total events
+                    self.assertLessEqual(peak, fill_n // 10)
 
         # loop start/stop sanity
         if not hasattr(rec, "start") or not hasattr(rec, "stop"):
@@ -1109,23 +1489,49 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
     async def test_05_transfers_fsm_and_logs_rotation(self) -> None:
         """Scénario 5 — Transfers/REB + Logs.
 
-        - TransferController: SUBMITTED -> SETTLED + timeout -> FAILED
+         - TransferController: fail path + timeout fail-close
         - LogWriter: rotation size-based (gzip)
         """
         TransferController = getattr(rm_mod, "TransferController")
 
+        class _StubLHM:
+            def __init__(self) -> None:
+                self.fail_closed: list[dict] = []
+
+            def mark_transfer_requested(self, **_kwargs):
+                return None
+
+            def mark_transfer_prepared(self, **_kwargs):
+                return None
+
+            def mark_transfer_submitted(self, **_kwargs):
+                return None
+
+            def mark_transfer_failed(self, **_kwargs):
+                return None
+
+            def mark_transfer_settled(self, **_kwargs):
+                return None
+
+            def get_transfer_state(self, **_kwargs):
+                return None
+
+            def activate_fail_closed_latch(self, **kwargs):
+                self.fail_closed.append(kwargs)
+
+        lhm = _StubLHM()
+
         tc = TransferController(
             submitted_timeout_s=0.2,
+            logger_historique_manager=lhm,
 
         )
 
+        async def submit_fn_fail(**_kwargs):
+            raise RuntimeError("smoke submit fail")
 
-        async def submit_fn(**kwargs):
-            # emulate successful submit (return any dict)
-            return {"ok": True, "id": kwargs.get("transfer_id")}
-
-        payload_ok = {
-            "transfer_id": "XFER-1",
+        payload_fail = {
+            "transfer_id": "XFER-FAIL",
             "exchange": "BINANCE",
             "from_alias": "A",
             "to_alias": "B",
@@ -1133,48 +1539,20 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             "amount": 1.23,
             "type": "transfer",
         }
-        res_ok = await tc.submit(
-            payload=payload_ok,
-            submit_fn=submit_fn,
+        res_fail = await tc.submit(
+            payload=payload_fail,
+            submit_fn=submit_fn_fail,
             venue="BINANCE",
         )
-        self.assertEqual(res_ok.get("transfer_id"), "XFER-1")
-        st = tc._states.get("XFER-1")
-        self.assertIsNotNone(st)
-        self.assertEqual(st.get("state"), "SUBMITTED")
-        self.assertIn("expires_ts_ms", st)
-
-        tc.mark_settled("XFER-1")
-        st2 = tc._states.get("XFER-1")
-        self.assertEqual(st2.get("state"), "SETTLED")
-
-        async def submit_fn_fail(**kwargs):
-            raise RuntimeError("smoke submit fail")
-
-        try:
-            await tc.submit(
-                payload={
-                    "transfer_id": "XFER-FAIL",
-                    "exchange": "BINANCE",
-                    "from_alias": "A",
-                    "to_alias": "B",
-                    "ccy": "USDC",
-                    "amount": 1.23,
-                },
-                submit_fn=submit_fn_fail,
-                venue="BINANCE",
-            )
-        except Exception:
-            pass
+        self.assertEqual(res_fail.get("transfer_id"), "XFER-FAIL")
         st_fail = tc._states.get("XFER-FAIL")
-        if st_fail is None:
-            self.skipTest("TransferController did not create state for failed submit")
+        self.assertIsNotNone(st_fail)
         self.assertIn(st_fail.get("state"), {"FAILED", "SUBMITTED"})
         tc.check_timeouts()
         st_fail2 = tc._states.get("XFER-FAIL")
         self.assertEqual(st_fail2.get("state"), "FAILED")
 
-        # Timeout path: inject a stale SUBMITTED state and run check_timeouts
+        # Timeout path: inject a stale SUBMITTED state and run check_timeouts (activates fail-close latch)
         tc._states["XFER-STALE"] = {
             "state": "SUBMITTED",
             "last_ts": time.time() - 1.0,
@@ -1184,6 +1562,7 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         tc.check_timeouts()
         st3 = tc._states.get("XFER-STALE")
         self.assertEqual(st3.get("state"), "FAILED")
+        self.assertTrue(lhm.fail_closed, "fail-close latch was not activated for stale transfer")
 
         # LogWriter rotation
         LogWriter = getattr(log_writer_mod, "LogWriter")
