@@ -44,6 +44,7 @@ Optionnel:
 
 from __future__ import annotations
 
+import importlib
 import asyncio
 import contextlib
 import copy
@@ -158,7 +159,12 @@ import modules.risk_manager as rm_mod  # noqa: E402
 import modules.logger_historique.log_writer as log_writer_mod  # noqa: E402
 import contracts.errors as errors_mod  # noqa: E402
 
+# --------------------------------------------------------------------------------------
+# Local imports
+# --------------------------------------------------------------------------------------
 
+router_mod = importlib.import_module("market_data_router")
+payloads_mod = importlib.import_module("payloads")
 # --------------------------------------------------------------------------------------
 # Helpers: network + ports
 # --------------------------------------------------------------------------------------
@@ -296,6 +302,39 @@ class _DummyHistoryFSM:
         self._seen.add(idempotency_key)
         return True
 
+class _DummyScannerForRouter:
+    def __init__(self) -> None:
+        self.events: list[Any] = []
+
+    def update_orderbook(self, ev):
+        self.events.append(ev)
+
+
+def _make_router_event(
+    exchange,
+    pair_key,
+    bid,
+    ask,
+    *,
+    with_l2: bool = True,
+    ts_ms: Optional[int] = None,
+    quote: str = "USDC",
+) -> dict:
+    now_ms = int(time.time() * 1000)
+    ts = ts_ms if ts_ms is not None else now_ms
+    ob = {"bids": [[bid, 1.0]], "asks": [[ask, 1.0]]} if with_l2 else {}
+    symbol = str(pair_key).replace("-", "")
+    return {
+        "exchange": exchange,
+        "pair_key": pair_key,
+        "symbol": symbol,
+        "best_bid": bid,
+        "best_ask": ask,
+        "orderbook": ob,
+        "exchange_ts_ms": ts,
+        "recv_ts_ms": ts,
+        "quote": quote,
+    }
 
 # --------------------------------------------------------------------------------------
 # The 5 institutional scenarios (unittest)
@@ -356,6 +395,300 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             self.skipTest("snapshot vol.ttl_s absent")
         self.assertEqual(snap0["slip"]["ttl_s"] + 1, snap1["slip"]["ttl_s"])
         self.assertEqual(snap0["vol"]["ttl_s"] + 1, snap1["vol"]["ttl_s"])
+        MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
+        if MarketDataRouter is None:
+            self.skipTest("MarketDataRouter absent")
+        if not hasattr(MarketDataRouter, "build_default_out_queues"):
+            self.skipTest("MarketDataRouter.build_default_out_queues absent")
+
+        in_q: asyncio.Queue = asyncio.Queue()
+        combos = [("BINANCE", "BYBIT")]
+        out_queues = MarketDataRouter.build_default_out_queues(
+            combos=combos,
+            maxsize={"combo": 50, "vol": 50, "slip": 50, "health": 50},
+        )
+        scanner = _DummyScannerForRouter()
+        router = MarketDataRouter(
+            in_queue=in_q,
+            out_queues=out_queues,
+            combos=combos,
+            scanner=scanner,
+            push_to_scanner=True,
+            publish_combo_to_bus=True,
+            require_l2_first=False,
+            stale_source_ms=1000,
+            coalesce_window_ms=5,
+            coalesce_maxlen=2,
+        )
+
+        t = asyncio.create_task(router.start())
+        try:
+            now_ms = int(time.time() * 1000)
+            for exch in ["BINANCE", "BYBIT"]:
+                ev = _make_router_event(
+                    exch,
+                    "BTC-USDC",
+                    100.0,
+                    101.0,
+                    with_l2=True,
+                    ts_ms=now_ms,
+                    quote="USDC",
+                )
+                await in_q.put(ev)
+
+            await asyncio.sleep(0.05)
+
+            self.assertGreaterEqual(len(scanner.events), 1)
+            cex_out = out_queues.get("cex:BINANCE")
+            if cex_out is None:
+                self.skipTest("out_queues['cex:BINANCE'] absent")
+            fanout_sizes = [
+                q.qsize()
+                for name, q in cex_out.items()
+                if name in {"vol", "slip", "health"} and hasattr(q, "qsize")
+            ]
+            self.assertTrue(any(sz >= 1 for sz in fanout_sizes), "no fan-out for BINANCE")
+            if hasattr(router, "_events_schema_errors"):
+                self.assertEqual(getattr(router, "_events_schema_errors"), 0)
+        finally:
+            with contextlib.suppress(Exception):
+                await router.stop()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(t, timeout=1.0)
+
+        stale_in_q: asyncio.Queue = asyncio.Queue()
+        stale_out_queues = MarketDataRouter.build_default_out_queues(
+            combos=combos,
+            maxsize={"combo": 50, "vol": 50, "slip": 50, "health": 50},
+        )
+        stale_scanner = _DummyScannerForRouter()
+        router_stale = MarketDataRouter(
+            in_queue=stale_in_q,
+            out_queues=stale_out_queues,
+            combos=combos,
+            scanner=stale_scanner,
+            push_to_scanner=True,
+            publish_combo_to_bus=True,
+            require_l2_first=False,
+            stale_source_ms=5,
+            coalesce_window_ms=5,
+            coalesce_maxlen=2,
+        )
+        t_stale = asyncio.create_task(router_stale.start())
+        try:
+            now_ms = int(time.time() * 1000)
+            ev_stale = _make_router_event(
+                "BINANCE",
+                "BTC-USDC",
+                99.0,
+                100.0,
+                with_l2=True,
+                ts_ms=now_ms - 1000,
+                quote="USDC",
+            )
+            ev_stale["recv_ts_ms"] = now_ms
+            initial_events = len(stale_scanner.events)
+            await stale_in_q.put(ev_stale)
+            await asyncio.sleep(0.05)
+
+            if hasattr(router_stale, "_events_ignored_stale"):
+                self.assertGreaterEqual(getattr(router_stale, "_events_ignored_stale"), 1)
+            else:
+                self.assertEqual(len(stale_scanner.events), initial_events)
+                cex_out = stale_out_queues.get("cex:BINANCE")
+                if cex_out is None:
+                    self.skipTest("stale_out_queues['cex:BINANCE'] absent")
+                fanout_sizes = [
+                    q.qsize()
+                    for name, q in cex_out.items()
+                    if name in {"vol", "slip", "health"} and hasattr(q, "qsize")
+                ]
+                self.assertTrue(all(sz == 0 for sz in fanout_sizes))
+        finally:
+            with contextlib.suppress(Exception):
+                await router_stale.stop()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(t_stale, timeout=1.0)
+
+        rl2_in_q: asyncio.Queue = asyncio.Queue()
+        rl2_out_queues = MarketDataRouter.build_default_out_queues(
+            combos=combos,
+            maxsize={"combo": 50, "vol": 50, "slip": 50, "health": 50},
+        )
+        rl2_scanner = _DummyScannerForRouter()
+        router_rl2 = MarketDataRouter(
+            in_queue=rl2_in_q,
+            out_queues=rl2_out_queues,
+            combos=combos,
+            scanner=rl2_scanner,
+            push_to_scanner=True,
+            publish_combo_to_bus=True,
+            require_l2_first=True,
+            stale_source_ms=1000,
+            coalesce_window_ms=5,
+            coalesce_maxlen=2,
+        )
+        t_rl2 = asyncio.create_task(router_rl2.start())
+        try:
+            now_ms = int(time.time() * 1000)
+            ev_nol2 = _make_router_event(
+                "BYBIT",
+                "BTC-USDC",
+                101.0,
+                102.0,
+                with_l2=False,
+                ts_ms=now_ms,
+                quote="USDC",
+            )
+            await rl2_in_q.put(ev_nol2)
+            await asyncio.sleep(0.05)
+
+            if hasattr(router_rl2, "_route_drops"):
+                drops = getattr(router_rl2, "_route_drops")
+                if isinstance(drops, dict) and drops:
+                    # no reason codes invented, just check any drop recorded
+                    total_drops = sum(
+                        int(v) for v in drops.values() if isinstance(v, (int, float))
+                    )
+                    self.assertGreaterEqual(total_drops, 1)
+            self.assertEqual(len(rl2_scanner.events), 0)
+            cex_out = rl2_out_queues.get("cex:BYBIT")
+            if cex_out is None:
+                self.skipTest("rl2_out_queues['cex:BYBIT'] absent")
+            fanout_sizes = [
+                q.qsize()
+                for name, q in cex_out.items()
+                if name in {"vol", "slip", "health"} and hasattr(q, "qsize")
+            ]
+            self.assertTrue(all(sz == 0 for sz in fanout_sizes))
+        finally:
+            with contextlib.suppress(Exception):
+                await router_rl2.stop()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(t_rl2, timeout=1.0)
+
+        if os.environ.get("SMOKE_STRESS_ROUTER") == "1":
+            stress_in_q: asyncio.Queue = asyncio.Queue()
+            stress_out_queues = MarketDataRouter.build_default_out_queues(
+                combos=combos,
+                maxsize={"combo": 10, "vol": 10, "slip": 10, "health": 10},
+            )
+            stress_scanner = _DummyScannerForRouter()
+            stress_router = MarketDataRouter(
+                in_queue=stress_in_q,
+                out_queues=stress_out_queues,
+                combos=combos,
+                scanner=stress_scanner,
+                push_to_scanner=True,
+                publish_combo_to_bus=True,
+                require_l2_first=False,
+                stale_source_ms=1000,
+                coalesce_window_ms=5,
+                coalesce_maxlen=2,
+            )
+            if hasattr(stress_router, "drop_alert_threshold"):
+                stress_router.drop_alert_threshold = 10
+            if hasattr(stress_router, "drop_window_s"):
+                stress_router.drop_window_s = 1.0
+
+            events: list[Any] = []
+            if hasattr(stress_router, "set_event_sink"):
+                stress_router.set_event_sink(lambda e: events.append(e))
+            else:
+                events = None  # type: ignore[assignment]
+
+            t_stress = asyncio.create_task(stress_router.start())
+            try:
+                pairs = ["BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC"]
+                now_ms = int(time.time() * 1000)
+                for i in range(2000):
+                    exch = "BINANCE" if i % 2 == 0 else "BYBIT"
+                    pair = pairs[i % len(pairs)]
+                    ev = _make_router_event(
+                        exch,
+                        pair,
+                        100.0 + i * 0.001,
+                        101.0 + i * 0.001,
+                        with_l2=True,
+                        ts_ms=now_ms + i,
+                        quote="USDC",
+                    )
+                    await stress_in_q.put(ev)
+                    if i % 200 == 0:
+                        await asyncio.sleep(0)
+
+                await asyncio.sleep(0.1)
+            finally:
+                with contextlib.suppress(Exception):
+                    await stress_router.stop()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(t_stress, timeout=5.0)
+
+            for cex_out in stress_out_queues.values():
+                for q in cex_out.values():
+                    if hasattr(q, "qsize"):
+                        self.assertLessEqual(q.qsize(), getattr(q, "maxsize", q.qsize()))
+
+            if events is not None:
+                self.assertGreaterEqual(len(events), 1)
+                self.assertTrue(
+                    any(
+                        isinstance(ev, dict)
+                        and ev.get("type") in {"backpressure", "router_drop"}
+                        for ev in events
+                    )
+                )
+
+        flush_in_q: asyncio.Queue = asyncio.Queue()
+        flush_out_queues = MarketDataRouter.build_default_out_queues(
+            combos=combos,
+            maxsize={"combo": 50, "vol": 50, "slip": 50, "health": 50},
+        )
+        flush_scanner = _DummyScannerForRouter()
+        flush_router = MarketDataRouter(
+            in_queue=flush_in_q,
+            out_queues=flush_out_queues,
+            combos=combos,
+            scanner=flush_scanner,
+            push_to_scanner=True,
+            publish_combo_to_bus=True,
+            require_l2_first=False,
+            stale_source_ms=1000,
+            coalesce_window_ms=50,
+            coalesce_maxlen=2,
+        )
+        t_flush = asyncio.create_task(flush_router.start())
+        try:
+            now_ms = int(time.time() * 1000)
+            ev_flush = _make_router_event(
+                "BINANCE",
+                "ETH-USDC",
+                200.0,
+                201.0,
+                with_l2=True,
+                ts_ms=now_ms,
+                quote="USDC",
+            )
+            await flush_in_q.put(ev_flush)
+            await asyncio.sleep(0)
+        finally:
+            with contextlib.suppress(Exception):
+                await flush_router.stop()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(t_flush, timeout=2.0)
+
+        flush_cex_out = flush_out_queues.get("cex:BINANCE")
+        if flush_cex_out is None:
+            self.skipTest("flush_out_queues['cex:BINANCE'] absent")
+        flush_fanout_sizes = [
+            q.qsize()
+            for name, q in flush_cex_out.items()
+            if name in {"vol", "slip", "health"} and hasattr(q, "qsize")
+        ]
+        self.assertTrue(
+            any(sz >= 1 for sz in flush_fanout_sizes) or len(flush_scanner.events) >= 1,
+            "router stop did not flush coalesced events",
+        )
 
         async with started_boot_with_servers(cfg) as (boot, _status_srv, _obs_srv):
             # Wait ready via HTTP (proxy for “superviseur /status & /ready”)
