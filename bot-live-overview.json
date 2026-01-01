@@ -1,0 +1,197 @@
+{
+  "uid": "bot-live-overview",
+  "title": "D1 — Bot Live (overview SLO)",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "live", "slo"],
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "fiscalYearStartMonth": 1,
+  "graphTooltip": 1,
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "label": "Job (fixed)",
+        "query": "arbitrage-bot",
+        "current": { "selected": true, "text": "arbitrage-bot", "value": "arbitrage-bot" },
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Status & Age",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "RM Trading Ready",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "rm_trading_ready{job=\"$job\"}",
+          "legendFormat": "ready",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "gauge",
+      "title": "Fee Snapshot Age (s)",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "max by (exchange, alias) (fee_snapshot_age_seconds{job=\"$job\"})",
+          "legendFormat": "{{exchange}}/{{alias}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 6, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Books Freshness Age (s)",
+      "id": 4,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "time() - last_books_fresh_ts_seconds{job=\"$job\"}",
+          "legendFormat": "{{pair}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Event Loop Lag (ms)",
+      "id": 5,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "event_loop_lag_ms{job=\"$job\"}",
+          "legendFormat": "lag",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 18, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Decisions & Latency",
+      "id": 6,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "RM Decisions / sec",
+      "id": 7,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(rm_decisions_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "RM Rejects / sec",
+      "id": 8,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(rm_reject_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Engine Submit→Ack p50/p95 (ms)",
+      "id": 9,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(engine_submit_to_ack_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(engine_submit_to_ack_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Router→Scanner p95 (ms)",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(router_to_scanner_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, route))",
+          "legendFormat": "{{route}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 10, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Logger Write p95 (ms)",
+      "id": 11,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(loggerh_write_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 10, "w": 6, "h": 4 }
+    },
+    {
+      "type": "gauge",
+      "title": "Logger DB Lane Queue Depth",
+      "id": 12,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "loggerh_db_lane_queue_depth{job=\"$job\"}",
+          "legendFormat": "queue",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 18, "y": 10, "w": 6, "h": 4 }
+    }
+  ]
+}

@@ -1,0 +1,206 @@
+{
+  "uid": "engine-slo-backpressure",
+  "title": "D2 — Engine SLO & Backpressure",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "engine", "slo"],
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "fiscalYearStartMonth": 1,
+  "graphTooltip": 1,
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "label": "Job (fixed)",
+        "query": "arbitrage-bot",
+        "current": { "selected": true, "text": "arbitrage-bot", "value": "arbitrage-bot" },
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Queues & Inflight",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Engine Inflight",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "engine_inflight{job=\"$job\"}",
+          "legendFormat": "inflight",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "gauge",
+      "title": "Submit Queue Depth",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "engine_submit_queue_depth{job=\"$job\"}",
+          "legendFormat": "depth",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 6, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Pacer Delay (ms)",
+      "id": 4,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "engine_pacer_delay_ms{job=\"$job\"}",
+          "legendFormat": "{{region}}/{{profile}}/{{mode}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Latency",
+      "id": 5,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Submit→Ack p50/p95/p99 (ms)",
+      "id": 6,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(engine_submit_to_ack_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(engine_submit_to_ack_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(engine_submit_to_ack_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Ack→Fill p50/p95/p99 (ms)",
+      "id": 7,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(engine_ack_to_fill_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(engine_ack_to_fill_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(engine_ack_to_fill_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Drain Latency p95 (ms)",
+      "id": 8,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(engine_drain_latency_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Backpressure & Blocks",
+      "id": 9,
+      "gridPos": { "x": 0, "y": 10, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Pacing Backpressure / sec",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(engine_pacing_backpressure_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 11, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "MM Panic Hedge / sec",
+      "id": 11,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (pair) (rate(mm_panic_hedge_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{pair}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 11, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "QueuePos Blocked / sec",
+      "id": 12,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange, pair) (rate(engine_queuepos_blocked_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{exchange}}/{{pair}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 11, "w": 8, "h": 4 }
+    }
+  ]
+}

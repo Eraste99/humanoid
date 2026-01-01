@@ -1,0 +1,163 @@
+{
+  "uid": "scanner-throughput",
+  "title": "D7 — Scanner Throughput",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "scanner", "throughput"],
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "fiscalYearStartMonth": 1,
+  "graphTooltip": 1,
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "label": "Job (fixed)",
+        "query": "arbitrage-bot",
+        "current": { "selected": true, "text": "arbitrage-bot", "value": "arbitrage-bot" },
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Latency",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Scanner Evaluate p50/p95 (ms)",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(scanner_evaluate_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, pair, route))",
+          "legendFormat": "{{pair}}/{{route}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(scanner_evaluate_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, pair, route))",
+          "legendFormat": "{{pair}}/{{route}} p95",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scanner Decision p95 (ms)",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(scanner_decision_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Throughput",
+      "id": 4,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Opportunities Emitted / sec",
+      "id": 5,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "rate(scanner_emitted_total{job=\"$job\"}[$__rate_interval])",
+          "legendFormat": "emitted",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scanner Rejections / sec",
+      "id": 6,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(scanner_rejections_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scanner Rate Limited / sec",
+      "id": 7,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (kind, cohort) (rate(scanner_rate_limited_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{kind}}/{{cohort}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Load",
+      "id": 8,
+      "gridPos": { "x": 0, "y": 10, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Scanner Global Load",
+      "id": 9,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "scanner_global_load{job=\"$job\"}",
+          "legendFormat": "load",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 11, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Configured Scan Interval (s)",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "scanner_cfg_scan_interval_s{job=\"$job\"}",
+          "legendFormat": "interval",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 11, "w": 12, "h": 4 }
+    }
+  ]
+}

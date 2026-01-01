@@ -1,0 +1,208 @@
+{
+  "uid": "logs-lhm-write-path",
+  "title": "D9 — Logs/LHM Write Path",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "logs", "lhm"],
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "fiscalYearStartMonth": 1,
+  "graphTooltip": 1,
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "label": "Job (fixed)",
+        "query": "arbitrage-bot",
+        "current": { "selected": true, "text": "arbitrage-bot", "value": "arbitrage-bot" },
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Write Latency",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Logger Write p95 (ms)",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(loggerh_write_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "DB Write p95 (ms)",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(loggerh_db_write_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, op))",
+          "legendFormat": "{{op}} p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Queues",
+      "id": 4,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "JSONL Queue Size",
+      "id": 5,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "lhm_jsonl_queue_size{job=\"$job\"}",
+          "legendFormat": "{{stream}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Logger DB Lane Queue Depth",
+      "id": 6,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "loggerh_db_lane_queue_depth{job=\"$job\"}",
+          "legendFormat": "queue",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "LHM DB Lane Queue Depth",
+      "id": 7,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "lhm_db_lane_queue_depth{job=\"$job\"}",
+          "legendFormat": "queue",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Drops & Rotations",
+      "id": 8,
+      "gridPos": { "x": 0, "y": 10, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "DB Lane Drops / sec",
+      "id": 9,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (lane, reason) (rate(loggerh_db_lane_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{lane}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 11, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "JSONL Drops / sec",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (stream, reason) (rate(lhm_jsonl_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{stream}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 11, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "JSONL Rotations / sec",
+      "id": 11,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (stream) (rate(loggerh_jsonl_rotations_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{stream}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 11, "w": 8, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Storage",
+      "id": 12,
+      "gridPos": { "x": 0, "y": 15, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "JSONL Bytes",
+      "id": 13,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "loggerh_jsonl_bytes{job=\"$job\"}",
+          "legendFormat": "bytes",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "DB File Bytes",
+      "id": 14,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "loggerh_db_file_bytes{job=\"$job\"}",
+          "legendFormat": "bytes",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 4 }
+    }
+  ]
+}

@@ -1,0 +1,172 @@
+{
+  "uid": "time-platform",
+  "title": "D10 — Time & Platform",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "platform", "time"],
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "fiscalYearStartMonth": 1,
+  "graphTooltip": 1,
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "label": "Job (fixed)",
+        "query": "arbitrage-bot",
+        "current": { "selected": true, "text": "arbitrage-bot", "value": "arbitrage-bot" },
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Time",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "gauge",
+      "title": "Time Skew (ms)",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "time_skew_ms{job=\"$job\"}",
+          "legendFormat": "skew",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "stat",
+      "title": "Time Sync Status",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "time_skew_status{job=\"$job\"}",
+          "legendFormat": "status",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 6, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Event Loop Lag (ms)",
+      "id": 4,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "event_loop_lag_ms{job=\"$job\"}",
+          "legendFormat": "lag",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Observability Errors",
+      "id": 5,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Obs Init Errors / sec",
+      "id": 6,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (metric, kind) (rate(obs_init_error_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{metric}}/{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Label Mismatch / sec",
+      "id": 7,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (metric) (rate(obs_label_mismatch_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{metric}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Obs Noop / sec",
+      "id": 8,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (metric, where) (rate(obs_noop_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{metric}}/{{where}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Platform",
+      "id": 9,
+      "gridPos": { "x": 0, "y": 10, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage Usage (%)",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "storage_usage_pct{job=\"$job\"}",
+          "legendFormat": "{{mount}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 11, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage Bytes Free",
+      "id": 11,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "storage_bytes_free{job=\"$job\"}",
+          "legendFormat": "{{mount}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 11, "w": 12, "h": 4 }
+    }
+  ]
+}

@@ -1,0 +1,191 @@
+{
+  "uid": "private-ws-trading",
+  "title": "D5 — Private WS Trading Plane",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "ws", "private"],
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "fiscalYearStartMonth": 1,
+  "graphTooltip": 1,
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "label": "Job (fixed)",
+        "query": "arbitrage-bot",
+        "current": { "selected": true, "text": "arbitrage-bot", "value": "arbitrage-bot" },
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Lag & Health",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "PWS Event Lag p50/p95 (ms)",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(pws_event_lag_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, exchange, alias))",
+          "legendFormat": "{{exchange}}/{{alias}} p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(pws_event_lag_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, exchange, alias))",
+          "legendFormat": "{{exchange}}/{{alias}} p95",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 4 }
+    },
+    {
+      "type": "stat",
+      "title": "PWS Health State",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pws_health_state{job=\"$job\"}",
+          "legendFormat": "{{exchange}}/{{alias}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Heartbeat Gap (s)",
+      "id": 4,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pws_heartbeat_gap_seconds{job=\"$job\"}",
+          "legendFormat": "{{exchange}}/{{alias}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 18, "y": 1, "w": 6, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Reconnects, Failovers, Drops",
+      "id": 5,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "PWS Reconnects / sec",
+      "id": 6,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange) (rate(pws_reconnects_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{exchange}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "WS Failovers / sec",
+      "id": 7,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange, reason) (rate(ws_failover_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{exchange}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "PWS Drops / sec",
+      "id": 8,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange, alias, reason) (rate(pws_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{exchange}}/{{alias}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Transfers & Queues",
+      "id": 9,
+      "gridPos": { "x": 0, "y": 10, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Transfer FSM Events / sec",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (status, reason) (rate(transfer_fsm_events_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{status}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 11, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "PWS Queue Depth",
+      "id": 11,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pws_queue_depth{job=\"$job\"}",
+          "legendFormat": "{{exchange}}/{{alias}}/{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 11, "w": 6, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "PWS Queue Fill Ratio",
+      "id": 12,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pws_queue_fill_ratio{job=\"$job\"}",
+          "legendFormat": "{{exchange}}/{{alias}}/{{kind}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 18, "y": 11, "w": 6, "h": 4 }
+    }
+  ]
+}
