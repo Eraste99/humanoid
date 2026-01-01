@@ -54,6 +54,7 @@ import socket
 import sys
 import tempfile
 import time
+import math
 import types
 import unittest
 import urllib.error
@@ -195,6 +196,37 @@ def wait_http_ready(url: str, timeout_s: float) -> None:
             time.sleep(0.2)
     raise AssertionError(f"HTTP not ready: {url} (last_err={last_err})")
 
+# --------------------------------------------------------------------------------------
+# Stress helpers (gated by SMOKE_STRESS=1)
+# --------------------------------------------------------------------------------------
+
+def _stress_enabled() -> bool:
+    return os.environ.get("SMOKE_STRESS", "0") == "1"
+
+
+def _stress_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except Exception:
+        return int(default)
+
+
+def _stress_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except Exception:
+        return float(default)
+
+
+async def _run_concurrent(n: int, conc: int, coro_factory):
+    sem = asyncio.Semaphore(conc)
+
+    async def _runner(idx: int):
+        async with sem:
+            return await coro_factory(idx)
+
+    tasks = [asyncio.create_task(_runner(i)) for i in range(n)]
+    return await asyncio.gather(*tasks)
 
 # --------------------------------------------------------------------------------------
 # Boot + servers context manager
@@ -488,10 +520,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
         # Tight staleness for smoke
         rec = PrivateWSReconciler(
+            cooldown_s=0.1,
             stale_ms=100,
             poll_every_s=0.05,
-            max_inflight=1,
-            enabled=True,
+            dedup_max=128,
         )
 
         # activity -> not stale
@@ -556,29 +588,29 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
         # healthy tick
         pacer.update(
-            now_ts=time.time(),
-            ack_p95_ms=80.0,
-            err_429_rate=0.0,
-            err_5xx_rate=0.0,
-            loop_lag_p95_ms=2.0,
-            in_flight=0,
+            region="EU",
+            p95_submit_ack_ms=80.0,
+            loop_lag_ms=2.0,
+            err_rate=0.0,
             queue_depth=0,
+            backpressure=False,
+            reason="healthy",
         )
         self.assertEqual(pacer.get_pacer_mode(), "NORMAL")
 
         # simulated 429 surge + latency degradation
         pacer.update(
-            now_ts=time.time(),
-            ack_p95_ms=800.0,
-            err_429_rate=0.25,
-            err_5xx_rate=0.05,
-            loop_lag_p95_ms=50.0,
-            in_flight=100,
+            region="EU",
+            p95_submit_ack_ms=800.0,
+            loop_lag_ms=50.0,
+            err_rate=0.30,
             queue_depth=5000,
+            backpressure=True,
+            reason="surge",
         )
         mode = pacer.get_pacer_mode()
         self.assertIn(mode, {"CONSTRAINED", "SEVERE"})
-        pol = pacer.get_policy()
+        pol = pacer.policy("EU")
         self.assertTrue(isinstance(pol, dict) and "pacing_ms" in pol)
         self.assertGreaterEqual(float(pol.get("pacing_ms", 0.0)), 0.0)
 
@@ -592,32 +624,36 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
         tc = TransferController(
             submitted_timeout_s=0.2,
-            retry_total_s=0.1,
-            retry_step_s=0.02,
+
         )
-        if not hasattr(tc, "get_state"):
-            self.skipTest("TransferController.get_state absent")
+
 
         async def submit_fn(**kwargs):
             # emulate successful submit (return any dict)
             return {"ok": True, "id": kwargs.get("transfer_id")}
 
-        tid = await tc.submit(
-            transfer_id="XFER-1",
-            venue="BINANCE",
-            alias="TT",
+        payload_ok = {
+            "transfer_id": "XFER-1",
+            "exchange": "BINANCE",
+            "from_alias": "A",
+            "to_alias": "B",
+            "ccy": "USDC",
+            "amount": 1.23,
+            "type": "transfer",
+        }
+        res_ok = await tc.submit(
+            payload=payload_ok,
             submit_fn=submit_fn,
-            amount=1.23,
-            asset="USDC",
-            from_account="A",
-            to_account="B",
+            venue="BINANCE",
         )
-        self.assertEqual(tid, "XFER-1")
-        st = tc.get_state("XFER-1")
+        self.assertEqual(res_ok.get("transfer_id"), "XFER-1")
+        st = tc._states.get("XFER-1")
+        self.assertIsNotNone(st)
         self.assertEqual(st.get("state"), "SUBMITTED")
+        self.assertIn("expires_ts_ms", st)
 
         tc.mark_settled("XFER-1")
-        st2 = tc.get_state("XFER-1")
+        st2 = tc._states.get("XFER-1")
         self.assertEqual(st2.get("state"), "SETTLED")
 
         async def submit_fn_fail(**kwargs):
@@ -625,36 +661,36 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
         try:
             await tc.submit(
-                transfer_id="XFER-FAIL",
-                venue="BINANCE",
-                alias="TT",
+                payload={
+                    "transfer_id": "XFER-FAIL",
+                    "exchange": "BINANCE",
+                    "from_alias": "A",
+                    "to_alias": "B",
+                    "ccy": "USDC",
+                    "amount": 1.23,
+                },
                 submit_fn=submit_fn_fail,
-                amount=1.23,
-                asset="USDC",
-                from_account="A",
-                to_account="B",
+                venue="BINANCE",
             )
         except Exception:
             pass
-        st_fail = tc.get_state("XFER-FAIL")
+        st_fail = tc._states.get("XFER-FAIL")
         if st_fail is None:
             self.skipTest("TransferController did not create state for failed submit")
         self.assertIn(st_fail.get("state"), {"FAILED", "SUBMITTED"})
         tc.check_timeouts()
-        st_fail2 = tc.get_state("XFER-FAIL")
+        st_fail2 = tc._states.get("XFER-FAIL")
         self.assertEqual(st_fail2.get("state"), "FAILED")
 
         # Timeout path: inject a stale SUBMITTED state and run check_timeouts
         tc._states["XFER-STALE"] = {
             "state": "SUBMITTED",
-            "submitted_at": time.time() - 1.0,
-            "settle_by": time.time() - 1.0,
-            "expires_at": time.time() - 1.0,
-            "venue": "BINANCE",
-            "alias": "TT",
+            "last_ts": time.time() - 1.0,
+            "payload": {"exchange": "BINANCE"},
+            "expires_ts_ms": int((time.time() - 1.0) * 1000),
         }
         tc.check_timeouts()
-        st3 = tc.get_state("XFER-STALE")
+        st3 = tc._states.get("XFER-STALE")
         self.assertEqual(st3.get("state"), "FAILED")
 
         # LogWriter rotation
@@ -662,22 +698,270 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             lw = LogWriter(
-                root_dir=str(root),
-                db_name="smoke.db",
-                max_bytes=1,  # force rotation immediately
-                max_age_s=3600,
-                compress=True,
+                db_dir=str(root),
+                rotate_bytes=1,  # force rotation immediately
+                backup_count=3,
+                compress_rotations=True,
             )
             # rotation must not throw
-            rotated = lw.rotate_if_needed()
+            rotated = lw.rotate_if_needed(max_bytes=1, max_age_s=0)
             # rotated may be False if file wasn't created yet; ensure it exists
-            db_path = root / "smoke.db"
+            db_path = Path(lw.db_path)
             self.assertTrue(db_path.exists())
             # Force one more check now that it exists
-            _ = lw.rotate_if_needed()
+            _ = lw.rotate_if_needed(max_bytes=1, max_age_s=0)
 
-            gz_files = list(root.glob("smoke.db.*.gz"))
-            self.assertTrue(len(gz_files) >= 1, f"no rotated gzip found in {root}: {list(root.iterdir())}")
+        gz_files = list(Path(lw.db_dir).glob(f"{db_path.stem}.*.db.gz"))
+        self.assertTrue(len(gz_files) >= 1, f"no rotated gzip found in {root}: {list(root.iterdir())}")
+
+@unittest.skipUnless(_stress_enabled(), "SMOKE_STRESS=1 required")
+class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
+    async def test_stress_http_status_metrics(self) -> None:
+        """Stress: rafales concurrentes sur /status et /metrics."""
+
+        cfg = modules.bot_config.BotConfig()
+        cfg.g.mode = "DRY_RUN"
+        cfg.g.deployment_mode = "EU_ONLY"
+        cfg.g.capital_profile = "NANO"
+        cfg.g.pairs = ["BTCUSDC", "ETHUSDC"]
+        cfg.discovery.enabled = False
+        cfg.g.enabled_exchanges = ["BINANCE", "BYBIT"]
+        cfg.g.feature_switches = {
+            "private_ws": False,
+            "balance_fetcher": False,
+            "engine_real": False,
+            "rpc_server": False,
+        }
+        cfg.obs.status_port = find_free_port()
+        cfg.obs.expose_metrics_on_status = True
+        cfg.obs.enable_obs_port = False
+
+        n = _stress_int("SMOKE_STRESS_HTTP_N", 200)
+        conc = _stress_int("SMOKE_STRESS_HTTP_CONC", 50)
+        timeout_s = _stress_float("SMOKE_STRESS_HTTP_TIMEOUT_S", 2.0)
+        p95_target_env = os.environ.get("SMOKE_STRESS_HTTP_P95_MS")
+        p95_target_ms = float(p95_target_env) if p95_target_env is not None else None
+
+        async with started_boot_with_servers(cfg) as (_boot, _status_srv, _obs_srv):
+            base_url = f"http://127.0.0.1:{cfg.obs.status_port}"
+            wait_http_ready(f"{base_url}/health", timeout_s=_timeout_s())
+
+            status_url = f"{base_url}/status"
+            metrics_url = f"{base_url}/metrics"
+
+            async def fetch_status(_idx: int) -> float:
+                t0 = time.perf_counter()
+                data = await asyncio.to_thread(http_get_json, status_url, timeout_s)
+                self.assertTrue(isinstance(data, dict))
+                self.assertIn("ready_all", data)
+                return (time.perf_counter() - t0) * 1000.0
+
+            async def fetch_metrics(_idx: int) -> float:
+                t0 = time.perf_counter()
+                txt = await asyncio.to_thread(http_get_text, metrics_url, timeout_s)
+                self.assertTrue(txt.strip(), "empty metrics response")
+                self.assertIn("event_loop_lag_ms", txt)
+                self.assertIn("time_skew_ms", txt)
+                return (time.perf_counter() - t0) * 1000.0
+
+            status_lat_ms = await _run_concurrent(n, conc, fetch_status)
+            metrics_lat_ms = await _run_concurrent(n, conc, fetch_metrics)
+
+        def p95(vals: Iterable[float]) -> float:
+            arr = sorted(vals)
+            if not arr:
+                return 0.0
+            idx = max(0, min(len(arr) - 1, math.ceil(0.95 * len(arr)) - 1))
+            return arr[idx]
+
+        if p95_target_ms is not None:
+            self.assertLessEqual(p95(status_lat_ms), p95_target_ms)
+            self.assertLessEqual(p95(metrics_lat_ms), p95_target_ms)
+
+    async def test_stress_rate_limiter_priority(self) -> None:
+        """Flood maker bucket et vérifier que hedge passe toujours."""
+
+        import modules.utils.rate_limiter as rate_limiter_mod
+
+        cfg = modules.bot_config.BotConfig()
+        rl_cfg = getattr(cfg, "rl", None)
+        if rl_cfg is None:
+            self.skipTest("RateLimiter cfg missing")
+
+        # Knobs : maker très restrictif, hedge permissif
+        if hasattr(rl_cfg, "hard_caps_rps_by_kind"):
+            rl_cfg.hard_caps_rps_by_kind = {"maker": 1.0, "hedge": 20.0}
+        if hasattr(rl_cfg, "bursts_by_kind"):
+            rl_cfg.bursts_by_kind = {"maker": 1, "hedge": 5}
+        if hasattr(rl_cfg, "priorities"):
+            rl_cfg.priorities = ["hedge", "maker"]
+
+        rl = rate_limiter_mod.RateLimiter(rl_cfg)
+
+        maker_n = _stress_int("SMOKE_STRESS_RL_MAKERS", 50)
+        hedge_n = _stress_int("SMOKE_STRESS_RL_HEDGES", 10)
+        maker_conc = _stress_int("SMOKE_STRESS_RL_MAKER_CONC", min(20, maker_n))
+        hedge_conc = _stress_int("SMOKE_STRESS_RL_HEDGE_CONC", min(5, hedge_n))
+
+        async def maker_load(_idx: int) -> bool:
+            try:
+                await rl.acquire("BINANCE", "maker", timeout=0.05)
+                return True
+            except Exception:
+                return False
+
+        async def hedge_probe(idx: int) -> bool:
+            await asyncio.sleep(0.001 * idx)
+            try:
+                await rl.acquire("BINANCE", "hedge", timeout=0.2)
+                return True
+            except Exception:
+                return False
+
+        maker_task = asyncio.create_task(_run_concurrent(maker_n, maker_conc, maker_load))
+        # Laisser les makers saturer le bucket avant de sonder les hedges
+        await asyncio.sleep(0.01)
+        hedge_results = await _run_concurrent(hedge_n, hedge_conc, hedge_probe)
+        maker_results = await maker_task
+
+        hedge_success = sum(1 for ok in hedge_results if ok)
+        self.assertGreaterEqual(hedge_success, 1, "hedges should pass despite maker flood")
+        # Les makers peuvent échouer (timeout) mais la majorité doivent avoir tenté
+        self.assertEqual(len(maker_results), maker_n)
+
+    async def test_stress_restart_cycles(self) -> None:
+        """Démarre/stoppe Boot en boucle avec ports dynamiques (détecter leaks grossiers)."""
+
+        cycles = _stress_int("SMOKE_STRESS_CYCLES", 3)
+        for _idx in range(cycles):
+            cfg = modules.bot_config.BotConfig()
+            cfg.g.mode = "DRY_RUN"
+            cfg.g.deployment_mode = "EU_ONLY"
+            cfg.g.capital_profile = "NANO"
+            cfg.g.pairs = ["BTCUSDC", "ETHUSDC"]
+            cfg.discovery.enabled = False
+            cfg.g.enabled_exchanges = ["BINANCE", "BYBIT"]
+            cfg.g.feature_switches = {
+                "private_ws": False,
+                "balance_fetcher": False,
+                "engine_real": False,
+                "rpc_server": False,
+            }
+
+            cfg.obs.status_port = find_free_port()
+            cfg.obs.expose_metrics_on_status = True
+            cfg.obs.enable_obs_port = False
+
+            async with started_boot_with_servers(cfg) as (_boot, _status_srv, _obs_srv):
+                base_url = f"http://127.0.0.1:{cfg.obs.status_port}"
+                wait_http_ready(f"{base_url}/health", timeout_s=_timeout_s())
+                data = await asyncio.to_thread(http_get_json, f"{base_url}/status", 5.0)
+                self.assertIn("ready_all", data)
+
+    async def test_stress_engine_pacer_storm(self) -> None:
+        """Rafale d'updates pacer et invariants policy basiques."""
+
+        updates_n = _stress_int("SMOKE_STRESS_PACER_UPDATES", 120)
+        pacer = pacer_mod.EnginePacer(region="EU", capital_profile="NANO", min_ms=0, max_ms=500, init_ms=0, jitter_ms=0)
+
+        seen_modes: set[str] = set()
+        for i in range(updates_n):
+            good = i % 2 == 0
+            ack_ms = 40.0 if good else 400.0
+            lag_ms = 5.0 if good else 120.0
+            err_rate = 0.0 if good else 0.2
+            qdepth = 0 if good else 50
+            backpressure = False if good else True
+            reason = "good" if good else "bad"
+
+            pol = pacer.update(
+                region="EU",
+                p95_submit_ack_ms=ack_ms,
+                loop_lag_ms=lag_ms,
+                err_rate=err_rate,
+                queue_depth=qdepth,
+                backpressure=backpressure,
+                reason=reason,
+            )
+
+            self.assertIsInstance(pol, dict)
+            self.assertIn("pacing_ms", pol)
+            self.assertGreaterEqual(pol.get("pacing_ms", 0), 0)
+            if pol.get("mode") != 0:
+                self.assertGreater(pol.get("pacing_ms", 0), 0)
+            self.assertIn("inflight_max", pol)
+            self.assertGreaterEqual(pol.get("inflight_max", 0), 1)
+            seen_modes.add(str(pol.get("pacer_mode")))
+
+            pol2 = pacer.policy("EU")
+            self.assertIsInstance(pol2, dict)
+            self.assertIn("pacing_ms", pol2)
+            self.assertGreaterEqual(pol2.get("pacing_ms", 0), 0)
+
+        self.assertTrue(seen_modes, "no pacer modes recorded")
+
+    async def test_stress_private_ws_reconciler_fill_storm(self) -> None:
+        """Staleness flip-flop + fill storm dedup bornée."""
+
+        stale_ms = _stress_int("SMOKE_STRESS_PWS_STALE_MS", 200)
+        dedup_max = _stress_int("SMOKE_STRESS_PWS_DEDUP_MAX", 50000)
+        pwsr = pwsr_mod.PrivateWSReconciler(
+            cooldown_s=0.1,
+            stale_ms=stale_ms,
+            poll_every_s=0.01,
+            dedup_max=dedup_max,
+        )
+        # Phase A: activité régulière, staleness False
+        for _ in range(3):
+            pwsr.mark_ws_activity()
+            await asyncio.sleep(0.001)
+            self.assertFalse(pwsr.is_ws_stale())
+
+        # Phase B: silence prolongé → staleness True
+        await asyncio.sleep(float(stale_ms) / 1000.0 * 1.5)
+        self.assertTrue(pwsr.is_ws_stale())
+
+        # Phase C: reprise activité → staleness False
+        pwsr.mark_ws_activity()
+        await asyncio.sleep(float(stale_ms) / 1000.0 * 0.1)
+        self.assertFalse(pwsr.is_ws_stale())
+
+        # Fill storm: trade_id uniques pour tester la borne de dédup
+        fill_n = _stress_int("SMOKE_STRESS_PWS_FILLS", 8000)
+
+        def _fill_evt(i: int) -> dict:
+            return {
+                "type": "fill",
+                "status": "FILL",
+                "exchange": "BINANCE",
+                "alias": "TT",
+                "trade_id": f"tid-{i}",
+                "client_id": f"CID-{i % 50}",
+                "fill_px": 100.0 + i * 0.0001,
+                "base_qty": 0.001 + (i % 5) * 0.0001,
+            }
+
+        for i in range(fill_n):
+            pwsr.observe_fill_event(_fill_evt(i))
+
+        seen = getattr(pwsr, "_seen_keys", None)
+        if seen is None:
+            self.skipTest("PrivateWSReconciler._seen_keys absent")
+
+        maxlen = getattr(seen, "_maxlen", None)
+        q = getattr(seen, "_q", None)
+        s = getattr(seen, "_s", None)
+        size_candidates = [v for v in (len(q) if q is not None else None, len(s) if s is not None else None) if
+                           v is not None]
+        if not size_candidates:
+            self.skipTest("unable to introspect _seen_keys size")
+        size = max(size_candidates)
+
+        if isinstance(maxlen, int) and maxlen > 0:
+            self.assertLessEqual(size, maxlen)
+        else:
+            # fallback: assert against provided dedup_max when maxlen unavailable
+            self.assertLessEqual(size, dedup_max)
 
 
 if __name__ == "__main__":
