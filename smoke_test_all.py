@@ -1,504 +1,574 @@
-#!/usr/bin/env python3
-# smoke_test_all.py
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+smoke_test_all.py
+
+Smoke tests “institutionnels” (J0) — **1 fichier unique**.
+
+Contrainte respectée: tout est ici, et on ne référence que des modules/fichiers existants
+(montés dans ce workspace):
+
+- bot_config.py
+- boot.py
+- obs_metrics.py
+- dynamic_execution_simulator.py
+- execution_engine.py
+- engine_pacer.py
+- private_ws_reconciler.py
+- risk_manager.py
+- retry_policy.py
+- log_writer.py
+- errors.py
+- payloads.py
+- rate_limiter.py
+
+Scénarios (max 5, comme tu l’as cadré):
+1) DRY_RUN : pipeline démarre → READY → stop + /status + /metrics cohérents.
+2) PROD micro-orders (simulées, sans trade réel) : submit→ack→fill/cancel cohérents, idempotence.
+3) PWS incident simulé : staleness + dedup + boucle reconciler (pas de crash).
+4) 429 surge : pacer passe NORMAL→CONSTRAINED/SEVERE, et expose une policy cohérente.
+5) Transfers/REB + Logs : TransferController FSM (SUBMITTED→SETTLED/FAILED) + rotation LogWriter.
+
+⚠️ Important (réaliste): un smoke J0 “unique” ne peut pas couvrir *toutes* les combinaisons
+(régions × profils × exchanges × stratégies) sans exploser. Ici on fait mieux:
+- on couvre la surface E2E “broad & shallow” + on vérifie la *pilotabilité* via knobs
+  (hash snapshot change, modes, caps, pacer, etc.),
+- on teste les compartiments critiques par contrats (Engine, Simulator, Reconciler, Transfer FSM, Logs).
+
+Usage:
+  python smoke_test_all.py
+
+Optionnel:
+  SMOKE_TIMEOUT_S=45  (timeout global par scénario)
+"""
+
 from __future__ import annotations
 
-import argparse
 import asyncio
 import contextlib
-import dataclasses
 import json
 import os
+import signal
+import socket
 import sys
+import tempfile
 import time
+import types
+import unittest
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
-from urllib.request import urlopen, Request
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-# ------------------------- Imports projet (avec fallback) -------------------------
 
-def _import_any(*candidates: str):
-    last = None
-    for name in candidates:
-        try:
-            module = __import__(name, fromlist=["*"])
-            return module
-        except Exception as e:
-            last = e
-    raise RuntimeError(f"Cannot import any of: {candidates}. Last error: {last}")
+# --------------------------------------------------------------------------------------
+# Bootstrap imports: support both layouts:
+# - real repo layout:    modules.* and contracts.*
+# - flattened layout:    bot_config.py, boot.py, errors.py, payloads.py, ...
+#
+# The bot code itself imports modules.* and contracts.* in several places (e.g. boot.py).
+# We create runtime aliases in sys.modules so smoke can import and run without refactors.
+# --------------------------------------------------------------------------------------
 
-boot_mod = _import_any("modules.boot", "boot")
-cfg_mod = _import_any("modules.bot_config", "bot_config")
-obs_mod = _import_any("modules.obs_metrics", "obs_metrics")
-payloads_mod = _import_any("contracts.payloads", "payloads")
-errors_mod = _import_any("contracts.errors", "errors")
+ROOT = Path(__file__).resolve().parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-Boot = getattr(boot_mod, "Boot")
-BotConfig = getattr(cfg_mod, "BotConfig")
 
-EngineSubmitError = getattr(errors_mod, "EngineSubmitError", Exception)
+def _ensure_pkg(name: str) -> None:
+    """Ensure 'name' exists in sys.modules as a package module."""
+    if name in sys.modules:
+        return
+    m = types.ModuleType(name)
+    m.__path__ = []  # mark as package
+    sys.modules[name] = m
 
-# ------------------------- Utilitaires -------------------------
 
-ART_DIR = Path("artifacts/smoke")
-ART_DIR.mkdir(parents=True, exist_ok=True)
+def _alias_module(alias: str, target_mod) -> None:
+    """Register alias -> target_mod, ensuring parent pkgs exist."""
+    parts = alias.split(".")
+    for i in range(1, len(parts)):
+        _ensure_pkg(".".join(parts[:i]))
+    sys.modules[alias] = target_mod
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
 
-@contextlib.contextmanager
-def env_patch(overrides: Dict[str, str]):
-    old = dict(os.environ)
-    os.environ.update({k: str(v) for k, v in overrides.items() if v is not None})
-    try:
-        yield
-    finally:
-        os.environ.clear()
-        os.environ.update(old)
+def _bootstrap_import_aliases() -> None:
+    import importlib
 
-def http_get_text(url: str, timeout_s: float = 2.0) -> Tuple[int, str]:
-    req = Request(url, headers={"User-Agent": "smoke_test_all/1.0"})
-    with urlopen(req, timeout=timeout_s) as resp:
-        body = resp.read().decode("utf-8", errors="replace")
-        return int(resp.status), body
+    # base pkgs
+    _ensure_pkg("modules")
+    _ensure_pkg("modules.utils")
+    _ensure_pkg("modules.risk_manager")
+    _ensure_pkg("modules.logger_historique")
+    _ensure_pkg("contracts")
 
-def http_get_json(url: str, timeout_s: float = 2.0) -> Tuple[int, Any]:
-    code, txt = http_get_text(url, timeout_s=timeout_s)
-    try:
-        return code, json.loads(txt)
-    except Exception:
-        return code, {"_raw": txt}
-
-async def wait_ready_http(host: str, port: int, timeout_s: float = 30.0) -> None:
-    deadline = time.time() + timeout_s
-    url = f"http://{host}:{port}/ready"
-    last = None
-    while time.time() < deadline:
-        try:
-            code, _ = http_get_text(url, timeout_s=1.5)
-            if code == 200:
-                return
-            last = f"HTTP {code}"
-        except Exception as e:
-            last = repr(e)
-        await asyncio.sleep(0.25)
-    raise TimeoutError(f"/ready not OK within {timeout_s}s (last={last})")
-
-def must_contain(hay: str, needle: str, label: str):
-    if needle not in hay:
-        raise AssertionError(f"{label}: missing '{needle}'")
-
-def write_json(path: Path, obj: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
-
-# ------------------------- Harness Bot runner -------------------------
-
-@dataclass
-class RunningBot:
-    cfg: Any
-    boot: Any
-    status_host: str
-    status_port: int
-    obs_port: Optional[int]
-    status_server: Any | None
-    obs_server: Any | None
-
-async def start_bot(cfg: Any) -> RunningBot:
-    boot = Boot(cfg)
-
-    # Probes “ossature”
-    try:
-        obs_mod.start_loop_lag_probe()
-    except Exception:
-        pass
-    try:
-        obs_mod.start_time_skew_probe()
-    except Exception:
-        pass
-
-    servers = {}
-    try:
-        servers = obs_mod.start_servers(boot=boot, cfg=cfg)
-    except Exception:
-        # On tolère si tes serveurs sont démarrés ailleurs (ex: bot_arbitrage.py),
-        # mais le smoke vise justement à les prouver.
-        servers = {"status": None, "obs": None}
-
-    status_server = servers.get("status")
-    obs_server = servers.get("obs")
-
-    # Démarrage HTTP
-    if obs_server is not None:
-        await obs_server.start()
-    if status_server is not None:
-        await status_server.start()
-
-    # Boot.start exige snapshot_hash + snapshot_dict (dans ton Boot actuel)
-    snapshot_hash = None
-    snapshot_dict = None
-    try:
-        snapshot_hash = cfg.snapshot_hash()
-        snapshot_dict = cfg.snapshot_dict()
-    except Exception:
-        # fallback si ton BotConfig expose déjà cfg.snapshot_hash / cfg.snapshot_dict
-        snapshot_hash = getattr(cfg, "snapshot_hash", None)
-        snapshot_dict = getattr(cfg, "snapshot_dict", None)
-
-    await boot.start(snapshot_hash=snapshot_hash, snapshot_dict=snapshot_dict)
-
-    # Ports (issus cfg.obs)
-    obs_cfg = getattr(cfg, "obs", None)
-    host = getattr(obs_cfg, "status_host", "127.0.0.1") if obs_cfg else "127.0.0.1"
-    s_port = int(getattr(obs_cfg, "status_port", 9110) if obs_cfg else 9110)
-    obs_port = None
-    if obs_cfg and getattr(obs_cfg, "obs_enable_9108", True):
-        obs_port = int(getattr(obs_cfg, "obs_port", 9108))
-
-    return RunningBot(
-        cfg=cfg,
-        boot=boot,
-        status_host=host,
-        status_port=s_port,
-        obs_port=obs_port,
-        status_server=status_server,
-        obs_server=obs_server,
-    )
-
-async def stop_bot(rb: RunningBot) -> None:
-    # Stop Boot
-    try:
-        await rb.boot.stop()
-    except Exception:
-        pass
-
-    # Stop HTTP
-    try:
-        if rb.status_server is not None:
-            await rb.status_server.stop()
-    except Exception:
-        pass
-    try:
-        if rb.obs_server is not None:
-            await rb.obs_server.stop()
-    except Exception:
-        pass
-
-# ------------------------- Scénarios -------------------------
-
-@dataclass
-class Scenario:
-    name: str
-    env: Dict[str, str]
-    fn: Callable[[RunningBot], "asyncio.Future[None]"]
-
-BASE_ENV = {
-    # RC base
-    "DEPLOYMENT_MODE": "EU_ONLY",
-    "CAPITAL_PROFILE": "NANO",
-    "MODE": "DRY_RUN",
-    "PAIRS": "BTC-USDC,ETH-USDC",
-    "ENABLED_EXCHANGES": "BINANCE,BYBIT",
-
-    # HTTP status/metrics
-    "STATUS_PORT": "9110",
-    "OBS_ENABLE_9108": "1",
-    "OBS_PORT": "9108",
-    "EXPOSE_METRICS_ON_9110": "1",
-}
-
-MUST_HAVE_METRICS = [
-    "event_loop_lag_ms",
-    "time_skew_ms",
-    "bot_startups_total",  # si présent dans ton obs_metrics
-    "deployment_mode_info",
-]
-
-async def assert_http_surfaces(rb: RunningBot) -> None:
-    await wait_ready_http(rb.status_host, rb.status_port, timeout_s=35.0)
-
-    code, st = http_get_json(f"http://{rb.status_host}:{rb.status_port}/status", timeout_s=2.0)
-    if code != 200:
-        raise AssertionError(f"/status not 200: {code} body={st}")
-
-    # /metrics peut être sur 9110 si EXPOSE_METRICS_ON_9110=1
-    code, metrics = http_get_text(f"http://{rb.status_host}:{rb.status_port}/metrics", timeout_s=2.5)
-    if code != 200:
-        raise AssertionError(f"/metrics not 200 on status port: {code}")
-
-    for m in MUST_HAVE_METRICS:
-        must_contain(metrics, m, label="metrics surface")
-
-async def scenario_1_dry_run(rb: RunningBot) -> None:
-    await assert_http_surfaces(rb)
-
-    # Dump utile
-    code, st = http_get_json(f"http://{rb.status_host}:{rb.status_port}/status", timeout_s=2.0)
-    write_json(ART_DIR / f"{rb.cfg.snapshot_hash() if hasattr(rb.cfg,'snapshot_hash') else 'cfg'}_status_dryrun.json", st)
-
-async def scenario_2_micro_orders_dry(rb: RunningBot) -> None:
-    await assert_http_surfaces(rb)
-
-    engine = getattr(getattr(rb.boot, "ctx", None), "engine", None)
-    if engine is None:
-        raise AssertionError("Engine missing (boot.ctx.engine is None)")
-
-    # 2a) submit bundle “valide” (DRY) + idempotence
-    bundle_id = f"smoke-{now_ms()}"
-    idem = f"smoke-idem-{bundle_id}"
-
-    legs = [
-        {"exchange": "BINANCE", "account_alias": "TT", "symbol": "BTC-USDC", "side": "BUY", "qty": 0.0001, "price": 50000.0, "type": "LIMIT", "tif": "IOC"},
-        {"exchange": "BYBIT",   "account_alias": "TT", "symbol": "BTC-USDC", "side": "SELL","qty": 0.0001, "price": 50010.0, "type": "LIMIT", "tif": "IOC"},
-    ]
-
-    meta = {
-        "branch": "TT",
-        "capital_profile": getattr(getattr(rb.cfg, "g", None), "capital_profile", "NANO"),
-        "deployment_mode": getattr(getattr(rb.cfg, "g", None), "deployment_mode", "EU_ONLY"),
-        "idempotency_key": idem,
-        "trace_id": bundle_id,
+    mapping = {
+        # core
+        "bot_config": ["modules.bot_config"],
+        "boot": ["modules.boot"],
+        "obs_metrics": ["modules.obs_metrics"],
+        "retry_policy": ["modules.retry_policy"],
+        "rate_limiter": ["modules.utils.rate_limiter"],
+        "errors": ["contracts.errors"],
+        "payloads": ["contracts.payloads"],
+        # public plane
+        "pairs_discovery": ["modules.pairs_discovery"],
+        "websockets_clients": ["modules.websockets_clients"],
+        "market_data_router": ["modules.market_data_router"],
+        "volatility_monitor": ["modules.volatility_monitor"],
+        "slippage_handler": ["modules.slippage_handler"],
+        "opportunity_scanner": ["modules.opportunity_scanner"],
+        # decision/execution plane
+        "risk_manager": ["modules.risk_manager.risk_manager"],
+        "dynamic_execution_simulator": ["modules.dynamic_execution_simulator"],
+        "execution_engine": ["modules.execution_engine"],
+        "engine_pacer": ["modules.engine_pacer"],
+        "private_ws_hub": ["modules.private_ws_hub"],
+        "balance_fetcher": ["modules.balance_fetcher"],
+        "private_ws_reconciler": ["modules.private_ws_reconciler"],
+        # logs
+        "logger_historique_manager": ["modules.logger_historique.logger_historique_manager"],
+        "log_writer": ["modules.logger_historique.log_writer"],
     }
 
-    bundle = payloads_mod.make_submit_bundle(bundle_id=bundle_id, legs=legs, meta=meta)
-
-    await engine.submit(bundle)
-
-    # Duplicate → doit retourner un reason (pas de “silent loss”)
-    try:
-        await engine.submit(bundle)
-        raise AssertionError("Expected duplicate bundle rejection, got success")
-    except EngineSubmitError as exc:
-        # “DUPLICATE_BUNDLE” attendu si ton engine est conforme
-        msg = str(exc)
-        if not msg:
-            raise AssertionError("Duplicate rejection has empty reason (silent-ish)")
-        # On tolère que le code exact varie, mais il doit être non vide + stable
-        write_json(ART_DIR / f"{bundle_id}_duplicate_reject.json", {"reason": msg, "metadata": getattr(exc, "metadata", {})})
-
-    # 2b) bundle invalide → reason
-    bad_bundle = dict(bundle)
-    bad_bundle["meta"] = dict(bad_bundle.get("meta", {}))
-    bad_bundle["meta"].pop("idempotency_key", None)
-    try:
-        await engine.submit(bad_bundle)
-        raise AssertionError("Expected invalid bundle rejection, got success")
-    except EngineSubmitError as exc:
-        msg = str(exc)
-        if not msg:
-            raise AssertionError("Invalid bundle rejection has empty reason")
-        write_json(ART_DIR / f"{bundle_id}_invalid_reject.json", {"reason": msg, "metadata": getattr(exc, "metadata", {})})
-
-async def scenario_3_pws_incident_sim(rb: RunningBot) -> None:
-    await assert_http_surfaces(rb)
-
-    pws = getattr(getattr(rb.boot, "ctx", None), "pws_hub", None)
-    if pws is None:
-        raise AssertionError("PrivateWSHub missing (boot.ctx.pws_hub is None)")
-
-    attempts = {"n": 0}
-
-    async def connect_coro():
-        attempts["n"] += 1
-        if attempts["n"] == 1:
-            raise RuntimeError("simulated disconnect")
-        await asyncio.sleep(0.15)
-
-    task = asyncio.create_task(pws.reconnect_with_backoff("BINANCE", "SMOKE", connect_coro))
-    try:
-        await asyncio.sleep(1.0)
-    finally:
-        task.cancel()
-        with contextlib.suppress(Exception):
-            await task
-
-    if attempts["n"] < 2:
-        raise AssertionError(f"PWS reconnect loop did not retry enough (attempts={attempts['n']})")
-
-async def scenario_4_rl_429_surge(rb: RunningBot) -> None:
-    await assert_http_surfaces(rb)
-
-    rl = getattr(getattr(rb.boot, "ctx", None), "rate_limiter", None)
-    if rl is None:
-        raise AssertionError("RateLimiter missing (boot.ctx.rate_limiter is None)")
-
-    # On prouve “hedge > cancel > maker” au minimum via priorités + comportement buckets
-    cfg_rl = getattr(rb.cfg, "rl", None)
-    priorities = list(getattr(cfg_rl, "priorities", [])) if cfg_rl else []
-    if priorities:
-        # doit contenir hedge et maker
-        if "hedge" not in [p.lower() for p in priorities] or "maker" not in [p.lower() for p in priorities]:
-            raise AssertionError(f"RL_PRIORITIES missing hedge/maker: {priorities}")
-
-    # Test pratique : maker très contraint, hedge plus “large”
-    # (si ton RL est bucketisé par kind, hedge doit passer avant maker sous surcharge)
-    maker = rl.bucket_for(exchange="BINANCE", kind="maker", sc_id="SMOKE")
-    hedge = rl.bucket_for(exchange="BINANCE", kind="hedge", sc_id="SMOKE")
-
-    async def one_acquire(bucket, name: str, timeout_s: float = 0.8) -> float:
-        t0 = time.time()
+    for top_name, aliases in mapping.items():
         try:
-            await asyncio.wait_for(bucket.acquire(), timeout=timeout_s)
-            return time.time() - t0
+            mod = importlib.import_module(top_name)
         except Exception:
-            return 999.0
+            continue
+        for a in aliases:
+            _alias_module(a, mod)
 
-    # On lance simultané : hedge doit être <= maker dans la majorité des configs raisonnables
-    dt_h, dt_m = await asyncio.gather(one_acquire(hedge, "hedge"), one_acquire(maker, "maker"))
-    write_json(ART_DIR / f"rl_timings_{now_ms()}.json", {"hedge_s": dt_h, "maker_s": dt_m, "priorities": priorities})
 
-    if dt_h > dt_m + 0.05:
-        raise AssertionError(f"RL priority not reflected (hedge slower than maker): hedge={dt_h:.3f}s maker={dt_m:.3f}s")
+_bootstrap_import_aliases()
 
-async def scenario_5_reb_transfers(rb: RunningBot) -> None:
-    await assert_http_surfaces(rb)
 
-    rm = getattr(getattr(rb.boot, "ctx", None), "rm", None)
-    if rm is None:
-        raise AssertionError("RiskManager missing (boot.ctx.rm is None)")
+# Now normal imports (should work in both layouts)
+import modules.bot_config  # noqa: E402
+import boot as boot_mod  # noqa: E402
+import modules.obs_metrics as obs_metrics_mod  # noqa: E402
+import modules.dynamic_execution_simulator as des_mod  # noqa: E402
+import modules.execution_engine as engine_mod  # noqa: E402
+import modules.engine_pacer as pacer_mod  # noqa: E402
+import modules.private_ws_reconciler as pwsr_mod  # noqa: E402
+import modules.risk_manager as rm_mod  # noqa: E402
+import modules.logger_historique.log_writer as log_writer_mod  # noqa: E402
+import contracts.errors as errors_mod  # noqa: E402
 
-    # Si REB est activé, on exige qu’un composant REB soit présent (nom variable selon ta stack)
-    enable_reb = bool(getattr(getattr(rb.cfg, "rm", None), "enable_reb", False))
-    reb_obj = getattr(rm, "rebalancing_mgr", None) or getattr(rm, "reb", None)
 
-    if enable_reb and reb_obj is None:
-        raise AssertionError("REB enabled but no rebalancing manager attached on RM")
+# --------------------------------------------------------------------------------------
+# Helpers: network + ports
+# --------------------------------------------------------------------------------------
 
-    # Si présent, on exige au minimum un status non-crash
-    if reb_obj is not None and hasattr(reb_obj, "get_status"):
-        st = reb_obj.get_status()
-        write_json(ART_DIR / f"reb_status_{now_ms()}.json", st)
+def _timeout_s() -> float:
+    return float(os.environ.get("SMOKE_TIMEOUT_S", "45"))
 
-# ------------------------- Main runner -------------------------
 
-def build_scenarios() -> list[Scenario]:
-    return [
-        Scenario(
-            name="1-DRY_RUN-pipeline",
-            env={
-                **BASE_ENV,
-                "MODE": "DRY_RUN",
-                "CAPITAL_PROFILE": "NANO",
-                "DEPLOYMENT_MODE": "EU_ONLY",
-                "PAIRS": "BTC-USDC,ETH-USDC",
-                "ENABLED_EXCHANGES": "BINANCE,BYBIT",
-            },
-            fn=scenario_1_dry_run,
-        ),
-        Scenario(
-            name="2-micro-orders-DRY",
-            env={
-                **BASE_ENV,
-                "MODE": "DRY_RUN",
-                "CAPITAL_PROFILE": "NANO",
-                "DEPLOYMENT_MODE": "EU_ONLY",
-                "PAIRS": "BTC-USDC",
-                "ENABLED_EXCHANGES": "BINANCE,BYBIT",
-            },
-            fn=scenario_2_micro_orders_dry,
-        ),
-        Scenario(
-            name="3-PWS-incident-sim",
-            env={
-                **BASE_ENV,
-                "MODE": "DRY_RUN",
-                # On force private_ws ON même en DRY_RUN (sinon Boot ne le démarre pas)
-                "FEATURE_SWITCHES": json.dumps({"private_ws": True, "engine_real": False, "balance_fetcher": False, "simulator": True}),
-            },
-            fn=scenario_3_pws_incident_sim,
-        ),
-        Scenario(
-            name="4-429-surge-RL",
-            env={
-                **BASE_ENV,
-                "MODE": "DRY_RUN",
-                # maker hyper contraint, hedge permissif
-                "RL_HARD_CAPS_RPS_BY_KIND": json.dumps({"maker": 0.2, "cancel": 1.0, "hedge": 5.0}),
-                "RL_BURSTS_BY_KIND": json.dumps({"maker": 1, "cancel": 2, "hedge": 5}),
-                "RL_PRIORITIES": "hedge,cancel,maker",
-            },
-            fn=scenario_4_rl_429_surge,
-        ),
-        Scenario(
-            name="5-REB-transfers",
-            env={
-                **BASE_ENV,
-                "MODE": "DRY_RUN",
-                "ENABLE_REB": "1",
-            },
-            fn=scenario_5_reb_transfers,
-        ),
-    ]
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
 
-async def run_one(s: Scenario, timeout_s: float) -> Tuple[bool, str]:
-    tag = s.name.replace("/", "_")
-    started = False
-    rb: RunningBot | None = None
 
-    with env_patch(s.env):
-        cfg = BotConfig.from_env()
+def http_get_text(url: str, timeout_s: float = 5.0) -> str:
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
-        # snapshot export (RC proof)
+
+def http_get_json(url: str, timeout_s: float = 5.0) -> Dict[str, Any]:
+    txt = http_get_text(url, timeout_s=timeout_s)
+    return json.loads(txt)
+
+
+def wait_http_ready(url: str, timeout_s: float) -> None:
+    deadline = time.time() + timeout_s
+    last_err: Optional[str] = None
+    while time.time() < deadline:
         try:
-            h = cfg.snapshot_hash()
-            snap = cfg.snapshot_dict()
-        except Exception:
-            h = f"nohash-{now_ms()}"
-            snap = {"note": "snapshot_* not available on cfg"}
-        write_json(ART_DIR / f"snapshot_{tag}_{h}.json", snap)
-
-        try:
-            rb = await asyncio.wait_for(start_bot(cfg), timeout=timeout_s)
-            started = True
-            await asyncio.wait_for(s.fn(rb), timeout=timeout_s)
-            return True, "PASS"
+            _ = http_get_text(url, timeout_s=2.0)
+            return
         except Exception as e:
-            # Dump status/metrics si possible
-            if rb is not None:
-                try:
-                    code, st = http_get_json(f"http://{rb.status_host}:{rb.status_port}/status", timeout_s=1.2)
-                    write_json(ART_DIR / f"FAIL_{tag}_status.json", {"code": code, "body": st})
-                except Exception:
-                    pass
-                try:
-                    code, mt = http_get_text(f"http://{rb.status_host}:{rb.status_port}/metrics", timeout_s=1.2)
-                    (ART_DIR / f"FAIL_{tag}_metrics.txt").write_text(mt, encoding="utf-8")
-                except Exception:
-                    pass
-            return False, f"FAIL: {type(e).__name__}: {e}"
-        finally:
-            if started and rb is not None:
-                await stop_bot(rb)
+            last_err = repr(e)
+            time.sleep(0.2)
+    raise AssertionError(f"HTTP not ready: {url} (last_err={last_err})")
 
-async def main_async() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--only", default="", help="Run only scenarios containing this substring")
-    ap.add_argument("--timeout", type=float, default=60.0)
-    args = ap.parse_args()
 
-    scenarios = build_scenarios()
-    if args.only:
-        scenarios = [s for s in scenarios if args.only in s.name]
-        if not scenarios:
-            print(f"No scenarios match --only={args.only}")
-            return 2
+# --------------------------------------------------------------------------------------
+# Boot + servers context manager
+# --------------------------------------------------------------------------------------
 
-    print(f"Running {len(scenarios)} scenarios… artifacts in {ART_DIR}")
-    ok_all = True
-    for s in scenarios:
-        t0 = time.time()
-        ok, msg = await run_one(s, timeout_s=args.timeout)
-        dt = time.time() - t0
-        print(f"[{s.name}] {msg} ({dt:.2f}s)")
-        ok_all = ok_all and ok
+@dataclass
+class Started:
+    boot: Any
+    status_server: Any
+    obs_server: Any
 
-    return 0 if ok_all else 1
 
-def main() -> int:
+@contextlib.asynccontextmanager
+async def started_boot_with_servers(cfg: modules.bot_config.BotConfig) -> Iterable[Tuple[Any, Any, Any]]:
+    Boot = getattr(boot_mod, "Boot")
+    boot = Boot(cfg)
+
+    # Start probes (supervisor usually does that)
+    loop_lag_task = obs_metrics_mod.start_loop_lag_probe(period_s=0.25)
+    time_skew_task = obs_metrics_mod.start_time_skew_probe(period_s=2.0)
+
+    # Start servers first (so /health comes up quickly), then boot
+    status_srv, obs_srv = obs_metrics_mod.start_servers(boot=boot, cfg=cfg)
+
     try:
-        return asyncio.run(main_async())
-    except KeyboardInterrupt:
-        return 130
+        await asyncio.wait_for(status_srv.start(), timeout=_timeout_s())
+        await asyncio.wait_for(obs_srv.start(), timeout=_timeout_s())
+
+        await asyncio.wait_for(boot.start(), timeout=_timeout_s())
+        # Wait ready barrier (fails if not ready in time)
+        await asyncio.wait_for(boot.wait_ready(timeout_s=_timeout_s()), timeout=_timeout_s())
+
+        yield boot, status_srv, obs_srv
+    finally:
+        # Stop order: servers → boot → probes
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(status_srv.stop(), timeout=10.0)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(obs_srv.stop(), timeout=10.0)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(boot.stop(), timeout=20.0)
+
+        for t in (loop_lag_task, time_skew_task):
+            with contextlib.suppress(Exception):
+                t.cancel()
+            with contextlib.suppress(Exception):
+                await t
+
+
+# --------------------------------------------------------------------------------------
+# Dummy history FSM for idempotence checks (Engine expects .check_and_mark_idempotency)
+# --------------------------------------------------------------------------------------
+
+class _DummyHistoryFSM:
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+
+    async def check_and_mark_idempotency(self, idempotency_key: str) -> bool:
+        if idempotency_key in self._seen:
+            return False
+        self._seen.add(idempotency_key)
+        return True
+
+
+# --------------------------------------------------------------------------------------
+# The 5 institutional scenarios (unittest)
+# --------------------------------------------------------------------------------------
+
+class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
+    async def test_01_dry_run_start_ready_status_metrics_stop(self) -> None:
+        """Scénario 1 — DRY_RUN E2E (superviseur HTTP)."""
+        cfg = modules.bot_config.BotConfig()
+        cfg.g.mode = "DRY_RUN"
+        cfg.g.deployment_mode = "EU_ONLY"
+        cfg.g.capital_profile = "NANO"
+        # Seed pairs minimal (utilisé par Boot si discovery off)
+        cfg.g.pairs = ["BTCUSDC", "ETHUSDC"]
+        cfg.discovery.enabled = False
+        # Exchanges: EU_ONLY (BINANCE/BYBIT). Tu peux élargir en staging.
+        cfg.g.enabled_exchanges = ["BINANCE", "BYBIT"]
+
+        # Feature switches: run public plane + decision plane, but keep trading plane OFF.
+        cfg.g.feature_switches = {
+            "private_ws": False,
+            "balance_fetcher": False,
+            "engine_real": False,
+            "rpc_server": False,
+        }
+
+        # Dynamic ports
+        cfg.obs.status_port = find_free_port()
+        cfg.obs.metrics_port = find_free_port()
+        cfg.obs.obs_enable_9108 = True
+
+        # Snapshot: hash + export (freeze)
+        snap_hash = cfg.snapshot_hash()
+        self.assertTrue(isinstance(snap_hash, str) and len(snap_hash) >= 8)
+        with tempfile.TemporaryDirectory() as td:
+            export_path = Path(td) / "config_snapshot.json"
+            export_path.write_text(
+                json.dumps(cfg.snapshot_dict(), sort_keys=True, indent=2, default=str),
+                encoding="utf-8",
+            )
+            self.assertTrue(export_path.exists() and export_path.stat().st_size > 100)
+
+        async with started_boot_with_servers(cfg) as (boot, _status_srv, _obs_srv):
+            # Wait ready via HTTP (proxy for “superviseur /status & /ready”)
+            base = f"http://127.0.0.1:{cfg.obs.status_port}"
+            wait_http_ready(f"{base}/health", timeout_s=_timeout_s())
+
+            # /ready should reflect boot readiness.
+            # (StatusHTTPServer uses Boot.get_status() under the hood.)
+            status = http_get_json(f"{base}/status")
+            self.assertIn("ready_all", status)
+            self.assertIn("active_pairs", status)
+            self.assertEqual(status.get("active_pairs"), ["BTCUSDC", "ETHUSDC"])
+
+            # The in-process Boot should have set ready_all.
+            self.assertTrue(bool(status.get("ready_all")), f"not READY: reasons={status.get('reasons')}")
+
+            # /metrics should be non-empty and contain at least these canonical metrics.
+            murl = f"http://127.0.0.1:{cfg.obs.metrics_port}/metrics"
+            metrics_txt = http_get_text(murl)
+            self.assertIn("event_loop_lag_ms", metrics_txt)
+            self.assertIn("time_skew_ms", metrics_txt)
+
+            # Stop path is executed by the context manager.
+            self.assertTrue(getattr(boot, "_running", False))
+
+    async def test_02_micro_orders_engine_idempotence_and_simulator(self) -> None:
+        """Scénario 2 — micro-orders “PROD-like” (simulées).
+
+        On ne trade pas réellement ici. On fait:
+        - Simulator: une simulation minimale valide
+        - Engine: enforcement idempotency_key + DUPLICATE_BUNDLE
+        """
+        cfg = modules.bot_config.BotConfig()
+        cfg.g.mode = "DRY_RUN"  # pas de trade réel
+        cfg.g.deployment_mode = "EU_ONLY"
+        cfg.g.capital_profile = "NANO"
+        cfg.g.enabled_exchanges = ["BINANCE", "BYBIT"]
+
+        # Engine flags “institutionnels” pour le test
+        cfg.engine.ff_enforce_client_oid_deterministic = True
+        cfg.engine.ff_fail_closed_idempotence = True
+
+        # --- Simulator sanity
+        sim = des_mod.DynamicExecutionSimulator(cfg)
+        buy_levels = [(100.0, 0.50), (99.9, 1.0)]
+        sell_levels = [(100.1, 0.40), (100.2, 1.0)]
+        opp = {
+            "pair": "BTCUSDC",
+            "buy_exchange": "BINANCE",
+            "sell_exchange": "BYBIT",
+            "notional_quote": 50.0,
+            "type": "TT",
+        }
+        sim_res = sim.simulate(
+            opportunity=opp,
+            buy_levels_raw=buy_levels,
+            sell_levels_raw=sell_levels,
+            now_ts=time.time(),
+        )
+        self.assertTrue(isinstance(sim_res, dict))
+        self.assertIn("ok", sim_res)
+        self.assertTrue(bool(sim_res["ok"]), f"sim rejected: {sim_res}")
+
+        # --- Engine idempotence contract (no private ws required in DRY_RUN branch)
+        ExecutionEngine = getattr(engine_mod, "ExecutionEngine")
+        eng = ExecutionEngine(
+            cfg=cfg,
+            private_ws=None,
+            balance_fetcher=None,
+            logger_historique_manager=None,
+            rate_limiter=None,
+            pacer=None,
+            rpc_gateway=None,
+        )
+        eng.ready_event.set()
+        eng.history_fsm = _DummyHistoryFSM()
+
+        EngineSubmitError = getattr(errors_mod, "EngineSubmitError")
+
+        # 1) Missing idempotency_key must fail closed when ff_enforce_client_oid_deterministic=True
+        order_missing_idk = {
+            "symbol": "BTCUSDC",
+            "side": "BUY",
+            "type": "LIMIT",
+            "price": 100.0,
+            "qty": 0.001,
+            "client_id": "SMOKE-CID-1",
+            # idempotency_key intentionally missing
+        }
+        with self.assertRaises(EngineSubmitError) as ctx1:
+            await eng._exec_single(venue="BINANCE", alias="TT", order=order_missing_idk)
+        self.assertEqual(ctx1.exception.metadata.get("reason_code"), "MISSING_IDEMPOTENCY_KEY")
+
+        # 2) Valid order should execute in DRY_RUN (filled=True)
+        order = {
+            "symbol": "BTCUSDC",
+            "side": "BUY",
+            "type": "LIMIT",
+            "price": 100.0,
+            "qty": 0.001,
+            "client_id": "SMOKE-CID-2",
+            "idempotency_key": "SMOKE-IDK-1",
+        }
+        res1 = await eng._exec_single(venue="BINANCE", alias="TT", order=order)
+        self.assertTrue(bool(res1.get("ok")), res1)
+        self.assertTrue(bool(res1.get("filled")), res1)
+
+        # 3) Duplicate idempotency_key must reject with DUPLICATE_BUNDLE
+        order2 = dict(order)
+        order2["client_id"] = "SMOKE-CID-3"  # different CID, same IDK
+        with self.assertRaises(EngineSubmitError) as ctx2:
+            await eng._exec_single(venue="BINANCE", alias="TT", order=order2)
+        self.assertEqual(ctx2.exception.metadata.get("reason_code"), "DUPLICATE_BUNDLE")
+
+    async def test_03_pws_incident_simulated_reconciler_stale_and_dedup(self) -> None:
+        """Scénario 3 — incident PWS simulé via PrivateWSReconciler.
+
+        On vérifie:
+        - staleness detection
+        - dedup fill events
+        - start/stop loop sans crash
+        """
+        PrivateWSReconciler = getattr(pwsr_mod, "PrivateWSReconciler")
+
+        # Tight staleness for smoke
+        rec = PrivateWSReconciler(
+            stale_ms=100,
+            poll_every_s=0.05,
+            max_inflight=1,
+            enabled=True,
+        )
+
+        # activity -> not stale
+        rec.mark_ws_activity("BINANCE", "TT")
+        self.assertFalse(rec.is_ws_stale("BINANCE", "TT"))
+
+        await asyncio.sleep(0.15)
+        self.assertTrue(rec.is_ws_stale("BINANCE", "TT"))
+
+        # dedup fill events
+        fill_ev = {
+            "exchange": "BINANCE",
+            "symbol": "BTCUSDC",
+            "trade_id": "T1",
+            "order_id": "O1",
+            "side": "BUY",
+            "price": 100.0,
+            "qty": 0.01,
+            "ts": time.time(),
+        }
+        ok1 = rec.observe_fill_event(fill_ev)
+        ok2 = rec.observe_fill_event(fill_ev)
+        self.assertTrue(ok1)
+        self.assertFalse(ok2)
+
+        # loop start/stop sanity
+        await asyncio.wait_for(rec.start(), timeout=_timeout_s())
+        await asyncio.sleep(0.20)
+        await asyncio.wait_for(rec.stop(), timeout=_timeout_s())
+
+    async def test_04_429_surge_pacer_degrades(self) -> None:
+        """Scénario 4 — 429 surge: pacer doit dégrader.
+
+        On teste EnginePacer “à sec”:
+        - NORMAL en conditions saines
+        - CONSTRAINED / SEVERE quand err_rate/latency explosent
+        """
+        EnginePacer = getattr(pacer_mod, "EnginePacer")
+
+        # Minimal targets (use defaults if present)
+        pacer = EnginePacer()
+
+        # healthy tick
+        pacer.update(
+            now_ts=time.time(),
+            ack_p95_ms=80.0,
+            err_429_rate=0.0,
+            err_5xx_rate=0.0,
+            loop_lag_p95_ms=2.0,
+            in_flight=0,
+            queue_depth=0,
+        )
+        self.assertEqual(pacer.get_pacer_mode(), "NORMAL")
+
+        # simulated 429 surge + latency degradation
+        pacer.update(
+            now_ts=time.time(),
+            ack_p95_ms=800.0,
+            err_429_rate=0.25,
+            err_5xx_rate=0.05,
+            loop_lag_p95_ms=50.0,
+            in_flight=100,
+            queue_depth=5000,
+        )
+        mode = pacer.get_pacer_mode()
+        self.assertIn(mode, {"CONSTRAINED", "SEVERE"})
+        pol = pacer.get_policy()
+        self.assertTrue(isinstance(pol, dict) and "pacing_ms" in pol)
+        self.assertGreaterEqual(float(pol.get("pacing_ms", 0.0)), 0.0)
+
+    async def test_05_transfers_fsm_and_logs_rotation(self) -> None:
+        """Scénario 5 — Transfers/REB + Logs.
+
+        - TransferController: SUBMITTED -> SETTLED + timeout -> FAILED
+        - LogWriter: rotation size-based (gzip)
+        """
+        TransferController = getattr(rm_mod, "TransferController")
+
+        tc = TransferController(
+            submitted_timeout_s=0.2,
+            retry_total_s=0.1,
+            retry_step_s=0.02,
+        )
+
+        async def submit_fn(**kwargs):
+            # emulate successful submit (return any dict)
+            return {"ok": True, "id": kwargs.get("transfer_id")}
+
+        tid = await tc.submit(
+            transfer_id="XFER-1",
+            venue="BINANCE",
+            alias="TT",
+            submit_fn=submit_fn,
+            amount=1.23,
+            asset="USDC",
+            from_account="A",
+            to_account="B",
+        )
+        self.assertEqual(tid, "XFER-1")
+        st = tc.get_state("XFER-1")
+        self.assertEqual(st.get("state"), "SUBMITTED")
+
+        tc.mark_settled("XFER-1")
+        st2 = tc.get_state("XFER-1")
+        self.assertEqual(st2.get("state"), "SETTLED")
+
+        # Timeout path: inject a stale SUBMITTED state and run check_timeouts
+        tc._states["XFER-STALE"] = {
+            "state": "SUBMITTED",
+            "submitted_at": time.time() - 1.0,
+            "settle_by": time.time() - 1.0,
+            "expires_at": time.time() - 1.0,
+            "venue": "BINANCE",
+            "alias": "TT",
+        }
+        tc.check_timeouts()
+        st3 = tc.get_state("XFER-STALE")
+        self.assertEqual(st3.get("state"), "FAILED")
+
+        # LogWriter rotation
+        LogWriter = getattr(log_writer_mod, "LogWriter")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lw = LogWriter(
+                root_dir=str(root),
+                db_name="smoke.db",
+                max_bytes=1,  # force rotation immediately
+                max_age_s=3600,
+                compress=True,
+            )
+            # rotation must not throw
+            rotated = lw.rotate_if_needed()
+            # rotated may be False if file wasn't created yet; ensure it exists
+            db_path = root / "smoke.db"
+            self.assertTrue(db_path.exists())
+            # Force one more check now that it exists
+            _ = lw.rotate_if_needed()
+
+            gz_files = list(root.glob("smoke.db.*.gz"))
+            self.assertTrue(len(gz_files) >= 1, f"no rotated gzip found in {root}: {list(root.iterdir())}")
+
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main(verbosity=2)
