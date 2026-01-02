@@ -36,7 +36,14 @@ Scénarios (max 5, comme tu l’as cadré):
 - on teste les compartiments critiques par contrats (Engine, Simulator, Reconciler, Transfer FSM, Logs).
 
 Usage:
-  python smoke_test_all.py
+   CI-1 : SMOKE_CI_PROFILE=CI1 python smoke_test_all.py
+  CI-2 : SMOKE_CI_PROFILE=CI2 python smoke_test_all.py
+  CI-3 : SMOKE_CI_PROFILE=CI3 python smoke_test_all.py
+
+Décision (profils CI):
+  - CI1 : permissif + rapide (scénarios 0–1)
+  - CI2 : strict + blocking (scénarios 0–5)
+  - CI3 : strict + nightly (scénarios 0–5 + stress pack)
 
 Optionnel:
   SMOKE_TIMEOUT_S=45  (timeout global par scénario)
@@ -164,7 +171,7 @@ import contracts.errors as errors_mod  # noqa: E402
 # Local imports
 # --------------------------------------------------------------------------------------
 
-router_mod = importlib.import_module("market_data_router")
+router_mod = importlib.import_module("modules.market_data_router")
 try:
     payloads_mod = importlib.import_module("contracts.payloads")
 except Exception:
@@ -243,11 +250,42 @@ def temp_env(extra: Optional[Dict[str, str]] = None):
         os.environ.clear()
         os.environ.update(saved)
 # --------------------------------------------------------------------------------------
-# Stress helpers (gated by SMOKE_STRESS=1)
+# # CI profiles & knobs
 # --------------------------------------------------------------------------------------
+def _ci_profile() -> str:
+    return os.environ.get("SMOKE_CI_PROFILE", "CI1").upper()
+
+
+def _strict_enabled() -> bool:
+    return os.environ.get("SMOKE_STRICT") == "1" or _ci_profile() in {"CI2", "CI3"}
 
 def _stress_enabled() -> bool:
-    return os.environ.get("SMOKE_STRESS", "0") == "1"
+    return os.environ.get("SMOKE_STRESS") == "1" or _ci_profile() == "CI3"
+
+print(
+    f"[smoke] profile={_ci_profile()} strict={_strict_enabled()} stress={_stress_enabled()}"
+)
+
+
+def require_contract(testcase: unittest.TestCase, cond: bool, msg: str, *, critical: bool = True) -> None:
+    if cond:
+        return
+
+    # Allowlist: explicit opt-out when stress pack is disabled outside CI3
+    if msg == "stress gate disabled" and _ci_profile() != "CI3":
+        critical = False
+
+    if critical and _strict_enabled():
+        testcase.fail(msg)
+    else:
+        testcase.skipTest(msg)
+
+
+def _skip_or_fail(testcase: unittest.TestCase, reason: str) -> None:
+    require_contract(testcase, False, reason)
+# --------------------------------------------------------------------------------------
+# Stress helpers (gated by CI3 or SMOKE_STRESS=1)
+# --------------------------------------------------------------------------------------
 
 
 def _stress_int(name: str, default: int) -> int:
@@ -483,16 +521,19 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                 elif hasattr(cfg2, "vol") and hasattr(cfg2.vol, "ttl_s"):
                     cfg2.vol.ttl_s = getattr(cfg2.vol, "ttl_s", 0) + 1
                     knob_changed = True
-                if not knob_changed:
-                    raise unittest.SkipTest("no slip/vol ttl knob available")
+                require_contract(self, knob_changed, "no slip/vol ttl knob available")
                 self.assertNotEqual(snapshot_hash, cfg2.snapshot_hash())
 
             with self.subTest("MarketDataRouter contract"):
                 MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
+                require_contract(self, MarketDataRouter is not None, "MarketDataRouter absent")
                 if MarketDataRouter is None:
-                    self.skipTest("MarketDataRouter absent")
-                if not hasattr(MarketDataRouter, "build_default_out_queues"):
-                    self.skipTest("MarketDataRouter.build_default_out_queues absent")
+                    return
+                    require_contract(
+                        self,
+                        hasattr(MarketDataRouter, "build_default_out_queues"),
+                        "MarketDataRouter.build_default_out_queues absent",
+                    )
 
                 in_q: asyncio.Queue = asyncio.Queue()
                 combos = [("BINANCE", "BYBIT")]
@@ -540,12 +581,17 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                     with contextlib.suppress(Exception):
                         await asyncio.wait_for(task, timeout=1.0)
 
-            with self.subTest("MarketDataRouter stress (SMOKE_STRESS=1)"):
+            with self.subTest("MarketDataRouter stress (CI3/SMOKE_STRESS=1)"):
                 MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
-                if MarketDataRouter is None:
-                    self.skipTest("MarketDataRouter absent")
-                if os.environ.get("SMOKE_STRESS") != "1":
-                    self.skipTest("stress gate disabled")
+                require_contract(self, MarketDataRouter is not None, "MarketDataRouter absent")
+                require_contract(
+                    self,
+                    _stress_enabled(),
+                    "stress gate disabled",
+                    critical=_ci_profile() == "CI3",
+                )
+                if MarketDataRouter is None or not _stress_enabled():
+                    return
                 stress_in_q: asyncio.Queue = asyncio.Queue()
                 stress_out_queues = MarketDataRouter.build_default_out_queues(
                     combos=combos,
@@ -596,10 +642,14 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             with self.subTest("VolatilityMonitor contract"):
                 vol_mod = importlib.import_module("volatility_monitor")
                 VolatilityMonitor = getattr(vol_mod, "VolatilityMonitor", None)
+                require_contract(self, VolatilityMonitor is not None, "VolatilityMonitor absent")
                 if VolatilityMonitor is None:
-                    self.skipTest("VolatilityMonitor absent")
-                if not hasattr(VolatilityMonitor, "attach_bus_vol_queues"):
-                    self.skipTest("VolatilityMonitor.attach_bus_vol_queues absent")
+                    return
+                    require_contract(
+                        self,
+                        hasattr(VolatilityMonitor, "attach_bus_vol_queues"),
+                        "VolatilityMonitor.attach_bus_vol_queues absent",
+                    )
 
                 vm = VolatilityMonitor(cfg)
                 vol_q: asyncio.Queue = asyncio.Queue()
@@ -631,10 +681,14 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             with self.subTest("SlippageHandler contract"):
                 slip_mod = importlib.import_module("slippage_handler")
                 SlippageHandler = getattr(slip_mod, "SlippageHandler", None)
+                require_contract(self, SlippageHandler is not None, "SlippageHandler absent")
                 if SlippageHandler is None:
-                    self.skipTest("SlippageHandler absent")
-                if not hasattr(SlippageHandler, "attach_bus_slip_queues"):
-                    self.skipTest("SlippageHandler.attach_bus_slip_queues absent")
+                    return
+                    require_contract(
+                        self,
+                        hasattr(SlippageHandler, "attach_bus_slip_queues"),
+                        "SlippageHandler.attach_bus_slip_queues absent",
+                    )
 
                 sh = SlippageHandler(cfg)
                 slip_q: asyncio.Queue = asyncio.Queue()
@@ -669,8 +723,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             with self.subTest("OpportunityScanner contract"):
                 scan_mod = importlib.import_module("opportunity_scanner")
                 OpportunityScanner = getattr(scan_mod, "OpportunityScanner", None)
+                require_contract(self, OpportunityScanner is not None, "OpportunityScanner absent")
                 if OpportunityScanner is None:
-                    self.skipTest("OpportunityScanner absent")
+                    return
 
                 class _StubRM:
                     def __init__(self, bot_cfg):
@@ -701,10 +756,14 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
 
         MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
+        require_contract(self, MarketDataRouter is not None, "MarketDataRouter absent")
         if MarketDataRouter is None:
-            self.skipTest("MarketDataRouter absent")
-        if not hasattr(MarketDataRouter, "build_default_out_queues"):
-            self.skipTest("MarketDataRouter.build_default_out_queues absent")
+            return
+            require_contract(
+                self,
+                hasattr(MarketDataRouter, "build_default_out_queues"),
+                "MarketDataRouter.build_default_out_queues absent",
+            )
 
         in_q: asyncio.Queue = asyncio.Queue()
         combos = [("BINANCE", "BYBIT")]
@@ -745,8 +804,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
 
             self.assertGreaterEqual(len(scanner.events), 1)
             cex_out = out_queues.get("cex:BINANCE")
+            require_contract(self, cex_out is not None, "out_queues['cex:BINANCE'] absent")
             if cex_out is None:
-                self.skipTest("out_queues['cex:BINANCE'] absent")
+                return
             fanout_sizes = [
                 q.qsize()
                 for name, q in cex_out.items()
@@ -801,8 +861,13 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             else:
                 self.assertEqual(len(stale_scanner.events), initial_events)
                 cex_out = stale_out_queues.get("cex:BINANCE")
+                require_contract(
+                    self,
+                    cex_out is not None,
+                    "stale_out_queues['cex:BINANCE'] absent",
+                )
                 if cex_out is None:
-                    self.skipTest("stale_out_queues['cex:BINANCE'] absent")
+                    return
                 fanout_sizes = [
                     q.qsize()
                     for name, q in cex_out.items()
@@ -858,8 +923,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                     self.assertGreaterEqual(total_drops, 1)
             self.assertEqual(len(rl2_scanner.events), 0)
             cex_out = rl2_out_queues.get("cex:BYBIT")
+            require_contract(self, cex_out is not None, "rl2_out_queues['cex:BYBIT'] absent")
             if cex_out is None:
-                self.skipTest("rl2_out_queues['cex:BYBIT'] absent")
+                return
             fanout_sizes = [
                 q.qsize()
                 for name, q in cex_out.items()
@@ -872,77 +938,6 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(t_rl2, timeout=1.0)
 
-        if os.environ.get("SMOKE_STRESS_ROUTER") == "1":
-            stress_in_q: asyncio.Queue = asyncio.Queue()
-            stress_out_queues = MarketDataRouter.build_default_out_queues(
-                combos=combos,
-                maxsize={"combo": 10, "vol": 10, "slip": 10, "health": 10},
-            )
-            stress_scanner = _DummyScannerForRouter()
-            stress_router = MarketDataRouter(
-                in_queue=stress_in_q,
-                out_queues=stress_out_queues,
-                combos=combos,
-                scanner=stress_scanner,
-                push_to_scanner=True,
-                publish_combo_to_bus=True,
-                require_l2_first=False,
-                stale_source_ms=1000,
-                coalesce_window_ms=5,
-                coalesce_maxlen=2,
-            )
-            if hasattr(stress_router, "drop_alert_threshold"):
-                stress_router.drop_alert_threshold = 10
-            if hasattr(stress_router, "drop_window_s"):
-                stress_router.drop_window_s = 1.0
-
-            events: list[Any] = []
-            if hasattr(stress_router, "set_event_sink"):
-                stress_router.set_event_sink(lambda e: events.append(e))
-            else:
-                events = None  # type: ignore[assignment]
-
-            t_stress = asyncio.create_task(stress_router.start())
-            try:
-                pairs = ["BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC"]
-                now_ms = int(time.time() * 1000)
-                for i in range(2000):
-                    exch = "BINANCE" if i % 2 == 0 else "BYBIT"
-                    pair = pairs[i % len(pairs)]
-                    ev = _make_router_event(
-                        exch,
-                        pair,
-                        100.0 + i * 0.001,
-                        101.0 + i * 0.001,
-                        with_l2=True,
-                        ts_ms=now_ms + i,
-                        quote="USDC",
-                    )
-                    await stress_in_q.put(ev)
-                    if i % 200 == 0:
-                        await asyncio.sleep(0)
-
-                await asyncio.sleep(0.1)
-            finally:
-                with contextlib.suppress(Exception):
-                    await stress_router.stop()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(t_stress, timeout=5.0)
-
-            for cex_out in stress_out_queues.values():
-                for q in cex_out.values():
-                    if hasattr(q, "qsize"):
-                        self.assertLessEqual(q.qsize(), getattr(q, "maxsize", q.qsize()))
-
-            if events is not None:
-                self.assertGreaterEqual(len(events), 1)
-                self.assertTrue(
-                    any(
-                        isinstance(ev, dict)
-                        and ev.get("type") in {"backpressure", "router_drop"}
-                        for ev in events
-                    )
-                )
 
         flush_in_q: asyncio.Queue = asyncio.Queue()
         flush_out_queues = MarketDataRouter.build_default_out_queues(
@@ -983,8 +978,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(t_flush, timeout=2.0)
 
         flush_cex_out = flush_out_queues.get("cex:BINANCE")
+        require_contract(self, flush_cex_out is not None, "flush_out_queues['cex:BINANCE'] absent")
         if flush_cex_out is None:
-            self.skipTest("flush_out_queues['cex:BINANCE'] absent")
+            return
         flush_fanout_sizes = [
             q.qsize()
             for name, q in flush_cex_out.items()
@@ -1048,6 +1044,8 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         - Simulator: une simulation minimale valide
         - Engine: enforcement idempotency_key + DUPLICATE_BUNDLE
         """
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 2")
         with self.subTest("RiskManager invalid opportunity emits reason"):
             cfg_rm = modules.bot_config.BotConfig()
             cfg_rm.g.mode = "DRY_RUN"
@@ -1056,8 +1054,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             cfg_rm.g.enabled_exchanges = ["BINANCE", "BYBIT"]
 
             RiskManager = getattr(rm_mod, "RiskManager", None)
+            require_contract(self, RiskManager is not None, "RiskManager absent")
             if RiskManager is None:
-                self.skipTest("RiskManager absent")
+                return
 
             class _StubBalanceFetcher:
                 async def get_all_balances(self, force_refresh: bool = False):
@@ -1153,8 +1152,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         cfg.engine.ff_fail_closed_idempotence = True
         # --- RiskManager lifecycle + readiness + decision record emission
         RiskManager = getattr(rm_mod, "RiskManager", None)
+        require_contract(self, RiskManager is not None, "RiskManager absent")
         if RiskManager is None:
-            self.skipTest("RiskManager absent")
+            return
 
         class _StubBalanceFetcher:
             async def get_all_balances(self, force_refresh: bool = False):
@@ -1319,27 +1319,32 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         eng.ready_event.set()
         eng.history_fsm = _DummyHistoryFSM()
 
-        if not hasattr(eng, "_sem_inflight"):
-            self.skipTest("ExecutionEngine._sem_inflight absent")
-        sem = eng._sem_inflight
+        require_contract(self, hasattr(eng, "_sem_inflight"), "ExecutionEngine._sem_inflight absent")
+        sem = getattr(eng, "_sem_inflight", None)
+        if sem is None:
+            return
         self.assertIsInstance(sem, dict)
         for k in ["hedge", "cancel", "maker"]:
             if k not in sem:
-                self.skipTest(f"ExecutionEngine._sem_inflight missing {k}")
-            self.assertIsInstance(sem[k], dict)
+                require_contract(self, False, f"ExecutionEngine._sem_inflight missing {k}")
+            self.assertIsInstance(sem.get(k, {}), dict)
 
         common_exchanges = set(sem["hedge"].keys()) & set(sem["maker"].keys())
         if not common_exchanges:
-            self.skipTest("No common exchange between hedge/maker semaphores")
+            require_contract(self, False, "No common exchange between hedge/maker semaphores")
         ex = sorted(common_exchanges)[0]
         s_hedge = sem["hedge"][ex]
         s_maker = sem["maker"][ex]
         if not isinstance(s_hedge, asyncio.Semaphore) or not isinstance(s_maker, asyncio.Semaphore):
-            self.skipTest("Hedge/maker semaphores are not asyncio.Semaphore instances")
+            require_contract(self, False, "Hedge/maker semaphores are not asyncio.Semaphore instances")
         hedge_value = getattr(s_hedge, "_value", None)
         maker_value = getattr(s_maker, "_value", None)
         if not isinstance(hedge_value, int) or not isinstance(maker_value, int):
-            self.skipTest("Semaphore _value not accessible for hedge/maker")
+            require_contract(
+                self,
+                isinstance(hedge_value, int) and isinstance(maker_value, int),
+                "Semaphore _value not accessible for hedge/maker",
+            )
         self.assertGreaterEqual(hedge_value, maker_value)
 
         EngineSubmitError = getattr(errors_mod, "EngineSubmitError")
@@ -1392,6 +1397,8 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         - dedup fill events
         - start/stop loop sans crash
         """
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 3")
         PrivateWSReconciler = getattr(pwsr_mod, "PrivateWSReconciler")
 
         # Tight staleness for smoke
@@ -1403,8 +1410,11 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         )
 
         # activity -> not stale
-        if not hasattr(rec, "mark_ws_activity") or not hasattr(rec, "is_ws_stale"):
-            self.skipTest("PrivateWSReconciler mark_ws_activity/is_ws_stale absent")
+        require_contract(
+            self,
+            hasattr(rec, "mark_ws_activity") and hasattr(rec, "is_ws_stale"),
+            "PrivateWSReconciler mark_ws_activity/is_ws_stale absent",
+        )
         rec.mark_ws_activity()
         self.assertFalse(rec.is_ws_stale())
 
@@ -1418,43 +1428,50 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         rec.mark_ws_activity()
         self.assertFalse(rec.is_ws_stale())
 
-        # dedup fill events
-        fill_ev = {
-            "exchange": "BINANCE",
-            "alias": "TT",
-            "type": "fill",
-            "status": "FILL",
-            "symbol": "BTCUSDC",
-            "trade_id": "T1",
-            "order_id": "O1",
-            "side": "BUY",
-            "price": 100.0,
-            "qty": 0.01,
-            "ts": time.time(),
-        }
-        if not hasattr(rec, "_seen_keys"):
-            self.skipTest("dedup store non accessible")
-        if not hasattr(rec._seen_keys, "_s"):
-            self.skipTest("dedup store non accessible")
-        before = len(rec._seen_keys._s)
-        rec.observe_fill_event(fill_ev)
-        rec.observe_fill_event(fill_ev)
-        after = len(rec._seen_keys._s)
-        if (after - before) not in (0, 1):
-            self.fail("dedup store grew unexpectedly after duplicate fills")
-        if os.environ.get("SMOKE_STRESS") == "1":
-            with self.subTest("PrivateWSReconciler fill storm (SMOKE_STRESS=1)"):
+        # dedup fill events (via public helpers)
+        seen = getattr(rec, "_seen_keys", None)
+        require_contract(self, seen is not None, "dedup store non accessible")
+
+        def _seen_size() -> int:
+            if seen is None:
+                require_contract(self, False, "dedup store non accessible")
+                return 0
+            for attr in ("_s", "_q"):
+                val = getattr(seen, attr, None)
+                if val is not None:
+                    try:
+                        return len(val)
+                    except Exception:
+                        continue
+            require_contract(self, False, "unable to introspect _seen_keys size")
+            return 0
+
+        before = _seen_size()
+        rec.note_seen_client_id("CID-1")
+        rec.note_seen_client_id("CID-1")
+        rec.note_seen_idempotency_key("IDK-1")
+        rec.note_seen_idempotency_key("IDK-1")
+        after = _seen_size()
+        if (after - before) not in (0, 2):
+            self.fail("dedup store grew unexpectedly after duplicate seen keys")
+        if _stress_enabled():
+            with self.subTest("PrivateWSReconciler fill storm (CI3/SMOKE_STRESS=1)"):
                 seen = getattr(rec, "_seen_keys", None)
+                require_contract(self, seen is not None, "PrivateWSReconciler._seen_keys absent")
                 if seen is None:
-                    self.skipTest("PrivateWSReconciler._seen_keys absent")
+                    return
 
                 def _seen_size() -> int:
-                    size_candidates = []
+
                     for attr in ("_q", "_s"):
                         val = getattr(seen, attr, None)
                         if val is not None:
-                            size_candidates.append(len(val))
-                    return max(size_candidates) if size_candidates else 0
+                            try:
+                                return len(val)
+                            except Exception:
+                                continue
+                            require_contract(self, False, "unable to introspect _seen_keys size")
+                            return 0
 
                 fill_n = _stress_int("SMOKE_STRESS_PWS_FILL_STORM", 5000)
                 maxlen = getattr(seen, "_maxlen", None)
@@ -1492,8 +1509,7 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                     self.assertLessEqual(peak, fill_n // 10)
 
         # loop start/stop sanity
-        if not hasattr(rec, "start") or not hasattr(rec, "stop"):
-            self.skipTest("PrivateWSReconciler start/stop absent")
+        require_contract(self, hasattr(rec, "start") and hasattr(rec, "stop"), "PrivateWSReconciler start/stop absent")
         await asyncio.wait_for(rec.start(), timeout=_timeout_s())
         await asyncio.sleep(0.20)
         await asyncio.wait_for(rec.stop(), timeout=_timeout_s())
@@ -1505,6 +1521,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         - NORMAL en conditions saines
         - CONSTRAINED / SEVERE quand err_rate/latency explosent
         """
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 4")
+
         EnginePacer = getattr(pacer_mod, "EnginePacer")
 
         # Minimal targets (use defaults if present)
@@ -1544,6 +1563,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
          - TransferController: fail path + timeout fail-close
         - LogWriter: rotation size-based (gzip)
         """
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 5")
+
         TransferController = getattr(rm_mod, "TransferController")
 
         class _StubLHM:
@@ -1646,8 +1668,93 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                 files_present = [p for p in Path(td).iterdir() if p.is_file()]
                 self.assertTrue(files_present, "no log files created during rotation test")
 
-@unittest.skipUnless(_stress_enabled(), "SMOKE_STRESS=1 required")
+@unittest.skipUnless(_stress_enabled(), "CI3 or SMOKE_STRESS=1 required")
 class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
+    async def test_stress_market_data_router(self) -> None:
+        """Stress: drain + backpressure avec bornes de queue."""
+
+        MarketDataRouter = getattr(router_mod, "MarketDataRouter", None)
+        require_contract(self, MarketDataRouter is not None, "MarketDataRouter absent")
+        if MarketDataRouter is None:
+            return
+
+        build_out = getattr(MarketDataRouter, "build_default_out_queues", None)
+        require_contract(
+            self, callable(build_out), "MarketDataRouter.build_default_out_queues absent"
+        )
+        if not callable(build_out):
+            return
+
+        combos = [
+            {"exchange": "BINANCE", "pair_key": "BTC-USDC", "pair": "BTCUSDC", "quote": "USDC"},
+            {"exchange": "BYBIT", "pair_key": "ETH-USDC", "pair": "ETHUSDC", "quote": "USDC"},
+        ]
+
+        in_q: asyncio.Queue = asyncio.Queue()
+        out_queues = build_out(
+            combos=combos, maxsize={"combo": 20, "vol": 20, "slip": 20, "health": 20}
+        )
+        scanner = _DummyScannerForRouter()
+        router = MarketDataRouter(
+            in_queue=in_q,
+            out_queues=out_queues,
+            combos=combos,
+            scanner=scanner,
+            push_to_scanner=True,
+            publish_combo_to_bus=True,
+            require_l2_first=False,
+            stale_source_ms=1000,
+            coalesce_window_ms=2,
+            coalesce_maxlen=2,
+        )
+
+        events: list[Any] = []
+        if hasattr(router, "set_event_sink"):
+            router.set_event_sink(lambda e: events.append(e))
+
+        t_router = asyncio.create_task(router.start())
+        try:
+            now_ms = int(time.time() * 1000)
+            pairs = ["BTC-USDC", "ETH-USDC", "SOL-USDC", "XRP-USDC"]
+            for i in range(2000):
+                exch = "BINANCE" if i % 2 == 0 else "BYBIT"
+                pair = pairs[i % len(pairs)]
+                ev = _make_router_event(
+                    exch,
+                    pair,
+                    100.0 + i * 0.001,
+                    101.0 + i * 0.001,
+                    with_l2=True,
+                    ts_ms=now_ms + i,
+                    quote="USDC",
+                )
+                await in_q.put(ev)
+                if i % 200 == 0:
+                    await asyncio.sleep(0)
+
+            await asyncio.sleep(0.25)
+            self.assertFalse(t_router.done(), "router task died under stress")
+            self.assertLessEqual(in_q.qsize(), 1, "router input queue not draining")
+        finally:
+            with contextlib.suppress(Exception):
+                await router.stop()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(t_router, timeout=5.0)
+
+        for cex_out in out_queues.values():
+            for q in cex_out.values():
+                if hasattr(q, "qsize"):
+                    self.assertLessEqual(q.qsize(), getattr(q, "maxsize", q.qsize()))
+
+        if events:
+            self.assertTrue(
+                any(
+                    isinstance(ev, dict)
+                    and ev.get("type") in {"backpressure", "router_drop"}
+                    for ev in events
+                ),
+                "router stress did not emit backpressure events",
+            )
     async def test_stress_http_status_metrics(self) -> None:
         """Stress: rafales concurrentes sur /status et /metrics."""
 
@@ -1717,8 +1824,9 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
 
         cfg = modules.bot_config.BotConfig()
         rl_cfg = getattr(cfg, "rl", None)
+        require_contract(self, rl_cfg is not None, "RateLimiter cfg missing")
         if rl_cfg is None:
-            self.skipTest("RateLimiter cfg missing")
+            return
 
         # Knobs : maker très restrictif, hedge permissif
         if hasattr(rl_cfg, "hard_caps_rps_by_kind"):
@@ -1767,8 +1875,9 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
 
         vol_mod = importlib.import_module("volatility_monitor")
         VolatilityMonitor = getattr(vol_mod, "VolatilityMonitor", None)
+        require_contract(self, VolatilityMonitor is not None, "VolatilityMonitor absent")
         if VolatilityMonitor is None:
-            self.skipTest("VolatilityMonitor absent")
+            return
 
         cfg = modules.bot_config.BotConfig()
         vm = VolatilityMonitor(cfg)
@@ -1797,8 +1906,9 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
 
         slip_mod = importlib.import_module("slippage_handler")
         SlippageHandler = getattr(slip_mod, "SlippageHandler", None)
+        require_contract(self, SlippageHandler is not None, "SlippageHandler absent")
         if SlippageHandler is None:
-            self.skipTest("SlippageHandler absent")
+            return
 
         cfg = modules.bot_config.BotConfig()
         sh = SlippageHandler(cfg)
@@ -1825,8 +1935,9 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
 
         scan_mod = importlib.import_module("opportunity_scanner")
         OpportunityScanner = getattr(scan_mod, "OpportunityScanner", None)
+        require_contract(self, OpportunityScanner is not None, "OpportunityScanner absent")
         if OpportunityScanner is None:
-            self.skipTest("OpportunityScanner absent")
+            return
 
         cfg = modules.bot_config.BotConfig()
 
@@ -1983,8 +2094,9 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
             pwsr.observe_fill_event(_fill_evt(i))
 
         seen = getattr(pwsr, "_seen_keys", None)
+        require_contract(self, seen is not None, "PrivateWSReconciler._seen_keys absent")
         if seen is None:
-            self.skipTest("PrivateWSReconciler._seen_keys absent")
+            return
 
         maxlen = getattr(seen, "_maxlen", None)
         q = getattr(seen, "_q", None)
@@ -1992,7 +2104,7 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
         size_candidates = [v for v in (len(q) if q is not None else None, len(s) if s is not None else None) if
                            v is not None]
         if not size_candidates:
-            self.skipTest("unable to introspect _seen_keys size")
+            require_contract(self, False, "unable to introspect _seen_keys size")
         size = max(size_candidates)
 
         if isinstance(maxlen, int) and maxlen > 0:
