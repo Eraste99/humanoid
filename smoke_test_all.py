@@ -354,7 +354,15 @@ class Started:
 
 @contextlib.asynccontextmanager
 async def started_boot_with_servers(cfg: modules.bot_config.BotConfig) -> Iterable[Tuple[Any, Any, Any]]:
-    Boot = getattr(boot_mod, "Boot")
+    Boot = getattr(boot_mod, "Boot", None)
+    if Boot is None:
+        raise AssertionError("Boot absent")
+    StatusHTTPServer = getattr(obs_metrics_mod, "StatusHTTPServer", None)
+    if StatusHTTPServer is None:
+        raise AssertionError("StatusHTTPServer absent")
+    start_servers = getattr(obs_metrics_mod, "start_servers", None)
+    if start_servers is None:
+        raise AssertionError("start_servers absent")
     boot = Boot(cfg)
 
     # Start probes (supervisor usually does that)
@@ -362,7 +370,7 @@ async def started_boot_with_servers(cfg: modules.bot_config.BotConfig) -> Iterab
     time_skew_task = obs_metrics_mod.start_time_skew_probe(period_s=2.0)
 
     # Start servers first (so /health comes up quickly), then boot
-    servers = obs_metrics_mod.start_servers(boot=boot, cfg=cfg) or {}
+    servers = start_servers(boot=boot, cfg=cfg) or {}
     status_srv = servers.get("status_server") if isinstance(servers, dict) else None
     obs_srv = servers.get("obs_server") if isinstance(servers, dict) else None
 
@@ -892,7 +900,7 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertTrue(any(sz >= 1 for sz in fanout_sizes), "no fan-out for BINANCE")
             if hasattr(router, "_events_schema_errors"):
-                self.assertEqual(getattr(router, "_events_schema_errors"), 0)
+                self.assertEqual(getattr(router, "_events_schema_errors", None), 0)
         finally:
             with contextlib.suppress(Exception):
                 await router.stop()
@@ -935,7 +943,7 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
 
             if hasattr(router_stale, "_events_ignored_stale"):
-                self.assertGreaterEqual(getattr(router_stale, "_events_ignored_stale"), 1)
+                self.assertGreaterEqual(getattr(router_stale, "_events_ignored_stale", None), 1)
             else:
                 self.assertEqual(len(stale_scanner.events), initial_events)
                 cex_out = stale_out_queues.get("cex:BINANCE")
@@ -992,7 +1000,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
 
             if hasattr(router_rl2, "_route_drops"):
-                drops = getattr(router_rl2, "_route_drops")
+                drops = getattr(router_rl2, "_route_drops", None)
+                require_contract(self, drops is not None, "_route_drops absent")
+                if drops is None:
+                    return
                 if isinstance(drops, dict) and drops:
                     # no reason codes invented, just check any drop recorded
                     total_drops = sum(
@@ -1369,7 +1380,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(bool(sim_res["ok"]), f"sim rejected: {sim_res}")
 
         # --- Engine idempotence contract (no private ws required in DRY_RUN branch)
-        ExecutionEngine = getattr(engine_mod, "ExecutionEngine")
+        ExecutionEngine = getattr(engine_mod, "ExecutionEngine", None)
+        require_contract(self, ExecutionEngine is not None, "ExecutionEngine absent")
+        if ExecutionEngine is None:
+            return
         cfg.engine.ff_enforce_client_oid_deterministic = True
         cfg.engine.ff_fail_closed_idempotence = True
 
@@ -1422,7 +1436,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             else:
                 self.skipTest("Semaphore _value not accessible; skipping lanes comparison")
 
-        EngineSubmitError = getattr(errors_mod, "EngineSubmitError")
+        EngineSubmitError = getattr(errors_mod, "EngineSubmitError", None)
+        require_contract(self, EngineSubmitError is not None, "EngineSubmitError absent")
+        if EngineSubmitError is None:
+            return
 
         # Order template aligned with ExecutionEngine._exec_single expectations
         order_common = {
@@ -1488,7 +1505,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         """
         if _ci_profile() == "CI1":
             self.skipTest("CI1 profile skips scenario 3")
-        PrivateWSReconciler = getattr(pwsr_mod, "PrivateWSReconciler")
+        PrivateWSReconciler = getattr(pwsr_mod, "PrivateWSReconciler", None)
+        require_contract(self, PrivateWSReconciler is not None, "PrivateWSReconciler absent")
+        if PrivateWSReconciler is None:
+            return
 
         # Tight staleness for smoke
         rec = PrivateWSReconciler(
@@ -1588,7 +1608,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                 for i in range(fill_n):
                     rec.observe_fill_event(_mk_evt(i))
                     if hasattr(rec, "sweep") and i % 500 == 0:
-                        sweep_fn = getattr(rec, "sweep")
+                        sweep_fn = getattr(rec, "sweep", None)
+                        require_contract(self, sweep_fn is not None, "sweep absent")
+                        if sweep_fn is None:
+                            return
                         if inspect.iscoroutinefunction(sweep_fn):
                             await sweep_fn()
                         else:
@@ -1762,7 +1785,10 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(lhm.fail_closed, "fail-close latch was not activated for stale transfer")
 
         # LogWriter rotation
-        LogWriter = getattr(log_writer_mod, "LogWriter")
+        LogWriter = getattr(log_writer_mod, "LogWriter", None)
+        require_contract(self, LogWriter is not None, "LogWriter absent")
+        if LogWriter is None:
+            return
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             lw = LogWriter(
