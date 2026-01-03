@@ -957,11 +957,13 @@ class SlippageHandler:
           - base = ttl_s explicite sinon self._ttl_s (cfg.slip.ttl_s, donc pilotée par BotConfig).
 
         side: "buy" | "sell" | None (None => max des deux si disponibles).
+        Drop reason stable si dépassement de plafond: "max_bps_exceeded".
         """
         ex = (exchange or "").upper()
         pk = (pair_key or "").replace("-", "").upper()
         bps = getattr(self, "_slip_bps", {})
         tsd = getattr(self, "_slip_ts", {})
+        quote = self._infer_quote(pk)
 
         now = time.time()
 
@@ -1010,7 +1012,15 @@ class SlippageHandler:
                         vals.append(float(v))
                     else:
                         self._note_drop("ttl_expired", ex, pk)
-            return max(vals) if vals else None
+            if not vals:
+                return None
+            slip = max(vals)
+            if quote:
+                max_allowed = self.max_bps_allowed(quote)
+                if slip > max_allowed:
+                    self._note_drop("max_bps_exceeded", ex, pk)
+                    return None
+            return slip
 
         v = bps.get((ex, pk, str(side).lower()))
         t = tsd.get((ex, pk))
@@ -1020,7 +1030,13 @@ class SlippageHandler:
         age = now - float(t)
         # (On ne met pas set_slip_age_seconds ici pour ne pas surcharger de calls ; on reste P0.)
         if age <= ttl:
-            return float(v)
+            slip = float(v)
+            if quote:
+                max_allowed = self.max_bps_allowed(quote)
+                if slip > max_allowed:
+                    self._note_drop("max_bps_exceeded", ex, pk)
+                    return None
+            return slip
         self._note_drop("ttl_expired", ex, pk)
         return None
 

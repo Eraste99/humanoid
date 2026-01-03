@@ -47,7 +47,6 @@ try:
         WS_RECONNECTS_TOTAL,
         WS_BACKOFF_SECONDS,
         WS_CONNECTIONS_OPEN,
-        WS_PUBLIC_DROPPED_TOTAL,
         note_ws_public_cfg,
         WS_SYMBOL_UNMAPPED_TOTAL,
     )
@@ -917,9 +916,7 @@ class WebSocketExchangeClient:
         self._out_queue_last_drop_reason[ex] = reason
         self._out_queue_last_drop_ts[ex] = time.time()
 
-        # métrique legacy (exchange + reason)
-        WS_PUBLIC_DROPPED_TOTAL.labels(exchange=ex, reason=reason).inc()  # type: ignore[name-defined]
-
+        
         self._note_drop(ex, reason=reason, kind="combo")
 
         try:

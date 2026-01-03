@@ -1078,21 +1078,15 @@ class ExecutionEngine:
             cap_profile = str(
                 getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))).upper()
 
-            # cibles par région depuis la config
-            targets_overrides = {}
-            eucb = getattr(self.config, "pacer_targets_eucb", None)
-            eu = getattr(self.config, "pacer_targets_eu", None)
-            us = getattr(self.config, "pacer_targets_us", None)
-            jp = getattr(self.config, "pacer_targets_jp", None)  # nouveau pour Japan/Tokyo
-
-            if eu:
-                targets_overrides["EU"] = eu
-            if us:
-                targets_overrides["US"] = us
-            if eucb:
-                targets_overrides["EU-CB"] = eucb
-            if jp:
-                targets_overrides["JP"] = jp
+            # cibles par région depuis la config (canonique: engine.pacer_targets)
+            targets_overrides: Dict[str, Dict[str, float]] = {}
+            pacer_targets = getattr(self.config, "pacer_targets", {}) or {}
+            for region, overrides in (pacer_targets or {}).items():
+                region_norm = str(region).upper().replace("_", "-")
+                if region_norm not in {"EU", "US", "JP", "EU-CB"}:
+                    continue
+                if isinstance(overrides, dict):
+                    targets_overrides[region_norm] = overrides
 
             # mapping exchange -> région (utile si SPLIT)
             region_map = getattr(self.config, "engine_pod_map", {"BINANCE": "EU", "BYBIT": "EU", "COINBASE": "US"})
@@ -1567,6 +1561,7 @@ class ExecutionEngine:
         self.default_tif_single = str(getattr(self.config, "default_tif_single", "GTC")).upper()
         self.default_tif_bundle = str(getattr(self.config, "default_tif_bundle", "IOC")).upper()
         self.order_timeout_s = float(getattr(self.config, "order_timeout_s", 2.5))
+        self.http_timeout_s = float(getattr(self.config, "http_timeout_s", self.order_timeout_s))
 
         # --- FSM / mapping client_id→(exchange,symbol) (tes classes) ---
         self._order_fsm: Dict[str, OrderFSM] = {}
@@ -3053,16 +3048,6 @@ class ExecutionEngine:
         lane = self._lane_from_meta(meta, maker_flag=bool(order.get("post_only")), action=None)
         if is_hedge:
             lane = "hedge"
-        # RL CEX (si présent)
-        rl = None
-        if ex == "BINANCE":
-            rl = getattr(self, "_rl_binance_order", None)
-        elif ex == "BYBIT":
-            rl = getattr(self, "_rl_bybit_order", None)
-        elif ex == "COINBASE":
-            rl = getattr(self, "_rl_coinbase_order", None)
-        if rl is not None:
-            await rl.acquire()
 
         # Armement SUBMIT→ACK (pending map)
         t_submit = time.time()
@@ -9472,7 +9457,7 @@ class ExecutionEngine:
         sig = hmac.new((keys or {}).get("secret", "").encode(), query.encode(), hashlib.sha256).hexdigest()
         headers = {"X-MBX-APIKEY": (keys or {}).get("api_key", "")}
         params["signature"] = sig
-        async with self._session.post(url, params=params, headers=headers, timeout=5) as resp:
+        async with self._session.post(url, params=params, headers=headers, timeout=self.http_timeout_s) as resp:
             resp.raise_for_status()
             return await resp.json()
 
@@ -9496,7 +9481,7 @@ class ExecutionEngine:
         sig = hmac.new(k.get("secret", "").encode(), q.encode(), hashlib.sha256).hexdigest()
         headers = {"X-MBX-APIKEY": k.get("api_key", "")}
         params["signature"] = sig
-        async with self._session.delete(url, params=params, headers=headers, timeout=5) as resp:
+        async with self._session.delete(url, params=params, headers=headers, timeout=self.http_timeout_s) as resp:
             resp.raise_for_status()
             return await resp.json()
 

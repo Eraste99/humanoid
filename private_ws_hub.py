@@ -264,9 +264,15 @@ class _BaseWSClient:
         self._reconnects: int = 0
         self._errors: int = 0
 
-        # --- cfg.pws (source de vérité) — compat si cfg/pws absent ---
+        # --- cfg.pws (source de vérité) ---
         pws = getattr(self.cfg, "pws", None) if self.cfg is not None else None
         if pws is None:
+            g = getattr(self.cfg, "g", None) if self.cfg is not None else None
+            mode = str(getattr(g, "mode", "DRY_RUN")).upper()
+            msg = "[PrivateWSHub] cfg.pws missing; PrivateWS knobs will be ignored"
+            if mode == "PROD":
+                raise RuntimeError(msg)
+            log.warning(msg)
             class _PWSStub:
                 pass
 
@@ -1198,14 +1204,27 @@ class PrivateWSHub:
 
         # Config / bases
         self.config = config
+        pws_cfg = getattr(self.config, "pws", None) if self.config is not None else None
+        if pws_cfg is None:
+            g = getattr(self.config, "g", None) if self.config is not None else None
+            mode = str(getattr(g, "mode", "DRY_RUN")).upper()
+            msg = "[PrivateWSHub] cfg.pws missing; PrivateWS knobs will be ignored"
+            if mode == "PROD":
+                raise RuntimeError(msg)
+            log.warning(msg)
+
+            class _PWSStub:
+                pass
+
+            pws_cfg = _PWSStub()
         if self.config is not None:
             try:
-                cb_interval_s = float(getattr(self.config, "cb_private_poll_interval_s", cb_interval_s))
+                cb_interval_s = float(getattr(pws_cfg, "cb_private_poll_interval_s", cb_interval_s))
             except Exception:
                 pass
             self._binance_rest_base = getattr(self.config, "binance_rest_base", "https://api.binance.com")
             self._binance_ws_priv  = getattr(self.config, "binance_ws_private_base", "wss://stream.binance.com:9443")
-            self._bybit_ws_priv    = getattr(self.config, "bybit_ws_private_url", "wss://stream.bybit.com/v5/private")
+            self._bybit_ws_priv = getattr(pws_cfg, "bybit_ws_private_url", "wss://stream.bybit.com/v5/private")
             self._coinbase_api_base= getattr(self.config, "coinbase_api_base", "https://api.coinbase.com")
         else:
             self._binance_rest_base = "https://api.binance.com"
@@ -1301,7 +1320,7 @@ class PrivateWSHub:
                     alias=alias,
                     api_key=creds["api_key"],
                     secret=creds["secret"],
-                    ws_url=getattr(self.config, "bybit_ws_private_url", "wss://stream.bybit.com/v5/private"),
+                    ws_url=getattr(pws_cfg, "bybit_ws_private_url", "wss://stream.bybit.com/v5/private"),
                 )
             c.register_callback(self._dispatch(alias, "BYBIT"))
             self.bybit_by_alias[alias] = c
@@ -1321,14 +1340,14 @@ class PrivateWSHub:
         # === P0: QoS / queues / heartbeats - init unique (après création des clients) ===
         # Alias compat (le reste du code lit 'self.cfg')
         self.cfg = self.config
-        # Source de vérité PWS : privilégier cfg.pws si présent, sinon cfg (legacy)
-        self._pws_cfg = getattr(self.config, "pws", self.config)
+        # Source de vérité PWS : cfg.pws uniquement
+        self._pws_cfg = pws_cfg
 
 
         # Priorités QoS (plus petit = plus prioritaire)
         if not hasattr(self, "_priority_map"):
             self._priority_map = {"fill": 0, "ack": 1, "reject": 2, "other": 3}
-        pws = getattr(self, "_pws_cfg", self.cfg)
+        pws = self._pws_cfg
         # Files par (exchange, alias)
         if not hasattr(self, "_queues"):
             from collections import defaultdict, deque
@@ -2050,7 +2069,7 @@ class PrivateWSHub:
         - DEGRADED: cap ≤ 2000 ms ; SEVERE: cap ≤ 800 ms.
         - base_ms ≥ 50 ms, cap_ms ≥ base_ms.
         """
-        pws = getattr(self, "_pws_cfg", self.cfg)
+        pws = self._pws_cfg
         base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 200))
         cap_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 5000))
         base_ms = max(50, base_ms)
@@ -2069,7 +2088,7 @@ class PrivateWSHub:
         """Construit le cache de gaps heartbeat par exchange depuis cfg.slo."""
         self._pws_gap_slo_by_ex.clear()
 
-        pws = getattr(self, "_pws_cfg", self.cfg)
+        pws = self._pws_cfg
         self._pws_gap_slo_default = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
 
         cfg = getattr(self, "cfg", None)
@@ -2105,7 +2124,7 @@ class PrivateWSHub:
                    - PWS_HEARTBEAT_MAX_GAP_S (def 5.0)
                    - PWS_ALERT_PERIOD_S (def 5.0)
                """
-        pws = getattr(self, "_pws_cfg", self.cfg)
+        pws = self._pws_cfg
         ratio_thr = float(getattr(pws, "PWS_QUEUE_SATURATION_RATIO", 0.85))
         period = float(getattr(pws, "PWS_ALERT_PERIOD_S", 5.0))
 
@@ -2229,7 +2248,7 @@ class PrivateWSHub:
 
         base_ms, cap_ms = self._pws_backoff_bounds(region)
         backoff_ms = max(50, base_ms)
-        pws = getattr(self, "_pws_cfg", self.cfg)
+        pws = self._pws_cfg
         stable_s = float(getattr(pws, "PWS_STABLE_RESET_S", 30.0))
         jitter_ms = int(getattr(pws, "PWS_JITTER_MS", 50))
 
@@ -2822,7 +2841,7 @@ class PrivateWSHub:
         heartbeat_gap_s = (now - last_ts) if last_ts is not None else None
 
         # Heuristiques simples (config-driven, fallback sur les valeurs historiques)
-        pws_cfg = getattr(self, "_pws_cfg", getattr(self, "config", None))
+        pws_cfg = self._pws_cfg
         soft_default = 60.0  # au-delà, on considère l'alias dégradé
         hard_default = 180.0  # au-delà, on considère l'alias DOWN
         error_default = 10

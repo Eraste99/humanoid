@@ -545,6 +545,23 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             self.assertIn("BINANCE-BYBIT", tiers["CORE"])
             self.assertEqual(tiers["CORE"]["BINANCE-BYBIT"], {"BTCUSDC"})
 
+    def test_01_config_mode_aliases(self) -> None:
+        """Scénario 1 — MODE/LIVE_TRADING_ARMED exposés en alias et via Globals."""
+
+        with temp_env({"MODE": "DRY_RUN", "LIVE_TRADING_ARMED": "0"}):
+            cfg = modules.bot_config.BotConfig.from_env()
+            self.assertEqual(str(cfg.MODE).upper(), "DRY_RUN")
+            self.assertEqual(str(cfg.g.mode).upper(), "DRY_RUN")
+            self.assertFalse(bool(cfg.LIVE_TRADING_ARMED))
+            self.assertFalse(bool(cfg.g.live_trading_armed))
+
+        with temp_env({"MODE": "PROD", "LIVE_TRADING_ARMED": "true"}):
+            cfg = modules.bot_config.BotConfig.from_env()
+            self.assertEqual(str(cfg.MODE).upper(), "PROD")
+            self.assertEqual(str(cfg.g.mode).upper(), "PROD")
+            self.assertTrue(bool(cfg.LIVE_TRADING_ARMED))
+            self.assertTrue(bool(cfg.g.live_trading_armed))
+
         # 3) Contract tests OFFLINE — WebSocketsClients (backoff policy only, no network)
         with self.subTest("websockets_clients contract (backoff policy)"):
             wc = importlib.import_module("modules.websockets_clients")
@@ -1699,6 +1716,123 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(isinstance(pol, dict) and "pacing_ms" in pol)
         self.assertGreaterEqual(float(pol.get("pacing_ms", 0.0)), 0.0)
 
+    async def test_04b_engine_pacer_targets_env_override(self) -> None:
+        """Scénario 4b — ENGINE_PACER_TARGETS doit modifier les targets du pacer."""
+        ExecutionEngine = getattr(engine_mod, "ExecutionEngine", None)
+        require_contract(self, ExecutionEngine is not None, "ExecutionEngine absent")
+        if ExecutionEngine is None:
+            return
+
+        class _StubPrivateWS:
+            ready_event: asyncio.Event = asyncio.Event()
+
+        class _StubRateLimiter:
+            async def acquire(self, *_args, **_kwargs):
+                return True
+
+        class _StubRetryPolicy:
+            async def with_retry(self, coro, *args, **kwargs):  # pragma: no cover - stub
+                return await coro(*args, **kwargs)
+
+        env_key = "ENGINE_PACER_TARGETS"
+        prior = os.environ.get(env_key)
+        try:
+            os.environ[env_key] = json.dumps({
+                "EU": {
+                    "ack_hi": 101.0,
+                    "ack_sev": 151.0,
+                }
+            })
+            cfg = modules.bot_config.BotConfig.from_env()
+        finally:
+            if prior is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = prior
+
+        eng = ExecutionEngine(
+            _StubPrivateWS(),
+            _StubRateLimiter(),
+            _StubRetryPolicy(),
+            history_logger=None,
+            cfg=cfg,
+            ready_event=asyncio.Event(),
+        )
+        eng._ensure_pacer_on()
+        pacer = getattr(eng, "_pacer", None)
+        require_contract(self, pacer is not None, "EnginePacer absent on engine")
+        if pacer is None:
+            return
+        targets = getattr(pacer, "_targets", {})
+        self.assertIsInstance(targets, dict)
+        self.assertIn("EU", targets)
+        self.assertEqual(float(targets["EU"].get("ack_hi", 0.0)), 101.0)
+        self.assertEqual(float(targets["EU"].get("ack_sev", 0.0)), 151.0)
+
+    async def test_04c_engine_pacer_knobs_env_override(self) -> None:
+        """Scénario 4c — ENGINE_PACER_*_MS doit modifier les knobs du pacer."""
+        ExecutionEngine = getattr(engine_mod, "ExecutionEngine", None)
+        require_contract(self, ExecutionEngine is not None, "ExecutionEngine absent")
+        if ExecutionEngine is None:
+            return
+
+        class _StubPrivateWS:
+            ready_event: asyncio.Event = asyncio.Event()
+
+        class _StubRateLimiter:
+            async def acquire(self, *_args, **_kwargs):
+                return True
+
+        class _StubRetryPolicy:
+            async def with_retry(self, coro, *args, **kwargs):  # pragma: no cover - stub
+                return await coro(*args, **kwargs)
+
+        env_overrides = {
+            "ENGINE_PACER_MIN_MS": "3",
+            "ENGINE_PACER_MAX_MS": "77",
+            "ENGINE_PACER_INIT_MS": "9",
+            "ENGINE_PACER_JITTER_MS": "4",
+        }
+        prior_env = {k: os.environ.get(k) for k in env_overrides}
+        try:
+            os.environ.update(env_overrides)
+            cfg = modules.bot_config.BotConfig.from_env()
+        finally:
+            for k, v in prior_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        eng = ExecutionEngine(
+            _StubPrivateWS(),
+            _StubRateLimiter(),
+            _StubRetryPolicy(),
+            history_logger=None,
+            cfg=cfg,
+            ready_event=asyncio.Event(),
+        )
+        eng._ensure_pacer_on()
+        pacer = getattr(eng, "_pacer", None)
+        require_contract(self, pacer is not None, "EnginePacer absent on engine")
+        if pacer is None:
+            return
+        self.assertEqual(getattr(pacer, "_min_ms", None), 3)
+        self.assertEqual(getattr(pacer, "_max_ms", None), 77)
+        self.assertEqual(getattr(pacer, "_init_ms", None), 9)
+        self.assertEqual(getattr(pacer, "_jitter_ms", None), 4)
+
+    async def test_04d_boot_private_ws_disabled(self) -> None:
+        """Scénario 4d — démarrage boot avec private_ws OFF."""
+        cfg = modules.bot_config.BotConfig()
+        cfg.g.mode = "DRY_RUN"
+        cfg.g.deployment_mode = "EU_ONLY"
+        cfg.g.feature_switches["private_ws"] = False
+        cfg.g.enabled_exchanges = ["BINANCE", "BYBIT"]
+
+        async with started_boot_with_servers(cfg) as (boot, _status, _obs):
+            self.assertTrue(getattr(boot, "_running", False))
+            self.assertFalse(bool(getattr(boot.ctx, "pws_hub", None)))
     async def test_05_transfers_fsm_and_logs_rotation(self) -> None:
         """Scénario 5 — Transfers/REB + Logs.
 

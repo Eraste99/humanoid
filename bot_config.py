@@ -1102,6 +1102,7 @@ class EngineCfg:
     pacer_targets: Dict[str, int] = field(default_factory=lambda: {"EU": 8, "EU_CB": 12, "US": 12, "JP": 12})
     pacer_knobs: EnginePacerKnobs = field(default_factory=EnginePacerKnobs)
     # Ticket 10 — capacités techniques Engine (workers / inflight par CEX)
+    engine_queue_max: int = 200
 
     # Nombre de workers (tâches ordre) par profil de capital.
     workers_by_profile: Dict[str, int] = field(default_factory=lambda: {
@@ -1164,6 +1165,7 @@ class EngineCfg:
 
     tt_max_skew_ms: int = 35
     order_timeout_s: int = 3
+    http_timeout_s: float = 5.0
     idempotency_ttl_s: float = 60.0
     ff_enforce_client_oid_deterministic: bool = False
     ff_fail_closed_idempotence: bool = False
@@ -1236,6 +1238,7 @@ class PrivateWSHubCfg:
     PWS_BACKOFF_MAX_MS: int = 20_000
     cb_ack_ws_enabled: bool = True
     cb_private_poll_interval_s: int = 2
+    bybit_ws_private_url: str = "wss://stream.bybit.com/v5/private"
     PWS_PACER_EU: str = "NORMAL"
     PWS_PACER_US: str = "NORMAL"
     PWS_ALERT_PERIOD_S: int = 5
@@ -1367,11 +1370,11 @@ class RateLimiterCfg:
     # Hard caps "globaux" (déjà en place)
     hard_caps_rps_by_exchange: Dict[str, float] = field(default_factory=dict)
     hard_caps_rps_by_exchange_kind: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    hard_caps_rps_by_kind: Dict[str, float] = field(default_factory=dict)
+    hard_caps_rps_by_kind: Dict[str, float] = field(default_factory=lambda: {"balances": 0.5})
 
     bursts_by_exchange: Dict[str, float] = field(default_factory=dict)
     bursts_by_exchange_kind: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    bursts_by_kind: Dict[str, float] = field(default_factory=dict)
+    bursts_by_kind: Dict[str, float] = field(default_factory=lambda: {"balances": 1})
 
     priorities: List[str] = field(default_factory=lambda: ["hedge", "cancel", "maker"])
     fair: bool = True
@@ -2048,7 +2051,8 @@ class BotConfig:
         cfg.wd.engine_escalate_after_cycles = _Env.get_int(
             "WD_ENGINE_ESCALATE_AFTER_CYCLES", cfg.wd.engine_escalate_after_cycles
         )
-        cfg.wd.engine_queue_max = _Env.get_int("ENGINE_QUEUE_MAX", cfg.wd.engine_queue_max)
+        cfg.engine.engine_queue_max = _Env.get_int("ENGINE_QUEUE_MAX", cfg.engine.engine_queue_max)
+        cfg.wd.engine_queue_max = cfg.engine.engine_queue_max
         cfg.wd.engine_blocked_ms = _Env.get_int("ENGINE_BLOCKED_MS", cfg.wd.engine_blocked_ms)
 
         cfg.wd.balance_interval_s = _Env.get_float("WD_BALANCE_INTERVAL_S", cfg.wd.balance_interval_s)
@@ -3065,6 +3069,7 @@ class BotConfig:
         cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
         cfg.engine.tt_max_skew_ms = _Env.get_int("ENGINE_TT_MAX_SKEW_MS", cfg.engine.tt_max_skew_ms)
         cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
+        cfg.engine.http_timeout_s = _Env.get_float("ENGINE_HTTP_TIMEOUT_S", cfg.engine.http_timeout_s)
 
         # Canonique TM — TTL d'exposition (ms)
         ttl_ms_global = _Env.get_int(
@@ -3142,6 +3147,38 @@ class BotConfig:
         pacer_knobs.weight_lag = _Env.get_float("ENGINE_PACER_WEIGHT_LAG", pacer_knobs.weight_lag)
         pacer_knobs.weight_err = _Env.get_float("ENGINE_PACER_WEIGHT_ERR", pacer_knobs.weight_err)
         pacer_knobs.weight_drain = _Env.get_float("ENGINE_PACER_WEIGHT_DRAIN", pacer_knobs.weight_drain)
+        pacer_min_ms_env = _Env.get("ENGINE_PACER_MIN_MS")
+        pacer_max_ms_env = _Env.get("ENGINE_PACER_MAX_MS")
+        pacer_init_ms_env = _Env.get("ENGINE_PACER_INIT_MS")
+        pacer_jitter_ms_env = _Env.get("ENGINE_PACER_JITTER_MS")
+        pacer_min_ms_legacy = _Env.get("ENGINE_PACER_MIN")
+        pacer_max_ms_legacy = _Env.get("ENGINE_PACER_MAX")
+        pacer_init_ms_legacy = _Env.get("ENGINE_PACER_INIT")
+        pacer_jitter_ms_legacy = _Env.get("ENGINE_PACER_JITTER")
+        if pacer_min_ms_env is not None and pacer_min_ms_legacy is not None and pacer_min_ms_env != pacer_min_ms_legacy:
+            logging.getLogger(__name__).warning(
+                "env collision on ENGINE_PACER_MIN_MS vs ENGINE_PACER_MIN; using ENGINE_PACER_MIN_MS"
+            )
+        if pacer_max_ms_env is not None and pacer_max_ms_legacy is not None and pacer_max_ms_env != pacer_max_ms_legacy:
+            logging.getLogger(__name__).warning(
+                "env collision on ENGINE_PACER_MAX_MS vs ENGINE_PACER_MAX; using ENGINE_PACER_MAX_MS"
+            )
+        if pacer_init_ms_env is not None and pacer_init_ms_legacy is not None and pacer_init_ms_env != pacer_init_ms_legacy:
+            logging.getLogger(__name__).warning(
+                "env collision on ENGINE_PACER_INIT_MS vs ENGINE_PACER_INIT; using ENGINE_PACER_INIT_MS"
+            )
+        if pacer_jitter_ms_env is not None and pacer_jitter_ms_legacy is not None and pacer_jitter_ms_env != pacer_jitter_ms_legacy:
+            logging.getLogger(__name__).warning(
+                "env collision on ENGINE_PACER_JITTER_MS vs ENGINE_PACER_JITTER; using ENGINE_PACER_JITTER_MS"
+            )
+        cfg.engine.pacer_min_ms = _Env.get_int("ENGINE_PACER_MIN_MS",
+                                               _Env.get_int("ENGINE_PACER_MIN", cfg.engine.pacer_min_ms))
+        cfg.engine.pacer_max_ms = _Env.get_int("ENGINE_PACER_MAX_MS",
+                                               _Env.get_int("ENGINE_PACER_MAX", cfg.engine.pacer_max_ms))
+        cfg.engine.pacer_init_ms = _Env.get_int("ENGINE_PACER_INIT_MS",
+                                                _Env.get_int("ENGINE_PACER_INIT", cfg.engine.pacer_init_ms))
+        cfg.engine.pacer_jitter_ms = _Env.get_int("ENGINE_PACER_JITTER_MS",
+                                                  _Env.get_int("ENGINE_PACER_JITTER", cfg.engine.pacer_jitter_ms))
         targets_override = _Env.get_dict("ENGINE_PACER_DEFAULT_TARGETS", {})
         if targets_override:
             try:
@@ -3200,6 +3237,12 @@ class BotConfig:
         cfg.pws.PWS_JITTER_MS = _Env.get_int("PWS_JITTER_MS", cfg.pws.PWS_JITTER_MS)
         cfg.pws.PWS_BACKOFF_BASE_MS = _Env.get_int("PWS_BACKOFF_BASE_MS", cfg.pws.PWS_BACKOFF_BASE_MS)
         cfg.pws.PWS_BACKOFF_MAX_MS = _Env.get_int("PWS_BACKOFF_MAX_MS", cfg.pws.PWS_BACKOFF_MAX_MS)
+        cfg.pws.cb_private_poll_interval_s = _Env.get_int(
+            "PWS_CB_PRIVATE_POLL_INTERVAL_S", cfg.pws.cb_private_poll_interval_s
+        )
+        cfg.pws.bybit_ws_private_url = _Env.get(
+            "PWS_BYBIT_WS_PRIVATE_URL", cfg.pws.bybit_ws_private_url
+        )
         cfg.pws.PWS_PACER_EU = _Env.get("PWS_PACER_EU", cfg.pws.PWS_PACER_EU)
         cfg.pws.PWS_PACER_US = _Env.get("PWS_PACER_US", cfg.pws.PWS_PACER_US)
         cfg.pws.PWS_ALERT_PERIOD_S = _Env.get_int("PWS_ALERT_PERIOD_S", cfg.pws.PWS_ALERT_PERIOD_S)

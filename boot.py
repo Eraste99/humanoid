@@ -1804,7 +1804,7 @@ class Boot:
             # Garantit la présence du hub privé avant l'Engine
             if getattr(self.ctx, "pws_hub", None) is None:
                 self.ctx.pws_hub = PrivateWSHub(
-                    getattr(self, "cfg", None),
+                    config=getattr(self, "cfg", None),
                     logger_historique_manager=getattr(self.ctx, "lhm", None),
                 )
 

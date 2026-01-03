@@ -2896,6 +2896,8 @@ def ws_public_note_event_dropped(
         et stream=kind si fourni.
     """
     try:
+        # compat legacy: compteur exchange + reason
+        WS_PUBLIC_DROPPED_TOTAL.labels(exchange=exchange, reason=reason).inc()
         # compteur “dropped” taggé par raison
         ws_public_drop(
             exchange=exchange,

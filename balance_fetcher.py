@@ -115,37 +115,6 @@ except Exception:
         def state(self): return "NORMAL"
     PACER = _P0Pacer()
 
-# ===== Rate limiter (token bucket/min) ======================================
-class _RateLimiter:
-    def __init__(self, per_min: int):
-        self.capacity = max(1, int(per_min))
-        self.tokens = float(self.capacity)
-        self.last = time.time()
-        self._lock = asyncio.Lock()
-
-    async def take(self):
-        extra_sleep = 0.0
-        while True:
-            sleep_needed = 0.0
-            async with self._lock:
-                now = time.time()
-                refill = (now - self.last) * (self.capacity / 60.0)
-                self.tokens = min(self.capacity, self.tokens + refill)
-                self.last = now
-                if self.tokens < 1.0:
-                    sleep_needed = (1.0 - self.tokens) * (60.0 / self.capacity)
-                else:
-                    self.tokens -= 1.0
-                    try:
-                        extra_sleep = float(PACER.clamp("bf_rate"))
-                    except Exception:
-                        extra_sleep = 0.0
-            if sleep_needed > 0.0:
-                await asyncio.sleep(sleep_needed)
-                continue
-            break
-        if extra_sleep > 0.0:
-            await asyncio.sleep(extra_sleep)
 
 
 def _upper(x: Optional[str]) -> str:
@@ -287,7 +256,7 @@ class MultiBalanceFetcher:
 
         # State
         self._running = False
-        self._limiter: Dict[Tuple[str, str], _RateLimiter] = {}
+        self._rl = RateLimiter(getattr(self.cfg, "rl", None))
         self.last_sync_time = time.time()
         self.successful_syncs = 0
         self.error_count = 0
@@ -769,9 +738,13 @@ class MultiBalanceFetcher:
             ok = False
             try:
                 if key is not None:
-                    if key not in self._limiter:
-                        self._limiter[key] = _RateLimiter(self.bf_rate_limit_per_min)
-                    await self._limiter[key].take()
+                    await self._rl.acquire(ex_label, "balances")
+                    try:
+                        extra_sleep = float(PACER.clamp("bf_rate"))
+                    except Exception:
+                        extra_sleep = 0.0
+                    if extra_sleep > 0.0:
+                        await asyncio.sleep(extra_sleep)
 
                 async def _do():
                     assert self._session is not None
