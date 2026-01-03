@@ -190,6 +190,7 @@ class MarketDataRouter:
         vol_heartbeat_s: float = 1.0,
         slip_onchange_bps: float = 7.0,      # proxy simple
         slip_max_hz: float = 5.0,
+        hb_onchange_bps: float = 5.0,
         slip_heartbeat_s: float = 1.5,
         health_heartbeat_s: float = 1.0,
         shard_id: str = "S0",
@@ -231,6 +232,15 @@ class MarketDataRouter:
             coalesce_window_ms = getattr_int(self.router_cfg, "coalesce_window_ms", coalesce_window_ms)
             require_l2_first = getattr_bool(self.router_cfg, "require_l2_first", require_l2_first)
 
+        vol_onchange_bps = getattr_float(self.router_cfg, "vol_onchange_bps", vol_onchange_bps)
+        slip_onchange_bps = getattr_float(self.router_cfg, "slip_onchange_bps", slip_onchange_bps)
+        hb_onchange_bps = getattr_float(self.router_cfg, "hb_onchange_bps", hb_onchange_bps)
+        coalesce_maxlen = getattr_int(self.router_cfg, "coalesce_maxlen", coalesce_maxlen)
+        ws_source_backpressure_cooldown_s = getattr_float(
+            self.router_cfg,
+            "ws_source_backpressure_cooldown_s",
+            ws_source_backpressure_cooldown_s,
+        )
 
         # --- Queues de sortie vers Scanner / Vol / Slip / Health -------------------
         queue_max_spec: int | Dict[str, int] | None = None
@@ -336,6 +346,7 @@ class MarketDataRouter:
         self.slip_max_hz = float(max(0.5, slip_max_hz))
         self.slip_heartbeat_s = float(max(0.5, slip_heartbeat_s))
         self.health_heartbeat_s = float(max(0.5, health_heartbeat_s))
+        self.hb_onchange_bps = float(hb_onchange_bps)
 
         # flags
         self.push_to_scanner = bool(push_to_scanner)

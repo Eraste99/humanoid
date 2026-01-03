@@ -563,8 +563,13 @@ async def discover_pairs_3cex(
 
     # Seuils: si non fournis en args, on lit la conf; sinon on dérive d’un base_min
     base_min = getattr_float(d, "min_24h_volume_usd", 100_000.0)
-    conf_usdc = getattr(d, "min_quote_volume_usdc", None)
-    conf_eur = getattr(d, "min_quote_volume_eur", None)
+    min_by_quote = getattr(d, "min_quote_volume_by_quote", None) or {}
+    conf_usdc = min_by_quote.get("USDC")
+    conf_eur = min_by_quote.get("EUR")
+    if conf_usdc is None:
+        conf_usdc = getattr(d, "min_quote_volume_usdc", None)
+    if conf_eur is None:
+        conf_eur = getattr(d, "min_quote_volume_eur", None)
     eur_factor = getattr_float(d, "eur_quote_volume_factor", 0.30)
     eur_floor = getattr_float(d, "min_quote_volume_floor", 1.0)
 

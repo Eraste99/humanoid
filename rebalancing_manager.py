@@ -181,6 +181,8 @@ class RebalancingManager:
         # Stratégie (legacy conservés)
         self.history_limit = int(history_limit)
         self.target_diff_quote = float(target_diff_quote)
+        if internal_transfer_threshold is None:
+            internal_transfer_threshold = getattr(self.cfg, "rebal_internal_transfer_threshold", 250.0)
         self.internal_transfer_threshold = float(internal_transfer_threshold)
         self.overlay_comp_threshold = float(overlay_comp_threshold)
         self.cross_cex_haircut = float(cross_cex_haircut)
@@ -206,7 +208,9 @@ class RebalancingManager:
         self.rebal_max_ops_per_min: int = int(getattr(self.cfg, "rebal_max_ops_per_min", 6))
         self.rebal_priority: List[str] = list(getattr(self.cfg, "rebal_priority", ["CASH", "CRYPTO", "OVERLAY"]))
         self.rebal_hint_ttl_s: int = int(getattr(self.cfg, "rebal_hint_ttl_s", 120))
-        self._reb_slot_ttl_s: float = float(getattr(self.cfg, "rebal_slot_ttl_s", self.rebal_hint_ttl_s))
+        self._reb_slot_ttl_s: float = float(
+            getattr(self.cfg, "rebal_slot_ttl_s", getattr(self.cfg, "rebal_hint_ttl_s", 120))
+        )
         cfg_min_frag = getattr(self.cfg, "min_fragment_usdc", None)
         cfg_min_map = getattr(self.cfg, "min_fragment_quote", None) or {}
         derived_min = max(cfg_min_map.get(q, 0.0) for q in self.quote_currencies) if cfg_min_map else 0.0

@@ -333,12 +333,14 @@ class Boot:
     def _resolve_transfer_clients(self) -> Optional[Dict[str, Any]]:
         """Retourne un mapping {exchange: client} pour les transferts internes.
 
-        Une seule source : on agrège la config statique (cfg.transfer_clients),
-        puis les instances déjà présentes côté RM si disponibles, et on cache
-        le résultat pour l'utiliser dans le Hub privé et le RiskManager.
+        Source canonique unique pour éviter tout split-brain :
+        - priorité à cfg.transfer_clients si défini,
+        - sinon fallback sur rm.transfer_clients,
+        - collisions (même exchange dans 2 sources) détectées et bloquantes
+          en PROD armée.
         """
 
-        base = dict(self._transfer_clients_cache or {})
+        base = {}
 
         cfg = getattr(self, "cfg", None)
         raw_cfg = getattr(cfg, "transfer_clients", None)
@@ -348,17 +350,40 @@ class Boot:
             except Exception:
                 self.log.exception("[Boot] transfer_clients factory failed")
                 raw_cfg = None
+        base = {}
         if isinstance(raw_cfg, dict):
-            base.update({str(k).upper(): v for k, v in raw_cfg.items() if v})
+            cfg_map = {str(k).upper(): v for k, v in raw_cfg.items() if v}
 
         rm = getattr(self.ctx, "rm", None)
         rm_mapping = getattr(rm, "transfer_clients", None)
-        if rm_mapping:
-            base.update({str(k).upper(): v for k, v in rm_mapping.items() if v})
+        rm_map = {str(k).upper(): v for k, v in (rm_mapping or {}).items() if v}
+
+        collisions = sorted(set(cfg_map.keys()) & set(rm_map.keys()))
+        g_cfg = getattr(cfg, "g", None)
+        mode = str(getattr(g_cfg, "mode", "") or "").upper()
+        live_armed = bool(getattr(g_cfg, "live_trading_armed", False))
+        if collisions:
+            msg = f"transfer_clients collision for exchanges: {collisions}"
+            if mode == "PROD" and live_armed:
+                self.log.error("[Boot] %s (armed PROD) — abort", msg)
+                raise RuntimeError(msg)
+            self.log.warning("[Boot] %s", msg)
+
+        if cfg_map:
+            base = dict(cfg_map)
+            if rm_map and not collisions:
+                extra = sorted(set(rm_map.keys()) - set(cfg_map.keys()))
+                if extra:
+                    self.log.warning(
+                        "[Boot] transfer_clients from RM ignored (cfg is canonical)",
+                        extra={"exchanges": extra},
+                    )
+        else:
+            base = dict(rm_map)
 
         self._transfer_clients_cache = base
 
-        g_cfg = getattr(cfg, "g", None)
+
         enabled = getattr(g_cfg, "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"]) or []
         enabled_norm = [str(ex).upper() for ex in enabled]
         available = sorted(base.keys()) if base else []
@@ -366,7 +391,11 @@ class Boot:
 
         if available:
             try:
-                self.log.info("[Boot] transfer clients available", extra={"exchanges": available})
+                source = "cfg.transfer_clients" if cfg_map else "rm.transfer_clients" if rm_map else "none"
+                self.log.info(
+                    "[Boot] transfer clients available",
+                    extra={"exchanges": available, "source": source},
+                )
             except Exception:
                 self.log.info("[Boot] transfer clients available: %s", available)
         if missing:
@@ -964,7 +993,11 @@ class Boot:
         if use_discovery:
             try:
 
-                pairs_map, discovered, disc_result = await discover_pairs_3cex(self.cfg, include_result=True)
+                pairs_map, discovered, disc_result = await discover_pairs_3cex(
+                    self.cfg,
+                    top_n=top_n,
+                    include_result=True,
+                )
                 if top_n > 0 and len(discovered) > top_n:
                     discovered = discovered[:top_n]
                 self.log.info("[Boot] discovery: %d pairs (top_n=%d)", len(discovered), top_n)
@@ -1515,11 +1548,10 @@ class Boot:
             engine_real,
             rm_dry_run,
         )
-        if live:
-            rm = getattr(self.ctx, "rm", None)
-            cb = getattr(rm, "on_scanner_opportunity", None) if rm else None
-            if callable(cb):
-                self.ctx.scanner.on_opportunity = cb
+        rm = getattr(self.ctx, "rm", None)
+        cb = getattr(rm, "handle_opportunity", None) if rm else None
+        if callable(cb):
+            self.ctx.scanner.on_opportunity = cb
         self._bind_lhm_sinks()
         with contextlib.suppress(Exception):
             lhm = getattr(self.ctx, "lhm", None)

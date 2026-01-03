@@ -764,13 +764,16 @@ async def main() -> None:
     dep_mode    = str(getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY")).upper()
     cap_profile = str(getattr(cfg, "CAPITAL_PROFILE", "NANO")).upper()
     restart_mode = str(getattr(cfg, "RESTART_MODE", "HYBRID")).upper()
-    mode_value = str(getattr(cfg, "MODE", "PROD")).upper()
-    live_trading_armed = _cfg_bool(cfg, "LIVE_TRADING_ARMED", False)
+    mode_value = str(cfg.g.mode).upper()
+    live_trading_armed = bool(cfg.g.live_trading_armed)
     raw = getattr(cfg, "TELEGRAM_REQUIRE_ACK", 1)
 
     if mode_value == "PROD" and not live_trading_armed:
         log.error("[Main] MODE=PROD sans LIVE_TRADING_ARMED — arrêt immédiat")
         raise ConfigError("CONFIG_SCHEMA_INVALID", "mode")
+    if live_trading_armed and not bool(getattr(cfg.lhm, "ff_fail_closed_logging", False)):
+        log.error("[Main] LIVE_TRADING_ARMED exige FF_FAIL_CLOSED_LOGGING — arrêt immédiat")
+        raise ConfigError("CONFIG_SCHEMA_INVALID", "ff_fail_closed_logging")
 
     # DRY-RUN: ne pas bloquer sur ACK par défaut ; PROD: ACK requis par défaut
     _default_ack = (mode_value != "DRY_RUN")

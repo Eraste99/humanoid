@@ -109,7 +109,7 @@ RM_REASON_PRIORITY = (
     "RM_REGION_UNSUPPORTED",
     "TT_CONTRACT_INVALID",
     "TM_CONTRACT_INVALID",
-    "REB_CONTRACT_INVALID"
+    "REB_CONTRACT_INVALID",
     "RM_REGION_UNKNOWN",
 
     # B) Readiness
@@ -1796,6 +1796,12 @@ class RiskManager:
         self.t_bal = float(lc.get("balances_interval", 5.0))
         self.t_rebal = float(lc.get("rebal_interval", 2.0))
         self.t_fee = float(lc.get("fee_sync_interval", fee_sync_interval or 600.0))
+        self.t_mode = float(
+            lc.get(
+                "mode_interval",
+                getattr(getattr(self.cfg, "rm", None), "mode_tick_interval_s", 1.0),
+            )
+        )
         self._last_fee_sync = 0.0
 
         # Rebalancing orchestration (TTL/cooldown)
@@ -1837,14 +1843,19 @@ class RiskManager:
         self._decision_id_cache: Dict[str, Dict[str, str]] = {}
 
         # Routes autorisées tri-CEX (configurable)
-        self.allowed_routes: Set[Tuple[str, str]] = set(getattr(
-            config, "allowed_routes",
-            {
+        raw_allowed_routes = (
+                getattr(getattr(self.cfg, "g", None), "allowed_routes", None)
+                or getattr(config, "allowed_routes", None)
+                or {
                 ("BINANCE", "BYBIT"), ("BYBIT", "BINANCE"),
                 ("BINANCE", "COINBASE"), ("COINBASE", "BINANCE"),
                 ("BYBIT", "COINBASE"), ("COINBASE", "BYBIT"),
             }
-        ))
+        )
+        self.allowed_routes: Set[Tuple[str, str]] = {
+            (str(a).upper(), str(b).upper())
+            for (a, b) in (raw_allowed_routes or [])
+        }
         self._sync_simulator_allowed_routes()
         # 1) s'assurer qu'on a un rebal_mgr dispo
         _mk_rebal_mgr_if_missing(self)
@@ -1876,11 +1887,12 @@ class RiskManager:
         self._inflight: Set[Tuple[str, str, str]] = set()
 
         # Seuil dynamique min_required_bps
-        self.dynamic_min_required = bool(getattr(config, "dynamic_min_required", True))
-        self.base_min_bps = _cfg_float(config, "base_min_bps", 20.0)
-        self.dynamic_K = _cfg_float(config, "dynamic_K", 0.3)
-        self.min_bps_floor = _cfg_float(config, "min_bps_floor", 10.0)
-        self.min_bps_cap = _cfg_float(config, "min_bps_cap", 60.0)
+        rm_cfg = _cfg_rm(self)
+        self.dynamic_min_required = bool(getattr(rm_cfg, "dynamic_min_required", True))
+        self.base_min_bps = _cfg_float(rm_cfg, "base_min_bps", 20.0)
+        self.dynamic_K = _cfg_float(rm_cfg, "dynamic_k", 0.3)
+        self.min_bps_floor = _cfg_float(rm_cfg, "min_bps_floor", 10.0)
+        self.min_bps_cap = _cfg_float(rm_cfg, "min_bps_cap", 60.0)
 
         # Caps d’inventaire / skew guard (cap interprété en **devise de cotation**)
         self.inventory_cap_usd = _cfg_float(config, "inventory_cap_usd", 1500.0)
@@ -4763,6 +4775,16 @@ class RiskManager:
                 # - On coupe les branches non critiques (MM) sur alias dégradé.
                 # - TT / TM / REB passent encore mais marqués en overlay pour dashboard.
                 self._obs_balance_ttl_breach(ex_ttl, alias_ttl, status)
+                try:
+                    ttl_cap_factor = float(self._get_alias_ttl_cap_factor(status, branch))
+                except Exception:
+                    ttl_cap_factor = 1.0
+                if ttl_cap_factor < 0.0:
+                    ttl_cap_factor = 0.0
+                if ttl_cap_factor > 1.0:
+                    ttl_cap_factor = 1.0
+                if ttl_cap_factor < alias_cap_factor:
+                    alias_cap_factor = ttl_cap_factor
 
                 if branch == "MM":
                     reason_ttl = f"BALANCE_TTL_DEGRADED:{ex_ttl}.{alias_ttl}"
@@ -4775,9 +4797,9 @@ class RiskManager:
                         age_s,
                         capital_at_risk,
                     )
-                if self._shadow:
-                    self._shadow.on_bundle_drop(bundle, reason_ttl)
-                return False
+                    if self._shadow:
+                        self._shadow.on_bundle_drop(bundle, reason_ttl)
+                    return False
 
             # Pour les branches critiques, on laisse passer mais on taggue l'overlay.
         overlays = meta.setdefault("overlays", {})
@@ -6611,6 +6633,18 @@ class RiskManager:
 
             # Condition 1: balance fraîche -> transfert visible.
             if age_s > 0.0 and age_s <= self._balance_ttl_s_normal:
+                if transfer_ids and isinstance(payloads, dict):
+                    pending_wallet = False
+                    for transfer_id in transfer_ids:
+                        payload = payloads.get(str(transfer_id)) if isinstance(payloads, dict) else None
+                        if str((payload or {}).get("type") or "").lower() in (
+                                "internal_wallet_transfer",
+                                "wallet_transfer",
+                        ):
+                            pending_wallet = True
+                            break
+                    if pending_wallet:
+                        continue
                 # On mesure la latence observée entre l'event de transfert et la
                 # première balance fraîche.
                 latency_s = max(0.0, now - start_ts) if start_ts > 0.0 else 0.0
@@ -7395,7 +7429,9 @@ class RiskManager:
             asyncio.create_task(self._loop_balances(), name="rm-balances"),
             asyncio.create_task(self._loop_rebalancing(), name="rm-rebalancing"),
             asyncio.create_task(self._loop_volatility(), name="rm-volatility"),
+            asyncio.create_task(self._loop_mode(), name="rm-mode"),
             asyncio.create_task(self._loop_fee_sync(), name="rm-fee-sync"),
+
         ]
 
         # Hook scanner -> RM
@@ -8436,7 +8472,97 @@ class RiskManager:
         self._emit_decision_record(status_final, primary_reason, opp, ctx)
 
     # =============================================================================
+    async def submit_bundle_from_rpc(self, payload: dict) -> dict:
+        def _bundle_ack(ok: bool, reason: str = "") -> dict:
+            meta = bundle.get("meta") or {}
+            return {
+                "trace_id": meta.get("trace_id") or bundle.get("trace_id"),
+                "decision_id": meta.get("decision_id") or bundle.get("decision_id"),
+                "bundle_id": meta.get("bundle_id") or bundle.get("bundle_id"),
+                "idempotency_key": meta.get("idempotency_key") or bundle.get("idempotency_key"),
+                "state": "ENGINE_ACCEPTED" if ok else "ENGINE_REJECTED",
+                "reason_code": reason or None,
+            }
 
+        if not isinstance(payload, dict):
+            bundle = {}
+            return _bundle_ack(False, BUNDLE_ILLEGAL)
+
+        bundle = dict(payload)
+        meta = bundle.get("meta") or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        route = bundle.get("route") or {}
+        if not isinstance(route, dict):
+            route = {}
+        if not route:
+            route = {
+                "pair": bundle.get("pair") or bundle.get("symbol") or meta.get("pair") or meta.get("symbol"),
+                "buy_ex": bundle.get("buy_ex") or bundle.get("buy_exchange") or meta.get("buy_ex"),
+                "sell_ex": bundle.get("sell_ex") or bundle.get("sell_exchange") or meta.get("sell_ex"),
+            }
+        bundle["route"] = route
+
+        branch = str(bundle.get("branch") or meta.get("branch") or meta.get("strategy") or "TT").upper()
+        profile = str(
+            bundle.get("profile") or meta.get("profile") or getattr(self, "capital_profile", "LARGE") or "LARGE"
+        ).upper()
+        meta.setdefault("branch", branch)
+        meta.setdefault("profile", profile)
+        if route.get("pair"):
+            meta.setdefault("pair", route.get("pair"))
+        if route.get("buy_ex"):
+            meta.setdefault("buy_ex", route.get("buy_ex"))
+        if route.get("sell_ex"):
+            meta.setdefault("sell_ex", route.get("sell_ex"))
+        bundle["meta"] = meta
+
+        if getattr(self, "trading_ready_event", None) and not self.trading_ready_event.is_set():
+            reason = normalize_reason_code("TRADING_NOT_READY") or "TRADING_NOT_READY"
+            return _bundle_ack(False, reason)
+
+        try:
+            self._ensure_ready()
+        except NotReadyError:
+            return _bundle_ack(False, RM_ENGINE_NOT_READY)
+
+        if branch == "TT" and not bool(getattr(self.cfg, "enable_tt", getattr(self, "enable_tt", True))):
+            return _bundle_ack(False, RM_CAP_BRANCH_DISABLED)
+        if branch == "TM" and not bool(getattr(self.cfg, "enable_tm", getattr(self, "enable_tm", True))):
+            return _bundle_ack(False, RM_CAP_BRANCH_DISABLED)
+        if branch == "MM" and not bool(getattr(self.cfg, "enable_mm", getattr(self, "enable_mm", False))):
+            return _bundle_ack(False, "MM_DISABLED")
+        if branch == "REB" and not bool(getattr(self.cfg, "enable_reb", getattr(self, "enable_reb", True))):
+            return _bundle_ack(False, RM_CAP_BRANCH_DISABLED)
+
+        legal, legal_reason = self._is_bundle_legal(bundle)
+        if not legal:
+            return _bundle_ack(False, legal_reason or BUNDLE_ILLEGAL)
+
+        notional_quote = bundle.get("notional_quote") or {}
+        if isinstance(notional_quote, dict) and "ccy" in notional_quote and "quote" not in notional_quote:
+            notional_quote = dict(notional_quote)
+            notional_quote["quote"] = notional_quote.get("ccy")
+
+        opp = {
+            "pair": route.get("pair") or meta.get("pair"),
+            "buy_exchange": route.get("buy_ex") or meta.get("buy_ex"),
+            "sell_exchange": route.get("sell_ex") or meta.get("sell_ex"),
+            "notional_quote": notional_quote,
+            "branch": branch,
+            "expected_net_bps": {"best": branch},
+        }
+        admit, reason, _ctx = self._preflight_gate(opp)
+        if not admit:
+            return _bundle_ack(False, reason)
+
+        decision_ctx: Dict[str, Any] = {"submitted": False, "attempted": False, "reasons": []}
+        ok = self.engine_enqueue_bundle(bundle, decision_ctx=decision_ctx)
+        reasons = decision_ctx.get("reasons") or []
+        primary_reason = _rm_pick_reason(*reasons) if reasons else ""
+        return _bundle_ack(bool(ok), primary_reason)
+
+    # =============================================================================
     async def rebalance_tick(self) -> None:
         """
         Tick manuel de la boucle rebalancing, utile en mode “piloté”.
@@ -9295,6 +9421,16 @@ class RiskManager:
                 self._mark_loop_error("volatility", e)
             await asyncio.sleep(self.t_vol)
 
+    async def _loop_mode(self) -> None:
+        interval_s = float(getattr(self, "t_mode", 1.0) or 1.0)
+        if interval_s <= 0.0:
+            interval_s = 1.0
+        while self._running:
+            try:
+                self._tick_mode()
+            except Exception:
+                logger.exception("[RiskManager] _tick_mode failed", exc_info=False)
+            await asyncio.sleep(interval_s)
     # ===================== Revalidation & Profitability API =====================
     def _apply_mode_overrides(self) -> None:
         """
@@ -9336,7 +9472,8 @@ class RiskManager:
             trade_ov = dict(self._overlay.get("SEVERE", {}))
 
         # 1) Min bps dynamiques
-        base_tt = float(getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 6.5)))
+        rm_cfg = getattr(self.cfg, "rm", None)
+        base_tt = float(getattr(self, "base_min_bps", getattr(rm_cfg, "base_min_bps", 6.5)))
         delta_tt = float(trade_ov.get("tt_min_bps_delta", 0.0))
         self.base_min_bps = max(0.0, base_tt + delta_tt)
 
@@ -10975,7 +11112,15 @@ class RiskManager:
             from_wallet = (op.get("from") or {}).get("wallet") or op.get("from_wallet")
             to_wallet = (op.get("to") or {}).get("wallet") or op.get("to_wallet")
             if from_wallet or to_wallet:
+                if not from_alias or not to_alias or from_alias != to_alias:
+                    logger.warning(
+                        "[RiskManager] overlay wallet transfer refused (alias mismatch): %s -> %s",
+                        from_alias,
+                        to_alias,
+                    )
+                    return
                 transfer_op.update({
+                    "alias": from_alias,
                     "from_wallet": str(from_wallet or "").upper() or "SPOT",
                     "to_wallet": str(to_wallet or "").upper() or "FUNDING",
                 })
@@ -11482,7 +11627,7 @@ class RiskManager:
                     expires_ts_ms = int(time.time() * 1000 + (self._transfer_controller._submitted_timeout_s * 1000.0))
                 except Exception:
                     expires_ts_ms = None
-            if status in ("SETTLED", "COMPLETED"):
+            if status in ("SETTLED", "COMPLETED") and bool(payload.get("pws_transfer")):
                 self._transfer_controller.mark_settled(transfer_id, payload=payload)
                 if self.rebalancing and hasattr(self.rebalancing, "mark_transfer_status"):
                     self.rebalancing.mark_transfer_status(transfer_id, "SETTLED")
@@ -11642,7 +11787,22 @@ class RiskManager:
 
     async def _exec_internal_wallet_transfer(self, op: Dict[str, Any]) -> None:
         ex = str(op.get("exchange")).upper()
-        alias = str(op.get("alias") or op.get("account_alias") or "TT").upper()
+        alias = str(op.get("alias") or op.get("account_alias") or "").upper()
+        from_alias = str(op.get("from_alias") or "").upper()
+        to_alias = str(op.get("to_alias") or "").upper()
+        if from_alias and to_alias and from_alias != to_alias:
+            logger.warning(
+                "[RiskManager] wallet transfer alias mismatch (%s != %s) for %s",
+                from_alias,
+                to_alias,
+                ex,
+            )
+            return
+        if not alias:
+            alias = from_alias or to_alias
+        if not alias:
+            logger.warning("[RiskManager] wallet transfer missing alias for %s", ex)
+            return
         from_wallet = str(op.get("from_wallet") or "SPOT").upper()
         to_wallet = str(op.get("to_wallet") or "FUNDING").upper()
         ccy = str(op.get("ccy") or "USDC").upper()
@@ -11670,12 +11830,25 @@ class RiskManager:
                 "type": "internal_wallet_transfer",
                 "exchange": ex,
                 "alias": alias,
+                "from_alias": alias,
+                "to_alias": alias,
                 "from_wallet": from_wallet,
                 "to_wallet": to_wallet,
                 "ccy": ccy,
                 "amount": amount,
-                "transfer_id": op.get("transfer_id"),
+
             }
+            expected_id = TransferController.canonical_transfer_id(payload)
+            transfer_id = op.get("transfer_id")
+            if transfer_id and transfer_id != expected_id:
+                logger.warning(
+                    "[RiskManager] wallet transfer_id mismatch (%s != %s) for %s",
+                    transfer_id,
+                    expected_id,
+                    ex,
+                )
+                return
+            payload["transfer_id"] = transfer_id or expected_id
             outcome = await self._transfer_controller.submit(
                 payload=payload,
                 submit_fn=_submit,
@@ -12629,9 +12802,9 @@ class RiskManager:
         # REB: on laisse min_required_bps à 0, la politique de perte finale est gérée ailleurs
         if strat == "REB":
             return 0.0
-
+        rm_cfg = getattr(self.cfg, "rm", None)
         base_tt = float(getattr(self, "base_min_bps",
-                                getattr(self.cfg, "base_min_bps", 20.0)))
+                                getattr(rm_cfg, "base_min_bps", 20.0)))
         base_tm = float(getattr(self, "tm_min_required_bps",
                                 getattr(self.cfg, "tm_min_required_bps_base", 11.0)))
 
@@ -12835,12 +13008,13 @@ class RiskManager:
                         try:
                             min_required_bps = self._dynamic_min_required_bps(pk)
                         except Exception:
+                            rm_cfg = getattr(self.cfg, "rm", None)
                             min_required_bps = float(
-                                getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0))
+                                getattr(self, "base_min_bps", getattr(rm_cfg, "base_min_bps", 20.0))
                             )
                     else:
                         min_required_bps = 0.0 if is_rebalancing else float(
-                            getattr(self, "base_min_bps", getattr(self.cfg, "base_min_bps", 20.0))
+                            getattr(self, "base_min_bps", getattr(getattr(self.cfg, "rm", None), "base_min_bps", 20.0))
                         )
 
                 # VM adjustments (boost threshold)

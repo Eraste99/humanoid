@@ -249,6 +249,7 @@ class Globals:
 
     pacer_mode: str = "NORMAL"
     mode: str = "DRY_RUN"  # DRY_RUN | PROD
+    live_trading_armed: bool = False
     feature_switches: Dict[str,bool] = field(default_factory=lambda: {
         "private_ws": False,
         "balance_fetcher": False,
@@ -334,6 +335,11 @@ class RouterCfg:
     # P0: cadence cible ≈ 5 ms
     mux_poll_ms: int = 5
     require_l2_first: bool = True
+    vol_onchange_bps: float = 2.5
+    slip_onchange_bps: float = 7.0
+    hb_onchange_bps: float = 1.0
+    coalesce_maxlen: int = 3
+    ws_source_backpressure_cooldown_s: float = 5.0
     # P0: matrix de comportement par tier, pilotée par env (ROUTER_DROP_POLICY)
     drop_policy: Dict[str, Any] = field(default_factory=lambda: {
         "CORE": "never",
@@ -375,6 +381,10 @@ class WsPublicCfg:
     pong_timeout_s: int = 10
     auto_resubscribe: bool = True
     max_retries: int = 0  # 0 = infini (avec backoff)
+    out_queue_put_timeout_s: float = 0.05
+    staleness_interval_s: float = 1.0
+    staleness_slo_s: Optional[float] = None
+    disabled_exchanges: List[str] = field(default_factory=list)
 
 # --- Watchdogs ---
 @dataclass
@@ -590,6 +600,7 @@ class ScannerCfg:
     max_pairs_per_tick: int = 150
     scan_interval: float = 0.02
     max_time_skew_s: float = 0.3
+    rm_ack_timeout_s: float = 0.0
 
     # P0: dimensionnement des deques par tier
     deque_max_core: int = 1800
@@ -703,6 +714,15 @@ class RiskManagerCfg:
     enable_tm: bool = True
     enable_mm: bool = False
     enable_reb: bool = True
+    base_min_bps: float = 20.0
+    dynamic_k: float = 0.3
+    min_bps_floor: float = 10.0
+    min_bps_cap: float = 60.0
+    ttl_factor_tt_degraded: float = 0.5
+    ttl_factor_tm_degraded: float = 0.4
+    ttl_factor_reb_degraded: float = 0.3
+    ttl_factor_mm_degraded: float = 0.0
+    mode_tick_interval_s: float = 1.0
     enable_maker_maker: bool = False
     ff_trading_state_unified: bool = False
     branch_priority: List[str] = field(default_factory=lambda: ["tt","tm","reb","mm"])
@@ -1228,12 +1248,14 @@ class PrivateWSHubCfg:
 class RebalancingCfg:
     # Utilisé par le chantier M6-B (REB via hints, RM → Simu → Engine)
     rebal_quantum_min_quote: float = 50.0
+    rebal_internal_transfer_threshold: float = 250.0
     # Cadence REB max (opérations/min). Doit rester bornée par inflight_rebal
     # multiplié par un ratio simple (cf. _sanity_check_rm_caps, ratio=3 par défaut).
     rebal_max_ops_per_min: int = 6
     rebal_ops_per_min_ratio: float = 3.0
     rebal_priority: List[str] = field(default_factory=lambda: ["CASH","CRYPTO","OVERLAY"])
     rebal_hint_ttl_s: int = 120
+    rebal_slot_ttl_s: float = 120.0
     rebal_snapshots_missing_error_s: float = 45.0
     rebal_snapshots_error_cooldown_s: float = 60.0
     rebal_quantum_quote_map: Dict[str, float] = field(default_factory=lambda: {"USDC": 250.0, "EUR": 250.0})
@@ -1635,6 +1657,13 @@ class BotConfig:
         return self.alerting.webhook
 
     @property
+    def MODE(self) -> str:
+        return str(getattr(self.g, "mode", "DRY_RUN"))
+
+    @property
+    def LIVE_TRADING_ARMED(self) -> bool:
+        return bool(getattr(self.g, "live_trading_armed", False))
+    @property
     def DESK_REBAL_POLICY(self) -> Dict[str, Any]:
         """
         Vue agrégée des paramètres de rebalancing (REB) pour pilotage "desk".
@@ -1717,6 +1746,7 @@ class BotConfig:
         g.min_fragment_quote = {k: float(v) for k,v in _Env.get_dict("MIN_FRAGMENT_QUOTE", g.min_fragment_quote).items()}
         g.guards = _Env.get_dict("GUARDS", g.guards)
         _vol_slip_ttl_env = _Env.get("VOL_SLIP_TTL", None)
+
         g.vol_slip_ttl = _Env.get_dict("VOL_SLIP_TTL", g.vol_slip_ttl)
         _slip_ttl_env = _Env.get("SLIP_TTL_S", None)
         _vol_ttl_env = _Env.get("VOL_TTL_S", None)
@@ -1743,9 +1773,22 @@ class BotConfig:
 
         g.ac = _Env.get_dict("AC_CONFIG", g.ac)
         g.mode = _Env.get("MODE", g.mode)
+        g.live_trading_armed = _Env.get_bool("LIVE_TRADING_ARMED", g.live_trading_armed)
         # 👇 Ajoute ce bloc de compat
         if str(g.mode).upper() in ("DEV", "DEVELOPMENT"):
             g.mode = "DRY_RUN"
+        mode_upper = str(g.mode or "").upper()
+
+        def _conflict_or_warn(key_a: str, key_b: str, *, field: str, prefer: str) -> None:
+            if _Env.get(key_a, None) is None or _Env.get(key_b, None) is None:
+                return
+            msg = f"Conflicting env keys for {field}: {key_a} + {key_b} (prefer {prefer})"
+            if mode_upper == "PROD":
+                raise ConfigError("CONFIG_SCHEMA_INVALID", field)
+            logging.getLogger(__name__).warning(msg)
+
+        _conflict_or_warn("VOL_SLIP_TTL", "SLIP_TTL_S", field="vol_slip_ttl", prefer="VOL_SLIP_TTL")
+        _conflict_or_warn("VOL_SLIP_TTL", "VOL_TTL_S", field="vol_slip_ttl", prefer="VOL_SLIP_TTL")
         if _pod_region_env is None and _region_alias_env is not None:
             logging.getLogger(__name__).warning(
                 "REGION (legacy) utilisé faute de POD_REGION; privilégier POD_REGION",
@@ -1844,7 +1887,22 @@ class BotConfig:
         )
         cfg.router.mux_poll_ms = _Env.get_int("ROUTER_MUX_POLL_MS", cfg.router.mux_poll_ms)
         cfg.router.require_l2_first = _Env.get_bool("ROUTER_REQUIRE_L2_FIRST", cfg.router.require_l2_first)
-        cfg.router.drop_policy = _Env.get_dict("ROUTER_DROP_POLICY", cfg.router.drop_policy)
+        cfg.router.vol_onchange_bps = _Env.get_float("ROUTER_VOL_ONCHANGE_BPS", cfg.router.vol_onchange_bps)
+        cfg.router.slip_onchange_bps = _Env.get_float("ROUTER_SLIP_ONCHANGE_BPS", cfg.router.slip_onchange_bps)
+        cfg.router.hb_onchange_bps = _Env.get_float("ROUTER_HB_ONCHANGE_BPS", cfg.router.hb_onchange_bps)
+        cfg.router.coalesce_maxlen = _Env.get_int("ROUTER_COALESCE_MAXLEN", cfg.router.coalesce_maxlen)
+        cfg.router.ws_source_backpressure_cooldown_s = _Env.get_float(
+            "ROUTER_WS_SOURCE_BACKPRESSURE_COOLDOWN_S",
+            cfg.router.ws_source_backpressure_cooldown_s,
+        )
+        drop_policy_raw = _Env.get("ROUTER_DROP_POLICY", None)
+        drop_policy_default = dict(cfg.router.drop_policy)
+        if drop_policy_raw is not None:
+            drop_policy = _Env.get_dict("ROUTER_DROP_POLICY", cfg.router.drop_policy)
+            mode = str(getattr(getattr(cfg, "g", None), "mode", "") or "").upper()
+            if mode == "PROD" and drop_policy != drop_policy_default:
+                raise ConfigError("CONFIG_SCHEMA_INVALID", "router.drop_policy")
+            cfg.router.drop_policy = drop_policy
         cfg.router.deque_maxlen_per_ex = _Env.get_dict("ROUTER_DEQUE_MAXLEN_PER_EX", cfg.router.deque_maxlen_per_ex)
         cfg.router.backpressure = _Env.get_dict("ROUTER_BACKPRESSURE", cfg.router.backpressure)
         cfg.router.cb_coalesce_bump_ms = _Env.get_int(
@@ -1871,6 +1929,21 @@ class BotConfig:
             "WS_UPDATE_PAIRS_JITTER_MS", cfg.ws_public.update_pairs_jitter_ms
         )
         cfg.ws_public.connect_timeout_s = _Env.get_int("WS_CONNECT_TIMEOUT_S", cfg.ws_public.connect_timeout_s)
+        cfg.ws_public.out_queue_put_timeout_s = _Env.get_float(
+            "WS_OUT_QUEUE_PUT_TIMEOUT_S", cfg.ws_public.out_queue_put_timeout_s
+        )
+        cfg.ws_public.staleness_interval_s = _Env.get_float(
+            "WS_STALENESS_INTERVAL_S", cfg.ws_public.staleness_interval_s
+        )
+        _slo_env = _Env.get("WS_STALENESS_SLO_S", None)
+        cfg.ws_public.staleness_slo_s = (
+            float(_slo_env)
+            if _slo_env is not None
+            else cfg.ws_public.staleness_slo_s
+        )
+        cfg.ws_public.disabled_exchanges = _Env.get_list(
+            "WS_DISABLED_EXCHANGES", cfg.ws_public.disabled_exchanges
+        )
         cfg.ws_public.read_timeout_s = _Env.get_int("WS_READ_TIMEOUT_S", cfg.ws_public.read_timeout_s)
         # Budget journalier par stratégie (en quote, ex: {"TT": 1_000_000, "TM": 500_000})
         cfg.rm.daily_strategy_budget_quote = _Env.get_dict(
@@ -2125,12 +2198,21 @@ class BotConfig:
         cfg.discovery.retry_policy = _Env.get_dict("DISCOVERY_RETRY_POLICY", cfg.discovery.retry_policy)
         cfg.discovery.max_inflight_requests = _Env.get_int("DISCOVERY_MAX_INFLIGHT", cfg.discovery.max_inflight_requests)
         cfg.discovery.quotes_allowed = _Env.get_list("DISCOVERY_QUOTES_ALLOWED", cfg.discovery.quotes_allowed)
-        cfg.discovery.min_24h_volume_usd = _Env.get_float("DISCOVERY_MIN_24H_VOL_USD", cfg.discovery.min_24h_volume_usd)
-        # Alias compat pour l’ancienne clé (avec "VOLUME")
-        cfg.discovery.min_24h_volume_usd = _Env.get_float(
+        _conflict_or_warn(
+            "DISCOVERY_MIN_24H_VOL_USD",
             "DISCOVERY_MIN_24H_VOLUME_USD",
-            cfg.discovery.min_24h_volume_usd
+            field="discovery.min_24h_volume_usd",
+            prefer="DISCOVERY_MIN_24H_VOL_USD",
         )
+        cfg.discovery.min_24h_volume_usd = _Env.get_float(
+            "DISCOVERY_MIN_24H_VOL_USD", cfg.discovery.min_24h_volume_usd
+        )
+        # Alias compat pour l’ancienne clé (avec "VOLUME")
+        if _Env.get("DISCOVERY_MIN_24H_VOL_USD", None) is None:
+            cfg.discovery.min_24h_volume_usd = _Env.get_float(
+                "DISCOVERY_MIN_24H_VOLUME_USD",
+                cfg.discovery.min_24h_volume_usd,
+            )
 
         # NEW: seuils quote-aware
         cfg.discovery.min_quote_volume_usdc = _Env.get_float(
@@ -2159,9 +2241,13 @@ class BotConfig:
         if pairs_list:
             cfg.g.pairs = [str(p).strip().upper() for p in pairs_list if str(p).strip()]
 
-        # fallback: se PAIRS assente ma hai PAIR_WHITELIST popolata, usa quella
-        if not getattr(cfg.g, "pairs", None) and getattr(cfg.g, "pair_whitelist", None):
-            cfg.g.pairs = list(cfg.g.pair_whitelist)
+        if cfg.g.pairs and cfg.g.pair_whitelist:
+            msg = "PAIR_WHITELIST ignored because PAIRS is set"
+            if mode_upper == "PROD":
+                raise ConfigError("CONFIG_SCHEMA_INVALID", "pair_whitelist")
+            logging.getLogger(__name__).warning(msg)
+        if cfg.g.pair_whitelist and not cfg.discovery.whitelist:
+            cfg.discovery.whitelist = list(cfg.g.pair_whitelist)
 
         # --- RM caps richiesti dal RiskManager (canonique cfg.rm avec compat racine) ---
         def _float_or_none(name: str):
@@ -2312,6 +2398,26 @@ class BotConfig:
         cfg.RM_PWS_FILL_LATENCY_SEVERE_MS = _Env.get_float(
             "RM_PWS_FILL_LATENCY_SEVERE_MS",
             getattr(cfg, "RM_PWS_FILL_LATENCY_SEVERE_MS", 1200.0),
+        )
+        cfg.rm.base_min_bps = _Env.get_float("RM_BASE_MIN_BPS", cfg.rm.base_min_bps)
+        cfg.rm.dynamic_k = _Env.get_float("RM_DYNAMIC_K", cfg.rm.dynamic_k)
+        cfg.rm.min_bps_floor = _Env.get_float("RM_MIN_BPS_FLOOR", cfg.rm.min_bps_floor)
+        cfg.rm.min_bps_cap = _Env.get_float("RM_MIN_BPS_CAP", cfg.rm.min_bps_cap)
+        cfg.rm.ttl_factor_tt_degraded = _Env.get_float(
+            "RM_TTL_FACTOR_TT_DEGRADED", cfg.rm.ttl_factor_tt_degraded
+        )
+        cfg.rm.ttl_factor_tm_degraded = _Env.get_float(
+            "RM_TTL_FACTOR_TM_DEGRADED", cfg.rm.ttl_factor_tm_degraded
+        )
+        cfg.rm.ttl_factor_reb_degraded = _Env.get_float(
+            "RM_TTL_FACTOR_REB_DEGRADED", cfg.rm.ttl_factor_reb_degraded
+        )
+        cfg.rm.ttl_factor_mm_degraded = _Env.get_float(
+            "RM_TTL_FACTOR_MM_DEGRADED", cfg.rm.ttl_factor_mm_degraded
+        )
+        cfg.rm.mode_tick_interval_s = _Env.get_float(
+            "RM_MODE_TICK_INTERVAL_S",
+            getattr(cfg.rm, "mode_tick_interval_s", 1.0),
         )
 
         # Min % fee tokens utilisé par RM (fallback si non piloté via balances.*)
@@ -2472,22 +2578,6 @@ class BotConfig:
 
 
         # --- Discovery : configuration centrale de l'univers -----------------
-        # Volumes minimaux 24h (USD) et par quote
-        cfg.discovery.min_24h_volume_usd = float(
-            _Env.get("DISCOVERY_MIN_24H_VOLUME_USD", cfg.discovery.min_24h_volume_usd)
-        )
-        cfg.discovery.min_quote_volume_usdc = float(
-            _Env.get(
-                "DISCOVERY_MIN_QUOTE_VOLUME_USDC",
-                cfg.discovery.min_quote_volume_usdc or cfg.discovery.min_24h_volume_usd,
-            )
-        )
-        cfg.discovery.min_quote_volume_eur = float(
-            _Env.get(
-                "DISCOVERY_MIN_QUOTE_VOLUME_EUR",
-                cfg.discovery.min_quote_volume_eur or cfg.discovery.min_24h_volume_usd,
-            )
-        )
 
         # Facteur EUR vs USD et plancher absolu pour la quote EUR
         # (évitons un EUR ridiculement bas même si base_min est petit)
@@ -2573,6 +2663,9 @@ class BotConfig:
         cfg.scanner.max_time_skew_s = _Env.get_float(
             "SCANNER_MAX_TIME_SKEW_S", cfg.scanner.max_time_skew_s
         )
+        cfg.scanner.rm_ack_timeout_s = _Env.get_float(
+            "SCANNER_RM_ACK_TIMEOUT_S", cfg.scanner.rm_ack_timeout_s
+        )
 
         # P0: fréquences d'évaluation par tier
         cfg.scanner.scanner_eval_hz_primary = _Env.get_float(
@@ -2595,16 +2688,29 @@ class BotConfig:
         # mais en propageant vers ScannerCfg pour garder une source unique.
 
         # --- Scanner / agrégateurs P0 (Ticket 6.A) ----------------------------
+        raw_scanner_hz = _Env.get("SCANNER_HZ", None)
         cfg.SCANNER_HZ = _Env.get_dict("SCANNER_HZ", getattr(cfg, "SCANNER_HZ", {}))
         cfg.SCANNER_DEQUE_MAX = _Env.get_dict("SCANNER_DEQUE_MAX", getattr(cfg, "SCANNER_DEQUE_MAX", {}))
         cfg.SCANNER_DEDUP_COOLDOWN_S = _Env.get_float(
             "SCANNER_DEDUP_COOLDOWN_S",
             getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", getattr(cfg.scanner, "dedup_cooldown_s", 0.16)),
         )
-        cfg.SCANNER_GLOBAL_EVAL_HZ = _Env.get_float(
+        tier_env_keys = (
+            "SCANNER_EVAL_HZ_PRIMARY",
+            "SCANNER_EVAL_HZ_CORE",
+            "SCANNER_EVAL_HZ_AUDITION",
+            "SCANNER_EVAL_HZ_SANDBOX",
             "SCANNER_GLOBAL_EVAL_HZ",
-            getattr(cfg, "SCANNER_GLOBAL_EVAL_HZ", getattr(cfg.scanner, "scanner_global_eval_hz", 200.0)),
         )
+        tier_env_present = any(_Env.get(k, None) is not None for k in tier_env_keys)
+        if raw_scanner_hz is not None and tier_env_present:
+            msg = (
+                "Conflicting env keys for scanner.eval_hz: "
+                "SCANNER_HZ + SCANNER_EVAL_HZ_* (prefer SCANNER_HZ)"
+            )
+            if mode_upper == "PROD":
+                raise ConfigError("CONFIG_SCHEMA_INVALID", "scanner.eval_hz")
+            logging.getLogger(__name__).warning(msg)
 
         sc = cfg.scanner
 
@@ -2614,45 +2720,53 @@ class BotConfig:
         except Exception:
             pass
 
-        # Garder BotConfig.scanner_global_eval_hz, cfg.SCANNER_GLOBAL_EVAL_HZ
-        # et ScannerCfg.scanner_global_eval_hz alignés
-        try:
-            v = float(cfg.SCANNER_GLOBAL_EVAL_HZ)
-        except Exception:
-            v = float(getattr(sc, "scanner_global_eval_hz", 200.0))
-        sc.scanner_global_eval_hz = v
-        cfg.scanner_global_eval_hz = v
+        if raw_scanner_hz is None:
+            cfg.SCANNER_GLOBAL_EVAL_HZ = _Env.get_float(
+                "SCANNER_GLOBAL_EVAL_HZ",
+                getattr(cfg, "SCANNER_GLOBAL_EVAL_HZ", getattr(cfg.scanner, "scanner_global_eval_hz", 200.0)),
+            )
+            try:
+                v = float(cfg.SCANNER_GLOBAL_EVAL_HZ)
+            except Exception:
+                v = float(getattr(sc, "scanner_global_eval_hz", 200.0))
+            sc.scanner_global_eval_hz = v
+            cfg.scanner_global_eval_hz = v
+            cfg.SCANNER_HZ = {
+                "CORE": sc.scanner_eval_hz_core,
+                "PRIMARY": sc.scanner_eval_hz_primary,
+                "AUDITION": sc.scanner_eval_hz_audition,
+                "SANDBOX": sc.scanner_eval_hz_sandbox,
+            }
+        else:
+            hz = cfg.SCANNER_HZ or {}
+            if isinstance(hz, dict):
+                v = hz.get("CORE") or hz.get("core")
+                if v is not None:
+                    try:
+                        sc.scanner_eval_hz_core = float(v)
+                    except Exception:
+                        pass
 
-        # Refléter SCANNER_HZ (legacy) dans ScannerCfg (P0 Marché Public)
-        hz = cfg.SCANNER_HZ or {}
-        if isinstance(hz, dict):
-            v = hz.get("CORE") or hz.get("core")
-            if v is not None:
-                try:
-                    sc.scanner_eval_hz_core = float(v)
-                except Exception:
-                    pass
+                v = hz.get("PRIMARY") or hz.get("primary")
+                if v is not None:
+                    try:
+                        sc.scanner_eval_hz_primary = float(v)
+                    except Exception:
+                        pass
 
-            v = hz.get("PRIMARY") or hz.get("primary")
-            if v is not None:
-                try:
-                    sc.scanner_eval_hz_primary = float(v)
-                except Exception:
-                    pass
+                v = hz.get("AUDITION") or hz.get("audition")
+                if v is not None:
+                    try:
+                        sc.scanner_eval_hz_audition = float(v)
+                    except Exception:
+                        pass
 
-            v = hz.get("AUDITION") or hz.get("audition")
-            if v is not None:
-                try:
-                    sc.scanner_eval_hz_audition = float(v)
-                except Exception:
-                    pass
-
-            v = hz.get("SANDBOX") or hz.get("sandbox")
-            if v is not None:
-                try:
-                    sc.scanner_eval_hz_sandbox = float(v)
-                except Exception:
-                    pass
+                v = hz.get("SANDBOX") or hz.get("sandbox")
+                if v is not None:
+                    try:
+                        sc.scanner_eval_hz_sandbox = float(v)
+                    except Exception:
+                        pass
 
         _legacy_branches = {
             "tt": _Env.get("ENABLE_TT", None),
@@ -3099,6 +3213,14 @@ class BotConfig:
         )
         cfg.rebal.rebal_priority = _Env.get_list("REBAL_PRIORITY", cfg.rebal.rebal_priority)
         cfg.rebal.rebal_hint_ttl_s = _Env.get_int("REBAL_HINT_TTL_S", cfg.rebal.rebal_hint_ttl_s)
+        cfg.rebal.rebal_internal_transfer_threshold = _Env.get_float(
+            "REBAL_INTERNAL_TRANSFER_THRESHOLD",
+            cfg.rebal.rebal_internal_transfer_threshold,
+        )
+        cfg.rebal.rebal_slot_ttl_s = _Env.get_float(
+            "REBAL_SLOT_TTL_S",
+            cfg.rebal.rebal_slot_ttl_s,
+        )
         cfg.rebal.rebal_snapshots_missing_error_s = _Env.get_float("REBAL_SNAPSHOTS_MISSING_ERROR_S",
                                                                    cfg.rebal.rebal_snapshots_missing_error_s)
         cfg.rebal.rebal_snapshots_error_cooldown_s = _Env.get_float("REBAL_SNAPSHOTS_ERROR_COOLDOWN_S",
@@ -3855,8 +3977,12 @@ class BotConfig:
         self._alias_map = {
             "DAILY_STRATEGY_BUDGET_QUOTE": "rm.daily_strategy_budget_quote",
             "daily_strategy_budget_quote": "rm.daily_strategy_budget_quote",
-            "enable_maker_maker": "rm.enable_maker_maker",
-            "ENABLE_MAKER_MAKER": "rm.enable_maker_maker",
+            "enable_taker_taker": "rm.enable_tt",
+            "ENABLE_TAKER_TAKER": "rm.enable_tt",
+            "enable_taker_maker": "rm.enable_tm",
+            "ENABLE_TAKER_MAKER": "rm.enable_tm",
+            "enable_maker_maker": "rm.enable_mm",
+            "ENABLE_MAKER_MAKER": "rm.enable_mm",
             "mm_alias_name": "rm.mm_alias_name",
             "MM_ALIAS_NAME": "rm.mm_alias_name",
             "preempt_mm_for_tt_tm": "rm.preempt_mm_for_tt_tm",
@@ -3916,8 +4042,12 @@ class BotConfig:
             "PRIMARY_QUOTE": "g.primary_quote",
             "min_usdc": "g.min_usdc",
             "MIN_USDC": "g.min_usdc",
+            "allowed_routes": "g.allowed_routes",
+            "ALLOWED_ROUTES": "g.allowed_routes",
             "DEPLOYMENT_MODE": "g.deployment_mode",
             "POD_REGION": "g.pod_region",
+            "MODE": "g.mode",
+            "LIVE_TRADING_ARMED": "g.live_trading_armed",
             # RM inventory/buffer
             "inventory_cap_quote": "rm.inventory_cap_quote",
             "INVENTORY_CAP_QUOTE": "rm.inventory_cap_quote",
