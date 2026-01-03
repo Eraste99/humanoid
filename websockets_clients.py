@@ -916,7 +916,7 @@ class WebSocketExchangeClient:
         self._out_queue_last_drop_reason[ex] = reason
         self._out_queue_last_drop_ts[ex] = time.time()
 
-        
+
         self._note_drop(ex, reason=reason, kind="combo")
 
         try:

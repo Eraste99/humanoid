@@ -445,13 +445,6 @@ class Boot:
         self.log.info("[Boot] config snapshot hash=%s", cfg_hash)
         self.log.debug("[Boot] config snapshot=%s", snapshot_dict())
 
-        overrides = getattr(self.cfg, "overrides", None) or []
-        if overrides:
-            mode_str = str(mode).upper()
-            if mode_str == "PROD":
-                self.log.error("[Boot] CONFIG_OVERRIDES présents mais non supportés en PROD; arrêt")
-                raise RuntimeError("CONFIG_OVERRIDES unsupported in PROD")
-            self.log.warning("[Boot] CONFIG_OVERRIDES ignorés (mode=%s)", mode_str)
 
         region = str(getattr(getattr(self.cfg, "g", object()), "pod_region", "EU")).upper()
         enable_jp = False

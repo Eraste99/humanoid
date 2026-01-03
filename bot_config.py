@@ -250,6 +250,13 @@ class Globals:
     pacer_mode: str = "NORMAL"
     mode: str = "DRY_RUN"  # DRY_RUN | PROD
     live_trading_armed: bool = False
+    restart_mode: str = "HYBRID"
+    ws_reload_cap_per_hour: Optional[int] = None
+    ws_reload_cooldown_s: Optional[int] = None
+    ws_reload_mute_s: Optional[int] = None
+    full_restart_cap_per_hour: Optional[int] = None
+    full_restart_cooldown_s: Optional[int] = None
+    full_restart_mute_s: Optional[int] = None
     feature_switches: Dict[str,bool] = field(default_factory=lambda: {
         "private_ws": False,
         "balance_fetcher": False,
@@ -280,6 +287,7 @@ class TelegramCfg:
     chat_id_warn: Optional[str] = None
     chat_id_crit: Optional[str] = None
     ack_pin: Optional[str] = None
+    require_ack: bool = False
 
 
 @dataclass
@@ -1777,6 +1785,24 @@ class BotConfig:
         g.ac = _Env.get_dict("AC_CONFIG", g.ac)
         g.mode = _Env.get("MODE", g.mode)
         g.live_trading_armed = _Env.get_bool("LIVE_TRADING_ARMED", g.live_trading_armed)
+        g.restart_mode = _Env.get("RESTART_MODE", g.restart_mode)
+
+        def _get_int_opt(name: str, default: Optional[int]) -> Optional[int]:
+            raw = _Env.get(name, None)
+            if raw is None:
+                return default
+            try:
+                return int(raw)
+            except Exception:
+                return default
+
+        g.ws_reload_cap_per_hour = _get_int_opt("WS_RELOAD_CAP_PER_HOUR", g.ws_reload_cap_per_hour)
+        g.ws_reload_cooldown_s = _get_int_opt("WS_RELOAD_COOLDOWN_S", g.ws_reload_cooldown_s)
+        g.ws_reload_mute_s = _get_int_opt("WS_RELOAD_MUTE_S", g.ws_reload_mute_s)
+        g.full_restart_cap_per_hour = _get_int_opt("FULL_RESTART_CAP_PER_HOUR", g.full_restart_cap_per_hour)
+        g.full_restart_cooldown_s = _get_int_opt("FULL_RESTART_COOLDOWN_S", g.full_restart_cooldown_s)
+        g.full_restart_mute_s = _get_int_opt("FULL_RESTART_MUTE_S", g.full_restart_mute_s)
+
         # 👇 Ajoute ce bloc de compat
         if str(g.mode).upper() in ("DEV", "DEVELOPMENT"):
             g.mode = "DRY_RUN"
@@ -1840,7 +1866,9 @@ class BotConfig:
             "TELEGRAM_CHAT_ID_CRIT", cfg.alerting.telegram.chat_id_crit
         )
         cfg.alerting.telegram.ack_pin = _Env.get("TELEGRAM_ACK_PIN", cfg.alerting.telegram.ack_pin)
-
+        cfg.alerting.telegram.require_ack = _Env.get_bool(
+            "TELEGRAM_REQUIRE_ACK", cfg.alerting.telegram.require_ack
+        )
         cfg.alerting.webhook.url = _Env.get("RESTART_WEBHOOK_URL", cfg.alerting.webhook.url)
         cfg.alerting.webhook.hmac_secret = _Env.get(
             "RESTART_WEBHOOK_HMAC_KEY", cfg.alerting.webhook.hmac_secret
@@ -3496,6 +3524,7 @@ class BotConfig:
         cfg._apply_profile_overlay()        # capital_profile
         cfg._apply_quote_overlay()          # primary_quote & min notionals
         cfg._apply_branches_routes_overlay()# enable_branches + allowed_routes
+        cfg.apply_overrides_inplace()
 
         # --- Wallet aliases (Engine) ---
         cfg.wallet_aliases = _Env.get_dict("WALLET_ALIASES", getattr(cfg, "wallet_aliases", {}))
@@ -3526,6 +3555,13 @@ class BotConfig:
         # --- Aliases & flatten ---
         cfg._init_aliases()
         cfg._rebuild_flat_cache()
+        for key in ("MODE", "LIVE_TRADING_ARMED"):
+            alias = cfg._resolve_alias(key)
+            if not alias:
+                raise ConfigError("CONFIG_SCHEMA_INVALID", key)
+            sentinel = object()
+            if cfg.get_by_dotpath(alias, sentinel) is sentinel:
+                raise ConfigError("CONFIG_SCHEMA_INVALID", key)
         # --- Validation fail-closed ---
         dep_mode = str(cfg.g.deployment_mode or "").upper()
         if dep_mode not in DEPLOYMENT_MODES:
@@ -3566,7 +3602,12 @@ class BotConfig:
             strategy: str | None = None,
             route: str | None = None,
             quote: str | None = None,
+            strict: bool = False,
     ) -> Dict[str, Any]:
+        def _handle_override_error(reason_code: str, path: str) -> None:
+            if strict:
+                raise ConfigError(reason_code, str(path))
+            self._note_config_error(reason_code, str(path))
         base = {
             "min_notional_by_exchange_quote": dict(self.g.min_notional_by_exchange_quote),
             "branch_budgets_quote": dict(self.rm.branch_budgets_quote),
@@ -3582,18 +3623,18 @@ class BotConfig:
                 ts_ms = ov.get("ts_ms")
                 path = ov.get("path")
                 if value is None or ttl_s is None or reason is None or ts_ms is None or not path:
-                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    _handle_override_error("CONFIG_OVERRIDE_INVALID", str(path))
                     continue
                 if ttl_s <= 0:
-                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    _handle_override_error("CONFIG_OVERRIDE_INVALID", str(path))
                     continue
                 try:
                     ts_ms = int(ts_ms)
                 except Exception:
-                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    _handle_override_error("CONFIG_OVERRIDE_INVALID", str(path))
                     continue
                 if (now_ms - int(ts_ms)) > int(ttl_s * 1000):
-                    self._note_config_error("CONFIG_OVERRIDE_EXPIRED", str(path))
+                    _handle_override_error("CONFIG_OVERRIDE_EXPIRED", str(path))
                     continue
                 if profile and ov.get("profile") and str(ov.get("profile")).upper() != str(profile).upper():
                     continue
@@ -3609,7 +3650,7 @@ class BotConfig:
                 keys = str(path).split(".")
                 for k in keys[:-1]:
                     if not isinstance(target, dict) or k not in target:
-                        self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                        _handle_override_error("CONFIG_OVERRIDE_INVALID", str(path))
                         target = None
                         break
                     target = target.get(k)
@@ -3617,17 +3658,32 @@ class BotConfig:
                     continue
                 leaf = keys[-1]
                 if leaf not in target:
-                    self._note_config_error("CONFIG_OVERRIDE_INVALID", str(path))
+                    _handle_override_error("CONFIG_OVERRIDE_INVALID", str(path))
                     continue
                 current = target.get(leaf)
                 if isinstance(current, (int, float)) and isinstance(value, (int, float)):
                     if float(value) > float(current):
-                        self._note_config_error("NO_UPSCALE_VIOLATION", str(path))
+                        _handle_override_error("NO_UPSCALE_VIOLATION", str(path))
                         continue
                 target[leaf] = value
             except Exception:
-                self._note_config_error("CONFIG_OVERRIDE_INVALID", str(ov.get("path")))
+                _handle_override_error("CONFIG_OVERRIDE_INVALID", str(ov.get("path")))
         return base
+
+    def apply_overrides_inplace(self) -> None:
+        strict = str(getattr(self.g, "mode", "")).upper() == "PROD"
+        resolved = self.resolve(
+            profile=getattr(self.g, "capital_profile", None),
+            region=getattr(self.g, "pod_region", None),
+            strategy=getattr(self.g, "strategy", None),
+            route=getattr(self.g, "route", None),
+            quote=getattr(self.g, "primary_quote", None),
+            strict=strict,
+        )
+        self.g.min_notional_by_exchange_quote = resolved["min_notional_by_exchange_quote"]
+        self.rm.branch_budgets_quote = resolved["branch_budgets_quote"]
+        self.rm.combo_cap_usd_by_profile = resolved["combo_cap_usd_by_profile"]
+        self.g.branch_budgets_quote = resolved["branch_budgets_quote"]
 
     def snapshot_dict(self) -> Dict[str, Any]:
         def _scrub(value: Any) -> Any:
@@ -4090,7 +4146,15 @@ class BotConfig:
             "DEPLOYMENT_MODE": "g.deployment_mode",
             "POD_REGION": "g.pod_region",
             "MODE": "g.mode",
+            "RUN_MODE": "g.mode",
             "LIVE_TRADING_ARMED": "g.live_trading_armed",
+            "RESTART_MODE": "g.restart_mode",
+            "WS_RELOAD_CAP_PER_HOUR": "g.ws_reload_cap_per_hour",
+            "WS_RELOAD_COOLDOWN_S": "g.ws_reload_cooldown_s",
+            "WS_RELOAD_MUTE_S": "g.ws_reload_mute_s",
+            "FULL_RESTART_CAP_PER_HOUR": "g.full_restart_cap_per_hour",
+            "FULL_RESTART_COOLDOWN_S": "g.full_restart_cooldown_s",
+            "FULL_RESTART_MUTE_S": "g.full_restart_mute_s",
             # RM inventory/buffer
             "inventory_cap_quote": "rm.inventory_cap_quote",
             "INVENTORY_CAP_QUOTE": "rm.inventory_cap_quote",
@@ -4227,6 +4291,9 @@ class BotConfig:
             "balances_ttl_s_normal": "rm.balance_ttl_s_normal",
             "balances_ttl_s_degraded": "rm.balance_ttl_s_degraded",
             "balances_ttl_s_block": "rm.balance_ttl_s_block",
+            "RESTART_WEBHOOK_URL": "alerting.webhook.url",
+            "RESTART_WEBHOOK_HMAC_KEY": "alerting.webhook.hmac_secret",
+            "TELEGRAM_REQUIRE_ACK": "alerting.telegram.require_ack",
         }
 
     def _rebuild_flat_cache(self) -> None:
