@@ -251,12 +251,6 @@ class Globals:
     mode: str = "DRY_RUN"  # DRY_RUN | PROD
     live_trading_armed: bool = False
     restart_mode: str = "HYBRID"
-    ws_reload_cap_per_hour: Optional[int] = None
-    ws_reload_cooldown_s: Optional[int] = None
-    ws_reload_mute_s: Optional[int] = None
-    full_restart_cap_per_hour: Optional[int] = None
-    full_restart_cooldown_s: Optional[int] = None
-    full_restart_mute_s: Optional[int] = None
     feature_switches: Dict[str,bool] = field(default_factory=lambda: {
         "private_ws": False,
         "balance_fetcher": False,
@@ -1796,13 +1790,6 @@ class BotConfig:
             except Exception:
                 return default
 
-        g.ws_reload_cap_per_hour = _get_int_opt("WS_RELOAD_CAP_PER_HOUR", g.ws_reload_cap_per_hour)
-        g.ws_reload_cooldown_s = _get_int_opt("WS_RELOAD_COOLDOWN_S", g.ws_reload_cooldown_s)
-        g.ws_reload_mute_s = _get_int_opt("WS_RELOAD_MUTE_S", g.ws_reload_mute_s)
-        g.full_restart_cap_per_hour = _get_int_opt("FULL_RESTART_CAP_PER_HOUR", g.full_restart_cap_per_hour)
-        g.full_restart_cooldown_s = _get_int_opt("FULL_RESTART_COOLDOWN_S", g.full_restart_cooldown_s)
-        g.full_restart_mute_s = _get_int_opt("FULL_RESTART_MUTE_S", g.full_restart_mute_s)
-
         # 👇 Ajoute ce bloc de compat
         if str(g.mode).upper() in ("DEV", "DEVELOPMENT"):
             g.mode = "DRY_RUN"
@@ -2241,6 +2228,10 @@ class BotConfig:
         )
         # Alias compat pour l’ancienne clé (avec "VOLUME")
         if _Env.get("DISCOVERY_MIN_24H_VOL_USD", None) is None:
+            if _Env.get("DISCOVERY_MIN_24H_VOLUME_USD", None) is not None:
+                logging.getLogger(__name__).warning(
+                    "DISCOVERY_MIN_24H_VOLUME_USD est dépréciée; utiliser DISCOVERY_MIN_24H_VOL_USD",
+                )
             cfg.discovery.min_24h_volume_usd = _Env.get_float(
                 "DISCOVERY_MIN_24H_VOLUME_USD",
                 cfg.discovery.min_24h_volume_usd,
@@ -2293,7 +2284,12 @@ class BotConfig:
 
         inv = _float_or_none("INVENTORY_CAP_QUOTE")
         if inv is None:
-            inv = _float_or_none("INVENTORY_CAP_USD")
+            legacy_inv = _float_or_none("INVENTORY_CAP_USD")
+            if legacy_inv is not None:
+                logging.getLogger(__name__).warning(
+                    "INVENTORY_CAP_USD est dépréciée; utiliser INVENTORY_CAP_QUOTE",
+                )
+            inv = legacy_inv
         if inv is None:
             inv = getattr(cfg.rm, "inventory_cap_quote", 1500.0)
         cfg.rm.inventory_cap_quote = float(inv)
@@ -2301,7 +2297,12 @@ class BotConfig:
 
         buf = _float_or_none("MIN_BUFFER_QUOTE")
         if buf is None:
-            buf = _float_or_none("MIN_BUFFER_USD")
+            legacy_buf = _float_or_none("MIN_BUFFER_USD")
+            if legacy_buf is not None:
+                logging.getLogger(__name__).warning(
+                    "MIN_BUFFER_USD est dépréciée; utiliser MIN_BUFFER_QUOTE",
+                )
+            buf = legacy_buf
         if buf is None:
             buf = getattr(cfg.rm, "min_buffer_quote", 0.0)
         cfg.rm.min_buffer_quote = float(buf)
@@ -2990,6 +2991,10 @@ class BotConfig:
                 "TM_NEUTRAL_HEDGE_RATIO",
                 getattr(cfg.rm, "tm_neutral_hedge_ratio", cfg.engine.tm_exposure_ttl_hedge_ratio),
             )
+            if neutral_hr_env is not None:
+                logging.getLogger(__name__).warning(
+                    "TM_NEUTRAL_HEDGE_RATIO est dépréciée; utiliser TM_EXPOSURE_TTL_HEDGE_RATIO",
+                )
         neutral_hr = float(neutral_hr_env)
 
         # Propagation NEUTRAL (TTL hedge ratio) vers RM + Engine
@@ -3104,6 +3109,10 @@ class BotConfig:
             "TM_EXPOSURE_TTL_MS",  # clé globale
             _Env.get_int("ENGINE_TM_EXPOSURE_TTL_MS", cfg.engine.tm_exposure_ttl_ms),  # alias Engine
         )
+        if os.getenv("ENGINE_TM_EXPOSURE_TTL_MS") and not os.getenv("TM_EXPOSURE_TTL_MS"):
+            logging.getLogger(__name__).warning(
+                "ENGINE_TM_EXPOSURE_TTL_MS est dépréciée; utiliser TM_EXPOSURE_TTL_MS",
+            )
         cfg.engine.tm_exposure_ttl_ms = ttl_ms_global
         setattr(cfg.rm, "tm_exposure_ttl_ms", ttl_ms_global)
 
@@ -3183,6 +3192,22 @@ class BotConfig:
         pacer_max_ms_legacy = _Env.get("ENGINE_PACER_MAX")
         pacer_init_ms_legacy = _Env.get("ENGINE_PACER_INIT")
         pacer_jitter_ms_legacy = _Env.get("ENGINE_PACER_JITTER")
+        if pacer_min_ms_env is None and pacer_min_ms_legacy is not None:
+            logging.getLogger(__name__).warning(
+                "ENGINE_PACER_MIN est dépréciée; utiliser ENGINE_PACER_MIN_MS",
+            )
+        if pacer_max_ms_env is None and pacer_max_ms_legacy is not None:
+            logging.getLogger(__name__).warning(
+                "ENGINE_PACER_MAX est dépréciée; utiliser ENGINE_PACER_MAX_MS",
+            )
+        if pacer_init_ms_env is None and pacer_init_ms_legacy is not None:
+            logging.getLogger(__name__).warning(
+                "ENGINE_PACER_INIT est dépréciée; utiliser ENGINE_PACER_INIT_MS",
+            )
+        if pacer_jitter_ms_env is None and pacer_jitter_ms_legacy is not None:
+            logging.getLogger(__name__).warning(
+                "ENGINE_PACER_JITTER est dépréciée; utiliser ENGINE_PACER_JITTER_MS",
+            )
         if pacer_min_ms_env is not None and pacer_min_ms_legacy is not None and pacer_min_ms_env != pacer_min_ms_legacy:
             logging.getLogger(__name__).warning(
                 "env collision on ENGINE_PACER_MIN_MS vs ENGINE_PACER_MIN; using ENGINE_PACER_MIN_MS"
@@ -3353,6 +3378,10 @@ class BotConfig:
             logging.getLogger(__name__).warning(
                 "env collision on RL_HARD_CAPS_RPS vs RL_HARD_CAPS_RPS_BY_EXCHANGE; using canonical BY_EXCHANGE"
             )
+        if os.getenv("RL_HARD_CAPS_RPS") and not os.getenv("RL_HARD_CAPS_RPS_BY_EXCHANGE"):
+            logging.getLogger(__name__).warning(
+                "RL_HARD_CAPS_RPS est dépréciée; utiliser RL_HARD_CAPS_RPS_BY_EXCHANGE",
+            )
         cfg.rl.hard_caps_rps_by_exchange = rl_caps_ex_by if os.getenv(
             "RL_HARD_CAPS_RPS_BY_EXCHANGE") else rl_caps_ex_legacy
 
@@ -3366,6 +3395,10 @@ class BotConfig:
         if os.getenv("RL_BURSTS") and os.getenv("RL_BURSTS_BY_EXCHANGE") and rl_bursts_ex_by != rl_bursts_ex_legacy:
             logging.getLogger(__name__).warning(
                 "env collision on RL_BURSTS vs RL_BURSTS_BY_EXCHANGE; using canonical BY_EXCHANGE"
+            )
+        if os.getenv("RL_BURSTS") and not os.getenv("RL_BURSTS_BY_EXCHANGE"):
+            logging.getLogger(__name__).warning(
+                "RL_BURSTS est dépréciée; utiliser RL_BURSTS_BY_EXCHANGE",
             )
         cfg.rl.bursts_by_exchange = rl_bursts_ex_by if os.getenv("RL_BURSTS_BY_EXCHANGE") else rl_bursts_ex_legacy
 
@@ -4148,13 +4181,7 @@ class BotConfig:
             "MODE": "g.mode",
             "RUN_MODE": "g.mode",
             "LIVE_TRADING_ARMED": "g.live_trading_armed",
-            "RESTART_MODE": "g.restart_mode",
-            "WS_RELOAD_CAP_PER_HOUR": "g.ws_reload_cap_per_hour",
-            "WS_RELOAD_COOLDOWN_S": "g.ws_reload_cooldown_s",
-            "WS_RELOAD_MUTE_S": "g.ws_reload_mute_s",
-            "FULL_RESTART_CAP_PER_HOUR": "g.full_restart_cap_per_hour",
-            "FULL_RESTART_COOLDOWN_S": "g.full_restart_cooldown_s",
-            "FULL_RESTART_MUTE_S": "g.full_restart_mute_s",
+"RESTART_MODE": "g.restart_mode",
             # RM inventory/buffer
             "inventory_cap_quote": "rm.inventory_cap_quote",
             "INVENTORY_CAP_QUOTE": "rm.inventory_cap_quote",
