@@ -49,6 +49,27 @@ if TYPE_CHECKING:  # pragma: no cover
     from modules.bot_config import BotConfig
 
 logger = logging.getLogger(__name__)
+_DEPLOYMENT_MODE_WARNED = False
+
+
+def _deployment_mode(cfg: Optional["BotConfig"]) -> str:
+    """Canonical deployment_mode resolver (never empty)."""
+    global _DEPLOYMENT_MODE_WARNED
+    g = getattr(cfg, "g", None) if cfg is not None else None
+    raw = getattr(g, "deployment_mode", None)
+    mode = str(raw or "").strip().upper()
+    allowed = {"EU_ONLY", "SPLIT", "US_ONLY", "JP_ONLY"}
+    if not mode:
+        if not _DEPLOYMENT_MODE_WARNED:
+            _DEPLOYMENT_MODE_WARNED = True
+            logger.warning("[EnginePacer] deployment_mode missing; using fallback EU_ONLY")
+        return "EU_ONLY"
+    if mode not in allowed:
+        if not _DEPLOYMENT_MODE_WARNED:
+            _DEPLOYMENT_MODE_WARNED = True
+            logger.warning("[EnginePacer] deployment_mode=%s unknown; using fallback EU_ONLY", mode)
+        return "EU_ONLY"
+    return mode
 
 # --------- Metrics (Prometheus) optional import ---------
 try:
@@ -175,7 +196,20 @@ class EnginePacer:
         knobs = getattr(engine_cfg, "pacer_knobs", None)
         if knobs is None:
             from modules.bot_config import EnginePacerKnobs
+            g_cfg = getattr(bot_cfg, "g", None) if bot_cfg else None
+            mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper()
+            armed = bool(getattr(g_cfg, "live_trading_armed", False))
+            msg = "[EnginePacer] engine.pacer_knobs missing; using defaults"
+            if mode == "PROD" and armed:
+                logger.critical("%s (PROD+armed)", msg)
+                if self._strict_config():
+                    raise RuntimeError("engine.pacer_knobs missing in PROD+armed")
+            else:
+                logger.warning(msg)
             knobs = EnginePacerKnobs()
+            self._pacer_knobs_source = "default"
+        else:
+            self._pacer_knobs_source = "config"
         self._pacer_knobs = knobs
         self._default_region = self._norm_region(region)
         self._regions: Dict[str, RegionState] = {}
@@ -279,6 +313,49 @@ class EnginePacer:
             base = self._targets.get(rg, {})
             self._targets[rg] = {**base, **override}
 
+    def _strict_config(self) -> bool:
+        cfg = self._bot_cfg
+        g_cfg = getattr(cfg, "g", None) if cfg else None
+        engine_cfg = getattr(cfg, "engine", None) if cfg else None
+        return bool(
+            getattr(g_cfg, "strict_config", False)
+            or getattr(engine_cfg, "strict_config", False)
+        )
+
+    def _warn_once(self, key: str, msg: str, *, level: int = logging.WARNING) -> None:
+        if not hasattr(self, "_warned_keys"):
+            self._warned_keys = set()
+        if key in self._warned_keys:
+            return
+        self._warned_keys.add(key)
+        logger.log(level, msg)
+
+    def _normalize_ack_targets(self, region: str, vals: Dict[str, Optional[float]]) -> Dict[str, Optional[float]]:
+        ack_target = vals.get("ack_target")
+        ack_hi = vals.get("ack_hi")
+        ack_sev = vals.get("ack_sev")
+        raw = [v for v in (ack_target, ack_hi, ack_sev) if v is not None]
+        if not raw:
+            return vals
+        ordered = sorted(raw)
+        if (
+                (ack_target is not None and ack_hi is not None and ack_target > ack_hi)
+                or (ack_hi is not None and ack_sev is not None and ack_hi > ack_sev)
+                or (ack_target is not None and ack_sev is not None and ack_target > ack_sev)
+        ):
+            msg = (
+                f"[EnginePacer] ack targets inconsistent for {region}; "
+                f"target={ack_target} hi={ack_hi} sev={ack_sev}"
+            )
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self._warn_once(f"ack_targets_{region}", msg)
+        corrected = {
+            "ack_target": ordered[0] if ordered else ack_target,
+            "ack_hi": ordered[1] if len(ordered) > 1 else ack_hi,
+            "ack_sev": ordered[2] if len(ordered) > 2 else ack_sev,
+        }
+        return corrected
     def _push_ack_metrics(self) -> None:
         try:
             for region, vals in self._targets.items():
@@ -308,16 +385,14 @@ class EnginePacer:
                 self._push_ack_metrics()
                 return
 
-            try:
-                mode_key = str(getattr(getattr(cfg, "g", None), "deployment_mode", "")).upper()
-            except Exception:
-                mode_key = ""
+            mode_key = _deployment_mode(cfg)
 
             if not hasattr(cfg, "slo"):
                 logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur pacer_knobs defaults",
                                mode_key)
                 self._apply_target_overrides()
                 self._push_ack_metrics()
+                self._warn_once("ack_targets_default", "[EnginePacer] pacer ack targets from default_targets")
                 return
 
             slo_map = getattr(cfg, "slo", {}) or {}
@@ -327,6 +402,7 @@ class EnginePacer:
                 logger.warning("[EnginePacer] SLO private absent pour mode=%s, fallback sur pacer_knobs defaults", mode_key)
                 self._apply_target_overrides()
                 self._push_ack_metrics()
+                self._warn_once("ack_targets_default", "[EnginePacer] pacer ack targets from default_targets")
                 return
 
             if not self._region_map:
@@ -362,6 +438,7 @@ class EnginePacer:
                 )
                 self._apply_target_overrides()
                 self._push_ack_metrics()
+                self._warn_once("ack_targets_default", "[EnginePacer] pacer ack targets from default_targets")
                 return
 
             for region, vals in agg.items():
@@ -372,11 +449,17 @@ class EnginePacer:
                     base["ack_hi"] = vals["ack_hi"]
                 if vals.get("ack_sev") is not None:
                     base["ack_sev"] = vals["ack_sev"]
+                    base = self._normalize_ack_targets(region, base)
                 self._targets[region] = base
-
+            self._warn_once(
+                "ack_targets_slo",
+                f"[EnginePacer] pacer ack targets from SLO mode={mode_key}",
+                level=logging.DEBUG,
+            )
             # ré-applique les overrides éventuels
             self._apply_target_overrides()
             self._push_ack_metrics()
+
 
     # ------------------ public API ------------------
 

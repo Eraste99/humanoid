@@ -39,6 +39,7 @@ import hashlib,json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
+from modules.bot_config import RmSwitchKnobs
 from dataclasses import fields
 from typing import Dict, Any, List, Optional, Tuple
 from modules.obs_metrics import inc_blocked, set_transfer_inflight, inc_transfer_fsm_event
@@ -1349,28 +1350,96 @@ class RiskManager:
 
     def _rm_cfg(self):
         try:
-            return getattr(self, "_rm_cfg_obj", None) or getattr(self.cfg, "rm", None) or getattr(self, "cfg", None)
+            return getattr(self, "_rm_cfg_obj", None) or getattr(self, "_cfg_root", None) or getattr(self.cfg, "rm",
+                                                                                                     None)
         except Exception:
             return getattr(self, "cfg", None)
 
+    def _rm_strict_config(self) -> bool:
+        rm_cfg = self._rm_cfg()
+        return bool(getattr(rm_cfg, "strict_config", False))
+
+    def _rm_live_armed(self) -> bool:
+        cfg_root = getattr(self, "_cfg_root", None) or getattr(self, "cfg", None)
+        g_cfg = getattr(cfg_root, "g", None)
+        fs = getattr(g_cfg, "feature_switches", {}) if g_cfg else {}
+        live_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD" or bool(
+            fs.get("engine_real", False)
+        )
+        return live_mode and bool(getattr(g_cfg, "live_trading_armed", False))
+
+    def _should_raise_config_conflict(self) -> bool:
+        return self._rm_strict_config() and self._rm_live_armed()
+
+    def _warn_rm_alias(self, key: str, msg: str) -> None:
+        if key in self._rm_alias_warnings:
+            return
+        self._rm_alias_warnings.add(key)
+        logger.warning("[RiskManager] %s", msg)
+
+    def _get_rm_knob(
+            self,
+            name: str,
+            *,
+            legacy: str | None = None,
+            default=None,
+            cast=None,
+    ):
+        """Resolve RM knob with legacy alias handling.
+
+        Legacy mappings (non-exhaustive):
+          - TM_EXPOSURE_TTL_MS -> rm.tm_exposure_ttl_ms
+          - VOL_SNAPSHOT_TTL_S / DEGRADED_VOL_TTL_S -> rm.vol_snapshot_ttl_s / rm.degraded_vol_ttl_s
+          - TOB_MAX_AGE_S -> rm.tob_max_age_s
+          - TM_QUEUEPOS_MAX_AHEAD_USD / TM_QUEUEPOS_MAX_ETA_MS -> rm.tm_queuepos_max_ahead_usd / rm.tm_queuepos_max_eta_ms
+          - DEGRADED_* -> rm.degraded_* (ratios/penalties)
+          - FEE_SNAPSHOT_TTL_S / FEE_TOLERATED_AGE_S -> rm.fee_snapshot_ttl_s / rm.fee_tolerated_age_s
+          - ENABLE_FEE_TOKEN_RESERVES_CHECK -> rm.enable_fee_token_reserves_check
+        """
+        missing = object()
+        rm_cfg = self._rm_cfg()
+        cfg_root = getattr(self, "_cfg_root", None) or getattr(self, "cfg", None)
+        val = getattr(rm_cfg, name, missing) if rm_cfg is not None else missing
+        legacy_val = getattr(cfg_root, legacy, missing) if legacy and cfg_root is not None else missing
+
+        if val is not missing and legacy_val is not missing and val != legacy_val:
+            msg = f"config mismatch for {name}: rm.{name}={val} legacy.{legacy}={legacy_val}"
+            if self._should_raise_config_conflict():
+                raise RuntimeError(msg)
+            self._warn_rm_alias(f"{name}_conflict", msg)
+
+        if val is not missing:
+            result = val
+        elif legacy_val is not missing:
+            msg = f"legacy config {legacy} is deprecated; use rm.{name} instead"
+            if self._should_raise_config_conflict():
+                raise RuntimeError(msg)
+            self._warn_rm_alias(f"{name}_legacy", msg)
+            result = legacy_val
+        else:
+            result = default
+
+        if cast is not None:
+            try:
+                return cast(result)
+            except Exception:
+                return result
+        return result
     def _resolve_rm_param(self, names: tuple | str, default=None):
         if isinstance(names, str):
             names = (names,)
 
         rm_cfg = self._rm_cfg()
-        bot_cfg = getattr(self, "bot_cfg", None)
-        cfg_obj = getattr(self, "cfg", None)
+        cfg_obj = getattr(self, "_cfg_root", None) or getattr(self, "cfg", None)
 
         for name in names:
             val = getattr(rm_cfg, name, None) if rm_cfg is not None else None
             if val is not None:
                 legacy_vals = []
-                for src in (bot_cfg, cfg_obj):
-                    if src is None:
-                        continue
-                    legacy_val = getattr(src, name, None)
+                if cfg_obj is not None:
+                    legacy_val = getattr(cfg_obj, name, None)
                     if legacy_val is not None and legacy_val != val:
-                        legacy_vals.append((type(src).__name__, legacy_val))
+                        legacy_vals.append((type(cfg_obj).__name__, legacy_val))
                 if legacy_vals:
                     try:
                         logger.warning(
@@ -1383,6 +1452,14 @@ class RiskManager:
                     except Exception:
                         pass
                 return val
+            if name.isupper() and cfg_obj is not None:
+                legacy_val = getattr(cfg_obj, name, None)
+                if legacy_val is not None:
+                    msg = f"legacy config {name} is deprecated; use rm.* instead"
+                    if self._should_raise_config_conflict():
+                        raise RuntimeError(msg)
+                    self._warn_rm_alias(f"{name}_legacy", msg)
+                    return legacy_val
 
         return default
 
@@ -1441,12 +1518,56 @@ class RiskManager:
             ready_event: asyncio.Event | None = None,
             history_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
     ) -> None:
+        def _cfg_signature(cfg_obj):
+            g_cfg = getattr(cfg_obj, "g", None)
+            rm_cfg = getattr(cfg_obj, "rm", None)
+            snapshot_hash = getattr(cfg_obj, "snapshot_hash", None)
+            snapshot_val = snapshot_hash() if callable(snapshot_hash) else None
+            return {
+                "snapshot_hash": snapshot_val,
+                "g.mode": getattr(g_cfg, "mode", None),
+                "g.deployment_mode": getattr(g_cfg, "deployment_mode", None),
+                "rm.strict_config": getattr(rm_cfg, "strict_config", None),
+                "rm.switch_knobs": getattr(rm_cfg, "switch_knobs", None),
+            }
 
+        def _cfg_live_armed(cfg_obj) -> bool:
+            g_cfg = getattr(cfg_obj, "g", None)
+            fs = getattr(g_cfg, "feature_switches", {}) if g_cfg else {}
+            live_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD" or bool(
+                fs.get("engine_real", False)
+            )
+            return live_mode and bool(getattr(g_cfg, "live_trading_armed", False))
+
+        def _cfg_strict(cfg_obj) -> bool:
+            rm_cfg = getattr(cfg_obj, "rm", None)
+            return bool(getattr(rm_cfg, "strict_config", False))
         base_cfg = bot_cfg or config
+        if bot_cfg is not None and config is not None and bot_cfg is not config:
+            bot_sig = _cfg_signature(bot_cfg)
+            cfg_sig = _cfg_signature(config)
+            conflict = False
+            if bot_sig.get("snapshot_hash") and cfg_sig.get("snapshot_hash"):
+                conflict = bot_sig["snapshot_hash"] != cfg_sig["snapshot_hash"]
+            else:
+                for key in ("g.mode", "g.deployment_mode", "rm.strict_config", "rm.switch_knobs"):
+                    if bot_sig.get(key) != cfg_sig.get(key):
+                        conflict = True
+                        break
+            if conflict:
+                msg = "config divergence between bot_cfg and cfg; using bot_cfg as canonical"
+                strict = _cfg_strict(bot_cfg) or _cfg_strict(config)
+                live_armed = _cfg_live_armed(bot_cfg) or _cfg_live_armed(config)
+                if strict and live_armed:
+                    raise RuntimeError(msg)
+                logger.warning("[RiskManager] %s", msg)
+
+        self._cfg_root = base_cfg
         self.bot_cfg = base_cfg
         self.config = base_cfg  # alias explicite conservé
         self.cfg = base_cfg
-        self._rm_cfg_obj = getattr(self.cfg, "rm", None)
+        self._rm_cfg_obj = getattr(self._cfg_root, "rm", None)
+        self._rm_alias_warnings: set[str] = set()
         self.fee_reserves = FeeTokenReservesPolicy(self.config)
         self.history_logger = history_logger
         self._history_fsm = None
@@ -1738,7 +1859,7 @@ class RiskManager:
         # --- Instanciation lazy des sous-modules internes (si non injectés) ---
 
         if self.vol_manager is None:
-            self.vol_manager = VolatilityManager(cfg=self.bot_cfg)
+            self.vol_manager = VolatilityManager(cfg_root=self.bot_cfg)
         else:
             logger.debug("[RiskManager] using injected VolatilityManager: %s", type(self.vol_manager).__name__)
 
@@ -1759,7 +1880,7 @@ class RiskManager:
             )
 
         if self.rebalancing is None:
-            self.rebalancing = RebalancingManager(rm=self, enabled_exchanges=self.exchanges)
+            self.rebalancing = RebalancingManager(rm=self)
         else:
             logger.debug("[RiskManager] using injected RebalancingManager: %s", type(self.rebalancing).__name__)
 
@@ -1950,10 +2071,15 @@ class RiskManager:
         # rm_mode      : état "business" interne (OPP_VOLUME / OPP_VOL / SEVERE…)
         # trade_mode   : mode consolidé exposé à l'Engine (rm_mode × pacer_mode)
         # pacer_mode   : vue consolidée du Pacer (NORMAL / CONSTRAINED / SEVERE)
-        rm_cfg = getattr(self, "cfg", None)
-        rm_cfg = getattr(rm_cfg, "rm", rm_cfg)
+        rm_cfg = self._rm_cfg()
         self._switch_knobs = getattr(rm_cfg, "switch_knobs", None)
         self._signal_policy = getattr(rm_cfg, "signal_policy", None)
+        if not isinstance(self._switch_knobs, RmSwitchKnobs):
+            msg = "rm.switch_knobs missing or invalid; using defaults"
+            if self._should_raise_config_conflict():
+                raise RuntimeError(msg)
+            self._warn_rm_alias("switch_knobs_default", msg)
+            self._switch_knobs = RmSwitchKnobs()
         self.rm_mode = "NORMAL"  # NORMAL | OPP_VOLUME | OPP_VOL | SEVERE
         self.trade_mode = "NORMAL"  # NORMAL | CONSTRAINED | SEVERE | OPPORTUNISTE
         self.pacer_mode = "NORMAL"  # NORMAL | CONSTRAINED | SEVERE (injecté par watcher/Pacer)
@@ -3136,7 +3262,14 @@ class RiskManager:
         if not hasattr(self, "fee_token_policy"):
             return True, "no_fee_token_policy"
 
-        if getattr(self.cfg, "ENABLE_FEE_TOKEN_RESERVES_CHECK", False) is False:
+        if (
+                self._get_rm_knob(
+                    "enable_fee_token_reserves_check",
+                    legacy="ENABLE_FEE_TOKEN_RESERVES_CHECK",
+                    default=False,
+                )
+                is False
+        ):
             return True, "disabled"
 
         # Source unique : MultiBalanceFetcher via glue RM_MBFGlue
@@ -5110,7 +5243,8 @@ class RiskManager:
             if accepted is None:
                 accepted = self.engine.execute_bundle(bundle)
         except EngineSubmitError as exc:
-            reason = str(getattr(exc, "reason", None) or str(exc))
+            raw_reason = getattr(exc, "reason", None) or str(exc)
+            reason = normalize_reason_code(raw_reason) or str(raw_reason)
             try:
                 if hasattr(self, "obs_inc"):
                     self.obs_inc("rm_engine_reject_total", reason=reason)
@@ -11435,10 +11569,22 @@ class RiskManager:
         vol_ready = True
         vol_reason = "vol_unknown_or_stale"
         try:
-            vol_ttl_s = float(getattr(getattr(self.bot_cfg, "vol", None), "ttl_s",
-                                      getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0)))
+            vol_ttl_s = float(
+                getattr(getattr(self.bot_cfg, "vol", None), "ttl_s", None)
+                or self._get_rm_knob(
+                    "vol_snapshot_ttl_s",
+                    legacy="VOL_SNAPSHOT_TTL_S",
+                    default=5.0,
+                )
+            )
         except Exception:
-            vol_ttl_s = float(getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0))
+            vol_ttl_s = float(
+                self._get_rm_knob(
+                    "vol_snapshot_ttl_s",
+                    legacy="VOL_SNAPSHOT_TTL_S",
+                    default=5.0,
+                )
+            )
         vm = getattr(self, "vol_manager", None)
         if vm and hasattr(vm, "get_current_metrics"):
             try:
@@ -12637,27 +12783,38 @@ class RiskManager:
         None se 'verde'. Se 'rosso' → alza DataStaleError/NotReadyError. Nessun default.
         """
         now = time.time()
-        cfg = getattr(self, "bot_cfg", self.cfg)
-        rm_cfg = getattr(cfg, "rm", cfg)
+        cfg = getattr(self, "_cfg_root", None) or getattr(self, "bot_cfg", self.cfg)
+        rm_cfg = self._rm_cfg() or cfg
 
         # Fees freshness (SFC = sorgente primaria)
         if not self.slip_collector:
             raise NotReadyError("SFC not attached")
         fee_age = now - float(getattr(self.slip_collector, "last_fee_sync_ts", 0.0))
-        fee_ttl_strict = float(getattr(cfg, "FEE_SNAPSHOT_TTL_S", 900.0))
-        fee_ttl_tol = float(getattr(cfg, "FEE_TOLERATED_AGE_S", 3600.0))
+        fee_ttl_strict = float(
+            self._get_rm_knob("fee_snapshot_ttl_s", legacy="FEE_SNAPSHOT_TTL_S", default=900.0)
+        )
+        fee_ttl_tol = float(
+            self._get_rm_knob("fee_tolerated_age_s", legacy="FEE_TOLERATED_AGE_S", default=3600.0)
+        )
 
         # Volatilità (VM)
         if not self.vol_manager:
             raise NotReadyError("VM not attached")
         vm = self.vol_manager.get_current_metrics(pair_key) or {}
         vol_age = float(vm.get("age_s", float("inf")))
-        vol_ttl_strict = float(getattr(cfg, "VOL_SNAPSHOT_TTL_S", 5.0))
-        vol_ttl_tol = float(getattr(cfg, "DEGRADED_VOL_TTL_S", 12.0))
+        vol_ttl_strict = float(
+            self._get_rm_knob("vol_snapshot_ttl_s", legacy="VOL_SNAPSHOT_TTL_S", default=5.0)
+        )
+        vol_ttl_tol = float(
+            self._get_rm_knob("degraded_vol_ttl_s", legacy="DEGRADED_VOL_TTL_S", default=12.0)
+        )
 
         # TOB (hard strict)
-        b_bid, b_ask = self.get_top_of_book(buy_ex, pair_key, max_age_s=float(getattr(cfg, "TOB_MAX_AGE_S", 1.0)))
-        s_bid, s_ask = self.get_top_of_book(sell_ex, pair_key, max_age_s=float(getattr(cfg, "TOB_MAX_AGE_S", 1.0)))
+        tob_max_age_s = float(
+            self._get_rm_knob("tob_max_age_s", legacy="TOB_MAX_AGE_S", default=1.0)
+        )
+        b_bid, b_ask = self.get_top_of_book(buy_ex, pair_key, max_age_s=tob_max_age_s)
+        s_bid, s_ask = self.get_top_of_book(sell_ex, pair_key, max_age_s=tob_max_age_s)
         if s_bid <= b_ask:
             raise InconsistentStateError(f"No edge: {sell_ex}->{buy_ex} bid<=ask")
 
@@ -12668,45 +12825,35 @@ class RiskManager:
         # Giallo (attività degradata esplicita, nessun valore inventato)
         if fee_age <= fee_ttl_tol and vol_age <= vol_ttl_tol:
             qpos_usd = int(
-                getattr(
-                    rm_cfg,
+                self._get_rm_knob(
                     "tm_queuepos_max_ahead_usd",
-                    getattr(cfg, "TM_QUEUEPOS_MAX_AHEAD_USD", 25000),
+                    legacy="TM_QUEUEPOS_MAX_AHEAD_USD",
+                    default=25000,
                 )
             )
             qpos_eta_ms = int(
-                getattr(
-                    rm_cfg,
+                self._get_rm_knob(
                     "tm_queuepos_max_eta_ms",
-                    getattr(cfg, "TM_QUEUEPOS_MAX_ETA_MS", 0),
+                    legacy="TM_QUEUEPOS_MAX_ETA_MS",
+                    default=0,
                 )
             )
-            legacy_qpos_usd = getattr(cfg, "TM_QUEUEPOS_MAX_AHEAD_USD", None)
-            legacy_qpos_eta = getattr(cfg, "TM_QUEUEPOS_MAX_ETA_MS", None)
-            if (legacy_qpos_usd is not None or legacy_qpos_eta is not None) and not getattr(self,
-                                                                                            "_tm_queuepos_legacy_warned",
-                                                                                            False):
-                try:
-                    if (legacy_qpos_usd is not None and float(legacy_qpos_usd) != float(qpos_usd)) or (
-                            legacy_qpos_eta is not None and int(legacy_qpos_eta) != int(qpos_eta_ms)
-                    ):
-                        logging.getLogger(__name__).warning(
-                            "Legacy TM queuepos keys differ from rm.* values; rm.* treated as canonical"
-                        )
-                finally:
-                    self._tm_queuepos_legacy_warned = True
 
             return {
                 "reason": "JAUNE_FEE" if fee_age > fee_ttl_strict else "JAUNE_VOL",
                 "tm_controls": {
                     "hedge_ratio": float(
-                        getattr(cfg, "DEGRADED_HEDGE_RATIO", 0.75)
+                        self._get_rm_knob(
+                            "degraded_hedge_ratio",
+                            legacy="DEGRADED_HEDGE_RATIO",
+                            default=0.75,
+                        )
                     ) if vol_age > fee_ttl_strict else None,
                     "ttl_ms": int(
-                        getattr(
-                            rm_cfg,
+                        self._get_rm_knob(
                             "tm_exposure_ttl_ms",
-                            getattr(cfg, "TM_EXPOSURE_TTL_MS", 2500),
+                            legacy="TM_EXPOSURE_TTL_MS",
+                            default=2500,
                         )
                     ),
                     # Canon : ahead_usd ; alias queuepos_max_usd pour compat Engine
@@ -12716,13 +12863,33 @@ class RiskManager:
                     "ioc_only": bool(vol_age > vol_ttl_strict),
                 },
                 "caps": {
-                    "size_factor": float(getattr(cfg, "DEGRADED_SIZE_FACTOR", 0.7))
+                    "size_factor": float(
+                        self._get_rm_knob(
+                            "degraded_size_factor",
+                            legacy="DEGRADED_SIZE_FACTOR",
+                            default=0.7,
+                        )
+                    )
                 },
                 "min_bps_lift_bps": float(
-                    getattr(cfg, "DEGRADED_MIN_BPS_LIFT", 4.0)) if vol_age > vol_ttl_strict else 0.0,
+                    self._get_rm_knob(
+                        "degraded_min_bps_lift",
+                        legacy="DEGRADED_MIN_BPS_LIFT",
+                        default=4.0,
+                    )) if vol_age > vol_ttl_strict else 0.0,
                 "cost_penalty_bps": float(
-                    getattr(cfg, "DEGRADED_FEE_PENALTY_BPS", 3.0)) if fee_age > fee_ttl_strict else 0.0,
-                "bundle_concurrency_delta": int(getattr(cfg, "DEGRADED_CONCURRENCY_DELTA", -1)),
+                    self._get_rm_knob(
+                        "degraded_fee_penalty_bps",
+                        legacy="DEGRADED_FEE_PENALTY_BPS",
+                        default=3.0,
+                    )) if fee_age > fee_ttl_strict else 0.0,
+                "bundle_concurrency_delta": int(
+                    self._get_rm_knob(
+                        "degraded_concurrency_delta",
+                        legacy="DEGRADED_CONCURRENCY_DELTA",
+                        default=-1,
+                    )
+                ),
             }
 
         # Rosso
@@ -13700,10 +13867,22 @@ class RiskManager:
 
         # TTLs (contrat BotConfig si dispo, sinon fallback cfg)
         try:
-            vol_ttl_s = float(getattr(getattr(self.bot_cfg, "vol", None), "ttl_s",
-                                      getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0)))
+            vol_ttl_s = float(
+                getattr(getattr(self.bot_cfg, "vol", None), "ttl_s", None)
+                or self._get_rm_knob(
+                    "vol_snapshot_ttl_s",
+                    legacy="VOL_SNAPSHOT_TTL_S",
+                    default=5.0,
+                )
+            )
         except Exception:
-            vol_ttl_s = float(getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0))
+            vol_ttl_s = float(
+                self._get_rm_knob(
+                    "vol_snapshot_ttl_s",
+                    legacy="VOL_SNAPSHOT_TTL_S",
+                    default=5.0,
+                )
+            )
 
         try:
             slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s",
@@ -16771,35 +16950,11 @@ def _mk_rebal_mgr_if_missing(rm):
     if RebalancingManager is None:
         return None
 
-    cfg = getattr(rm, "cfg", None)
-
-    quotes = list(getattr(cfg, "ccy_filter", []) or []) or ["USDC", "EUR"]
-    quotes = [q.upper() for q in quotes if q]
-
-    min_usdc = float(getattr(cfg, "min_usdc", 1000.0))
-    min_map = {"USDC": min_usdc}
-    if "EUR" in quotes:
-        min_map["EUR"] = float(getattr(cfg, "min_eur", 0.0))
-
-    enabled_exchanges = list(getattr(rm, "exchanges", []) or getattr(cfg, "enabled_exchanges", []) or [])
-    enabled_aliases   = list(getattr(cfg, "aliases", []) or ["TT", "TM"])
-    preferred_pairs   = list(getattr(cfg, "pairs", []) or ["ETHUSDC", "BTCUSDC", "ETHEUR", "BTCEUR"])
 
     # >>> CHANGEMENT CLÉ : on passe rm=rm <<<
     rm.rebal_mgr = RebalancingManager(
         rm=rm,
-        quote_currencies=quotes,
-        min_cash_per_quote=min_map,
-        enabled_exchanges=[e.upper() for e in enabled_exchanges],
-        enabled_aliases=[a.upper() for a in enabled_aliases],
-        preferred_pairs=[p.replace("-", "").upper() for p in preferred_pairs],
-        history_limit=200,
-        target_diff_quote=200.0,
-        internal_transfer_threshold=250.0,
-        overlay_comp_threshold=100.0,
-        cross_cex_haircut=0.80,
-        min_crypto_value_usdc=1000.0,
-        virtual_wallets=("EUR" in quotes),
+
     )
 
     # brancher un event sink si dispo

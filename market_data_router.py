@@ -211,6 +211,8 @@ class MarketDataRouter:
         self.bot_cfg = bot_cfg
         self.router_cfg = router_cfg or (bot_cfg.router if bot_cfg is not None else None)
         self.shard = str(shard_id).upper()  # ➌ NOUVEAU
+        self._deployment_mode_logged = False
+        self._missing_slo_warned: set[tuple[str, str]] = set()
 
         # scanner obligatoire (fail-fast)
         if scanner is None or not hasattr(scanner, "update_orderbook"):
@@ -231,6 +233,8 @@ class MarketDataRouter:
             stale_source_ms = getattr_int(self.router_cfg, "stale_ms", stale_source_ms)
             coalesce_window_ms = getattr_int(self.router_cfg, "coalesce_window_ms", coalesce_window_ms)
             require_l2_first = getattr_bool(self.router_cfg, "require_l2_first", require_l2_first)
+        self.stale_cfg_ms = int(stale_source_ms or 1000)
+        stale_source_ms = self.stale_cfg_ms
 
         vol_onchange_bps = getattr_float(self.router_cfg, "vol_onchange_bps", vol_onchange_bps)
         slip_onchange_bps = getattr_float(self.router_cfg, "slip_onchange_bps", slip_onchange_bps)
@@ -995,6 +999,59 @@ class MarketDataRouter:
                 self._flush_pair_after(pair, self.coalesce_window_ms / 1000.0)
             )
 
+    def _deployment_mode(self) -> str:
+        g_cfg = getattr(self.bot_cfg, "g", None) if self.bot_cfg is not None else None
+        mode = getattr(g_cfg, "deployment_mode", None) if g_cfg else None
+        mode_norm = str(mode).strip().upper() if mode else ""
+        if not mode_norm:
+            mode_norm = "EU_ONLY"
+        if mode_norm not in {"EU_ONLY", "SPLIT", "JP_ONLY"}:
+            logger.warning("[Router] unknown deployment_mode=%s; falling back to EU_ONLY", mode_norm)
+            mode_norm = "EU_ONLY"
+        if not self._deployment_mode_logged:
+            self._deployment_mode_logged = True
+            logger.info("[Router] deployment_mode_resolved=%s", mode_norm)
+        return mode_norm
+
+    def _resolve_stale_limit_ms(self, exchange: str) -> int:
+        stale_cfg_ms = int(getattr(self, "stale_cfg_ms", 1000) or 1000)
+        exu = str(exchange or "").upper()
+        mode_key = self._deployment_mode()
+        slo_limit_ms = None
+        try:
+            cfg = getattr(self, "bot_cfg", None)
+            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+            if slo_map:
+                per_ex = slo_map.get(mode_key) or {}
+                path_slo = per_ex.get(exu)
+                if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                    l2_fresh_max_s = float(getattr(path_slo.public, "l2_fresh_max_s", 0.0) or 0.0)
+                    if l2_fresh_max_s > 0.0:
+                        slo_limit_ms = int(l2_fresh_max_s * 1000.0)
+        except Exception:
+            logger.warning(
+                "[Router] unable to resolve SLO-based stale_limit_ms; using router.stale_ms",
+                exc_info=False,
+            )
+            return stale_cfg_ms
+
+        if slo_limit_ms is None:
+            warn_key = (mode_key, exu)
+            if warn_key not in self._missing_slo_warned:
+                self._missing_slo_warned.add(warn_key)
+                logger.warning(
+                    "[Router] missing SLO for mode=%s exchange=%s; using router.stale_ms",
+                    mode_key,
+                    exu,
+                )
+            return stale_cfg_ms
+
+        resolved = min(stale_cfg_ms, slo_limit_ms)
+        logger.debug(
+            "[Router] stale_limit_ms resolved from cfg/slo",
+            extra={"exchange": exu, "mode": mode_key, "stale_ms": resolved},
+        )
+        return resolved
     # ------------------------- Coalescing par paire -------------------------
 
     async def _flush_pair_after(self, pair: str, delay_s: float) -> None:
@@ -1010,11 +1067,8 @@ class MarketDataRouter:
             base_ms = getattr_int(self, "coalesce_window_ms", 20)
 
             # --- Lecture robuste du mode de déploiement -------------------------
-            dep_mode = "EU_ONLY"
-            if self.bot_cfg is not None:
-                dep_mode = str(getattr(getattr(self.bot_cfg, "g", object()), "deployment_mode", dep_mode))
-            split = str(dep_mode).upper() == "SPLIT"
-
+            dep_mode = self._deployment_mode()
+            split = dep_mode == "SPLIT"
             # --- Bonus CB (5..15ms) si SPLIT et si COINBASE présent -------------
             cb_bump_ms = 0
             if split:
@@ -1777,35 +1831,7 @@ class MarketDataRouter:
 
 
                     # --- PATCH C2: guard staleness + métriques reason-codées ---
-                    # Base legacy : TTL brut (ms) injecté via stale_source_ms / BotConfig.router.stale_ms.
-                    stale_limit_ms = getattr_int(self, "stale_source_ms", 1200)
-
-                    # Alignement avec contrat SLO public (cfg.slo[mode][exchange].public.l2_fresh_max_s)
-                    try:
-                        cfg = getattr(self, "bot_cfg", None)
-                        slo_map = getattr(cfg, "slo", None) if cfg is not None else None
-                        if slo_map:
-                            g_cfg = getattr(cfg, "g", None)
-                            mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
-                            per_ex = slo_map.get(mode_key) or {}
-                            exu = str(ev.get("exchange") or "").upper()
-                            path_slo = per_ex.get(exu)
-                            if path_slo is not None and getattr(path_slo, "public", None) is not None:
-                                l2_fresh_max_s = float(
-                                    getattr(path_slo.public, "l2_fresh_max_s", 0.0) or 0.0
-                                )
-                                if l2_fresh_max_s > 0.0:
-                                    slo_limit_ms = int(l2_fresh_max_s * 1000.0)
-                                    # On ne permet jamais un seuil plus large que le contrat SLO.
-                                    stale_limit_ms = min(stale_limit_ms, slo_limit_ms)
-                    except Exception:
-                        # En cas de souci de résolution SLO, on garde le fallback legacy.
-                        logger.warning(
-                            "[Router] unable to resolve SLO-based stale_limit_ms, "
-                            "falling back to stale_source_ms",
-                            exc_info=False,
-                        )
-
+                    stale_limit_ms = self._resolve_stale_limit_ms(ev.get("exchange"))
                     staleness_mode = str(
                         getattr(self.router_cfg, "staleness_mode", "WALLCLOCK") if self.router_cfg else "WALLCLOCK"
                     ).upper()

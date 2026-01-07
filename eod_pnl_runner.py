@@ -19,6 +19,7 @@ import argparse
 import json
 import logging
 import sys
+import os
 from typing import Callable, Any
 from pathlib import Path
 from typing import Optional
@@ -112,10 +113,14 @@ async def run_eod(
     dict : meta dict retourné par LoggerHistoriqueManager.run_eod()
     """
     cfg = BotConfig.from_env()
+    g_cfg = getattr(cfg, "g", None)
+    if g_cfg is None:
+        raise ValueError("cfg.g is required for EOD runner")
 
     # Résolution de la région effective
     if region is None or not str(region).strip():
         region_effective = str(getattr(cfg.g, "pod_region", "EU")).upper()
+        logger.info("REGION_DEFAULTED=1 region=%s", region_effective)
     else:
         region_effective = str(region).strip().upper()
 
@@ -126,14 +131,7 @@ async def run_eod(
         region_effective,
     )
 
-    enable_jp = False
-    try:
-        g_cfg = getattr(cfg, "g", None)
-        enable_jp = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else bool(
-            getattr(cfg, "enable_jp", False)
-        )
-    except Exception:
-        enable_jp = False
+    enable_jp = bool(getattr(g_cfg, "enable_jp", False))
     if region_effective == "JP" and not enable_jp:
         reason_code = "REGION_UNSUPPORTED_JP"
         since_ms, until_ms = _resolve_window(local_day, region_effective)
@@ -166,7 +164,24 @@ async def run_eod(
             sys.stdout.write("\n")
             sys.stdout.flush()
         return result
+    if skip_cex:
+        exchanges = getattr(g_cfg, "enabled_exchanges", None)
+        logger.info("SKIPPED_CEX=1 exchanges=%s", exchanges)
+    if skip_finalize:
+        logger.info("SKIPPED_FINALIZE=1")
 
+    if sign_priv_pem_path:
+        priv_path = Path(sign_priv_pem_path)
+        if not priv_path.exists():
+            raise FileNotFoundError(f"sign-priv-pem not found: {priv_path}")
+        if not os.access(priv_path, os.R_OK):
+            raise PermissionError(f"sign-priv-pem not readable: {priv_path}")
+        try:
+            mode = priv_path.stat().st_mode
+            if mode & 0o004:
+                logger.warning("sign-priv-pem is world-readable: %s", priv_path)
+        except Exception:
+            logger.warning("sign-priv-pem stat failed for path: %s", priv_path)
     lhm = LoggerHistoriqueManager(cfg, out_dir)
 
     fetch_pnl_cex_fn: Callable[[str, str, str, str], Any] | None = None
@@ -360,15 +375,13 @@ def main(argv: list[str] | None = None) -> int:
         if isinstance(report, dict):
             pnl_reco = report.get("pnl_reconciliation") or {}
             state = pnl_reco.get("state") or report.get("state") or report.get("status")
-            reason_code = pnl_reco.get("reason_code") or report.get("reason_code")
-            if reason_code == "PNL_RECO_SKIPPED_ADAPTER_MISSING" and not args.skip_cex:
-                return 1
+
             if state == "MISMATCH":
-                return int(args.mismatch_exit_code)
-            if state == "ERROR" or report.get("status") == "ERROR":
-                return 1
+                if int(args.mismatch_exit_code) != 0:
+                    return int(args.mismatch_exit_code)
+                logger.info("MISMATCH_DETECTED=1")
     except Exception:
-        pass
+        logger.exception("Mismatch detection failed")
 
     return 0
 

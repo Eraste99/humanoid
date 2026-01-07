@@ -1075,8 +1075,7 @@ class ExecutionEngine:
         """
         try:
             region = str(getattr(self.config, "region", "EU")).upper()
-            cap_profile = str(
-                getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))).upper()
+            cap_profile = self._resolve_capital_profile()
 
             # cibles par région depuis la config (canonique: engine.pacer_targets)
             targets_overrides: Dict[str, Dict[str, float]] = {}
@@ -1148,9 +1147,101 @@ class ExecutionEngine:
             self._pacer_unavailable_logged = True
 
     # === /PACER: init & targets ===
+    def _warn_once(self, key: str, msg: str) -> None:
+        if key in self._alias_warnings:
+            return
+        self._alias_warnings.add(key)
+        logger.warning("[ExecutionEngine] %s", msg)
 
-    # === /PACER: init & targets ===
+    def _strict_config(self) -> bool:
+        root_cfg = getattr(self, "cfg", None)
+        engine_cfg = getattr(root_cfg, "engine", None) if root_cfg is not None else None
+        rm_cfg = getattr(root_cfg, "rm", None) if root_cfg is not None else None
+        return bool(
+            getattr(engine_cfg, "strict_config", False)
+            or getattr(self.config, "strict_config", False)
+            or getattr(rm_cfg, "strict_config", False)
+        )
 
+    def _strict_conflict(self) -> bool:
+        if not self._strict_config():
+            return False
+        g_cfg = getattr(self.cfg, "g", None)
+        fs = getattr(g_cfg, "feature_switches", {}) if g_cfg else {}
+        live_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD" or bool(
+            fs.get("engine_real", False)
+        )
+        live_armed = bool(getattr(g_cfg, "live_trading_armed", False))
+        return live_mode and live_armed
+
+    def _handle_alias_conflict(self, key: str, msg: str) -> None:
+        if self._strict_conflict():
+            raise RuntimeError(msg)
+        self._warn_once(key, msg)
+
+    def _resolve_capital_profile(self) -> str:
+        primary = getattr(self.config, "capital_profile", None)
+        alias = getattr(self.config, "engine_profile", None)
+        primary_norm = str(primary).upper() if primary else ""
+        alias_norm = str(alias).upper() if alias else ""
+        if primary_norm and alias_norm and primary_norm != alias_norm:
+            self._handle_alias_conflict(
+                "capital_profile_conflict",
+                f"capital_profile mismatch: capital_profile={primary_norm} engine_profile={alias_norm}",
+            )
+        if primary_norm:
+            return primary_norm
+        if alias_norm:
+            self._warn_once(
+                "capital_profile_alias",
+                "engine_profile is deprecated; use capital_profile instead",
+            )
+            return alias_norm
+        return "NANO"
+
+    def _resolve_engine_queue_max(self) -> int:
+        primary = getattr(self.config, "engine_queue_max", None)
+        alias = getattr(self.config, "engine_submit_queue_size", None)
+        primary_val = int(primary) if primary is not None else None
+        alias_val = int(alias) if alias is not None else None
+        if primary_val is not None and alias_val is not None and primary_val != alias_val:
+            self._handle_alias_conflict(
+                "engine_queue_max_conflict",
+                f"engine_queue_max mismatch: engine_queue_max={primary_val} engine_submit_queue_size={alias_val}",
+            )
+        if primary_val is not None:
+            return max(1, primary_val)
+        if alias_val is not None:
+            self._warn_once(
+                "engine_queue_max_alias",
+                "engine_submit_queue_size is deprecated; use engine_queue_max instead",
+            )
+            return max(1, alias_val)
+        return 256
+
+    def _resolve_engine_dedupe_store(self, ttl: float) -> Any:
+        primary = getattr(self.config, "engine_dedupe_store", None)
+        alias = getattr(self.cfg, "engine_dedupe_store", None)
+        conflict = False
+        if primary is not None and alias is not None:
+            try:
+                conflict = primary is not alias and primary != alias
+            except Exception:
+                conflict = True
+        if conflict:
+            self._handle_alias_conflict(
+                "engine_dedupe_store_conflict",
+                "engine_dedupe_store mismatch between cfg.engine and cfg root",
+            )
+        if primary is not None:
+            return primary
+        if alias is not None:
+            self._warn_once(
+                "engine_dedupe_store_alias",
+                "engine_dedupe_store at cfg root is deprecated; use cfg.engine.engine_dedupe_store instead",
+            )
+            return alias
+        return _InMemoryCIDStore(ttl)
     def _pacing_sleep_s(self, regime: str) -> float:
         """
         Calcule le sleep à appliquer après un envoi d'ordre en se basant en priorité
@@ -1356,7 +1447,7 @@ class ExecutionEngine:
         self.rl = rate_limiter
         self.retry = retry_policy
         self.history = history_logger
-
+        self._alias_warnings: set[str] = set()
 
         self.risk_manager = risk_manager
         self.reconciler = None
@@ -1408,15 +1499,7 @@ class ExecutionEngine:
 
         # --- File d’ordres bornée & workers ---
         # --- Profil capital & capacités Engine (Ticket 10) ---
-        try:
-            profile = str(
-                getattr(self.config, "capital_profile",
-                        getattr(self.config, "engine_profile", "NANO"))
-            ).upper()
-        except Exception:
-            profile = "NANO"
-        self._capital_profile = profile
-
+        self._capital_profile = self._resolve_capital_profile()
         # Sous-configs Engine / RM (BotConfig)
         root_cfg = getattr(self, "cfg", None)
 
@@ -1491,16 +1574,8 @@ class ExecutionEngine:
 
         # --- File d’ordres bornée & workers ---
         # --- File d’ordres bornée & workers ---
-        qmax = int(
-            getattr(
-                self.config,
-                "engine_queue_max",
-                getattr(self.config, "engine_submit_queue_size", 256),
-            )
-            or 256
-        )
-        qmax = max(1, qmax)
-        self.order_queue: asyncio.Queue = asyncio.Queue(maxsize=qmax)
+        self._engine_queue_max_cfg = self._resolve_engine_queue_max()
+        self.order_queue: asyncio.Queue = asyncio.Queue(maxsize=self._engine_queue_max_cfg)
         self.running: bool = False
         self._pacer_available: bool = True
         self._pacer_unavailable_logged: bool = False
@@ -1510,10 +1585,7 @@ class ExecutionEngine:
 
         # déduplication des submissions (TTL configurable)
         ttl = float(getattr(self.config, "engine_submit_dedupe_ttl_s", 300.0))
-        store = getattr(self.config, "engine_dedupe_store", None)
-        if store is None:
-            store = getattr(self.cfg, "engine_dedupe_store", None)
-        self._seen_cid_store = store or _InMemoryCIDStore(ttl)
+        self._seen_cid_store = self._resolve_engine_dedupe_store(ttl)
 
         # --- Rate limiting par CEX (utilise ta classe TokenBucket existante) ---
         # au lieu de self._rl_binance_order = TokenBucket(...):
@@ -1949,7 +2021,7 @@ class ExecutionEngine:
 
         try:
             if reconciler is None:
-                g_cfg = getattr(self.config, "g", None)
+                g_cfg = getattr(self.cfg, "g", None)
                 live_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD"
                 fs = getattr(g_cfg, "feature_switches", {}) if g_cfg else {}
                 require_private = bool(fs.get("private_ws", False))
@@ -3372,7 +3444,7 @@ class ExecutionEngine:
             return ack_base
 
         # 3) Contexte backpressure (queue globale + profondeur par branche + high watermark)
-        queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
+        queue_max_cfg = int(getattr(self, "_engine_queue_max_cfg", 0) or 0)
         queue_max = getattr(self.order_queue, "maxsize", 0) or queue_max_cfg or 0
         depth = int(self.order_queue.qsize())
         overflow_policy = str(
@@ -4443,7 +4515,7 @@ class ExecutionEngine:
                     await self._preempt_mm_for_pair([combo[1], combo[2]], combo[0], "HEDGE")
                 except Exception:
                     logging.exception("Unhandled exception while preempting MM before submit")
-        queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
+        queue_max_cfg = int(getattr(self, "_engine_queue_max_cfg", 0) or 0)
         queue_max = getattr(self.order_queue, "maxsize", 0) or queue_max_cfg or 0
         depth = int(self.order_queue.qsize())
         overflow_policy = str(getattr(self.config, "engine_enqueue_overflow_policy", "defer")).lower()
@@ -9203,10 +9275,6 @@ class ExecutionEngine:
     # LIMIT ORDERS (TT/TM) — Industry-like with PACER hooks
     # Remplace intégralement la méthode existante.
     # ---------------------------------------------------------------------------
-    # ---------------------------------------------------------------------------
-    # LIMIT ORDERS (TT/TM) — Industry-like with PACER hooks
-    # Remplace intégralement la méthode existante.
-    # ---------------------------------------------------------------------------
     # execution_engine.py — class ExecutionEngine
 
     async def _place_limit(
@@ -9253,10 +9321,9 @@ class ExecutionEngine:
         )
 
         branch = (meta.get("branch") or meta.get("strategy") or "").upper() or "UNKNOWN"
-        profile = str(
-            meta.get("capital_profile")
-            or getattr(self.config, "capital_profile", getattr(self.config, "engine_profile", "NANO"))
-        ).upper()
+        profile = str(meta.get("capital_profile") or self._capital_profile or "").upper()
+        if not profile:
+            profile = self._resolve_capital_profile()
 
         # 1) Pacer / région (EU/US/EU-CB, etc.) — via config.engine_pod_map
         region = str(getattr(self.config, "region", "EU")).upper()

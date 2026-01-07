@@ -46,7 +46,7 @@ mk, tk = sfc.get_effective_fees("BINANCE", "TT", pair="ETHUSDC", prudence_key="N
 total = sfc.get_total_cost_pct("ETHUSDC",
     buy_leg = {"ex":"BINANCE","alias":"TT","side":"buy","role":"taker"},
     sell_leg= {"ex":"COINBASE","alias":"TT","side":"sell","role":"taker"},
-    slippage_kind=getattr(bot_cfg, "sfc_slippage_source", "ewma"))
+    slippage_kind=getattr(bot_cfg.rm, "sfc_slippage_source", "ewma"))
 
 Notes
 -----
@@ -156,9 +156,25 @@ class SlippageAndFeesCollector:
     def __init__(self, *,
                  cfg: Optional[Any] = None,
                  slippage_lookback_s: Optional[float] = None):
+        if cfg is None:
+            raise ValueError("cfg_root is required to initialize SlippageAndFeesCollector")
+        rm_cfg = getattr(cfg, "rm", None)
+        slip_cfg = getattr(cfg, "slip", None)
+        if rm_cfg is None:
+            raise ValueError("cfg_root.rm is required to initialize SlippageAndFeesCollector")
+        if slip_cfg is None:
+            raise ValueError("cfg_root.slip is required to initialize SlippageAndFeesCollector")
         self.cfg = cfg
-        self.lookback_s = float(slippage_lookback_s if slippage_lookback_s is not None
-                                else getattr(cfg, "sfc_slippage_lookback_s", 60))
+        self.rm_cfg = rm_cfg
+        self.slip_cfg = slip_cfg
+        resolved_lookback = slippage_lookback_s
+        if resolved_lookback is None:
+            resolved_lookback = float(getattr(self.slip_cfg, "ttl_s", 2))
+        self.lookback_s = max(1.0, float(resolved_lookback))
+        self._fee_snapshot_ttl_s = 600.0
+        self._fee_sync_max_concurrency = int(
+            getattr(self.slip_cfg, "fee_sync_max_concurrency", 4)
+        )
         # Slippage buffers (optionnels)
         self._ewma: Dict[Tuple[str,str,str], float] = defaultdict(float)
         self._hist: Dict[Tuple[str,str,str], deque] = defaultdict(lambda: deque(maxlen=3600))
@@ -359,7 +375,7 @@ class SlippageAndFeesCollector:
         sell_leg = {"ex": sell_ex, "alias": sell_alias, "side": "sell", "role": "maker" if maker_on_sell else "taker"}
 
         if slippage_kind is None:
-            slippage_kind = str(getattr(self.cfg, "sfc_slippage_source", "ewma"))
+            slippage_kind = str(getattr(self.rm_cfg, "sfc_slippage_source", "ewma"))
 
         # Version 'paire + jambes' déjà présente dans ce module
         return float(self.get_total_cost_pct(pair, buy_leg=buy_leg, sell_leg=sell_leg, slippage_kind=slippage_kind))
@@ -624,7 +640,7 @@ class SlippageAndFeesCollector:
         Rafraîchit TOUTES les paires (exchange, alias) enregistrées.
         Concurrence bornée par cfg.fee_sync_max_concurrency (défaut 4).
         """
-        sem = asyncio.Semaphore(max(1, int(getattr(self.cfg, "fee_sync_max_concurrency", 4))))
+        sem = asyncio.Semaphore(max(1, int(self._fee_sync_max_concurrency)))
         tasks = []
         for ex, per in list(self._fee_clients.items()):
             for alias, cli in list(per.items()):
@@ -645,11 +661,10 @@ class SlippageAndFeesCollector:
         Lit les frais auprès du client (signatures souples) puis
         calcule les frais "effectifs" (VIP + token) pour l'alias.
         """
-        cfg = self.cfg
-        initial_s = float(getattr(cfg, "fee_sync_backoff_initial_s", 1.0))
-        max_s     = float(getattr(cfg, "fee_sync_backoff_max_s", 8.0))
-        max_retries = int(getattr(cfg, "fee_sync_max_retries", 3))
-        jitter_s  = float(getattr(cfg, "fee_sync_jitter_s", 0.2))
+        initial_s = float(getattr(self.slip_cfg, "fee_sync_backoff_initial_s", 1.0))
+        max_s = float(getattr(self.slip_cfg, "fee_sync_backoff_max_s", 8.0))
+        max_retries = int(getattr(self.slip_cfg, "fee_sync_max_retries", 3))
+        jitter_s = float(getattr(self.slip_cfg, "fee_sync_jitter_s", 0.2))
 
         async def _call_api():
             # Normalisation des signatures: get_trading_fees / get_fees / maker+taker séparés
@@ -738,7 +753,7 @@ class SlippageAndFeesCollector:
         taker = _safe_f(res.get("taker", 0.0))
         per_pair_raw = res.get("per_pair") or {}
         now = time.time()
-        ttl_s = float(getattr(self.cfg, "FEE_SNAPSHOT_TTL_S", 600.0))
+        ttl_s = float(self._fee_snapshot_ttl_s)
 
         # 1) VIP — si l’API fournit déjà un "effective_*" + "vip_tier", on les prend directement
         vip_tier = int(res.get("vip_tier", -1))
@@ -1012,7 +1027,7 @@ class SlippageAndFeesCollector:
         role = (role or "taker").lower()
 
         # NB: size_quote et prudence_key sont acceptés mais pas encore utilisés ici
-        k = (slippage_kind or getattr(self.cfg, "sfc_slippage_source", "ewma")).lower()
+        k = (slippage_kind or getattr(self.rm_cfg, "sfc_slippage_source", "ewma")).lower()
         slip = self.get_slippage(ex, pair, side, kind=k, default=default_slippage)
         fee = self.leg_fee_pct(ex, alias, pair=pair, role=role)
 
@@ -1085,7 +1100,7 @@ class SlippageAndFeesCollector:
         Forme B (legacy):
             get_total_cost_pct("BTCUSDC", buy_leg={ex,alias,role}, sell_leg={...}, slippage_kind="ewma")
         """
-        k = (slippage_kind or getattr(self.cfg, "sfc_slippage_source", "ewma")).lower()
+        k = (slippage_kind or getattr(self.rm_cfg, "sfc_slippage_source", "ewma")).lower()
         size_q = float(size_quote or 0.0)
         prud = str(prudence_key or "NORMAL")
 
@@ -1187,7 +1202,7 @@ class SlippageAndFeesCollector:
         denom = notional if notional > 0 else 1e-12
         dev_bps = abs(fee_paid - exp_fee) / denom * 1e4
 
-        threshold = float(getattr(self.cfg, "fee_reality_check_threshold_bps", 3.0))
+        threshold = float(getattr(self.slip_cfg, "fee_reality_check_threshold_bps", 3.0))
         exceeded = bool(dev_bps > threshold)
 
         res = {

@@ -295,7 +295,7 @@ class Boot:
             self._mark_degraded("BOOT_DEP_MISSING", where="rate_limiter")
         if getattr(self.ctx, "retry_policy", None) is None:
             self._mark_degraded("BOOT_DEP_MISSING", where="retry_policy")
-        pacer = getattr(self.cfg, "pacer", None) or getattr(self.cfg, "engine_pacer", None)
+        pacer = self._resolve_pacer_cfg()
         if pacer is None:
             self._mark_degraded("BOOT_DEP_MISSING", where="pacer")
 
@@ -331,6 +331,107 @@ class Boot:
         boot_cfg = getattr(self.cfg, "boot", None)
         return str(getattr(boot_cfg, "scanner_proxy_mode", "REJECT") or "REJECT").upper()
 
+    def _strict_config(self) -> bool:
+        rm_cfg = getattr(self.cfg, "rm", None)
+        return bool(getattr(rm_cfg, "strict_config", False))
+
+    def _canonical_deployment_mode(self) -> str:
+        g_cfg = getattr(self.cfg, "g", None)
+        g_mode = getattr(g_cfg, "deployment_mode", None) if g_cfg else None
+        cfg_mode = getattr(self.cfg, "DEPLOYMENT_MODE", None)
+        g_mode_norm = str(g_mode).upper() if g_mode else ""
+        cfg_mode_norm = str(cfg_mode).upper() if cfg_mode else ""
+        if g_mode_norm and cfg_mode_norm and g_mode_norm != cfg_mode_norm:
+            msg = f"deployment_mode mismatch: g.deployment_mode={g_mode_norm} cfg.DEPLOYMENT_MODE={cfg_mode_norm}"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self.log.warning("[Boot] %s; using g.deployment_mode", msg)
+        if g_mode_norm:
+            return g_mode_norm
+        if cfg_mode_norm:
+            self.log.warning("[Boot] g.deployment_mode missing; falling back to cfg.DEPLOYMENT_MODE")
+            return cfg_mode_norm
+        return ""
+
+    def _canonical_mode(self) -> str:
+        g_cfg = getattr(self.cfg, "g", None)
+        g_mode = getattr(g_cfg, "mode", None) if g_cfg else None
+        cfg_mode = getattr(self.cfg, "mode", None)
+        g_mode_norm = str(g_mode).upper() if g_mode else ""
+        cfg_mode_norm = str(cfg_mode).upper() if cfg_mode else ""
+        if g_mode_norm and cfg_mode_norm and g_mode_norm != cfg_mode_norm:
+            msg = f"mode mismatch: g.mode={g_mode_norm} cfg.mode={cfg_mode_norm}"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self.log.warning("[Boot] %s; using g.mode", msg)
+        if g_mode_norm:
+            return g_mode_norm
+        if cfg_mode_norm:
+            self.log.warning("[Boot] g.mode missing; falling back to cfg.mode")
+            return cfg_mode_norm
+        return "DRY_RUN"
+
+    def _resolve_obs_cfg(self) -> Any:
+        obs_cfg = getattr(self.cfg, "obs", None)
+        obs_compat = getattr(self.cfg, "observability", None)
+        if obs_cfg and obs_compat and obs_cfg is not obs_compat:
+            msg = "obs config provided in both cfg.obs and cfg.observability"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self.log.warning("[Boot] %s; using cfg.obs", msg)
+        if obs_cfg:
+            return obs_cfg
+        if obs_compat:
+            self.log.warning("[Boot] cfg.obs missing; falling back to cfg.observability")
+        return obs_compat
+
+    def _resolve_pacer_cfg(self) -> Any:
+        pacer_cfg = getattr(self.cfg, "pacer", None)
+        compat_cfg = getattr(self.cfg, "engine_pacer", None)
+        if pacer_cfg and compat_cfg and pacer_cfg is not compat_cfg:
+            msg = "pacer config provided in both cfg.pacer and cfg.engine_pacer"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self.log.warning("[Boot] %s; using cfg.pacer", msg)
+        if pacer_cfg:
+            return pacer_cfg
+        if compat_cfg:
+            self.log.warning("[Boot] cfg.pacer missing; falling back to cfg.engine_pacer")
+        return compat_cfg
+
+    def _resolve_enable_jp(self) -> bool:
+        g_cfg = getattr(self.cfg, "g", None)
+        g_enable = getattr(g_cfg, "enable_jp", None) if g_cfg else None
+        cfg_enable = getattr(self.cfg, "enable_jp", None)
+        if g_enable is not None and cfg_enable is not None and bool(g_enable) != bool(cfg_enable):
+            msg = f"enable_jp mismatch: g.enable_jp={bool(g_enable)} cfg.enable_jp={bool(cfg_enable)}"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self.log.warning("[Boot] %s; using g.enable_jp", msg)
+        if g_enable is not None:
+            return bool(g_enable)
+        if cfg_enable is not None:
+            self.log.warning("[Boot] g.enable_jp missing; falling back to cfg.enable_jp")
+        return bool(cfg_enable) if cfg_enable is not None else False
+
+    def _resolve_lhm_out_dir(self) -> str:
+        lhm_cfg = getattr(self.cfg, "lhm", None)
+        candidates = [
+            ("lhm.out_dir", getattr(lhm_cfg, "out_dir", None)),
+            ("cfg.LHM_OUT_DIR", getattr(self.cfg, "LHM_OUT_DIR", None)),
+            ("cfg.LOG_DIR", getattr(self.cfg, "LOG_DIR", None)),
+            ("cfg.HISTORY_DIR", getattr(self.cfg, "HISTORY_DIR", None)),
+        ]
+        resolved = [(name, value) for name, value in candidates if value]
+        if resolved:
+            values = {str(value) for _, value in resolved}
+            if len(values) > 1:
+                msg = f"LHM out_dir mismatch across {', '.join(name for name, _ in resolved)}"
+                if self._strict_config():
+                    raise RuntimeError(msg)
+                self.log.warning("[Boot] %s; using %s", msg, resolved[0][0])
+            return str(resolved[0][1])
+        return "/srv/app/logs"
     def _resolve_transfer_clients(self) -> Optional[Dict[str, Any]]:
         """Retourne un mapping {exchange: client} pour les transferts internes.
 
@@ -351,7 +452,7 @@ class Boot:
             except Exception:
                 self.log.exception("[Boot] transfer_clients factory failed")
                 raw_cfg = None
-        base = {}
+        cfg_map: Dict[str, Any] = {}
         if isinstance(raw_cfg, dict):
             cfg_map = {str(k).upper(): v for k, v in raw_cfg.items() if v}
 
@@ -404,7 +505,7 @@ class Boot:
 
         return self._transfer_clients_cache if self._transfer_clients_cache else None
     def _check_obs_preflight(self) -> None:
-        obs_cfg = getattr(self.cfg, "obs", None) or getattr(self.cfg, "observability", None)
+        obs_cfg = self._resolve_obs_cfg()
         strict = bool(getattr(obs_cfg, "strict_obs", False))
         obs_ready = True
         details = ""
@@ -433,10 +534,10 @@ class Boot:
     async def start(self) -> BootContext:
         self._check_obs_preflight()
         # boot.py — dans async def start(self): juste au début
-        mode = getattr(self.cfg, "DEPLOYMENT_MODE", None)
-        if mode is None:
-            self.log.error("[Boot] cfg.DEPLOYMENT_MODE manquant; arrêt")
-            raise RuntimeError("missing DEPLOYMENT_MODE")
+        mode = self._canonical_deployment_mode()
+        if not mode:
+            self.log.error("[Boot] deployment_mode manquant; arrêt")
+            raise RuntimeError("missing deployment_mode")
         snapshot_hash = getattr(self.cfg, "snapshot_hash", None)
         snapshot_dict = getattr(self.cfg, "snapshot_dict", None)
         if not callable(snapshot_hash) or not callable(snapshot_dict):
@@ -448,14 +549,7 @@ class Boot:
 
 
         region = str(getattr(getattr(self.cfg, "g", object()), "pod_region", "EU")).upper()
-        enable_jp = False
-        try:
-            g_cfg = getattr(self.cfg, "g", None)
-            enable_jp = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else bool(
-                getattr(self.cfg, "enable_jp", False)
-            )
-        except Exception:
-            enable_jp = False
+        enable_jp = self._resolve_enable_jp()
 
         if self._running:
             return self.ctx
@@ -480,7 +574,7 @@ class Boot:
         except Exception:
             pass
         self._emit_lifecycle("boot.starting")
-        self.log.info("[Boot] 🚀 start… mode=%s", str(mode).upper())
+        self.log.info("[Boot] 🚀 start… deployment_mode=%s", str(mode).upper())
 
         if region == "JP" and not enable_jp:
             self._mark_degraded("REGION_JP_DISABLED_BY_DEFAULT", where="region_guard")
@@ -917,13 +1011,7 @@ class Boot:
 
         lhm_cfg = getattr(self.cfg, "lhm", None)
         # 1) Résolution robuste de l'out_dir (priorité décroissante)
-        out_dir = (
-                getattr(lhm_cfg, "out_dir", None)
-                or getattr(self.cfg, "LHM_OUT_DIR", None)
-                or getattr(self.cfg, "LOG_DIR", None)
-                or getattr(self.cfg, "HISTORY_DIR", None)
-                or "/srv/app/logs"
-        )
+        out_dir = self._resolve_lhm_out_dir()
         try:
             obs_metrics.set_strict_obs(
                 getattr(lhm_cfg, "strict_obs", getattr(getattr(self.cfg, "g", object()), "strict_obs", None)))
@@ -1447,8 +1535,9 @@ class Boot:
 
         self.ctx.rm = RiskManager(**rm_kwargs)
         try:
-            dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY") or "EU_ONLY").upper()
-            self.ctx.rm.split_mode = dep_mode
+            dep_mode = self._canonical_deployment_mode()
+            if dep_mode:
+                self.ctx.rm.split_mode = dep_mode
         except Exception:
             pass
         try:
@@ -1526,38 +1615,35 @@ class Boot:
         feature_switches = getattr(g_cfg, "feature_switches", {}) or {}
         engine_real = bool(feature_switches.get("engine_real", False))
         rm_dry_run = bool(getattr(rm_cfg, "dry_run", False))
-        mode = str(getattr(g_cfg, "mode", "")) or ""
-        mode_upper = mode.upper()
+        mode_upper = self._canonical_mode()
         strict_cfg = bool(getattr(rm_cfg, "strict_config", False))
 
         if mode_upper == "DRY_RUN":
             if engine_real or not rm_dry_run:
                 msg = (
                     f"[Boot] Mode={mode_upper} but engine_real={engine_real} rm.dry_run={rm_dry_run};"
-                    " enforcing DRY_RUN invariants"
+                    " configuration mismatch"
                 )
                 if strict_cfg:
                     raise RuntimeError(msg)
                 self.log.warning(msg)
-                engine_real = False
-                rm_dry_run = True
+
         elif mode_upper == "PROD":
             if not engine_real or rm_dry_run:
                 msg = (
                     f"[Boot] Mode={mode_upper} but engine_real={engine_real} rm.dry_run={rm_dry_run};"
-                    " enforcing PROD invariants"
+                     " configuration mismatch"
                 )
                 if strict_cfg:
                     raise RuntimeError(msg)
                 self.log.warning(msg)
-                engine_real = True
-                rm_dry_run = False
 
-        live = bool(engine_real)
+
+        live = (mode_upper == "PROD") or bool(engine_real)
         self.log.info(
             "[Boot] Scanner live=%s (mode=%s engine_real=%s rm.dry_run=%s)",
             live,
-            mode_upper or mode,
+            mode_upper,
             engine_real,
             rm_dry_run,
         )
@@ -1576,7 +1662,7 @@ class Boot:
                 coh = get_coh()
 
             # (3) Applique au Scanner (fallback binaire si 4-tiers non fournis)
-            dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY"))
+            dep_mode = self._canonical_deployment_mode()
             if coh:
                 def _sorted_pairs(values: Any) -> List[str]:
                     if not values:
@@ -1601,8 +1687,7 @@ class Boot:
         self._scanner_proxy.bind(self.ctx.scanner)
         await self.ctx.scanner.start()
 
-        self.ready_scanner.set()
-        self._mark_stage("scanner_ready")
+
         # P0: bind du proxy pour que le Router n’ait plus 100% de drops
         with contextlib.suppress(Exception):
             self._scanner_proxy.bind(self.ctx.scanner)
@@ -1662,7 +1747,7 @@ class Boot:
 
         # 2) Reconciler (unique)
         if not getattr(self.ctx, "reconciler", None):
-            reco_cfg = getattr(self.cfg, "reconciler", None)
+            reco_cfg = getattr(self.cfg, "pws_reco", None) or getattr(self.cfg, "reconciler", None)
             reco_kwargs = {
                 "venue_name": "TRI-CEX",
                 "cooldown_s": getattr(reco_cfg, "cooldown_s", 60.0),
@@ -1672,11 +1757,12 @@ class Boot:
                 "cold_every_h": getattr(
                     reco_cfg, "cold_every_h", getattr(reco_cfg, "cold_resync_interval_h", 6.0)
                 ),
+                "cfg": reco_cfg,
             }
             self.ctx.reconciler = PrivateWSReconciler(**reco_kwargs)
 
         try:
-            self.ctx.reconciler.cfg = getattr(self.cfg, "reconciler", None)
+            self.ctx.reconciler.cfg = getattr(self.cfg, "pws_reco", None) or getattr(self.cfg, "reconciler", None)
         except Exception:
             pass
 
@@ -1791,7 +1877,7 @@ class Boot:
                     coh = get_coh()
 
                 if coh:
-                    dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY"))
+                    dep_mode = self._canonical_deployment_mode()
                     scn.set_universe(
                         mode=dep_mode,
                         core=coh.get("CORE", []),
@@ -2360,7 +2446,8 @@ class Boot:
 
         g = getattr(self.cfg, "g", None)
         fs = getattr(g, "feature_switches", {}) if g else {}
-        live = (str(getattr(self.cfg, "mode", "DRY_RUN")).upper() == "PROD") or bool(fs.get("engine_real", False))
+        mode_upper = self._canonical_mode()
+        live = (mode_upper == "PROD") or bool(fs.get("engine_real", False))
         private_ws_enabled = bool(fs.get("private_ws", False))
 
         rm_status: Dict[str, Any] = {}
@@ -2432,7 +2519,7 @@ class Boot:
             reasons.append("rpc_unavailable")
         if rpc_enabled:
             gcfg = getattr(self.cfg, "g", self.cfg)
-            deployment_mode = str(getattr(gcfg, "deployment_mode", "SPLIT") or "SPLIT").upper()
+            deployment_mode = self._canonical_deployment_mode() or "SPLIT"
             if deployment_mode == "SPLIT" and bool(getattr(getattr(self.cfg, "rpc", object()), "ready_strict", True)):
                 loc_region = str(getattr(gcfg, "pod_region", "EU")).upper()
                 ex_region_map = getattr(gcfg, "exchange_region_map", {}) or {}
@@ -2443,8 +2530,7 @@ class Boot:
                                                                                           engine_pods.keys()}:
                         reasons.append("engine_pod_missing")
                         break
-        dry_run = bool(getattr(getattr(self.cfg, "g", object()), "dry_run", False))
-        live = not dry_run
+        live = (mode_upper == "PROD") or bool(fs.get("engine_real", False))
         scanner = getattr(self.ctx, "scanner", None)
         lhm = getattr(self.ctx, "lhm", None)
         if live:
@@ -2505,7 +2591,7 @@ class Boot:
                 elif not eng_private.get("hub_wiring_ok", False):
                     reasons.append("engine_private_hub_wiring_incomplete")
 
-        dep_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "EU_ONLY")).upper()
+        dep_mode = self._canonical_deployment_mode()
         if dep_mode not in {"EU_ONLY", "SPLIT", "JP_ONLY"}:
             reasons.append("BOOT_MODE_FALLBACK")
 

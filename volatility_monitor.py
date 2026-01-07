@@ -113,6 +113,8 @@ class VolatilityMonitor:
 
         self.cfg = cfg
         v = self.cfg.vol
+        self._missing_slo_warned: set[tuple[str, str]] = set()
+        self._slo_resolution_warned = False
 
         self._ttl_s = getattr_int(v, "ttl_s", 5)
         self._ema_alpha = getattr_float(v, "ema_alpha", 0.20)
@@ -354,6 +356,71 @@ class VolatilityMonitor:
             values.extend(val for (t, val) in series if now - t <= duration)
         return values
 
+    def _strict_config(self) -> bool:
+        rm_cfg = getattr(self.cfg, "rm", None)
+        vol_cfg = getattr(self.cfg, "vol", None)
+        return bool(
+            getattr(rm_cfg, "strict_config", False)
+            or getattr(vol_cfg, "strict_config", False)
+        )
+
+    def _deployment_mode(self) -> str:
+        g_cfg = getattr(self.cfg, "g", None)
+        mode = getattr(g_cfg, "deployment_mode", None) if g_cfg else None
+        mode_norm = str(mode).strip().upper() if mode else ""
+        if not mode_norm:
+            msg = "deployment_mode missing; using EU_ONLY fallback"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            logger.warning("[VolatilityMonitor] %s", msg)
+            mode_norm = "EU_ONLY"
+        if mode_norm not in {"EU_ONLY", "SPLIT", "JP_ONLY"}:
+            logger.warning("[VolatilityMonitor] unknown deployment_mode=%s; falling back to EU_ONLY", mode_norm)
+            mode_norm = "EU_ONLY"
+        return mode_norm
+
+    def _resolve_ttl_s(self, exchange: str, ttl_s: Optional[float]) -> float:
+        base_ttl = float(ttl_s) if ttl_s is not None else float(getattr(self, "_ttl_s", 5.0))
+        mode_key = self._deployment_mode()
+        exu = str(exchange or "").upper()
+        slo_ttl = None
+        try:
+            cfg = getattr(self, "cfg", None)
+            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+            if slo_map:
+                per_ex = slo_map.get(mode_key) or {}
+                path_slo = per_ex.get(exu)
+                if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                    vol_ttl_s = float(getattr(path_slo.public, "vol_ttl_s", 0.0) or 0.0)
+                    if vol_ttl_s > 0.0:
+                        slo_ttl = vol_ttl_s
+        except Exception:
+            if not self._slo_resolution_warned:
+                self._slo_resolution_warned = True
+                logger.warning(
+                    "[VolatilityMonitor] unable to resolve SLO-based vol TTL; using cfg.vol.ttl_s",
+                    exc_info=False,
+                )
+            return base_ttl
+
+        if slo_ttl is None:
+            warn_key = (mode_key, exu)
+            if warn_key not in self._missing_slo_warned:
+                self._missing_slo_warned.add(warn_key)
+                logger.warning(
+                    "[VolatilityMonitor] missing SLO vol_ttl_s for mode=%s exchange=%s; using cfg.vol.ttl_s",
+                    mode_key,
+                    exu,
+                )
+            return base_ttl
+
+        ttl = min(base_ttl, slo_ttl)
+        if ttl_s is not None and ttl_s > ttl:
+            logger.debug(
+                "[VolatilityMonitor] requested vol TTL clamped by SLO",
+                extra={"requested_ttl": base_ttl, "slo_ttl": slo_ttl, "effective_ttl": ttl},
+            )
+        return ttl
     def get_price_volatility(
         self,
         pair: str,
@@ -387,43 +454,7 @@ class VolatilityMonitor:
             return None
 
         # --- Résolution du TTL (SLO public plafonne) -----------------------------
-        legacy_ttl = float(getattr(self, "_ttl_s", 5.0))
-        requested_ttl = float(ttl_s) if ttl_s is not None else None
-        slo_ttl = None
-        try:
-            cfg = getattr(self, "cfg", None)
-            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
-            if slo_map:
-                g_cfg = getattr(cfg, "g", None)
-                mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
-                per_ex = slo_map.get(mode_key) or {}
-                path_slo = per_ex.get(ex)
-                if path_slo is not None and getattr(path_slo, "public", None) is not None:
-                    vol_ttl_s = float(getattr(path_slo.public, "vol_ttl_s", 0.0) or 0.0)
-                    if vol_ttl_s > 0.0:
-                        slo_ttl = vol_ttl_s
-        except Exception:
-            logger.warning(
-                "[VolatilityMonitor] unable to resolve SLO-based vol TTL, "
-                "falling back to cfg.vol.ttl_s",
-                exc_info=False,
-            )
-
-        base_ttl = (
-            requested_ttl
-            if requested_ttl is not None
-            else (slo_ttl if slo_ttl is not None else legacy_ttl)
-        )
-        ttl = min(base_ttl, slo_ttl) if slo_ttl is not None else base_ttl
-        if (
-                requested_ttl is not None
-                and slo_ttl is not None
-                and requested_ttl > ttl
-        ):
-            logger.debug(
-                "[VolatilityMonitor] requested vol TTL clamped by SLO",
-                extra={"requested_ttl": requested_ttl, "slo_ttl": slo_ttl, "effective_ttl": ttl},
-            )
+        ttl = self._resolve_ttl_s(ex, ttl_s)
         # --- Application du TTL sur la dernière mesure --------------------------
         age_s = max(0.0, time.time() - float(rec.get("ts_recv_s", 0.0)))
         if age_s > ttl:

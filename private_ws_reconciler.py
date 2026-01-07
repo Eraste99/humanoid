@@ -6,6 +6,11 @@ private_ws_reconciler.py — fallback polling si WS privé devient intermittent.
 Alignement P0/Hub :
 - Evénements Hub: 'fill' avec 'client_id' standardisé (fallback clientOrderId, etc.)
 - Latences/horodatages gérés côté Hub ; ici on se concentre sur idempotence + resync.
+Knobs cfg consommés (scope cfg.reconciler ou objet proxy équivalent) :
+- RECO_MISS_BURST_THRESHOLD (default: 30)
+- RECO_ALERT_PERIOD_S (default: 5.0, min 1.0)
+- RECO_MISS_RECENT_THRESHOLD (default: RECO_MISS_BURST_THRESHOLD)
+- RECO_ALIAS_RESYNC_MAX_AGE_S (default: 6 * 3600)
 """
 from __future__ import annotations
 import inspect
@@ -128,6 +133,7 @@ class PrivateWSReconciler:
         request_full_resync: Optional[Callable[[str], Awaitable[None]]] = None,
         dedup_max: int = 20000,
         cold_every_h: Optional[float] = None,
+        cfg: Optional[Any] = None,
     ) -> None:
 
         # --- Détection du mode "riche" legacy si signature positionnelle fournie ---
@@ -144,6 +150,8 @@ class PrivateWSReconciler:
         self._apply_reco = apply_reconciliation
         self._is_inflight = is_inflight_client_id
         self._request_full_resync = request_full_resync
+        self.request_full_resync = request_full_resync
+        self.cfg = cfg
 
         self._stale_ms = int(stale_ms)
         self._poll_every_s = float(poll_every_s)
@@ -205,7 +213,23 @@ class PrivateWSReconciler:
         # NB: on utilise directement deque(), importé depuis collections.
         self._miss_win: Deque[float] = deque(maxlen=512)
         self._miss_alert_task: Optional[asyncio.Task] = None
+        self._resync_conflict_warned = False
 
+    def _strict_config(self) -> bool:
+        cfg = getattr(self, "cfg", None)
+        return bool(getattr(cfg, "strict_config", False))
+
+    def _resolve_request_full_resync(self) -> Optional[Callable[[str], Awaitable[None]]]:
+        public = getattr(self, "request_full_resync", None)
+        private = getattr(self, "_request_full_resync", None)
+        if public and private and public is not private:
+            msg = "request_full_resync conflict: public != _request_full_resync"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            if not self._resync_conflict_warned:
+                self._resync_conflict_warned = True
+                log.warning("[Reconciler] %s", msg)
+        return private or public
 
     def _record_miss(self) -> None:
         # Appeler ceci à chaque "miss" détecté (en plus du compteur existant)
@@ -369,7 +393,7 @@ class PrivateWSReconciler:
         Exécute un cold-resync périodique (4–6h par défaut).
         """
         import asyncio, time
-        if not callable(getattr(self, "_request_full_resync", None)) and not callable(getattr(self, "request_full_resync", None)):
+        if not callable(self._resolve_request_full_resync()):
             return
         while not self._stop.is_set():
             try:
@@ -390,7 +414,7 @@ class PrivateWSReconciler:
                 t0 = time.perf_counter()
                 ok = False
                 try:
-                    fn = getattr(self, "_request_full_resync", None) or getattr(self, "request_full_resync", None)
+                    fn = self._resolve_request_full_resync()
                     venue = getattr(self, "venue", "UNKNOWN")
                     if callable(fn):
                         await fn(venue)
@@ -777,9 +801,10 @@ class PrivateWSReconciler:
                             await self._apply_reco(opens, fills, self.venue)
 
                             # Optionnel: pleine resynchronisation si un MISS a été vu pendant la passe
-                            if miss_detected and callable(self._request_full_resync):
+                            fn = self._resolve_request_full_resync()
+                            if miss_detected and callable(fn):
                                 try:
-                                    await self._request_full_resync(self.venue)
+                                    await fn(self.venue)
                                 except Exception:
                                     log.exception("PrivateWSReconciler: request_full_resync failed")
 
@@ -979,7 +1004,7 @@ class PrivateWSReconciler:
             try:
                 while True:
                     await asyncio.sleep(max(1.0, float(period_hours) * 3600.0))
-                    fn = getattr(self, "_request_full_resync", None) or getattr(self, "request_full_resync", None)
+                    fn = self._resolve_request_full_resync()
                     if callable(fn):
                         try:
                             await fn(self.venue)

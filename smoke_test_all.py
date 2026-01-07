@@ -66,6 +66,7 @@ import time
 import math
 import types
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -1743,12 +1744,21 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         if PrivateWSReconciler is None:
             return
 
+        class _FakeRecoCfg:
+            RECO_MISS_BURST_THRESHOLD = 2
+            RECO_ALERT_PERIOD_S = 1.5
+            RECO_MISS_RECENT_THRESHOLD = 1
+            RECO_ALIAS_RESYNC_MAX_AGE_S = 0.1
+
+        fake_cfg = _FakeRecoCfg()
+
         # Tight staleness for smoke
         rec = PrivateWSReconciler(
             cooldown_s=0.1,
             stale_ms=100,
             poll_every_s=0.05,
             dedup_max=128,
+            cfg=fake_cfg,
         )
 
         # activity -> not stale
@@ -1796,6 +1806,62 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                     self.fail(f"dedup store grew unexpectedly: before={before} after={after}")
             except Exception:
                 self.skipTest("unable to introspect dedup store size; no-crash contract only")
+        with self.subTest("reconciler cfg knobs (alerts/health)"):
+            class _Metric:
+                def __init__(self) -> None:
+                    self.inc_count = 0
+                    self.set_values: list[float] = []
+
+                def labels(self, *_args, **_kwargs):
+                    return self
+
+                def inc(self, *_args, **_kwargs) -> None:
+                    self.inc_count += 1
+
+                def set(self, value: float) -> None:
+                    self.set_values.append(float(value))
+
+            burst_metric = _Metric()
+            rate_metric = _Metric()
+
+            rec._miss_win.clear()
+            now = time.time()
+            rec._miss_win.extend([now - 1.0, now - 2.0])
+
+            captured_timeouts: list[float] = []
+
+            async def _fake_wait_for(awaitable, timeout):
+                captured_timeouts.append(float(timeout))
+                rec._stop.set()
+                raise asyncio.TimeoutError
+
+            rec._stop.clear()
+            with mock.patch.object(pwsr_mod, "WS_RECO_MISS_BURST_TOTAL", burst_metric), \
+                    mock.patch.object(pwsr_mod, "WS_RECO_MISS_PER_MINUTE", rate_metric), \
+                    mock.patch("asyncio.wait_for", side_effect=_fake_wait_for):
+                await rec.run_miss_alerts(threshold_per_minute=999, period_s=9.0)
+
+            self.assertEqual(burst_metric.inc_count, 1)
+            self.assertTrue(captured_timeouts, "run_miss_alerts did not await interval")
+            self.assertEqual(captured_timeouts[0], float(fake_cfg.RECO_ALERT_PERIOD_S))
+
+            ex = "BINANCE"
+            alias = "TT"
+            key = (ex, alias)
+            rec._miss_win.clear()
+
+            rec._alias_miss_counter[key] = 1
+            rec._last_alias_resync[key] = time.time()
+            health_recent = rec.health(ex, alias)
+            self.assertEqual(health_recent.get("status"), "AT_RISK")
+
+            rec._alias_miss_counter[key] = 0
+            rec._last_alias_resync[key] = time.time() - 999.0
+            health_age = rec.health(ex, alias)
+            self.assertEqual(health_age.get("status"), "AT_RISK")
+
+            snap = rec.get_alias_status_snapshot(ex, alias)
+            self.assertEqual(snap.get("status"), "AT_RISK")
 
         if _stress_enabled():
             with self.subTest("PrivateWSReconciler fill storm (CI3/SMOKE_STRESS=1)"):
@@ -1863,6 +1929,203 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.20)
         await asyncio.wait_for(rec.stop(), timeout=_timeout_s())
 
+    async def test_03b_pws_bybit_normalization(self) -> None:
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips PWS normalization test")
+
+        import private_ws_hub as pws_hub_mod
+        from bot_config import PrivateWSHubCfg
+
+        class _Cfg:
+            def __init__(self) -> None:
+                self.pws = PrivateWSHubCfg()
+
+                class _G:
+                    mode = "DRY_RUN"
+
+                self.g = _G()
+
+        cfg = _Cfg()
+        hub = pws_hub_mod.PrivateWSHub(config=cfg)
+        seen: list[dict] = []
+
+        def _cb(ev: dict) -> None:
+            seen.append(ev)
+
+        hub.register_callback(_cb, role="engine")
+
+        raw = {
+            "exchange": "BYBIT",
+            "alias": "TT",
+            "type": "order",
+            "status": "ACK",
+            "orderId": "OID-1",
+            "clientOrderId": " CID-1 ",
+            "ts_exchange": 1690000000000,
+        }
+        hub.emit(raw, dedup=True)
+
+        self.assertTrue(seen, "no event received from PWS hub")
+        ev = seen[-1]
+        self.assertEqual(ev.get("exchange_order_id"), "OID-1")
+        self.assertEqual(ev.get("client_id"), "CID-1")
+        self.assertIsInstance(ev.get("ts_exchange"), (float, int))
+        self.assertLess(float(ev.get("ts_exchange") or 0.0), 1e11)
+
+        with self.subTest("pws_queue_backpressure_ms_removed"):
+            hub_src = Path(pws_hub_mod.__file__).read_text(encoding="utf-8")
+            self.assertNotIn("PWS_QUEUE_BACKPRESSURE_MS", hub_src)
+
+    async def test_03c_balance_fetcher_cfg_knobs(self) -> None:
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips balance fetcher knob test")
+
+        import balance_fetcher as bf_mod
+        from bot_config import BalanceFetcherCfg
+
+        class _Cfg:
+            def __init__(self) -> None:
+                self.balances = BalanceFetcherCfg()
+                self.balances.BF_ALERT_PERIOD_S = 7
+                self.balances.WS_BAL_TTL_SECONDS = 1
+                self.balances.ENABLE_WS_BALANCE_MERGE = True
+                self.balances.coinbase_api_base = "http://coinbase.local"
+                self.balances.bybit_api_base = "http://bybit.local"
+
+                class _G:
+                    deployment_mode = "SPLIT"
+
+                self.g = _G()
+
+        cfg = _Cfg()
+        bf = bf_mod.MultiBalanceFetcher(config=cfg, dry_run=True)
+
+        self.assertEqual(bf._ws_ttl_s, 1.0)
+        self.assertTrue(bf._enable_ws_balance_merge)
+
+        captured: list[float] = []
+
+        async def _fake_sleep(delay: float):
+            captured.append(float(delay))
+            raise asyncio.CancelledError
+
+        bf._running = True
+        with mock.patch("asyncio.sleep", side_effect=_fake_sleep):
+            await bf.run_alerts()
+        self.assertTrue(captured, "balance fetcher did not sleep in alerts loop")
+        self.assertEqual(captured[0], 7.0)
+
+        adapter = bf_mod.PnlRecoCexAdapter(cfg)
+        self.assertEqual(
+            adapter._resolve_api_base("coinbase_api_base", default="http://x", legacy_root="coinbase_rest_base"),
+            "http://coinbase.local",
+        )
+        self.assertEqual(
+            adapter._resolve_api_base("bybit_api_base", default="http://x", legacy_root="bybit_rest_base"),
+            "http://bybit.local",
+        )
+
+    async def test_03d_engine_pacer_config(self) -> None:
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips engine pacer config test")
+
+        import engine_pacer as pacer_mod
+
+        class _G:
+            mode = "DEV"
+            live_trading_armed = False
+
+        class _Cfg:
+            def __init__(self, deployment_mode=None, slo=None, engine=None, g=None) -> None:
+                self.g = g or _G()
+                if deployment_mode is not None:
+                    self.g.deployment_mode = deployment_mode
+                self.slo = slo
+                self.engine = engine
+
+        class _EngineCfg:
+            pass
+
+        cfg_missing_dm = _Cfg(deployment_mode=None)
+        self.assertEqual(pacer_mod._deployment_mode(cfg_missing_dm), "EU_ONLY")
+
+        pacer = pacer_mod.EnginePacer(bot_cfg=cfg_missing_dm)
+        self.assertEqual(getattr(pacer, "_pacer_knobs_source", None), "default")
+
+        cfg_prod = _Cfg(deployment_mode="EU_ONLY", g=type("G", (), {"mode": "PROD", "live_trading_armed": True})())
+        pacer_prod = pacer_mod.EnginePacer(bot_cfg=cfg_prod)
+        self.assertEqual(getattr(pacer_prod, "_pacer_knobs_source", None), "default")
+
+        class _PrivateSLO:
+            ack_target_ms = 300.0
+            ack_hi_ms = 200.0
+            ack_sev_ms = 400.0
+
+        class _Path:
+            private = _PrivateSLO()
+
+        slo = {"EU_ONLY": {"BINANCE": _Path()}}
+        cfg_slo = _Cfg(deployment_mode="EU_ONLY", slo=slo, engine=_EngineCfg())
+        pacer_slo = pacer_mod.EnginePacer(bot_cfg=cfg_slo, region_map={"BINANCE": "EU"})
+        targets = pacer_slo._targets.get("EU") or {}
+        self.assertEqual(targets.get("ack_target"), 200.0)
+        self.assertEqual(targets.get("ack_hi"), 300.0)
+        self.assertEqual(targets.get("ack_sev"), 400.0)
+
+    async def test_03e_rpc_gateway_config_and_idem(self) -> None:
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips rpc gateway config test")
+
+        import rpc_gateway as rpc_mod
+        from bot_config import RPCCfg
+
+        class _G:
+            mode = "DEV"
+            live_trading_armed = False
+            deployment_mode = "EU_ONLY"
+
+        class _Cfg:
+            def __init__(self) -> None:
+                self.g = _G()
+                self.rpc = RPCCfg()
+                self.rpc.enabled = False
+                self.rpc.host = "127.0.0.1"
+                self.rpc.port = 9999
+                self.rpc.timeout_s = 5.0
+                self.rpc.loopback_inproc = True
+                self.rpc.remote_base_url = "http://rpc.local"
+
+        cfg = _Cfg()
+        settings = rpc_mod.RPCSettings.from_cfg(cfg)
+        self.assertFalse(settings.enabled)
+        self.assertEqual(settings.host, "127.0.0.1")
+        self.assertEqual(settings.port, 9999)
+
+        submitter = rpc_mod.make_submitter_for_exchange(
+            cfg,
+            exchange="BINANCE",
+            local_region="EU",
+            exchange_region_map={"BINANCE": "EU"},
+            rpc_server=mock.Mock(),
+        )
+        self.assertIsInstance(submitter, rpc_mod.InprocSubmitter)
+
+        async def _noop(_payload):
+            return {"ok": True}
+
+        async def _stream(_payload):
+            if False:
+                yield {}
+
+        handlers = rpc_mod.RPCHandlers(
+            submit_bundle=_noop,
+            cancel=_noop,
+            status=_noop,
+            stream=_stream,
+        )
+        server = rpc_mod.RPCServer(cfg, handlers=handlers)
+        idem = server._derive_idem_key_from_payload({"meta": {"idempotency_key": "IDK-1"}})
+        self.assertEqual(idem, "IDK-1")
     async def test_04_429_surge_pacer_degrades(self) -> None:
         """Scénario 4 — 429 surge: pacer doit dégrader.
 
@@ -2143,7 +2406,6 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             root = Path(td)
             lw = LogWriter(
                 db_dir=str(root),
-                rotate_bytes=1,  # force rotation immediately
                 backup_count=3,
                 compress_rotations=True,
             )
@@ -2167,6 +2429,251 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                 files_present = [p for p in Path(td).iterdir() if p.is_file()]
                 self.assertTrue(files_present, "no log files created during rotation test")
 
+    async def test_05b_lhm_cfg_and_fail_closed(self) -> None:
+        """Scénario 5b — LHM cfg canonique + rotation/DB lane + fail-closed."""
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 5b")
+
+        lhm_mod = importlib.import_module("modules.logger_historique.logger_historique_manager")
+        LHM = getattr(lhm_mod, "LoggerHistoriqueManager", None)
+        require_contract(self, LHM is not None, "LoggerHistoriqueManager absent")
+        if LHM is None:
+            return
+
+        cfg = modules.bot_config.BotConfig()
+        cfg.lhm.LHM_JSONL_MAX_BYTES = 64
+        cfg.lhm.LHM_DB_LANE_ENABLED = False
+        cfg.lhm.ff_truth_model_enabled = True
+        cfg.lhm.ff_truth_fail_closed = True
+
+        with tempfile.TemporaryDirectory() as td:
+            lhm = LHM(cfg, out_dir=td)
+            self.assertFalse(getattr(lhm, "_db_lane_enabled", True))
+
+            rot = lhm._jsonl["events"]
+            path_before = rot.current_path
+            rot.write_line(b"x" * 128)
+            path_after = rot.current_path
+            self.assertIsNotNone(path_before)
+            self.assertIsNotNone(path_after)
+            self.assertNotEqual(path_before, path_after)
+
+            reasons: list[str] = []
+
+            def _on_fail_closed(reason: str) -> None:
+                reasons.append(reason)
+
+            lhm.set_fail_closed_callback(_on_fail_closed)
+            await lhm._emit_trade_fsm_event(stream="trade_fsm_events", payload={}, event_type="missing")
+            self.assertTrue(reasons)
+
+    async def test_05bb_lhm_tracker_cfg(self) -> None:
+        """Scénario 5bb — LHM tracker cfg canonique + LogWriter signature."""
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 5bb")
+
+        LHM = getattr(importlib.import_module("modules.logger_historique.logger_historique_manager"),
+                      "LoggerHistoriqueManager", None)
+        require_contract(self, LHM is not None, "LoggerHistoriqueManager absent")
+        if LHM is None:
+            return
+
+        LogWriter = getattr(log_writer_mod, "LogWriter", None)
+        require_contract(self, LogWriter is not None, "LogWriter absent")
+        if LogWriter is None:
+            return
+
+        sig = inspect.signature(LogWriter.__init__)
+        self.assertNotIn("rotate_bytes", sig.parameters)
+
+        cfg = modules.bot_config.BotConfig()
+        cfg.lhm.tracker_window_score_s = 1234
+        with tempfile.TemporaryDirectory() as td:
+            lhm = LHM(cfg, out_dir=td)
+            tracker_cfg = getattr(lhm, "_tracker_cfg", None)
+            self.assertIsNotNone(tracker_cfg)
+            self.assertEqual(getattr(tracker_cfg, "window_score_s", None), 1234)
+
+    async def test_05bc_btl_high_watermark(self) -> None:
+        """Scénario 5bc — BTL high watermark configuré par ratio."""
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 5bc")
+
+        try:
+            btl_mod = importlib.import_module("modules.logger_historique.base_trade_logger")
+        except Exception:
+            btl_mod = importlib.import_module("base_trade_logger")
+        BaseTradeLogger = getattr(btl_mod, "BaseTradeLogger", None)
+        require_contract(self, BaseTradeLogger is not None, "BaseTradeLogger absent")
+        if BaseTradeLogger is None:
+            return
+
+        class _Proxy:
+            def __init__(self) -> None:
+                self.highwater = 0
+
+            def on_btl_queue_depth(self, *_args, **_kwargs):
+                return None
+
+            def on_btl_highwater(self, *_args, **_kwargs):
+                self.highwater += 1
+
+        proxy = _Proxy()
+        logger = BaseTradeLogger(
+            log_type="trades",
+            trade_filter=lambda _t: True,
+            batch_size=100,
+            flush_interval=1.0,
+            queue_maxsize=10_000,
+            drop_when_full=False,
+            high_watermark_ratio=0.5,
+        )
+        logger.set_metrics_proxy(proxy)
+        self.assertEqual(getattr(logger, "_q_high_watermark", None), 5000)
+
+        for idx in range(5000):
+            logger.ingest({"trade_id": f"t{idx}"})
+
+        self.assertGreater(proxy.highwater, 0)
+
+    async def test_05c_rebalancing_cfg_resolution(self) -> None:
+        """Scénario 5c — REB cfg canonique (reb/sim/g/rm)."""
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 5c")
+
+        try:
+            reb_mod = importlib.import_module("modules.risk_manager.rebalancing_manager")
+        except Exception:
+            reb_mod = importlib.import_module("rebalancing_manager")
+        RebalancingManager = getattr(reb_mod, "RebalancingManager", None)
+        require_contract(self, RebalancingManager is not None, "RebalancingManager absent")
+        if RebalancingManager is None:
+            return
+
+        def _make_plan(cfg: modules.bot_config.BotConfig) -> tuple[Any, dict]:
+            rm_stub = types.SimpleNamespace(config=cfg)
+            reb = RebalancingManager(rm=rm_stub)
+            reb.update_balances(
+                {"BINANCE": {"TT": {"USDC": 2000.0}, "TM": {"USDC": 0.0}}}
+            )
+            imbalance = reb.detect_imbalance()
+            self.assertIsNotNone(imbalance)
+            plan = reb.build_plan_raw(imbalance or {})
+            return reb, plan
+
+        cfg = modules.bot_config.BotConfig()
+        cfg.g.enabled_exchanges = ["BINANCE"]
+        cfg.g.min_fragment_quote = {"USDC": 200.0}
+        cfg.sim.min_fragment_usdc = 333.0
+        cfg.reb.rebal_quantum_min_quote = 10.0
+        cfg.reb.rebal_max_ops_per_min = 0
+
+        reb0, plan0 = _make_plan(cfg)
+        self.assertEqual(reb0.rebal_fragment_min_quote, 333.0)
+        self.assertEqual(len(plan0.get("internal_transfers") or []), 0)
+
+        cfg2 = modules.bot_config.BotConfig()
+        cfg2.g.enabled_exchanges = ["BINANCE"]
+        cfg2.g.min_fragment_quote = {"USDC": 200.0}
+        cfg2.sim.min_fragment_usdc = 333.0
+        cfg2.reb.rebal_quantum_min_quote = 10.0
+        cfg2.reb.rebal_max_ops_per_min = 1
+
+        _reb1, plan1 = _make_plan(cfg2)
+        self.assertEqual(len(plan1.get("internal_transfers") or []), 1)
+
+    async def test_05d_sfc_cfg_resolution(self) -> None:
+        """Scénario 5d — SFC cfg canonique (rm/slip)."""
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 5d")
+
+        try:
+            sfc_mod = importlib.import_module("modules.risk_manager.slippage_and_fees_collector")
+        except Exception:
+            sfc_mod = importlib.import_module("slippage_and_fees_collector")
+        SFC = getattr(sfc_mod, "SlippageAndFeesCollector", None)
+        require_contract(self, SFC is not None, "SlippageAndFeesCollector absent")
+        if SFC is None:
+            return
+
+        class _CfgRoot:
+            def __init__(self) -> None:
+                self.rm = types.SimpleNamespace(sfc_slippage_source="p95")
+                self.slip = types.SimpleNamespace(
+                    fee_sync_max_concurrency=1,
+                    fee_sync_backoff_initial_s=0.1,
+                    fee_sync_backoff_max_s=0.2,
+                    fee_sync_max_retries=1,
+                    fee_sync_jitter_s=0.0,
+                    fee_reality_check_threshold_bps=0.5,
+                    ttl_s=2,
+                )
+
+            def __getattr__(self, name: str) -> Any:
+                if name in {"sfc_slippage_lookback_s", "FEE_SNAPSHOT_TTL_S"}:
+                    raise AssertionError(f"unexpected access to legacy knob {name}")
+                raise AttributeError(name)
+
+        cfg_root = _CfgRoot()
+        sfc = SFC(cfg=cfg_root)
+        self.assertEqual(getattr(sfc, "_fee_sync_max_concurrency", None), 1)
+
+        kinds: list[str] = []
+
+        def _capture_slip(_ex, _pair, _side, *, kind="ewma", default=0.0):
+            kinds.append(kind)
+            return 0.0
+
+        sfc.get_slippage = _capture_slip
+        _ = sfc.leg_cost_pct(ex="BINANCE", alias="TT", pair="BTCUSDC", side="buy", role="taker")
+        self.assertIn("p95", kinds)
+
+        res = sfc.on_fill_fee_reality_check(
+            {
+                "exchange": "BINANCE",
+                "alias": "TT",
+                "symbol": "BTCUSDC",
+                "side": "BUY",
+                "role": "taker",
+                "quote_qty": 100.0,
+                "fee_quote": 1.0,
+            }
+        )
+        self.assertEqual(res.get("threshold_bps"), 0.5)
+
+    async def test_05e_volatility_cfg_resolution(self) -> None:
+        """Scénario 5e — Volatility cfg canonique (vol)."""
+        if _ci_profile() == "CI1":
+            self.skipTest("CI1 profile skips scenario 5e")
+
+        try:
+            vm_mod = importlib.import_module("modules.volatility_manager")
+        except Exception:
+            vm_mod = importlib.import_module("volatility_manager")
+        VM = getattr(vm_mod, "VolatilityManager", None)
+        require_contract(self, VM is not None, "VolatilityManager absent")
+        if VM is None:
+            return
+
+        cfg = modules.bot_config.BotConfig()
+        cfg.vol.vm_prudence_thresholds_bps = {
+            "NORMAL_TO_CAREFUL": 1.0,
+            "CAREFUL_TO_ALERT": 2.0,
+            "ALERT_TO_CAREFUL": 1.5,
+            "CAREFUL_TO_NORMAL": 0.5,
+        }
+        cfg.vol.vm_size_factor_map = {"NORMAL": 1.0, "CAREFUL": 0.9, "ALERT": 0.8}
+        cfg.vol.vm_min_bps_boost_map = {"NORMAL": 0.0, "CAREFUL": 0.0002, "ALERT": 0.0005}
+        cfg.vol.tm_neutral_hedge_ratio_map = {"NORMAL": 0.5, "CAREFUL": 0.55, "ALERT": 0.65}
+        cfg.vol.vm_maker_pad_ticks_map = {"NORMAL": 2, "CAREFUL": 3, "ALERT": 4}
+
+        vm = VM(cfg_root=cfg)
+        vm.ingest_orderbook_top("BINANCE", "BTCUSDC", 100.0, 100.2, ts=time.time())
+        res1 = vm.step("BTCUSDC")
+        self.assertEqual(res1.get("maker_pad_ticks"), 2)
+
+        res2 = vm.step("BTCUSDC")
+        self.assertIn("cooloff", res2)
     async def test_06_public_data_plane_contracts(self) -> None:
         """Scénario 6 — Public data plane (Router / Vol / Slip / Scanner)."""
         if _ci_profile() == "CI1":

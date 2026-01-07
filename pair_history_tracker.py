@@ -133,6 +133,7 @@ class TrackerConfig:
 class PairHistoryTracker:
     def __init__(self, config: Optional[TrackerConfig] = None):
         self.cfg = config or TrackerConfig()
+        self._validate_cfg()
 
         # Historiques (FIFO bornés) — PAIR
         self.opps_by_pair: Dict[str, deque] = defaultdict(lambda: deque(maxlen=self.cfg.history_limit))
@@ -176,6 +177,17 @@ class PairHistoryTracker:
         self.universe_by_mode: Dict[str, Set[str]] = {"TT": set(), "TM": set(), "REB": set(), "MM": set()}
         self.rotation_logger = None  # callback optionnel injecté par le LHM
 
+    def _validate_cfg(self) -> None:
+        if self.cfg.history_limit <= 0:
+            raise ValueError("tracker history_limit must be > 0")
+        if self.cfg.window_score_s <= 0 or self.cfg.window_daily_s <= 0:
+            raise ValueError("tracker windows must be > 0")
+        if not (0.0 < float(self.cfg.ema_alpha) <= 1.0):
+            raise ValueError("tracker ema_alpha must be in (0,1]")
+        if not (0.0 < float(self.cfg.ema_slip_alpha) <= 1.0):
+            raise ValueError("tracker ema_slip_alpha must be in (0,1]")
+        if self.cfg.max_active < 0:
+            raise ValueError("tracker max_active must be >= 0")
     def _all_known_pairs(self) -> Set[str]:
         """Retourne l'ensemble des paires connues (historiques, scores, actives, univers)."""
         seen: Set[str] = set()
@@ -381,7 +393,7 @@ class PairHistoryTracker:
 
     def _is_latency_stale_pair(self, pair: str, now_s: Optional[float] = None) -> bool:
         now_s = float(now_s) if now_s is not None else float(_now())
-        win = float(getattr(self.cfg, "window_score_s"))
+        win = float(self.cfg.window_score_s)
         obj = self.lat_ema_by_pair.get(pair)
         if not obj:
             return False
@@ -737,7 +749,11 @@ class PairHistoryTracker:
         """Score utilisé pour classer par mode: base + (bonus_mode_mode * bias_mode)."""
         b = self.mode_bias_by_pair.get(pair, {})
         bias = _to_float(b.get(mode, 0.0))
-        bonus = getattr(self.cfg, f"bonus_mode_{mode}", 0.0)
+        bonus = {
+            "TT": self.cfg.bonus_mode_TT,
+            "TM": self.cfg.bonus_mode_TM,
+            "REB": self.cfg.bonus_mode_REB,
+        }.get(mode, 0.0)
         return round(base_score + bonus * bias, 3)
 
     def refresh_pair_scores(self, now: Optional[float] = None) -> None:

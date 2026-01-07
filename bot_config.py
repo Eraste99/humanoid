@@ -1322,6 +1322,8 @@ class BalanceFetcherCfg:
     wallet_types: List[str] = field(default_factory=lambda: ["SPOT","FUNDING"])
     WS_BAL_TTL_SECONDS: float = 10.0
     ENABLE_WS_BALANCE_MERGE: bool = False
+    ws_reco_miss_rate_thr_per_min: float = 30.0
+    ws_reco_resync_age_thr_s: float = 6 * 3600.0
 
 
 # --- Slippage Handler ---
@@ -1462,6 +1464,10 @@ class RPCCfg:
     client_cert: Optional[str] = None
     client_key: Optional[str] = None
     require_client_cert: bool = True
+    admin_enabled: bool = False
+    admin_token: Optional[str] = None
+    strict_validation: bool = False
+    remote_base_url: Optional[str] = None
     rpc_server_bind: str = "0.0.0.0:8080"
     rpc_client_base: str = "http://127.0.0.1:8080"
     rpc_timeout_s: int = 3
@@ -1502,6 +1508,44 @@ class LoggerCfg:
     jsonl_queue_cap: Optional[int] = None
     LHM_JSONL_MAX_BYTES: int = 256 * 1024 * 1024
     LHM_JSONL_MAX_AGE_S: int = 3600
+    tracker_history_limit: int = 6000
+    tracker_rotation_interval: int = 1800
+    tracker_max_active: int = 10
+    tracker_pause_secs: int = 600
+    tracker_min_daily_volume_usdc: float = 500_000.0
+    tracker_slippage_bad_thr: float = 0.005
+    tracker_e2e_latency_bad_ms: int = 1200
+    tracker_window_opp_freq_s: int = 600
+    tracker_window_score_s: int = 1800
+    tracker_window_daily_s: int = 86400
+    tracker_w_opp_score: float = 0.6
+    tracker_w_spread_net: float = 1.0
+    tracker_w_volume: float = 0.00001
+    tracker_w_latency_penalty: float = 0.003
+    tracker_penalty_trade_fail: float = 10.0
+    tracker_penalty_slippage: float = 5.0
+    tracker_penalty_vol_modere: float = 5.0
+    tracker_penalty_vol_eleve: float = 10.0
+    tracker_bonus_low_vol: float = 2.0
+    tracker_bonus_high_freq: float = 10.0
+    tracker_bias_ttl_s: int = 1500
+    tracker_bonus_mode_TT: float = 2.0
+    tracker_bonus_mode_TM: float = 1.5
+    tracker_bonus_mode_REB: float = 0.5
+    tracker_ema_alpha: float = 0.2
+    tracker_ema_slip_alpha: float = 0.2
+    tracker_route_latency_penalty_scale: float = 0.002
+    tracker_route_win_bonus: float = 1.0
+    tracker_route_fail_penalty: float = 2.0
+    tracker_max_active_TT: Optional[int] = None
+    tracker_max_active_TM: Optional[int] = None
+    tracker_max_active_REB: Optional[int] = None
+    tracker_max_active_MM: Optional[int] = None
+    tracker_mm_w_pnl: float = 0.001
+    tracker_mm_w_winrate: float = 20.0
+    tracker_mm_penalty_latency: float = 1.5
+    tracker_mm_penalty_slippage: float = 1.0
+    tracker_constrain_universe_by_mode: bool = False
     LHM_DISK_WARN_PCT: float = 70.0
     LHM_DISK_CRIT_PCT: float = 85.0
     LHM_STORAGE_ALERT_COOLDOWN_S: float = 60.0

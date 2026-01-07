@@ -212,7 +212,6 @@ class LogWriter:
         self,
         db_dir: str = "logs",
         *,
-        rotate_bytes: int = 256 * 1024 * 1024,   # 256 MiB (borne taille)
         backup_count: int = 10,                  # nombre de rotations à conserver (compressées)
         compress_rotations: bool = True,  # compresser les rotations
         ops_retention_days: int = 30,
@@ -221,7 +220,6 @@ class LogWriter:
         os.makedirs(self.db_dir, exist_ok=True)
 
         # seuils de rotation size/age (size traité par rotate_if_needed côté manager)
-        self._rotate_bytes = int(max(1, rotate_bytes))
         self._backup_count = int(max(0, backup_count))
         self._compress_rot = bool(compress_rotations)
         self._ops_retention_days = int(max(0, ops_retention_days)) or 30

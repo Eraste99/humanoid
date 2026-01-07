@@ -111,14 +111,11 @@ class RebalancingManager:
         *,
         rm,  # RiskManager parent (gardé pour compat ; non utilisé pour I/O)
         # --- Devises / seuils
-        quote_currencies: Optional[Iterable[str]] = None,       # ["USDC","EUR"]
         min_cash_per_quote: Optional[Dict[str, float]] = None,  # {"USDC":1000.0,"EUR":1000.0}
         min_crypto_value_usdc: float = 1000.0,
 
         # --- Périmètre
-        enabled_exchanges: Optional[Iterable[str]] = None,      # ["BINANCE","BYBIT","COINBASE"]
         enabled_assets: Optional[Iterable[str]] = None,         # universe crypto suivi
-        enabled_aliases: Optional[Iterable[str]] = None,        # ["TT","TM"]
 
         # --- Stratégie (legacy conservés pour compat)
         history_limit: int = 200,
@@ -126,7 +123,6 @@ class RebalancingManager:
         internal_transfer_threshold: float = 250.0,
         overlay_comp_threshold: float = 100.0,
         cross_cex_haircut: float = 0.80,
-        preferred_pairs: Optional[List[str]] = None,
 
         # --- Wallets (compat)
         wallet_types: Optional[List[str]] = None,               # ["SPOT","FUNDING"]
@@ -148,14 +144,28 @@ class RebalancingManager:
         # Parent / cfg (source de vérité), mais ce module reste passif.
         self.rm = rm
         self.cfg = getattr(rm, "config", None) or getattr(rm, "cfg", None)
+        if self.cfg is None:
+            raise ValueError("rm config is required to initialize RebalancingManager")
+        reb_cfg = getattr(self.cfg, "reb", None)
+        rm_cfg = getattr(self.cfg, "rm", None)
+        sim_cfg = getattr(self.cfg, "sim", None)
         g = getattr(self.cfg, "g", None)
+        if rm_cfg is None:
+            raise ValueError("cfg.rm is required to initialize RebalancingManager")
+        if reb_cfg is None:
+            raise ValueError("cfg.reb is required to initialize RebalancingManager")
+        if sim_cfg is None:
+            raise ValueError("cfg.sim is required to initialize RebalancingManager")
+        if g is None:
+            raise ValueError("cfg.g is required to initialize RebalancingManager")
 
+    # Devises / seuils
+        quote_ccys = list((getattr(g, "min_fragment_quote", None) or {}).keys()) or ["USDC", "EUR"]
+        self.quote_ccys = _norm_list_upper(
+            quote_ccys,
 
-        # Devises / seuils
-        self.quote_currencies = _norm_list_upper(
-            quote_currencies if quote_currencies is not None else getattr(self.cfg, "quote_currencies", None),
-            ["USDC", "EUR"]
-        )
+          ["USDC", "EUR"]
+    )
 
         self.min_cash_per_quote = {k.upper(): float(v) for k, v in (min_cash_per_quote or {"USDC": 1000.0, "EUR": 1000.0}).items()}
         self.min_crypto_value_usdc = float(min_crypto_value_usdc)
@@ -163,15 +173,8 @@ class RebalancingManager:
         # Périmètre (avec fallbacks cfg)
         # --- enabled_exchanges: tolérant None / str CSV / JSON / liste ---
         self.enabled_exchanges = _norm_list_upper(
-            enabled_exchanges if enabled_exchanges is not None else (
-                    getattr(self.cfg, "enabled_exchanges", None) or (getattr(g, "enabled_exchanges", None))
-            ),
+            getattr(g, "enabled_exchanges", None),
             ["BINANCE", "BYBIT", "COINBASE"]
-        )
-
-        self.enabled_aliases = _norm_list_upper(
-            enabled_aliases if enabled_aliases is not None else getattr(self.cfg, "enabled_aliases", None),
-            ["TT", "TM"]
         )
         self.enabled_assets    = [a.upper() for a in (enabled_assets or [
             "ETH","BTC","SOL","ADA","XRP","DOGE","DOT","AVAX","AXS","LTC","SHIB","UNI","LINK",
@@ -182,14 +185,10 @@ class RebalancingManager:
         self.history_limit = int(history_limit)
         self.target_diff_quote = float(target_diff_quote)
         if internal_transfer_threshold is None:
-            internal_transfer_threshold = getattr(self.cfg, "rebal_internal_transfer_threshold", 250.0)
+            internal_transfer_threshold = getattr(reb_cfg, "rebal_internal_transfer_threshold", 250.0)
         self.internal_transfer_threshold = float(internal_transfer_threshold)
         self.overlay_comp_threshold = float(overlay_comp_threshold)
         self.cross_cex_haircut = float(cross_cex_haircut)
-        self.preferred_pairs = _norm_list_upper(
-            preferred_pairs if preferred_pairs is not None else getattr(self.cfg, "preferred_pairs", None),
-            ["ETHUSDC", "BTCUSDC", "ETHEUR", "BTCEUR"]
-        )
 
         # Wallets (compat)
         self.wallet_types = [w.upper() for w in (wallet_types or ["SPOT", "FUNDING"])]
@@ -204,16 +203,19 @@ class RebalancingManager:
         self.virtual_parking_wallet_name = str(virtual_parking_wallet_name).upper()
 
         # Politique anti-thrash (lue depuis cfg si dispo)
-        self.rebal_quantum_min_quote: float = float(getattr(self.cfg, "rebal_quantum_min_quote", 50.0))
-        self.rebal_max_ops_per_min: int = int(getattr(self.cfg, "rebal_max_ops_per_min", 6))
-        self.rebal_priority: List[str] = list(getattr(self.cfg, "rebal_priority", ["CASH", "CRYPTO", "OVERLAY"]))
-        self.rebal_hint_ttl_s: int = int(getattr(self.cfg, "rebal_hint_ttl_s", 120))
-        self._reb_slot_ttl_s: float = float(
-            getattr(self.cfg, "rebal_slot_ttl_s", getattr(self.cfg, "rebal_hint_ttl_s", 120))
+        self.rebal_quantum_min_quote: float = float(getattr(reb_cfg, "rebal_quantum_min_quote", 50.0))
+        self.rebal_max_ops_per_min: int = int(getattr(reb_cfg, "rebal_max_ops_per_min", 6))
+        self.rebal_priority: List[str] = list(getattr(reb_cfg, "rebal_priority", ["CASH", "CRYPTO", "OVERLAY"]))
+        self.rebal_hint_ttl_s: int = int(getattr(reb_cfg, "rebal_hint_ttl_s", 120))
+        self.rebal_quantum_quote_map: Dict[str, float] = dict(
+            getattr(reb_cfg, "rebal_quantum_quote_map", None) or {"USDC": 250.0, "EUR": 250.0}
         )
-        cfg_min_frag = getattr(self.cfg, "min_fragment_usdc", None)
-        cfg_min_map = getattr(self.cfg, "min_fragment_quote", None) or {}
-        derived_min = max(cfg_min_map.get(q, 0.0) for q in self.quote_currencies) if cfg_min_map else 0.0
+        self._reb_slot_ttl_s: float = float(
+            getattr(reb_cfg, "rebal_slot_ttl_s", getattr(reb_cfg, "rebal_hint_ttl_s", 120))
+        )
+        cfg_min_frag = getattr(sim_cfg, "min_fragment_usdc", None)
+        cfg_min_map = getattr(g, "min_fragment_quote", None) or {}
+        derived_min = max(cfg_min_map.get(q, 0.0) for q in self.quote_ccys) if cfg_min_map else 0.0
         try:
             derived_min = float(derived_min)
         except Exception:
@@ -224,15 +226,14 @@ class RebalancingManager:
         except Exception:
             base_min_frag = 0.0
         self.rebal_fragment_min_quote = max(self.rebal_quantum_min_quote, base_min_frag, derived_min)
-        rm_cfg = getattr(self.cfg, "rm", None)
-        profile = str(getattr(getattr(self.cfg, "g", None), "capital_profile", "LARGE") or "LARGE").upper()
-        inflight_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {}) if rm_cfg else {}
+        profile = str(getattr(g, "capital_profile", "LARGE") or "LARGE").upper()
+        inflight_reb = getattr(rm_cfg, "inflight_rebal_by_profile", {})
         self.rebal_inflight_cap: int = int((inflight_reb or {}).get(profile) or (inflight_reb or {}).get("LARGE") or 0)
-        combo_caps = getattr(rm_cfg, "combo_cap_usd_by_profile", {}) if rm_cfg else {}
+        combo_caps = getattr(rm_cfg, "combo_cap_usd_by_profile", {})
         base_combo_cap = float((combo_caps or {}).get(profile) or (combo_caps or {}).get("LARGE") or 0.0)
         degraded_factor = 1.0
         try:
-            degraded_factor = float(getattr(rm_cfg, "combo_ttl_degraded_factor", 1.0)) if rm_cfg else 1.0
+            degraded_factor = float(getattr(rm_cfg, "combo_ttl_degraded_factor", 1.0))
         except Exception:
             degraded_factor = 1.0
         degraded_factor = min(max(degraded_factor, 0.0), 1.0)
@@ -261,11 +262,11 @@ class RebalancingManager:
         self._snapshots_last_error_ts: float = 0.0
         self._snapshots_missing_error_s: float = max(
             5.0,
-            float(getattr(self.cfg, "rebal_snapshots_missing_error_s", 45.0)),
+            float(getattr(reb_cfg, "rebal_snapshots_missing_error_s", 45.0)),
         )
         self._snapshots_error_cooldown_s: float = max(
             5.0,
-            float(getattr(self.cfg, "rebal_snapshots_error_cooldown_s", 60.0)),
+            float(getattr(reb_cfg, "rebal_snapshots_error_cooldown_s", 60.0)),
         )
 
         # Historique (debug) & rate-limit
@@ -435,7 +436,7 @@ class RebalancingManager:
             if pair:
                 pk = str(pair).replace("-", "").upper()
                 possible_assets.append(pk)
-                for q in self.quote_currencies or []:
+                for q in self.quote_ccys or []:
                     if pk.endswith(str(q).upper()) and len(pk) > len(q):
                         possible_assets.append(pk[: -len(str(q))])
 
@@ -597,8 +598,7 @@ class RebalancingManager:
                 norm[exu] = {}
                 for alias, per_wallet in (per_alias or {}).items():
                     al = _norm(alias)
-                    if self.enabled_aliases and al not in self.enabled_aliases:
-                        continue
+
                     norm[exu][al] = {}
                     for wallet, ccy_map in (per_wallet or {}).items():
                         w = _norm(wallet)
@@ -624,7 +624,7 @@ class RebalancingManager:
 
     def overlay_add_flow(self, alias: str, ex_from: str, ex_to: str, amount: float) -> None:
         """Ajoute un flux d’overlay simulé (en devise `ccy`), utile pour flécher les compensations."""
-        key = self._dir_key(alias, ex_from, ex_to, self.quote_currencies[0])
+        key = self._dir_key(alias, ex_from, ex_to, self.quote_ccys[0])
         self._overlay_flow[key] += _to_f(amount)
 
     def overlay_snapshot(self) -> Dict[str, float]:
@@ -702,9 +702,6 @@ class RebalancingManager:
         common = {p for p in (books_from & books_to) if p.endswith(_norm(quote))}
         if not common:
             return None
-        for p in self.preferred_pairs:
-            if p in common:
-                return p
         return next(iter(common), None)
 
     def _best_alias_for(self, ex: str, quote: str) -> str:
@@ -724,7 +721,7 @@ class RebalancingManager:
             return None
 
         out = {
-            "CASH": {q: {} for q in self.quote_currencies},
+            "CASH": {q: {} for q in self.quote_ccys},
             "CRYPTO": {},
             "OVERLAY": self.overlay_snapshot(),
         }
@@ -733,7 +730,7 @@ class RebalancingManager:
 
         # 1) CASH par CEX/alias
         for ex, accounts in self.latest_balances.items():
-            for q in self.quote_currencies:
+            for q in self.quote_ccys:
                 needed: Dict[str, float] = {}
                 target_min = self.min_cash_per_quote.get(q, 0.0)
                 if target_min <= 0.0:
@@ -751,7 +748,7 @@ class RebalancingManager:
             for alias, assets in (accounts or {}).items():
                 for asset, qty in (assets or {}).items():
                     a = _norm(asset)
-                    if a in self.quote_currencies:
+                    if a in self.quote_ccys:
                         continue
                     if a not in self.enabled_assets:
                         continue
@@ -807,7 +804,7 @@ class RebalancingManager:
     def _plan_internal_transfers(self) -> List[Dict[str, Any]]:
         plans: List[Dict[str, Any]] = []
         for ex, accounts in (self.latest_balances or {}).items():
-            for q in self.quote_currencies:
+            for q in self.quote_ccys:
                 holdings = {al: _to_f((assets or {}).get(q, 0.0)) for al, assets in (accounts or {}).items()}
                 if not holdings:
                     continue
@@ -851,7 +848,7 @@ class RebalancingManager:
         t0 = time.perf_counter_ns()
 
         if not self._snapshots_ready():
-            qmap = getattr(self.cfg, "rebal_quantum_quote_map", None) or {"USDC": 250.0, "EUR": 250.0}
+            qmap = dict(self.rebal_quantum_quote_map)
             ages = self._freshness_ages()
             return {
                 "overlay_comp": [],
@@ -1041,7 +1038,7 @@ class RebalancingManager:
         # 3) Quantum par quote (toujours présent)
         qmap = raw.get("quantum_quote")
         if not isinstance(qmap, dict) or not qmap:
-            qmap = getattr(self.cfg, "rebal_quantum_quote_map", None) or {"USDC": 250.0, "EUR": 250.0}
+            qmap = dict(self.rebal_quantum_quote_map)
 
         # 4) Statut READY|SKIP garanti
         status = "READY" if steps else "SKIP"
@@ -1226,7 +1223,7 @@ class RebalancingManager:
             "orderbooks_count": sum(len(v or {}) for v in self.latest_orderbooks.values()),
             "overlay": self.overlay_snapshot(),
             "policy": {
-                "quote_currencies": self.quote_currencies,
+                "quote_ccys": self.quote_ccys,
                 "min_cash_per_quote": self.min_cash_per_quote,
                 "min_crypto_value_usdc": self.min_crypto_value_usdc,
                 "rebal_quantum_min_quote": self.rebal_quantum_min_quote,

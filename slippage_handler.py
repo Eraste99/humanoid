@@ -160,6 +160,8 @@ class SlippageHandler:
         self.cfg = cfg
         s = self.cfg.slip  # section dédiée Slippage
         g = self.cfg.g  # globaux (pour quotes/overlays)
+        self._missing_slo_warned: set[tuple[str, str]] = set()
+        self._slo_resolution_warned = False
 
         # --------- TTL / Heartbeat / Seuils par quote (depuis cfg) ---------
         # (Les args __init__ ne proposent pas TTL/heartbeat, donc cfg -> direct)
@@ -190,10 +192,7 @@ class SlippageHandler:
         self._pair_budget: Dict[str, float] = {}
         self._quote_budget: Dict[str, float] = {"USDC": vol_usdc, "EUR": vol_eur}
         self._primary_quote = str(getattr(g, "primary_quote", "USDC")).upper()
-        default_strategy = getattr(getattr(self.cfg, "rm", None), "trade_mode", None)
-        if not default_strategy:
-            default_strategy = getattr(g, "trade_mode", None)
-        self._default_strategy = str(default_strategy or "TT").upper()
+        self._default_strategy = self._trade_mode()
 
 
         # seuil legacy min (fraction, ex: 0.005 = 50 bps)
@@ -232,6 +231,89 @@ class SlippageHandler:
     def ttl_seconds(self) -> int:
         return self._ttl_s
 
+    def _strict_config(self) -> bool:
+        rm_cfg = getattr(self.cfg, "rm", None)
+        slip_cfg = getattr(self.cfg, "slip", None)
+        return bool(
+            getattr(rm_cfg, "strict_config", False)
+            or getattr(slip_cfg, "strict_config", False)
+        )
+
+    def _deployment_mode(self) -> str:
+        g_cfg = getattr(self.cfg, "g", None)
+        mode = getattr(g_cfg, "deployment_mode", None) if g_cfg else None
+        mode_norm = str(mode).strip().upper() if mode else ""
+        if not mode_norm:
+            msg = "deployment_mode missing; using EU_ONLY fallback"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            logger.warning("[SlippageHandler] %s", msg)
+            mode_norm = "EU_ONLY"
+        if mode_norm not in {"EU_ONLY", "SPLIT", "JP_ONLY"}:
+            logger.warning("[SlippageHandler] unknown deployment_mode=%s; falling back to EU_ONLY", mode_norm)
+            mode_norm = "EU_ONLY"
+        return mode_norm
+
+    def _trade_mode(self) -> str:
+        rm_cfg = getattr(self.cfg, "rm", None)
+        g_cfg = getattr(self.cfg, "g", None)
+        rm_mode = getattr(rm_cfg, "trade_mode", None) if rm_cfg else None
+        g_mode = getattr(g_cfg, "trade_mode", None) if g_cfg else None
+        rm_norm = str(rm_mode).strip().upper() if rm_mode else ""
+        g_norm = str(g_mode).strip().upper() if g_mode else ""
+        if rm_norm and g_norm and rm_norm != g_norm:
+            msg = f"trade_mode mismatch: rm.trade_mode={rm_norm} g.trade_mode={g_norm}"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            logger.warning("[SlippageHandler] %s; using rm.trade_mode", msg)
+        if rm_norm:
+            return rm_norm
+        if g_norm:
+            return g_norm
+        return "TT"
+
+    def _resolve_ttl_s(self, exchange: str, ttl_s: float | None) -> float:
+        base_ttl = float(ttl_s) if ttl_s is not None else float(getattr(self, "_ttl_s", 2.0))
+        mode_key = self._deployment_mode()
+        exu = str(exchange or "").upper()
+        slo_ttl = None
+        try:
+            cfg = getattr(self, "cfg", None)
+            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
+            if slo_map:
+                per_ex = slo_map.get(mode_key) or {}
+                path_slo = per_ex.get(exu)
+                if path_slo is not None and getattr(path_slo, "public", None) is not None:
+                    slo_ttl_s = float(getattr(path_slo.public, "slip_ttl_s", 0.0) or 0.0)
+                    if slo_ttl_s > 0.0:
+                        slo_ttl = slo_ttl_s
+        except Exception:
+            if not self._slo_resolution_warned:
+                self._slo_resolution_warned = True
+                logger.warning(
+                    "[SlippageHandler] unable to resolve SLO-based slip TTL; using cfg.slip.ttl_s",
+                    exc_info=False,
+                )
+            return base_ttl
+
+        if slo_ttl is None:
+            warn_key = (mode_key, exu)
+            if warn_key not in self._missing_slo_warned:
+                self._missing_slo_warned.add(warn_key)
+                logger.warning(
+                    "[SlippageHandler] missing SLO slip_ttl_s for mode=%s exchange=%s; using cfg.slip.ttl_s",
+                    mode_key,
+                    exu,
+                )
+            return base_ttl
+
+        ttl = min(base_ttl, slo_ttl)
+        if ttl_s is not None and ttl_s > ttl:
+            logger.debug(
+                "[SlippageHandler] ttl_s clamped by SLO",
+                extra={"requested_ttl": base_ttl, "slo_ttl": slo_ttl, "effective_ttl": ttl},
+            )
+        return ttl
     def max_bps_allowed(self, quote: str) -> float:
         return float(self._max_bps_by_quote.get(str(quote).upper(), 9999.0))
     # -------------------- utils --------------------
@@ -968,37 +1050,7 @@ class SlippageHandler:
         now = time.time()
 
         # --- Résolution du TTL (SLO public → fallback cfg.slip.ttl_s) ------------
-        requested_ttl = float(ttl_s) if ttl_s is not None else None
-        legacy_ttl = float(getattr(self, "_ttl_s", 2.0))
-        base_ttl = requested_ttl if requested_ttl is not None else legacy_ttl
-        ttl = base_ttl
-        try:
-            cfg = getattr(self, "cfg", None)
-            slo_map = getattr(cfg, "slo", None) if cfg is not None else None
-            if slo_map:
-                g_cfg = getattr(cfg, "g", None)
-                mode_key = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
-                per_ex = slo_map.get(mode_key) or {}
-                path_slo = per_ex.get(ex)
-                if path_slo is not None and getattr(path_slo, "public", None) is not None:
-                    slo_ttl_s = float(getattr(path_slo.public, "slip_ttl_s", 0.0) or 0.0)
-                    if slo_ttl_s > 0.0:
-                        if ttl is None or ttl > slo_ttl_s:
-                            if ttl is not None:
-                                logger.debug(
-                                    "[SlippageHandler] ttl_s=%.3f clamped by SLO=%.3f",
-                                    ttl,
-                                    slo_ttl_s,
-                                )
-                            ttl = slo_ttl_s if ttl is None else min(ttl, slo_ttl_s)
-        except Exception:
-            # En cas de problème sur le contrat SLO, on retombe sur le TTL legacy.
-            logger.warning(
-                "[SlippageHandler] unable to resolve SLO-based slip TTL, "
-                "falling back to cfg.slip.ttl_s",
-                exc_info=False,
-            )
-            ttl = base_ttl
+        ttl = self._resolve_ttl_s(ex, ttl_s)
 
         # --- Application du TTL sur les snapshots -------------------------------
         if side is None:

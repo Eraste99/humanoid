@@ -34,6 +34,19 @@ Objectifs
 #     "risk_neutral"    : neutre ou quasi-neutre
 #     "risk_reducing"   : réduit le risque net (hedge/unwind)
 
+# Alias Policy (canon de sortie)
+# ------------------------------
+# - symbol est canonique en sortie; pair est un alias d'entrée (normalisé vers symbol).
+# - alias est canonique en sortie; account_alias est un alias d'entrée.
+#   Si alias et account_alias sont fournis et divergent -> ValueError.
+# - exchange_ts_ms est canonique en sortie; ts_ex_ms est un alias d'entrée.
+#
+# Error → Reason Policy
+# ---------------------
+# - error_kind : stable interne (lowercase), utile pour observabilité non fatale.
+# - reason_code : stable décisionnel (uppercase), utilisé côté RM/Engine,
+#   BundleAck.reason_code, etc. et normalisé via KNOWN_REASON_CODES.
+
 Patchs demandés (inclus)
 ------------------------
 1) Tolérance `side` (B/S/BUY/SELL/buy/sell → buy/sell) dans OrderIntent, SubmitLeg, EngineAction, OrderModel.
@@ -297,7 +310,7 @@ def normalize_leg_dict(leg: Dict[str, Any]) -> Dict[str, Any]:
     """Normalise un dictionnaire de leg pour le contrat SubmitLeg.
 
     - Mappe price ↔ px_limit pour compat.
-    - Mappe alias ↔ account_alias pour compat.
+    - - Mappe alias ↔ account_alias pour compat (alias est canonique en sortie).
     - Normalise exchange/symbol/side/qty (best-effort).
     """
     if not isinstance(leg, dict):
@@ -318,6 +331,8 @@ def normalize_leg_dict(leg: Dict[str, Any]) -> Dict[str, Any]:
     # alias compat
     alias = normalized.get("alias")
     account_alias = normalized.get("account_alias")
+    if alias and account_alias and str(alias) != str(account_alias):
+        raise ValueError("alias/account_alias mismatch in leg payload")
     if alias and not account_alias:
         account_alias = alias
     if account_alias and not alias:
@@ -331,6 +346,7 @@ def normalize_leg_dict(leg: Dict[str, Any]) -> Dict[str, Any]:
     symbol = normalized.get("symbol") or normalized.get("pair")
     if symbol is not None:
         normalized["symbol"] = _norm_symbol(symbol, keep_dash=True)
+        normalized.pop("pair", None)
     try:
         normalized["qty"] = float(normalized["qty"]) if normalized.get("qty") is not None else None
     except Exception:
@@ -840,6 +856,19 @@ class RiskDecision(_Cfg, BaseModel):
     def _v_symbol(cls, v: str) -> str:
         return _norm_symbol(v, keep_dash=True)
 
+    @field_validator("side", mode="before")
+    @classmethod
+    def _v_side_anycase(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, str):
+            s = v.strip().upper()
+            if s in ("B", "BUY", "BUYER"):
+                return "buy"
+            if s in ("S", "SELL", "SELLER"):
+                return "sell"
+        return v
+
 class EngineAction(_Cfg, BaseModel):
     symbol: str
     side: Side
@@ -1266,9 +1295,10 @@ def engine_action_from_decision(dec: RiskDecision, *,
         raise ValueError("EngineAction needs SUBMIT or HEDGE")
     if dec.side is None or dec.px is None or dec.qty is None:
         raise ValueError("Missing side/px/qty in RiskDecision")
+    side = _side_ok(dec.side)
     return EngineAction(
         symbol=_norm_symbol(symbol or dec.symbol or ""),
-        side=dec.side,
+        side=side,
         px=float(dec.px),
         qty=float(dec.qty),
         exchange=exchange,
@@ -1572,6 +1602,8 @@ KNOWN_REASON_CODES = {
     "RM_CAPS_INVALID",
     "ENGINE_SUBMIT_TIMEOUT",
     "RM_CAPS_BROKEN",
+    "RATE_LIMIT_TIMEOUT",
+    "MM_THROTTLED_PLACE",
     "ENGINE_REJECT",
     "ENGINE_BACKPRESSURE_QUEUE_FULL",
     "ENGINE_BACKPRESSURE_HIGH_WM",
@@ -1695,7 +1727,17 @@ def normalize_reason_code(reason: Optional[str]) -> Optional[str]:
     if canon in KNOWN_REASON_CODES or canon.startswith(ReasonCodes.SIGNAL_MISSING_PREFIX):
         return canon
     return canon
-
+def reason_from_exc(exc: BaseException) -> str:
+    """Retourne un reason_code canonique à partir d'une exception (best-effort)."""
+    reason = getattr(exc, "reason", None)
+    if reason:
+        return normalize_reason_code(reason) or str(reason)
+    kind = getattr(exc, "kind", None)
+    if kind:
+        normalized = normalize_reason_code(kind)
+        return normalized or str(kind).strip().upper()
+    exc_name = type(exc).__name__
+    return normalize_reason_code(exc_name) or exc_name.strip().upper()
 def tt_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
     meta = payload.get("meta") if isinstance(payload, dict) else {}
     meta = meta if isinstance(meta, dict) else {}
@@ -1835,6 +1877,7 @@ __all__ = [
     "validate_fill_normalized_lite", "validate_order_intent_lite", "make_submit_bundle",
     "make_rm_shutdown_event", "normalize_reason_code", "validate_idempotency_key_lite",
     "validate_ws_alias_status_snapshot_lite", "validate_reco_alias_status_snapshot_lite",
+    "reason_from_exc",
     "tt_contract_missing_fields", "tm_contract_missing_fields", "reb_contract_missing_fields",
     "validate_balance_snapshot_rm_lite", "normalize_leg_dict",
     # >>> PATCH #3 — helpers publics

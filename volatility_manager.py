@@ -19,7 +19,7 @@ Rôle
 
 Intégration
 -----------
-- Passer `cfg` (instance de BotConfig) au constructeur pour consommer:
+- Passer `cfg_root` (instance de BotConfig) au constructeur pour consommer:
   vm_size_factor_map, vm_min_bps_boost_map, tm_neutral_hedge_ratio_map.
   Optionnellement `vm_prudence_thresholds_bps` (dict) depuis le cfg:
 
@@ -60,11 +60,6 @@ import time
 from collections import deque, defaultdict
 from statistics import median
 from typing import Dict, Any, Optional, Tuple
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
-
-
-
-
 # Observabilité — sous-module PASSIF (no Prometheus ici)
 from typing import Callable, Optional, Dict, Any
 import logging, time
@@ -100,6 +95,10 @@ def _norm_pair(pk: str) -> str:
 class VolatilityManager:
     """
     Passive Volatility Manager (pas de tâches internes).
+
+    VolatilityManager is instantiated by RiskManager and receives BotConfig root (cfg_root).
+    Canonical config inputs: cfg_root.vol.* (maps + thresholds) and cfg_root.engine.* for
+    tm_exposure_ttl_hedge_ratio.
     """
 
     # États de prudence (FR) : "normal" | "modere" | "eleve"
@@ -107,19 +106,27 @@ class VolatilityManager:
 
     def __init__(self,
                  *,
-                 cfg: Optional[Any] = None,
+                 cfg_root: Optional[Any] = None,
                  history_limit: int = 240,
                  ewma_alpha: float = 0.18,
                  window_s: float = 120.0,
                  cooloff_s: float = 1.2) -> None:
         """
-        :param cfg: BotConfig (utilisé pour maps & seuils). Peut être None (fallbacks sûrs).
+        :param cfg_root: BotConfig root (utilisé pour maps & seuils). Doit être fourni.
         :param history_limit: taille max de l'historique par (pair, exchange).
         :param ewma_alpha: alpha EWMA (0<alpha<=1).
         :param window_s: durée max des échantillons conservés (pruning par âge).
         :param cooloff_s: délai min entre deux step(pair) pour limiter la charge.
         """
-        self.cfg = cfg
+        if cfg_root is None:
+            raise ValueError("cfg_root is required to initialize VolatilityManager")
+        vol_cfg = getattr(cfg_root, "vol", None)
+        if vol_cfg is None:
+            raise ValueError("cfg_root.vol is required to initialize VolatilityManager")
+        self.cfg_root = cfg_root
+        self.vol_cfg = vol_cfg
+        self.engine_cfg = getattr(cfg_root, "engine", None)
+        self.rm_cfg = getattr(cfg_root, "rm", None)
         self.history_limit = max(8, int(history_limit))
         self.ewma_alpha = float(ewma_alpha)
         self.window_s = float(window_s)
@@ -143,6 +150,7 @@ class VolatilityManager:
         self._pair_metrics_cache: Dict[str, Dict[str, Any]] = {}
         self._stale_alert_ts: Dict[str, float] = defaultdict(lambda: 0.0)
         self._event_sink: Optional[Callable[[Dict[str, Any]], Any]] = None
+        self._pair_last_step_ts: Dict[str, float] = defaultdict(float)
 
         # Seuils par défaut (en bps) + hysteresis
         defaults = {
@@ -152,14 +160,13 @@ class VolatilityManager:
             "CAREFUL_TO_NORMAL": 6.0,   # si p95 <=  6 bps → normal
         }
         self._thr: Dict[str, float] = dict(defaults)
-        if cfg is not None:
-            try:
-                custom = getattr(cfg, "vm_prudence_thresholds_bps", None)
-                if isinstance(custom, dict):
-                    for k, v in custom.items():
-                        self._thr[k] = _safe_float(v, self._thr.get(k, defaults.get(k, 0.0)))
-            except Exception:
-                pass
+        try:
+            custom = getattr(self.vol_cfg, "vm_prudence_thresholds_bps", None)
+            if isinstance(custom, dict):
+                for k, v in custom.items():
+                    self._thr[k] = _safe_float(v, self._thr.get(k, defaults.get(k, 0.0)))
+        except Exception:
+            pass
 
     # ------------------------------- Ingestion --------------------------------
     def set_event_sink(self, sink: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
@@ -402,7 +409,7 @@ class VolatilityManager:
             return
         if not hasattr(self, "_vol_ts"):
             self._vol_ts: Dict[str, float] = {}
-        lam = getattr_float(self, "vol_ema_lambda", getattr(self, "vol_alpha_penalty", 0.7))
+        lam = 0.7
         for pair, bps in (by_pair or {}).items():
             p = _norm_pair(pair)
             x = float(max(0.0, bps))
@@ -719,7 +726,7 @@ class VolatilityManager:
                 pass
 
         now = _now()
-        if (now - self._pair_last_step_ts[pk]) < self.cooloff_s:
+        if (now - self._pair_last_step_ts.get(pk, 0.0)) < self.cooloff_s:
             # Retourne le dernier état connu (sans recalcul) pour limiter la charge
             state = self._pair_prudence[pk]
             met = self.get_current_metrics(pk)
@@ -787,27 +794,21 @@ class VolatilityManager:
         - min_bps_boost (fraction),
         - tm_neutral_hedge_ratio.
         """
-        size_factor = 1.0
-        min_bps_boost = 0.0
-        hedge_ratio = 0.50
-        cfg = self.cfg
-        if cfg is not None:
+        size_factor = float(getattr(self.vol_cfg, "vm_size_factor_map", {}).get(cfg_key, 1.0))
+        min_bps_boost = float(getattr(self.vol_cfg, "vm_min_bps_boost_map", {}).get(cfg_key, 0.0))
+        if self.engine_cfg is not None:
             try:
-                size_factor = float(getattr(cfg, "vm_size_factor_map", {}).get(cfg_key, 1.0))
-                min_bps_boost = float(getattr(cfg, "vm_min_bps_boost_map", {}).get(cfg_key, 0.0))
-                hedge_ratio = float(getattr(cfg, "tm_neutral_hedge_ratio_map", {}).get(
-                    cfg_key, getattr(cfg, "tm_exposure_ttl_hedge_ratio", 0.50)
-                ))
+                default_hr = float(getattr(self.engine_cfg, "tm_exposure_ttl_hedge_ratio", 0.50))
             except Exception:
-                pass
+                default_hr = 0.50
+        elif self.rm_cfg is not None:
+            try:
+                default_hr = float(getattr(self.rm_cfg, "tm_exposure_ttl_hedge_ratio", 0.50))
+            except Exception:
+                default_hr = 0.50
         else:
-            # Fallback legacy compatibles
-            if cfg_key == "ALERT":
-                size_factor, min_bps_boost, hedge_ratio = 0.70, 0.0005, 0.65
-            elif cfg_key == "CAREFUL":
-                size_factor, min_bps_boost, hedge_ratio = 0.85, 0.0002, 0.55
-            else:
-                size_factor, min_bps_boost, hedge_ratio = 1.00, 0.0000, 0.50
+            default_hr = 0.50
+        hedge_ratio = float(getattr(self.vol_cfg, "tm_neutral_hedge_ratio_map", {}).get(cfg_key, default_hr))
         return size_factor, min_bps_boost, hedge_ratio
 
     def _pad_ticks_from_cfg(self, cfg_key: str) -> int:
@@ -816,9 +817,9 @@ class VolatilityManager:
         cfg_key ∈ {"NORMAL","CAREFUL","ALERT"}
         """
         try:
-            return int(getattr(self.cfg, "vm_maker_pad_ticks_map", {}).get(cfg_key,
-                                                                           {"NORMAL": 0, "CAREFUL": 1, "ALERT": 2}[
-                                                                               cfg_key]))
+            return int(getattr(self.vol_cfg, "vm_maker_pad_ticks_map", {}).get(
+                cfg_key, {"NORMAL": 0, "CAREFUL": 1, "ALERT": 2}[cfg_key]
+            ))
         except Exception:
             return 0
 

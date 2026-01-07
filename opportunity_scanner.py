@@ -305,6 +305,7 @@ class OpportunityScanner:
             raise RuntimeError("Scanner: market_router is required")
         if self.risk_manager is None:
             raise RuntimeError("Scanner: risk_manager is required")
+        self._warned_aliases: set[str] = set()
 
         # -------------------------------
         # 1) Paramètres Router (re-logés)
@@ -337,7 +338,7 @@ class OpportunityScanner:
         # --------------------------------
         s = self.cfg.scanner
         # workers / windows / habilitations
-        self._workers = int(getattr(s, "workers", 1))
+        self._workers = int(self._get_scanner_knob("workers", legacy="SCANNER_WORKERS", default=1, cast=int))
         self._workers_target = self._workers
         self._dedup_window_s = float(getattr(s, "dedup_window_s", 0.5))
         self._ttl_hints_s = float(getattr(s, "ttl_hints_s", 1.0))
@@ -352,7 +353,9 @@ class OpportunityScanner:
             self.logger.warning("SCANNER_ENABLE_MM_HINTS=1 ignored because ENABLE_MAKER_MAKER=0")
         self._enable_mm_hints = global_mm_enabled and scanner_mm_enabled
         self.mm_mode = str(getattr(s, "mm_mode", "OFF") or "OFF").upper()
-        self._binance_depth_level = int(getattr(s, "binance_depth_level", 10))
+        self._binance_depth_level = int(
+            self._get_scanner_knob("binance_depth_level", legacy="binance_depth_level", default=10, cast=int)
+        )
 
         # seuils/rythme (override possibles via cfg.scanner.*)
         self.min_spread_net = D(getattr(s, "min_spread_net", 0.002))          # 20 bps
@@ -361,7 +364,9 @@ class OpportunityScanner:
         self.max_pairs_per_tick = int(getattr(s, "max_pairs_per_tick", 40))
         self.max_time_skew_s = D(getattr(s, "max_time_skew_s", 0.20))         # 200 ms
         self.scan_interval = float(getattr(s, "scan_interval", 0.5))
-        self.dedup_cooldown_s = float(max(0.05, getattr(s, "dedup_cooldown_s", 0.35)))
+        self.dedup_cooldown_s = float(
+            max(0.05, self._get_scanner_knob("dedup_cooldown_s", legacy="SCANNER_DEDUP_COOLDOWN_S", default=0.35))
+        )
         self.backpressure_log_every = int(max(1, getattr(s, "backpressure_log_every", 100)))
         self.max_opportunities = int(max(100, getattr(s, "max_opportunities", 5000)))
 
@@ -1470,7 +1475,7 @@ class OpportunityScanner:
         Somme notional QUOTE (proxy depth) sur N niveaux côté ask et bid, puis max.
         N via cfg.binance_depth_level (def 10).
         """
-        N = int(getattr(self.cfg, "binance_depth_level", 10) or 10)
+        N = int(self._get_scanner_knob("binance_depth_level", legacy="binance_depth_level", default=10, cast=int))
         d = (self.orderbooks.get(ex, {}) or {}).get(pair) or {}
         ob = d.get("orderbook") or {}
         asks = (ob.get("asks") or d.get("asks") or [])[:N]
@@ -1718,6 +1723,45 @@ class OpportunityScanner:
         """API read-only minimale: expose la cohorte actuelle d'une paire."""
         return self._cohort_of(pair)
 
+    def _strict_config(self) -> bool:
+        rm_cfg = getattr(self.cfg, "rm", None)
+        return bool(getattr(rm_cfg, "strict_config", False))
+
+    def _warn_alias(self, key: str, msg: str) -> None:
+        if key in self._warned_aliases:
+            return
+        self._warned_aliases.add(key)
+        self.logger.warning("%s", msg)
+
+    def _get_scanner_knob(self, name: str, *, legacy: str | None = None, default=None, cast=None):
+        missing = object()
+        scanner_cfg = getattr(self.cfg, "scanner", None)
+        val = getattr(scanner_cfg, name, missing) if scanner_cfg is not None else missing
+        legacy_val = getattr(self.cfg, legacy, missing) if legacy else missing
+
+        if val is not missing and legacy_val is not missing and val != legacy_val:
+            msg = f"scanner.{name} mismatch: scanner.{name}={val} legacy {legacy}={legacy_val}"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self._warn_alias(f"{name}_conflict", msg)
+
+        if val is not missing:
+            result = val
+        elif legacy_val is not missing:
+            msg = f"legacy {legacy} is deprecated; use scanner.{name} instead"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self._warn_alias(f"{name}_legacy", msg)
+            result = legacy_val
+        else:
+            result = default
+
+        if cast is not None:
+            try:
+                return cast(result)
+            except Exception:
+                return result
+        return result
     # À mettre dans opportunity_scanner.py (dans la classe)
     def apply_runtime_config(self, cfg: Any) -> None:
         """
@@ -1743,12 +1787,19 @@ class OpportunityScanner:
         if scanner_cfg is not None and legacy_dedup is not None:
             try:
                 scanner_cfg.dedup_cooldown_s = float(legacy_dedup)
+                msg = "legacy SCANNER_DEDUP_COOLDOWN_S used; prefer scanner.dedup_cooldown_s"
+                if self._strict_config() and float(scanner_cfg.dedup_cooldown_s) != float(legacy_dedup):
+                    raise RuntimeError(msg)
+                self._warn_alias("dedup_cooldown_s_legacy", msg)
             except Exception:
                 pass
 
         # SCANNER_HZ : override agrégé des fréquences par tier (legacy)
         legacy_hz = getattr(cfg, "SCANNER_HZ", None)
         if scanner_cfg is not None and isinstance(legacy_hz, dict):
+            if self._strict_config():
+                raise RuntimeError("legacy SCANNER_HZ used; prefer scanner.scanner_eval_hz_*")
+            self._warn_alias("scanner_hz_legacy", "legacy SCANNER_HZ used; prefer scanner.scanner_eval_hz_*")
             def _pick(d: Dict[str, Any], *keys: str) -> Optional[float]:
                 for k in keys:
                     if k in d and d[k] is not None:
@@ -1774,7 +1825,9 @@ class OpportunityScanner:
         # --- Global Hz, workers & fréquences par tier -----------------------
         if scanner_cfg is not None:
             self.global_eval_hz = float(
-                getattr(scanner_cfg, "scanner_global_eval_hz", getattr(self, "global_eval_hz", 200.0)) or 200.0
+                self._get_scanner_knob(
+                    "scanner_global_eval_hz", legacy="SCANNER_HZ", default=getattr(self, "global_eval_hz", 200.0)
+                )
             )
             self.eval_hz_core = float(
                 getattr(scanner_cfg, "scanner_eval_hz_core", getattr(self, "eval_hz_core", self.global_eval_hz))
@@ -1796,7 +1849,7 @@ class OpportunityScanner:
                     getattr(self, "eval_hz_sandbox", max(0.5, self.global_eval_hz * 0.15)),
                 )
             )
-            self._workers = int(max(1, getattr(scanner_cfg, "workers", getattr(self, "_workers", 1))))
+            self._workers = int(max(1, self._get_scanner_knob("workers", legacy="SCANNER_WORKERS", default=self._workers, cast=int)))
         else:
             # compat très ancien cfg sans ScannerCfg
             self.global_eval_hz = float(
@@ -1822,7 +1875,8 @@ class OpportunityScanner:
                     getattr(self, "eval_hz_sandbox", max(0.5, self.global_eval_hz * 0.15)),
                 )
             )
-            self._workers = int(max(1, getattr(cfg, "SCANNER_WORKERS", getattr(self, "_workers", 1))))
+            self._workers = int(
+                max(1, self._get_scanner_knob("workers", legacy="SCANNER_WORKERS", default=self._workers, cast=int)))
 
         # --- Dedup window & cooldown ----------------------------------------
         if scanner_cfg is not None:
@@ -1836,11 +1890,23 @@ class OpportunityScanner:
         else:
             # compat legacy : on se rabat sur l'ancien champ global si présent
             self.dedup_cooldown_s = float(
-                max(0.01, getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", getattr(self, "dedup_cooldown_s", 0.16)))
+                max(
+                    0.01,
+                    self._get_scanner_knob(
+                        "dedup_cooldown_s",
+                        legacy="SCANNER_DEDUP_COOLDOWN_S",
+                        default=getattr(self, "dedup_cooldown_s", 0.16),
+                    ),
+                )
             )
 
         # --- Deques input / backlog (SCANNER_DEQUE_MAX = agrégateur P0) ----
         dq_cfg = getattr(cfg, "SCANNER_DEQUE_MAX", None)
+        if dq_cfg is not None:
+            msg = "legacy SCANNER_DEQUE_MAX used; prefer scanner.* queue sizing"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self._warn_alias("scanner_deque_max_legacy", msg)
 
         if isinstance(dq_cfg, dict):
             base_core = int(dq_cfg.get("CORE", dq_cfg.get("core", getattr(self, "_deque_max_core", 1500))))
@@ -1966,6 +2032,11 @@ class OpportunityScanner:
 
         # agrégateur SCANNER_DEQUE_MAX : on part de PRIMARY
         dq_cfg = getattr(cfg, "SCANNER_DEQUE_MAX", None)
+        if dq_cfg is not None:
+            msg = "legacy SCANNER_DEQUE_MAX used; prefer scanner.* queue sizing"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self._warn_alias("scanner_deque_max_legacy", msg)
         base_primary = None
         if isinstance(dq_cfg, dict):
             try:

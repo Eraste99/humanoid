@@ -96,6 +96,8 @@ class DynamicExecutionSimulator:
         self.depth_limit = int(depth_limit)
         self._allowed_routes: Optional[Set[Tuple[str, str]]] = set()
         self._fee_map_pct: Dict[str, Dict[str, float]] = {}  # {EX:{maker: frac, taker: frac}}
+        self._sim_warned_aliases: set[str] = set()
+        self._suggest_slices_logged = False
 
         # Contexte poussé par le RiskManager
         self.volatility_metrics: Dict[str, Dict[str, Any]] = {}
@@ -124,10 +126,27 @@ class DynamicExecutionSimulator:
         self._worker_task: Optional[asyncio.Task] = None
         self._mm_hints_task: Optional[asyncio.Task] = None
         self._workers_started = False
-        sim_cfg = getattr(self.bot_cfg, "sim", self.bot_cfg)
-        self.max_concurrency = getattr_int(sim_cfg, "sim_max_inflight_jobs", 32)
-        self.shadow_max_inflight = getattr_int(sim_cfg, "sim_shadow_max_inflight", 8)
-
+        self.max_concurrency = int(self._sim_knob("sim_max_inflight_jobs", legacy="sim_max_inflight_jobs", default=32))
+        self.shadow_max_inflight = int(
+            self._sim_knob("sim_shadow_max_inflight", legacy="sim_shadow_max_inflight", default=8)
+        )
+        self.timeout_each_s = float(
+            self._sim_knob("sim_timeout_each_s", legacy="timeout_each_s", default=1.2, cast=float)
+        )
+        self.cb_coalescing_ms = float(
+            self._sim_knob("sim_cb_coalescing_ms", legacy="cb_coalescing_ms", default=10.0, cast=float)
+        )
+        self.split_mode = self._resolve_split_mode()
+        if not self._sim_knob_present("sim_timeout_each_s", "timeout_each_s"):
+            self._warn_sim_alias(
+                "sim_timeout_each_s_default",
+                f"sim_timeout_each_s not configured; using default {self.timeout_each_s:.2f}s",
+            )
+        if not self._sim_knob_present("sim_cb_coalescing_ms", "cb_coalescing_ms"):
+            self._warn_sim_alias(
+                "sim_cb_coalescing_ms_default",
+                f"sim_cb_coalescing_ms not configured; using default {self.cb_coalescing_ms:.2f}ms",
+            )
     # ----------------- hooks RiskManager -----------------
     def set_event_sink(self, sink: Optional[Callable[[dict], None]]) -> None:
         self._event_sink = sink
@@ -237,9 +256,110 @@ class DynamicExecutionSimulator:
         return f"{strategy}:{combo_key}:{idk}:{leg_index}:{digest[:12]}"
 
     def _use_deterministic_trade_id(self) -> bool:
-        cfg = getattr(self, "bot_cfg", None)
-        sim_cfg = getattr(cfg, "sim", cfg)
-        return bool(getattr_bool(sim_cfg, "sim_deterministic_trade_id", False))
+        return bool(self._sim_knob("sim_deterministic_trade_id", legacy="sim_deterministic_trade_id", default=False))
+
+    def _strict_config(self) -> bool:
+        rm_cfg = getattr(self.config, "rm", None)
+        sim_cfg = getattr(self.config, "sim", None)
+        return bool(
+            getattr(rm_cfg, "strict_config", False)
+            or getattr(sim_cfg, "strict_config", False)
+        )
+
+    def _warn_sim_alias(self, key: str, msg: str) -> None:
+        if key in self._sim_warned_aliases:
+            return
+        self._sim_warned_aliases.add(key)
+        logger.warning("[DynamicExecutionSimulator] %s", msg)
+
+    def _sim_knob(self, name: str, *, legacy: str | None = None, default=None, cast=None):
+        missing = object()
+        sim_cfg = getattr(self.config, "sim", None)
+        if sim_cfg is None:
+            val = getattr(self.config, name, missing)
+            legacy_val = getattr(self.config, legacy, missing) if legacy else missing
+            if val is not missing and legacy_val is not missing and val != legacy_val:
+                msg = f"sim.{name} mismatch: sim.{name}={val} legacy {legacy}={legacy_val}"
+                if self._strict_config():
+                    raise RuntimeError(msg)
+                self._warn_sim_alias(f"{name}_conflict", msg)
+            if val is not missing:
+                msg = f"legacy {name} is deprecated; use sim.{name} instead"
+                if self._strict_config():
+                    raise RuntimeError(msg)
+                self._warn_sim_alias(f"{name}_legacy", msg)
+                result = val
+            elif legacy_val is not missing:
+                msg = f"legacy {legacy} is deprecated; use sim.{name} instead"
+                if self._strict_config():
+                    raise RuntimeError(msg)
+                self._warn_sim_alias(f"{name}_legacy", msg)
+                result = legacy_val
+            else:
+                result = default
+
+            if cast is not None:
+                try:
+                    return cast(result)
+                except Exception:
+                    return result
+            return result
+
+        val = getattr(sim_cfg, name, missing)
+        legacy_val = getattr(self.config, legacy, missing) if legacy else missing
+
+        if val is not missing and legacy_val is not missing and val != legacy_val:
+            msg = f"sim.{name} mismatch: sim.{name}={val} legacy {legacy}={legacy_val}"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self._warn_sim_alias(f"{name}_conflict", msg)
+
+        if val is not missing:
+            result = val
+        elif legacy_val is not missing:
+            msg = f"legacy {legacy} is deprecated; use sim.{name} instead"
+            if self._strict_config():
+                raise RuntimeError(msg)
+            self._warn_sim_alias(f"{name}_legacy", msg)
+            result = legacy_val
+        else:
+            result = default
+
+        if cast is not None:
+            try:
+                return cast(result)
+            except Exception:
+                return result
+        return result
+
+    def _sim_knob_present(self, name: str, legacy: str | None = None) -> bool:
+        sim_cfg = getattr(self.config, "sim", None)
+        if sim_cfg is None:
+            return bool(hasattr(self.config, name) or (legacy and hasattr(self.config, legacy)))
+        if hasattr(sim_cfg, name):
+            return True
+        return bool(legacy and hasattr(self.config, legacy))
+
+    def _resolve_split_mode(self) -> str:
+        sim_split = self._sim_knob("sim_split_mode", legacy="split_mode", default=None, cast=str)
+        g_mode = getattr(getattr(self.config, "g", None), "deployment_mode", None)
+        g_norm = str(g_mode).strip().upper() if g_mode else ""
+        if sim_split:
+            sim_norm = str(sim_split).strip().upper()
+            if g_norm and g_norm != sim_norm:
+                msg = f"sim_split_mode mismatch: sim_split_mode={sim_norm} g.deployment_mode={g_norm}"
+                if self._strict_config():
+                    raise RuntimeError(msg)
+                self._warn_sim_alias("sim_split_mode_conflict", msg)
+            return sim_norm
+        if g_norm:
+            self._warn_sim_alias("sim_split_mode_from_g", f"sim_split_mode missing; using g.deployment_mode={g_norm}")
+            return g_norm
+        msg = "sim_split_mode missing; using EU_ONLY fallback"
+        if self._strict_config():
+            raise RuntimeError(msg)
+        self._warn_sim_alias("sim_split_mode_default", msg)
+        return "EU_ONLY"
 
     def _emit_shadow_event(self, payload: dict, result: dict) -> None:
         if not self._event_sink:
@@ -364,8 +484,22 @@ class DynamicExecutionSimulator:
         # Cap utilisable côté ladder (quote)
         ladder_quote = min(self._cum_usdc(asks_n), self._cum_usdc(bids_n))
 
-        # 2) Paramètres avec fallbacks cfg
+        # 2) Paramètres avec fallbacks cfg (cfg fourni par le caller: RM/Engine)
         cfg = self.config
+        if not self._suggest_slices_logged:
+            self._suggest_slices_logged = True
+            logger.debug(
+                "[DynamicExecutionSimulator] suggest_slices uses caller cfg for fragmentation knobs",
+                extra={"cfg_type": type(cfg).__name__},
+            )
+        if self._strict_config():
+            missing_attrs = [
+                name
+                for name in ("target_ladder_participation", "max_fragments", "min_fragment_usdc", "fragment_safety_pad")
+                if not hasattr(cfg, name)
+            ]
+            if missing_attrs:
+                raise RuntimeError(f"suggest_slices missing cfg attributes: {missing_attrs}")
         tp = float(target_participation if target_participation is not None
                    else getattr(cfg, "target_ladder_participation", 0.25))
         tp = max(0.0, min(tp, 1.0))
@@ -995,7 +1129,7 @@ class DynamicExecutionSimulator:
                 "reason": reason,
                 "dev_bps": float("inf"),
                 "fills_ratio": 0.0,
-                "lat_ms": float(getattr(self, "timeout_each_s", 1.2)) * 1000.0,
+                "lat_ms": float(self.timeout_each_s) * 1000.0,
                 "guards": guards or {},
             }
 
@@ -1068,7 +1202,7 @@ class DynamicExecutionSimulator:
         meta.setdefault("shadow_branch", "TT")
 
         # 5) Timeout par branche (aligné grossièrement sur timeout_each_s)
-        timeout_each = float(getattr(self, "timeout_each_s", 1.2))
+        timeout_each = float(self.timeout_each_s)
         timeout_branch = max(0.05, timeout_each - float(extra_latency_s))
 
         # 6) Appel à la simulation TT
@@ -1145,7 +1279,7 @@ class DynamicExecutionSimulator:
                 "reason": reason,
                 "dev_bps": float("inf"),
                 "fills_ratio": 0.0,
-                "lat_ms": float(getattr(self, "timeout_each_s", 1.2)) * 1000.0,
+                "lat_ms": float(self.timeout_each_s) * 1000.0,
                 "guards": guards or {},
             }
 
@@ -1240,7 +1374,7 @@ class DynamicExecutionSimulator:
                 "reason": "TM_BLOCKED_IOC_ONLY",
                 "dev_bps": float("inf"),
                 "fills_ratio": 0.0,
-                "lat_ms": float(getattr(self, "timeout_each_s", 1.2)) * 1000.0,
+                "lat_ms": float(self.timeout_each_s) * 1000.0,
                 "guards": guards,
             }
 
@@ -1250,7 +1384,7 @@ class DynamicExecutionSimulator:
             opportunity.setdefault("maker_best_ask", sell_best_ask_px)
 
         # 5) Timeout par branche (aligné grossièrement sur timeout_each_s)
-        timeout_each = float(getattr(self, "timeout_each_s", 1.2))
+        timeout_each = float(self.timeout_each_s)
         timeout_branch = max(0.05, timeout_each - float(extra_latency_s))
 
         # 6) Appel à la simulation TM
@@ -1346,11 +1480,11 @@ class DynamicExecutionSimulator:
         try:
             async with self._sem:
                 t0 = time.time()
-                timeout_each = float(getattr(self, "timeout_each_s", 1.2))
-                split_mode = getattr(self, "split_mode", "EU_ONLY")
+                timeout_each = float(self.timeout_each_s)
+                split_mode = self.split_mode
                 cb_bonus = 0.0
                 if split_mode == "SPLIT":
-                    cb_bonus = float(getattr(self, "cb_coalescing_ms", 10.0)) / 1000.0
+                    cb_bonus = float(self.cb_coalescing_ms) / 1000.0
                 meta_payload = dict(payload.get("meta") or {})
                 region_vals = {
                     str(meta_payload.get("region") or "").upper(),
@@ -1684,14 +1818,25 @@ class DynamicExecutionSimulator:
         return (str(branch).upper(), str(route_combo), str(pair).upper(), str(quote).upper(), float(bucket), fingerprint)
 
     def _book_fingerprint(self, book_snapshot: Dict[str, Any]) -> Any:
-        sim_cfg = getattr(self.config, "sim", self.config)
+
         mode = str(
-            getattr(sim_cfg, "sim_book_fingerprint_mode",
-                    getattr(self.config, "sim_book_fingerprint_mode", "TOP_AND_SUMMARY"))
+            self._sim_knob(
+                "sim_book_fingerprint_mode",
+                legacy="sim_book_fingerprint_mode",
+                default="TOP_AND_SUMMARY",
+                cast=str,
+            )
             or "TOP_AND_SUMMARY"
         ).upper()
-        levels = int(getattr(sim_cfg, "sim_book_fingerprint_levels",
-                             getattr(self.config, "sim_book_fingerprint_levels", 5)) or 5)
+        levels = int(
+            self._sim_knob(
+                "sim_book_fingerprint_levels",
+                legacy="sim_book_fingerprint_levels",
+                default=5,
+                cast=int,
+            )
+            or 5
+        )
         def _top_levels(side: List[Tuple[Any, Any]], reverse: bool = False) -> List[Tuple[float, float]]:
             cleaned = []
             for p, q in (side or [])[: levels]:
@@ -1727,26 +1872,50 @@ class DynamicExecutionSimulator:
         return [float(x) for x in str(text).split(',') if str(x).strip()]
 
     def _candidate_buckets(self, notional: float, *, profile: Optional[str] = None, vol_size_factor: Optional[float] = None) -> List[float]:
-        sim_cfg = getattr(self.config, "sim", self.config)
+
         base = self._parse_buckets(
-            getattr(sim_cfg, "sim_notional_buckets_base",
-                    getattr(self.config, "sim_notional_buckets_base", "250,500,1000,2000,4000"))
+            self._sim_knob(
+                "sim_notional_buckets_base",
+                legacy="sim_notional_buckets_base",
+                default="250,500,1000,2000,4000",
+            )
         )
         profile_key = str(profile or getattr(getattr(self.config, "g", object()), "capital_profile", "")).upper()
-        per_profile = getattr(sim_cfg, "sim_buckets_per_profile", getattr(self.config, "sim_buckets_per_profile", {})) or {}
+        per_profile = self._sim_knob(
+            "sim_buckets_per_profile",
+            legacy="sim_buckets_per_profile",
+            default={},
+        ) or {}
         if profile_key and profile_key in per_profile:
             try:
                 base = self._parse_buckets(per_profile[profile_key])
             except Exception:
                 pass
         factor = vol_size_factor
-        if getattr(sim_cfg, "sim_buckets_adapt_with_vol", getattr(self.config, "sim_buckets_adapt_with_vol", True)):
+        if self._sim_knob(
+                "sim_buckets_adapt_with_vol",
+                legacy="sim_buckets_adapt_with_vol",
+                default=True,
+                cast=bool,
+        ):
             if factor is None:
                 factor = 1.0
             floor = float(
-                getattr(sim_cfg, "sim_vol_size_factor_floor", getattr(self.config, "sim_vol_size_factor_floor", 0.6)))
+                self._sim_knob(
+                    "sim_vol_size_factor_floor",
+                    legacy="sim_vol_size_factor_floor",
+                    default=0.6,
+                    cast=float,
+                )
+            )
             ceil = float(
-                getattr(sim_cfg, "sim_vol_size_factor_ceil", getattr(self.config, "sim_vol_size_factor_ceil", 1.0)))
+                self._sim_knob(
+                    "sim_vol_size_factor_ceil",
+                    legacy="sim_vol_size_factor_ceil",
+                    default=1.0,
+                    cast=float,
+                )
+            )
             factor = max(floor, min(ceil, float(factor)))
         else:
             factor = 1.0
@@ -1778,9 +1947,16 @@ class DynamicExecutionSimulator:
         vol_size_factor: Optional[float] = None,
     ) -> None:
         try:
-            sim_cfg = getattr(self.config, "sim", self.config)
+
             k = int(
-                getattr(sim_cfg, "sim_prime_multibucket_k", getattr(self.config, "sim_prime_multibucket_k", 3)) or 3)
+                self._sim_knob(
+                    "sim_prime_multibucket_k",
+                    legacy="sim_prime_multibucket_k",
+                    default=3,
+                    cast=int,
+                )
+                or 3
+            )
             buckets = self._candidate_buckets(float(notional_quote), profile=getattr(getattr(self.config, "g", object()), "capital_profile", None), vol_size_factor=vol_size_factor)
             buckets = self._nearest_buckets(float(notional_quote), buckets or [float(notional_quote)], k)
             fingerprint = self._book_fingerprint(book_snapshot or {})
@@ -1808,8 +1984,9 @@ class DynamicExecutionSimulator:
             report_nonfatal("DynamicExecutionSimulator", "prime_failed", None, pair=pair)
 
     def peek_plan(self, key: tuple) -> Optional[Dict[str, Any]]:
-        sim_cfg = getattr(self.config, "sim", self.config)
-        ttl_ms = int(getattr(sim_cfg, "sim_cache_ttl_ms", getattr(self.config, "sim_cache_ttl_ms", 300)) or 300)
+        ttl_ms = int(
+            self._sim_knob("sim_cache_ttl_ms", legacy="sim_cache_ttl_ms", default=300, cast=int) or 300
+        )
         entry = self._plan_cache.get(key)
         if not entry:
             return None
@@ -1837,9 +2014,10 @@ class DynamicExecutionSimulator:
         return self.peek_plan(key)
 
     async def _plan_worker(self) -> None:
-        sim_cfg = getattr(self.config, "sim", self.config)
+
         max_jobs = int(
-            getattr(sim_cfg, "sim_max_inflight_jobs", getattr(self.config, "sim_max_inflight_jobs", 32)) or 32)
+            self._sim_knob("sim_max_inflight_jobs", legacy="sim_max_inflight_jobs", default=32, cast=int) or 32
+        )
         while True:
             key = await self._jobs_queue.get()
             job = self._latest_job_by_key.pop(key, None)
@@ -1866,11 +2044,17 @@ class DynamicExecutionSimulator:
     def _compute_fragmentation_plan(self, job: Dict[str, Any]) -> Dict[str, Any]:
         asks = (job.get("book_snapshot") or {}).get("asks") or []
         bids = (job.get("book_snapshot") or {}).get("bids") or []
-        sim_cfg = getattr(self.config, "sim", self.config)
-        asks = asks[: int(getattr(sim_cfg, "sim_prime_depth_levels",
-                                  getattr(self.config, "sim_prime_depth_levels", self.depth_limit)))]
-        bids = bids[: int(getattr(sim_cfg, "sim_prime_depth_levels",
-                                  getattr(self.config, "sim_prime_depth_levels", self.depth_limit)))]
+        depth_levels = int(
+            self._sim_knob(
+                "sim_prime_depth_levels",
+                legacy="sim_prime_depth_levels",
+                default=self.depth_limit,
+                cast=int,
+            )
+        )
+        asks = asks[:depth_levels]
+        bids = bids[:depth_levels]
+
         plan = self.suggest_slices(
             budget_usdc=float(job.get("bucket") or 0.0),
             asks=asks,
@@ -1880,10 +2064,25 @@ class DynamicExecutionSimulator:
         return plan
 
     async def _mm_hints_worker(self) -> None:
-        sim_cfg = getattr(self.config, "sim", self.config)
+
         interval_ms = int(
-            getattr(sim_cfg, "sim_mm_hints_interval_ms", getattr(self.config, "sim_mm_hints_interval_ms", 0)) or 0)
-        levels = int(getattr(sim_cfg, "sim_mm_hints_levels", getattr(self.config, "sim_mm_hints_levels", 5)) or 5)
+            self._sim_knob(
+                "sim_mm_hints_interval_ms",
+                legacy="sim_mm_hints_interval_ms",
+                default=0,
+                cast=int,
+            )
+            or 0
+        )
+        levels = int(
+            self._sim_knob(
+                "sim_mm_hints_levels",
+                legacy="sim_mm_hints_levels",
+                default=5,
+                cast=int,
+            )
+            or 5
+        )
         if interval_ms <= 0:
             return
         while True:
@@ -1920,7 +2119,7 @@ class DynamicExecutionSimulator:
         pair = opp.get("pair_key") or opp.get("pair")
         quote = (opp.get("quote_ccy") or opp.get("quote") or "USDC").upper()
         fingerprint = self._book_fingerprint(snap)
-        sim_cfg = getattr(self.config, "sim", self.config)
+
         candidates = self._nearest_buckets(
             bucket,
             self._candidate_buckets(
@@ -1928,7 +2127,15 @@ class DynamicExecutionSimulator:
                 profile=getattr(getattr(self.config, "g", object()), "capital_profile", None),
                 vol_size_factor=opp.get("vol_size_factor"),
             ),
-            int(getattr(sim_cfg, "sim_prime_multibucket_k", getattr(self.config, "sim_prime_multibucket_k", 3)) or 3),
+            int(
+                self._sim_knob(
+                    "sim_prime_multibucket_k",
+                    legacy="sim_prime_multibucket_k",
+                    default=3,
+                    cast=int,
+                )
+                or 3
+            ),
         )
         if not candidates:
             return None

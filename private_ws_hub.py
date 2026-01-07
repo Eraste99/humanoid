@@ -278,16 +278,16 @@ class _BaseWSClient:
 
             pws = _PWSStub()
 
-        self._region_map = dict(getattr(pws, "PWS_REGION_MAP", {"BINANCE": "EU", "BYBIT": "EU", "COINBASE": "US"}))
-        self._queue_max = getattr_int(pws, "PWS_QUEUE_MAXLEN", 10_000)
+        self._queue_max = getattr_int(pws, "PWS_QUEUE_MAXLEN", 5000)
+        self._sat_ratio = getattr_float(pws, "PWS_QUEUE_SATURATION_RATIO", 0.85)
         self._sat_ratio = getattr_float(pws, "PWS_QUEUE_SATURATION_RATIO", 0.90)
         self._ping_s = getattr_int(pws, "PWS_PING_INTERVAL_S", 20)
         self._pong_to_s = getattr_int(pws, "PWS_PONG_TIMEOUT_S", 10)
         self._hb_max_gap = getattr_int(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30)
-        self._stable_reset_s = getattr_int(pws, "PWS_STABLE_RESET_S", 3600)
-        self._jitter_ms = getattr_int(pws, "PWS_JITTER_MS", 50)
+        self._stable_reset_s = getattr_int(pws, "PWS_STABLE_RESET_S", 30)
+        self._jitter_ms = getattr_int(pws, "PWS_JITTER_MS", 2)
         self._bo_base_ms = getattr_int(pws, "PWS_BACKOFF_BASE_MS", 500)
-        self._bo_max_ms = getattr_int(pws, "PWS_BACKOFF_MAX_MS", 15_000)
+        self._bo_max_ms = getattr_int(pws, "PWS_BACKOFF_MAX_MS", 20_000)
 
         # dérivés pratiques
         self._bo_base_s = self._bo_base_ms / 1000.0
@@ -646,8 +646,30 @@ class BybitPrivateWS(_BaseWSClient):
         super().__init__(cfg, "BYBIT", alias)
         self.api_key = api_key
         self.secret = secret.encode()
+        self._last_cum_exec: Dict[str, float] = {}
+        self._last_fill_px: Dict[str, float] = {}
 
+    @staticmethod
+    def _normalize_ts_seconds(ts_value: Any) -> Optional[float]:
+        try:
+            ts = float(ts_value)
+        except Exception:
+            return None
+        if ts <= 0:
+            return None
+        if ts > 1e11:
+            ts /= 1000.0
+        return ts
 
+    @staticmethod
+    def _normalize_id(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
     @staticmethod
     def _sign(ts_ms: int, api_key: str, secret: bytes) -> str:
         recv_window = "5000"
@@ -670,6 +692,64 @@ class BybitPrivateWS(_BaseWSClient):
         }
         return m.get((x or "").upper(), "ACK")
 
+    def _maybe_emit_fill(self, order_event: dict, row: dict, filled_cum: float) -> None:
+        order_id = order_event.get("exchange_order_id") or order_event.get("orderId")
+        client_id = order_event.get("client_id") or order_event.get("clientId")
+        key = str(order_id or client_id or "")
+        if not key:
+            return
+        prev = float(self._last_cum_exec.get(key, 0.0) or 0.0)
+        if filled_cum <= prev:
+            self._last_cum_exec[key] = filled_cum
+            return
+        delta_qty = filled_cum - prev
+        self._last_cum_exec[key] = filled_cum
+        if delta_qty <= 0:
+            return
+        avg_px = _safe_float(
+            row.get("avgPrice")
+            or row.get("avg_price")
+            or row.get("lastPrice")
+            or row.get("execPrice")
+            or row.get("price")
+            or row.get("p")
+        )
+        px_source = "avg_price"
+        if avg_px <= 0:
+            cum_value = _safe_float(row.get("cumExecValue") or row.get("cum_exec_value"))
+            if cum_value > 0 and filled_cum > 0:
+                avg_px = cum_value / filled_cum
+                px_source = "cum_exec_value"
+        if avg_px <= 0:
+            avg_px = float(self._last_fill_px.get(key, 0.0) or 0.0)
+            px_source = "cached"
+        if avg_px <= 0:
+            return
+        self._last_fill_px[key] = avg_px
+        symbol = order_event.get("symbol") or ""
+        quote = _quote_ccy_from_symbol(str(symbol))
+        quote_qty = avg_px * delta_qty
+        usdc_qty = quote_qty if quote == "USDC" else 0.0
+        ev = {
+            "type": "fill",
+            "status": "FILL",
+            "exchange": "BYBIT",
+            "alias": self.alias,
+            "symbol": str(symbol).replace("-", "").upper(),
+            "side": order_event.get("side"),
+            "fill_px": avg_px,
+            "base_qty": delta_qty,
+            "quote": quote,
+            "quote_qty": quote_qty,
+            "usdc_qty": usdc_qty,
+            "client_id": client_id,
+            "exchange_order_id": order_id,
+            "ts_exchange": order_event.get("ts_exchange"),
+            "ts_local": order_event.get("ts_local"),
+            "ts": order_event.get("ts"),
+            "meta": {"source": "ws", "fill_px_source": px_source},
+        }
+        self._emit(ev)
     async def start(self) -> None:
         if self._running:
             return
@@ -714,21 +794,23 @@ class BybitPrivateWS(_BaseWSClient):
                                     for row in data:
                                         try:
                                             status = self._map_status(row.get("orderStatus") or row.get("o", ""))
-                                            order_id = row.get("orderId") or row.get("i")
-                                            client_id = row.get("orderLinkId") or row.get("c")
+                                            order_id = self._normalize_id(row.get("orderId") or row.get("i"))
+                                            client_id = self._normalize_id(row.get("orderLinkId") or row.get("c"))
                                             symbol = row.get("symbol") or row.get("s")
                                             side = (row.get("side") or row.get("S") or "").upper()
                                             price = _safe_float(row.get("price") or row.get("p"))
                                             filled_cum = _safe_float(row.get("cumExecQty") or row.get("z"))
-                                            ts_ex = _safe_float(row.get("updatedTime") or row.get("T"))
+                                            ts_ex = self._normalize_ts_seconds(row.get("updatedTime") or row.get("T"))
                                             ts_loc = _now()
-                                            self._emit({
+                                            event = {
                                                 "type": "order",
                                                 "status": status,
                                                 "exchange": "BYBIT",
                                                 "alias": self.alias,
                                                 "orderId": order_id,
                                                 "clientId": client_id,
+                                                "exchange_order_id": order_id,
+                                                "client_id": client_id,
                                                 "symbol": symbol,
                                                 "side": side,
                                                 "price": price,
@@ -736,7 +818,9 @@ class BybitPrivateWS(_BaseWSClient):
                                                 "ts_exchange": ts_ex,
                                                 "ts_local": ts_loc,
                                                 "ts": ts_loc,
-                                            })
+                                            }
+                                            self._emit(event)
+                                            self._maybe_emit_fill(event, row, filled_cum)
                                         except Exception:
                                             continue
                             except Exception:
@@ -1351,12 +1435,12 @@ class PrivateWSHub:
         # Files par (exchange, alias)
         if not hasattr(self, "_queues"):
             from collections import defaultdict, deque
-            qmax = int(getattr(pws, "PWS_QUEUE_MAXLEN", 1000))
+            qmax = int(getattr(pws, "PWS_QUEUE_MAXLEN", 5000))
             self._queue_max = qmax
             self._queues = defaultdict(deque)
 
         if not hasattr(self, "_queue_max"):
-            self._queue_max = int(getattr(pws, "PWS_QUEUE_MAXLEN", 1000))
+            self._queue_max = int(getattr(pws, "PWS_QUEUE_MAXLEN", 5000))
 
         # Heartbeats
         if not hasattr(self, "_last_hb"):
@@ -1364,11 +1448,10 @@ class PrivateWSHub:
 
         # Paramètres ping/backoff (défauts sûrs)
 
-        self._ping_interval_s = float(getattr(pws, "PWS_PING_INTERVAL_S", 10.0))
-        self._pong_timeout_s = float(getattr(pws, "PWS_PONG_TIMEOUT_S", 3.0))
-        self._backoff_base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 200))
-        self._backoff_max_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 5000))
-        self._queue_backpressure_ms = int(getattr(pws, "PWS_QUEUE_BACKPRESSURE_MS", 50))
+        self._ping_interval_s = float(getattr(pws, "PWS_PING_INTERVAL_S", 20.0))
+        self._pong_timeout_s = float(getattr(pws, "PWS_PONG_TIMEOUT_S", 10.0))
+        self._backoff_base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 500))
+        self._backoff_max_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 20_000))
         self._critical_drop_seen = bool(getattr(self, "_critical_drop_seen", False))
         self._last_critical_drop_reason = getattr(self, "_last_critical_drop_reason", None)
         self._last_critical_drop_ts = float(getattr(self, "_last_critical_drop_ts", 0.0) or 0.0)
@@ -1414,7 +1497,7 @@ class PrivateWSHub:
 
         # Gap heartbeat PWS (SLO privé par exchange + fallback global)
         self._pws_gap_slo_by_ex: Dict[str, float] = {}
-        self._pws_gap_slo_default: float = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
+        self._pws_gap_slo_default: float = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30.0))
         self._refresh_pws_gap_slo_from_slo()
 
         # Health state par (exchange, alias)
@@ -1452,12 +1535,62 @@ class PrivateWSHub:
         else:
             self.on_event(event)
 
+    @staticmethod
+    def _normalize_client_id(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
+
+    def _normalize_event_fields(self, ev: dict) -> None:
+        if not ev:
+            return
+        if not ev.get("exchange_order_id"):
+            for key in ("orderId", "order_id", "orderID", "exchangeOrderId", "id"):
+                if ev.get(key):
+                    ev["exchange_order_id"] = self._normalize_client_id(ev.get(key))
+                    break
+        if "exchange_order_id" in ev:
+            ev["exchange_order_id"] = self._normalize_client_id(ev.get("exchange_order_id"))
+        if not ev.get("client_id"):
+            for key in ("clientId", "clientOrderId", "client_order_id", "orderLinkId", "origClientOrderId"):
+                if ev.get(key):
+                    ev["client_id"] = self._normalize_client_id(ev.get(key))
+                    break
+        if "client_id" in ev:
+            ev["client_id"] = self._normalize_client_id(ev.get("client_id"))
+        if "clientOrderId" in ev:
+            ev["clientOrderId"] = self._normalize_client_id(ev.get("clientOrderId"))
+        if "ts_exchange" in ev and ev.get("ts_exchange") is not None:
+            try:
+                ts_val = float(ev.get("ts_exchange"))
+                if ts_val > 1e11:
+                    ts_val /= 1000.0
+                ev["ts_exchange"] = ts_val
+            except Exception:
+                pass
+
+    def _record_queue_drop(self, dropped: Optional[dict], *, exchange: str, alias: str, reason: str) -> None:
+        ev = dropped or {}
+        critical = self._is_critical_event(ev)
+        label = "queue_full_critical" if critical else "queue_full_other"
+        try:
+            PWS_DROPPED_TOTAL.labels(exchange, alias, label).inc()
+        except Exception:
+            pass
+        if critical:
+            kind = str(ev.get("type") or "other").lower()
+            self._record_critical_drop(exchange=exchange, alias=alias, reason=reason, kind=kind)
     def on_event(self, event: dict) -> None:
         """
         Entrée unique: QoS, métriques (ACK/FILL + lag + heartbeats), drain minimal.
         """
         import time as _t
         ev = dict(event or {})
+        self._normalize_event_fields(ev)
         exu = _upper(ev.get("exchange") or "UNKNOWN")
         alu = _upper(ev.get("alias") or "NA")
         status = _upper(ev.get("status") or "OTHER")
@@ -1561,7 +1694,12 @@ class PrivateWSHub:
                     while len(q) >= cap:
                         try:
                             dropped = q.pop()
-                            PWS_DROPPED_TOTAL.labels(exu, alu, "queue_full_other").inc()
+                            self._record_queue_drop(
+                                dropped,
+                                exchange=exu,
+                                alias=alu,
+                                reason="queue_full_critical",
+                            )
                         except Exception:
                             break
 
@@ -1571,15 +1709,22 @@ class PrivateWSHub:
                 if cap > 0 and len(q) >= cap and pri >= 2:
                     if self._drop_policy == "DROP_OLDEST" and len(q) > 0:
                         try:
-                            _ = q.pop()
-                            PWS_DROPPED_TOTAL.labels(exu, alu, "queue_full_other").inc()
+                            dropped = q.pop()
+                            self._record_queue_drop(
+                                dropped,
+                                exchange=exu,
+                                alias=alu,
+                                reason="queue_full_critical",
+                            )
                         except Exception:
                             pass
                     else:
-                        try:
-                            PWS_DROPPED_TOTAL.labels(exu, alu, "queue_full_other").inc()
-                        except Exception:
-                            pass
+                        self._record_queue_drop(
+                            ev,
+                            exchange=exu,
+                            alias=alu,
+                            reason="queue_full_critical",
+                        )
                         return
                 q.append(ev)
         except Exception:
@@ -1857,6 +2002,7 @@ class PrivateWSHub:
         # Émission directe
         if len(args) == 1 and isinstance(args[0], dict):
             ev = dict(args[0] or {})
+            self._normalize_event_fields(ev)
             exu = str((ev.get("exchange") or "UNKNOWN")).upper()
             alu = str((ev.get("alias") or "NA")).upper()
             ev.setdefault("exchange", exu)
@@ -1893,6 +2039,7 @@ class PrivateWSHub:
                 e = dict(ev or {})
                 e.setdefault("alias", alu)
                 e.setdefault("exchange", exu)
+                self._normalize_event_fields(e)
                 try:
                     key_d, key_meta = self._dedup_key(e)
                     if (
@@ -2070,8 +2217,8 @@ class PrivateWSHub:
         - base_ms ≥ 50 ms, cap_ms ≥ base_ms.
         """
         pws = self._pws_cfg
-        base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 200))
-        cap_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 5000))
+        base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 500))
+        cap_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 20_000))
         base_ms = max(50, base_ms)
         cap_ms = max(base_ms, cap_ms)
         try:
@@ -2089,7 +2236,7 @@ class PrivateWSHub:
         self._pws_gap_slo_by_ex.clear()
 
         pws = self._pws_cfg
-        self._pws_gap_slo_default = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 5.0))
+        self._pws_gap_slo_default = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30.0))
 
         cfg = getattr(self, "cfg", None)
         slo_map = getattr(cfg, "slo", None)
@@ -2126,7 +2273,7 @@ class PrivateWSHub:
                """
         pws = self._pws_cfg
         ratio_thr = float(getattr(pws, "PWS_QUEUE_SATURATION_RATIO", 0.85))
-        period = float(getattr(pws, "PWS_ALERT_PERIOD_S", 5.0))
+        period = float(getattr(pws, "PWS_ALERT_PERIOD_S", 30.0))
 
         while getattr(self, "_started", False):
             now = _now()

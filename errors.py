@@ -50,6 +50,11 @@ class SimulationError(RMError):
 class EngineSubmitError(RMError):
     error_kind = "engine_submit_error"
 
+    def __init__(self, reason: str | None = None, **metadata: Any) -> None:
+        super().__init__(reason if reason is not None else self.error_kind, **metadata)
+        self.reason = reason if reason is not None else self.error_kind
+        self.reason_code = self.reason
+
 
 class EngineCancelError(RMError):
     error_kind = "engine_cancel_error"

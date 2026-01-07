@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import contextlib
+import logging
 import ssl
 import time
 import random
@@ -86,6 +87,7 @@ class _NoopMetric:
         return contextlib.nullcontext()
 
 _METRICS_DISABLED_LOGGED = False
+_RPC_WARNED_KEYS: set[str] = set()
 
 def _get_metric(name: str):
     global _METRICS_DISABLED_LOGGED
@@ -99,6 +101,54 @@ def _get_metric(name: str):
                 pass
         return _NoopMetric()
     return metric
+def _warn_once(key: str, msg: str, *, level: int = logging.WARNING) -> None:
+    if key in _RPC_WARNED_KEYS:
+        return
+    _RPC_WARNED_KEYS.add(key)
+    try:
+        logger.log(level, msg)
+    except Exception:
+        pass
+
+def _strict_config(cfg: Optional[BotConfig]) -> bool:
+    g_cfg = getattr(cfg, "g", None) if cfg is not None else None
+    rpc_cfg = getattr(cfg, "rpc", None) if cfg is not None else None
+    return bool(
+        getattr(g_cfg, "strict_config", False)
+        or getattr(rpc_cfg, "strict_config", False)
+    )
+
+def _resolve_rpc_cfg(cfg: BotConfig):
+    return getattr(cfg, "rpc", cfg)
+
+def _resolve_rpc_region(cfg: BotConfig, default_region: str) -> str:
+    g_cfg = getattr(cfg, "g", None)
+    g_region = getattr(g_cfg, "region", None) if g_cfg is not None else None
+    if g_region:
+        return str(g_region).upper()
+    if hasattr(cfg, "region"):
+        _warn_once("rpc_region_legacy", "[rpc_gateway] cfg.region is deprecated; use cfg.g.region or deployment_mode")
+        legacy_region = getattr(cfg, "region", None)
+        if legacy_region:
+            return str(legacy_region).upper()
+    mode = str(getattr(g_cfg, "deployment_mode", "") or "").upper()
+    if mode in ("US_ONLY",):
+        return "US"
+    if mode in ("EU_ONLY", "SPLIT", "JP_ONLY"):
+        return "EU"
+    _warn_once("rpc_region_fallback", "[rpc_gateway] region missing; using default EU")
+    return str(default_region).upper()
+
+def _resolve_rpc_attr(rpc_cfg, cfg: BotConfig, name: str, *, default=None, legacy_root: str | None = None):
+    if hasattr(rpc_cfg, name):
+        return getattr(rpc_cfg, name)
+    if legacy_root and hasattr(cfg, legacy_root):
+        _warn_once(
+            f"rpc_legacy_{legacy_root}",
+            f"[rpc_gateway] {legacy_root} is deprecated; use rpc.{name}",
+        )
+        return getattr(cfg, legacy_root)
+    return default
 
 def _observe(metric, value: float, **labels):
     try:
@@ -204,27 +254,42 @@ class RPCSettings:
     def from_cfg(cfg: BotConfig, *, default_host="0.0.0.0", default_port=8443, default_region="EU") -> "RPCSettings":
         # Les noms exacts des clés d'env sont libres côté BotConfig;
         # ici on consomme uniquement les attributs exposés par cfg.
-        enabled = getattr(cfg, "rpc_enabled", True)
-        host = getattr(cfg, "rpc_host", default_host)
-        port = getattr_int(cfg, "rpc_port", default_port)
-        region = getattr(cfg, "region", default_region)  # label métrique
-        timeout_ms = getattr_int(cfg, "rpc_timeout_ms", 0) or None
-        timeout_s = getattr_float(cfg, "rpc_timeout_s", 2.0)
+        rpc_cfg = _resolve_rpc_cfg(cfg)
+        enabled = _resolve_rpc_attr(rpc_cfg, cfg, "enabled", default=True, legacy_root="rpc_enabled")
+        host = _resolve_rpc_attr(rpc_cfg, cfg, "host", default=default_host, legacy_root="rpc_host")
+        port = getattr_int(rpc_cfg, "port", default_port)
+        region = _resolve_rpc_region(cfg, default_region)
+        timeout_ms = getattr_int(rpc_cfg, "timeout_ms", 0) or None
+        timeout_s = getattr_float(rpc_cfg, "timeout_s", 2.0)
         if timeout_ms is not None:
             try:
                 timeout_s = max(timeout_s, float(timeout_ms) / 1000.0)
             except Exception:
                 pass
-        max_retries = int(min(getattr(cfg, "rpc_max_retries", 2), 2))
-        idempotency_ttl_s = getattr_int(cfg, "rpc_idempotency_ttl_s", 600)
-        memoize_response = getattr_bool(cfg, "rpc_idempotency_memoize_response", True)
-        mtls_enabled = getattr_bool(cfg, "rpc_mtls_enabled", True)
-        ca_cert = getattr(cfg, "rpc_ca_cert", None)
-        server_cert = getattr(cfg, "rpc_server_cert", None)
-        server_key = getattr(cfg, "rpc_server_key", None)
-        client_cert = getattr(cfg, "rpc_client_cert", None)
-        client_key = getattr(cfg, "rpc_client_key", None)
-        require_client_cert = getattr_bool(cfg, "rpc_require_client_cert", True)
+        max_retries = int(min(getattr(rpc_cfg, "max_retries", 2), 2))
+        idempotency_ttl_s = getattr_int(rpc_cfg, "rpc_idempotency_ttl_s", 600)
+        memoize_response = getattr_bool(rpc_cfg, "rpc_idempotency_memoize_response", True)
+        mtls_enabled = getattr_bool(rpc_cfg, "mtls_enabled", True)
+        ca_cert = getattr(rpc_cfg, "ca_cert", None)
+        server_cert = getattr(rpc_cfg, "server_cert", None)
+        server_key = getattr(rpc_cfg, "server_key", None)
+        client_cert = getattr(rpc_cfg, "client_cert", None)
+        client_key = getattr(rpc_cfg, "client_key", None)
+        require_client_cert = getattr_bool(rpc_cfg, "require_client_cert", True)
+        g_cfg = getattr(cfg, "g", None)
+        mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper()
+        armed = bool(getattr(g_cfg, "live_trading_armed", False))
+        if not hasattr(rpc_cfg, "enabled") and mode == "PROD" and armed:
+            msg = "[rpc_gateway] rpc.enabled missing in PROD+armed"
+            _warn_once("rpc_enabled_missing", msg, level=logging.CRITICAL)
+            if _strict_config(cfg):
+                raise RuntimeError("rpc.enabled missing in PROD+armed")
+        if mtls_enabled and mode == "PROD" and armed:
+            if not (ca_cert and server_cert and server_key):
+                msg = "[rpc_gateway] rpc mTLS enabled but cert paths missing in PROD+armed"
+                _warn_once("rpc_mtls_missing", msg, level=logging.CRITICAL)
+                if _strict_config(cfg):
+                    raise RuntimeError("rpc mTLS certs missing in PROD+armed")
         return RPCSettings(
             enabled, host, port, region, timeout_s, max_retries, idempotency_ttl_s, memoize_response,
             mtls_enabled, ca_cert, server_cert, server_key, client_cert, client_key, require_client_cert
@@ -267,12 +332,18 @@ class RPCServer:
         self._runner = None
         self._site = None
         self._lhm = lhm  # <= LoggerHistoriqueManager (facultatif)
-        self._admin_enabled = getattr_bool(cfg, "rpc_admin_enabled", False)
-        self._admin_token = admin_token or getattr_str(cfg, "rpc_admin_token", None)
-        self._strict_validation = getattr_bool(cfg, "rpc_strict_validation", False)
+        rpc_cfg = _resolve_rpc_cfg(cfg)
+        self._admin_enabled = getattr_bool(rpc_cfg, "admin_enabled", False)
+        self._admin_token = admin_token or getattr_str(rpc_cfg, "admin_token", None)
+        self._strict_validation = getattr_bool(rpc_cfg, "strict_validation", False)
         g_cfg = getattr(cfg, "g", None)
         mode = str(getattr(g_cfg, "mode", "DRY_RUN") or "DRY_RUN").upper()
         self._prod_armed = bool(mode == "PROD" and bool(getattr(g_cfg, "live_trading_armed", False)))
+        if self._prod_armed and self._admin_enabled and not self._admin_token:
+            msg = "[rpc_gateway] admin_enabled without admin_token in PROD+armed"
+            _warn_once("rpc_admin_token_missing", msg, level=logging.CRITICAL)
+            if _strict_config(cfg):
+                raise RuntimeError("admin_token missing in PROD+armed")
         self._status_handler = None
 
     # ---------- API wrappers (conformes à la spec, utiles en tests) ----------
@@ -532,16 +603,20 @@ class RPCServer:
     # ----- utils -----
     async def _handle_idempotent_request(self, request: web.Request, *, method: str, validator: Callable[[dict], dict],
                                          handler: Callable[[dict], Awaitable[dict]]):
-        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-        if not idem:
-            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
-            raise web.HTTPBadRequest(text="missing idempotency key")
+
 
         body = await self._read_json(request, method=method)
         if body is None:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
             raise web.HTTPBadRequest(text="invalid JSON")
-
+        idem = (
+                request.headers.get("X-Idempotency-Key")
+                or request.headers.get("Idempotency-Key")
+                or self._derive_idem_key_from_payload(body)
+        )
+        if not idem:
+            _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
+            raise web.HTTPBadRequest(text="missing idempotency key")
         body = validator(body)
         res, replayed = await self._process_idempotent_flow(
             key=idem,
@@ -700,10 +775,18 @@ class RPCServer:
     def _derive_idem_key_from_payload(self, body: Optional[dict]) -> Optional[str]:
         """
         Construit une clé d'idempotence stable à partir des champs usuels si présents.
-        Priorité: client_order_id | bundle_id | trace_id | ts_ns (concat).
+        Priorité: meta.idempotency_key | idempotency_key | client_order_id | bundle_id | trace_id | ts_ns.
         """
         if not isinstance(body, dict):
             return None
+        meta = body.get("meta") if isinstance(body.get("meta"), dict) else {}
+        for key in ("idempotency_key",):
+            v = meta.get(key) if isinstance(meta, dict) else None
+            if v:
+                return str(v)
+            v = body.get(key)
+            if v:
+                return str(v)
         parts = []
         for k in ("client_order_id", "bundle_id", "trace_id", "ts_ns"):
             v = body.get(k)
@@ -741,7 +824,12 @@ class RPCClient:
         self._ssl_ctx = _make_client_ssl(self.settings)
         self._session: Optional[ClientSession] = None
         # endpoint distant (ex: cfg.engine_pod_map["US"])
-        self._base_url = base_url or getattr(cfg, "rpc_remote_base_url", "https://engine-us:8443")
+        rpc_cfg = _resolve_rpc_cfg(cfg)
+        remote_base = getattr(rpc_cfg, "remote_base_url", None) or getattr(rpc_cfg, "rpc_client_base", None)
+        if remote_base is None:
+            _warn_once("rpc_remote_base_missing", "[rpc_gateway] rpc.remote_base_url missing; using fallback")
+            remote_base = "https://engine-us:8443"
+        self._base_url = base_url or remote_base
 
     async def _ensure_session(self):
         if self._session is None or self._session.closed:
@@ -885,7 +973,8 @@ def make_submitter_for_exchange(
     ex = str(exchange or "").upper()
     region_map = {k.upper(): str(v).upper() for k, v in (exchange_region_map or {}).items()}
     target_region = region_map.get(ex, str(local_region or "EU").upper())
-    loopback = bool(getattr(getattr(cfg, "rpc", object()), "loopback_inproc", True))
+    rpc_cfg = _resolve_rpc_cfg(cfg)
+    loopback = bool(getattr(rpc_cfg, "loopback_inproc", True))
     if target_region == str(local_region or "EU").upper() and loopback:
         if rpc_server is None:
             raise ValueError("RPC server required for inproc submitter")

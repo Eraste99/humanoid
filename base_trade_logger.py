@@ -91,6 +91,9 @@ class BaseTradeLogger:
         self.flush_interval = float(max(0.05, flush_interval))
         self.dry_run = bool(dry_run)
         self.drop_when_full = bool(drop_when_full)
+        queue_maxsize = max(1, int(queue_maxsize))
+        ratio = float(high_watermark_ratio)
+        ratio = min(max(ratio, 0.1), 0.99)
         self._critical_streams = {
             str(name or "").lower()
             for name in (critical_streams or [])
@@ -98,8 +101,8 @@ class BaseTradeLogger:
         }
 
         import queue  # stdlib
-        self._queue = queue.Queue(maxsize=int(queue_maxsize))
-        self._q_high_watermark = max(1, int(queue_maxsize * float(high_watermark_ratio)))
+        self._queue = queue.Queue(maxsize=queue_maxsize)
+        self._q_high_watermark = max(1000, int(queue_maxsize * ratio))
 
         import threading, time
         self._stop = threading.Event()
@@ -181,7 +184,7 @@ class BaseTradeLogger:
             qd = self._queue.qsize()
             # proxy métriques centralisé LHM
             self._emit_metric("on_btl_queue_depth", self.log_type, depth=qd)
-            if qd >= max(1000, int(self._queue.maxsize * 0.8)):
+            if qd >= self._q_high_watermark:
                 self._emit_metric("on_btl_highwater", self.log_type, depth=qd)
             self._last_enqueue_ts_ms = int(time.time() * 1000)
         except QueueFull:

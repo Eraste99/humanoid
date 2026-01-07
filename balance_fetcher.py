@@ -178,29 +178,59 @@ class MultiBalanceFetcher:
         # cfg: expose self.cfg (alias) + bases API
         self.config = config
         self.cfg = config
-        self.BINANCE_API = getattr(self.cfg, "binance_rest_base", self.BINANCE_API_DEFAULT)
-        self.COINBASE_API = getattr(self.cfg, "coinbase_api_base", self.COINBASE_API_DEFAULT)
-        self.BYBIT_API    = getattr(self.cfg, "bybit_api_base", self.BYBIT_API_DEFAULT)
+        self._warned_cfg_keys: Set[str] = set()
+        self._bf_cfg = self._resolve_bf_cfg()
+        self.BINANCE_API = self._bf_attr(
+            "binance_rest_base",
+            default=self.BINANCE_API_DEFAULT,
+            legacy_root="binance_rest_base",
+        )
+        self.COINBASE_API = self._bf_attr(
+            "coinbase_api_base",
+            default=self.COINBASE_API_DEFAULT,
+            legacy_root="coinbase_api_base",
+        )
+        self.BYBIT_API = self._bf_attr(
+            "bybit_api_base",
+            default=self.BYBIT_API_DEFAULT,
+            legacy_root="bybit_api_base",
+        )
 
         # TTL balances par défaut (fallback BF) + cache SLO par exchange
-        bf_cfg = getattr(self, "_bf_cfg", getattr(self.cfg, "balances", self.cfg))
+        bf_cfg = self._bf_cfg
         rm_cfg = getattr(self.cfg, "rm", self.cfg)
-        self._bal_ttl_default_normal = float(
-            getattr(rm_cfg, "balance_ttl_s_normal", getattr(rm_cfg, "BALANCES_TTL_S_NORMAL", 10.0))
+        self._bal_ttl_default_normal, self._bal_ttl_default_degraded, self._bal_ttl_default_block, ttl_src = (
+            self._resolve_default_balance_ttls(rm_cfg)
         )
-        self._bal_ttl_default_degraded = float(
-            getattr(rm_cfg, "balance_ttl_s_degraded", getattr(rm_cfg, "BALANCES_TTL_S_DEGRADED", 30.0))
-        )
-        self._bal_ttl_default_block = float(
-            getattr(rm_cfg, "balance_ttl_s_block", getattr(rm_cfg, "BALANCES_TTL_S_BLOCK", 120.0))
-        )
+        self._bal_ttl_default_source = ttl_src
         self._bal_ttl_by_ex: Dict[str, Dict[str, float]] = {}
         self._balances_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._balances_freshness_status: Dict[str, Any] = {"status": "UNKNOWN", "ready": False, "reason_code": None}
         # Seuils observabilité WS/Reconciler pour dériver capital_at_risk
-        self._ws_miss_rate_thr = float(getattr(bf_cfg, "BF_WS_RECO_MISS_RATE_THR_PER_MIN", 30.0))
-        self._ws_resync_age_thr_s = float(getattr(bf_cfg, "BF_WS_RECO_RESYNC_AGE_THR_S", 6 * 3600.0))
-
+        if hasattr(bf_cfg, "BF_WS_RECO_MISS_RATE_THR_PER_MIN"):
+            self._warn_once(
+                "bf_ws_reco_miss_rate_legacy",
+                "[BalanceFetcher] BF_WS_RECO_MISS_RATE_THR_PER_MIN is deprecated; use balances.ws_reco_miss_rate_thr_per_min",
+            )
+        if hasattr(bf_cfg, "BF_WS_RECO_RESYNC_AGE_THR_S"):
+            self._warn_once(
+                "bf_ws_reco_resync_age_legacy",
+                "[BalanceFetcher] BF_WS_RECO_RESYNC_AGE_THR_S is deprecated; use balances.ws_reco_resync_age_thr_s",
+            )
+        self._ws_miss_rate_thr = float(
+            getattr(
+                bf_cfg,
+                "ws_reco_miss_rate_thr_per_min",
+                getattr(bf_cfg, "BF_WS_RECO_MISS_RATE_THR_PER_MIN", 30.0),
+            )
+        )
+        self._ws_resync_age_thr_s = float(
+            getattr(
+                bf_cfg,
+                "ws_reco_resync_age_thr_s",
+                getattr(bf_cfg, "BF_WS_RECO_RESYNC_AGE_THR_S", 6 * 3600.0),
+            )
+        )
         # Comptes par alias (upper)
         self.binance_accounts = { _upper(k): v for k, v in (binance_accounts or {}).items() }
         self.coinbase_accounts= { _upper(k): v for k, v in (coinbase_at_accounts or {}).items() }
@@ -236,12 +266,12 @@ class MultiBalanceFetcher:
         self.latest_balances: Dict[str, Dict[str, Dict[str, float]]] = {"BINANCE": {}, "COINBASE": {}, "BYBIT": {}}
         self.latest_wallets: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
         self._default_wallet_type = str(
-            getattr(self.cfg, "default_private_wallet", "SPOT") if self.cfg else "SPOT"
+            self._bf_attr("default_private_wallet", default="SPOT")
         ).upper()
         self._expected_wallet_types = self._build_expected_wallet_types()
         self._wallet_missing_log: Dict[Tuple[str, str, str], float] = {}
         self._wallet_missing_log_interval_s = float(
-            getattr(self.cfg, "wallet_missing_log_interval_s", 60.0)
+            self._bf_attr("wallet_missing_log_interval_s", default=60.0)
             if self.cfg else 60.0
         )
 
@@ -272,8 +302,8 @@ class MultiBalanceFetcher:
         self._ws_balances: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._ws_lock = asyncio.Lock()
         # TTL pour considérer la source WS
-        self._ws_ttl_s = float(getattr(self.cfg, "WS_BAL_TTL_SECONDS", 10.0)) if self.cfg else 10.0
-        self._enable_ws_balance_merge = bool(getattr(self.cfg, "ENABLE_WS_BALANCE_MERGE", False)) if self.cfg else False
+        self._ws_ttl_s = float(self._bf_attr("WS_BAL_TTL_SECONDS", default=10.0))
+        self._enable_ws_balance_merge = bool(self._bf_attr("ENABLE_WS_BALANCE_MERGE", default=False))
 
         # Statut WS / Reconciler (optionnel) pour marquer le capital « à risque »
         # Ces providers sont injectés par le Boot / orchestrateur:
@@ -290,6 +320,65 @@ class MultiBalanceFetcher:
         self._alerts_tasks: Set[asyncio.Task] = set()
 
     # =========================== Lifecycle ===================================
+    def _warn_once(self, key: str, msg: str) -> None:
+        if key in self._warned_cfg_keys:
+            return
+        self._warned_cfg_keys.add(key)
+        log.warning(msg)
+
+    def _resolve_bf_cfg(self):
+        bf_cfg = getattr(self.cfg, "balances", None) if self.cfg else None
+        legacy_bf_cfg = getattr(self, "_bf_cfg", None)
+        if legacy_bf_cfg is not None and bf_cfg is not None and legacy_bf_cfg is not bf_cfg:
+            self._warn_once(
+                "bf_cfg_conflict",
+                "[BalanceFetcher] legacy _bf_cfg ignored; use cfg.balances instead",
+            )
+        if bf_cfg is not None:
+            return bf_cfg
+        if legacy_bf_cfg is not None:
+            self._warn_once(
+                "bf_cfg_legacy",
+                "[BalanceFetcher] legacy _bf_cfg is deprecated; use cfg.balances instead",
+            )
+            return legacy_bf_cfg
+        return self.cfg
+
+    def _bf_attr(self, name: str, *, default=None, legacy_root: str | None = None):
+        bf_cfg = self._bf_cfg
+        if bf_cfg is not None and hasattr(bf_cfg, name):
+            return getattr(bf_cfg, name)
+        if legacy_root and self.cfg is not None and hasattr(self.cfg, legacy_root):
+            self._warn_once(
+                f"{name}_legacy_root",
+                f"[BalanceFetcher] {legacy_root} is deprecated; use balances.{name}",
+            )
+            return getattr(self.cfg, legacy_root)
+        return default
+
+    def _resolve_default_balance_ttls(self, rm_cfg) -> Tuple[float, float, float, str]:
+        has_rm = any(
+            hasattr(rm_cfg, name)
+            for name in (
+                "balance_ttl_s_normal",
+                "balance_ttl_s_degraded",
+                "balance_ttl_s_block",
+                "BALANCES_TTL_S_NORMAL",
+                "BALANCES_TTL_S_DEGRADED",
+                "BALANCES_TTL_S_BLOCK",
+            )
+        )
+        source = "rm" if has_rm else "default"
+        t_norm = float(
+            getattr(rm_cfg, "balance_ttl_s_normal", getattr(rm_cfg, "BALANCES_TTL_S_NORMAL", 10.0))
+        )
+        t_deg = float(
+            getattr(rm_cfg, "balance_ttl_s_degraded", getattr(rm_cfg, "BALANCES_TTL_S_DEGRADED", 30.0))
+        )
+        t_blk = float(
+            getattr(rm_cfg, "balance_ttl_s_block", getattr(rm_cfg, "BALANCES_TTL_S_BLOCK", 120.0))
+        )
+        return t_norm, t_deg, t_blk, source
 
     async def update_ws_account_balances(self, exchange: str, alias: str, balances: Dict[str, float]) -> None:
         """
@@ -334,16 +423,24 @@ class MultiBalanceFetcher:
         """
         Map des seuils bas par token, ex:
           {"BNB": 40.0, "MNT": 15.0}
-        Peut être fourni par config: FEE_TOKEN_LOW_WATERMARKS = {"BNB": 40, "MNT": 15}
+        Peut être fourni par config: balances.fee_token_low_watermarks
         """
         try:
-            m = getattr_dict(self.cfg, "FEE_TOKEN_LOW_WATERMARKS")
-            # valeurs de secours si vides
+            bf_cfg = self._bf_cfg
+            m = getattr(bf_cfg, "fee_token_low_watermarks", None) if bf_cfg is not None else None
             if not m:
-                m = {"BNB": 40.0, "MNT": 15.0}
-            return {str(k).upper(): float(v) for k, v in m.items()}
+                legacy = getattr_dict(self.cfg, "FEE_TOKEN_LOW_WATERMARKS")
+                if legacy:
+                    self._warn_once(
+                        "fee_token_low_watermarks_legacy",
+                        "[BalanceFetcher] FEE_TOKEN_LOW_WATERMARKS is deprecated; use balances.fee_token_low_watermarks",
+                    )
+                    m = legacy
+            if not m:
+                m = {"BNB": 0.1, "MNT": 0.1}
+            return {str(k).upper(): float(v) for k, v in (m or {}).items()}
         except Exception:
-            return {"BNB": 40.0, "MNT": 15.0}
+            return {"BNB": 0.1, "MNT": 0.1}
 
     @staticmethod
     def _compute_fee_level(balance, low_thr):
@@ -376,17 +473,17 @@ class MultiBalanceFetcher:
 
         cfg = getattr(self, "cfg", None)
         g = getattr(cfg, "g", None)
-        mode_key = str(getattr(g, "deployment_mode", "SPLIT")).upper() if g else "SPLIT"
+        mode_val = getattr(g, "deployment_mode", None) if g else None
+        if not mode_val:
+            self._warn_once(
+                "missing_deployment_mode",
+                "[BalanceFetcher] cfg.g.deployment_mode missing; fallback to SPLIT for balances TTL",
+            )
+            mode_val = "SPLIT"
+        mode_key = str(mode_val).upper()
 
         slo_map = getattr(cfg, "slo", None) if cfg else None
-        if not slo_map:
-            log.warning(
-                "[BalanceFetcher] aucun balances_ttl_s_* trouvé dans cfg.slo[mode=%s], fallback sur TTL BF par défaut",
-                mode_key,
-            )
-            return
-
-        per_ex = slo_map.get(mode_key) or {}
+        per_ex = slo_map.get(mode_key) if slo_map else {}
 
         for ex, path_slo in (per_ex or {}).items():
             exu = str(ex).upper()
@@ -423,10 +520,15 @@ class MultiBalanceFetcher:
             except Exception:
                 pass
 
-        if not self._bal_ttl_by_ex:
-            log.warning(
-                "[BalanceFetcher] aucun balances_ttl_s_* trouvé dans cfg.slo[mode=%s], fallback sur TTL BF par défaut",
-                mode_key,
+        if self._bal_ttl_by_ex:
+            self._warn_once(
+                "ttl_source_slo",
+                f"[BalanceFetcher] balances TTL source=SLO mode={mode_key}",
+            )
+        else:
+            self._warn_once(
+                "ttl_source_fallback",
+                f"[BalanceFetcher] balances TTL source={self._bal_ttl_default_source} (no SLO for mode={mode_key})",
             )
 
     @staticmethod
@@ -522,7 +624,8 @@ class MultiBalanceFetcher:
         Boucle d'alerting des tokens de frais bas.
         Périodicité par config BF_ALERT_PERIOD_S (def 15s).
         """
-        period = getattr_float(self.cfg, "BF_ALERT_PERIOD_S", 15.0)
+        bf_cfg = self._bf_cfg
+        period = getattr_float(bf_cfg, "BF_ALERT_PERIOD_S", 15.0)
         low_map = self._get_fee_token_low_map()
 
         task = asyncio.current_task()
@@ -608,8 +711,9 @@ class MultiBalanceFetcher:
                 # pacer-aware sleep
                 mult = 1.0
                 try:
-                    state_eu = getattr_str(self.cfg, "BF_PACER_EU", "NORMAL").upper()
-                    state_us = getattr_str(self.cfg, "BF_PACER_US", "NORMAL").upper()
+                    bf_cfg = self._bf_cfg
+                    state_eu = getattr_str(bf_cfg, "BF_PACER_EU", "NORMAL").upper()
+                    state_us = getattr_str(bf_cfg, "BF_PACER_US", "NORMAL").upper()
                     if state_eu == "DEGRADED": mult = max(mult, 1.4)
                     if state_eu == "SEVERE":   mult = max(mult, 2.0)
                     if state_us == "DEGRADED": mult = max(mult, 1.6)
@@ -663,11 +767,9 @@ class MultiBalanceFetcher:
     def _build_expected_wallet_types(self) -> Set[str]:
         base: List[str] = [self._default_wallet_type or "SPOT"]
         cfg_wallets = None
-        cfg_rm = getattr(self.cfg, "rm", None) if self.cfg else None
-        if cfg_rm and getattr(cfg_rm, "wallet_types", None):
-            cfg_wallets = getattr(cfg_rm, "wallet_types")
-        elif self.cfg and getattr(self.cfg, "wallet_types", None):
-            cfg_wallets = getattr(self.cfg, "wallet_types")
+        bf_cfg = self._bf_cfg
+        if bf_cfg and getattr(bf_cfg, "wallet_types", None):
+            cfg_wallets = getattr(bf_cfg, "wallet_types")
         if not cfg_wallets:
             base.append("FUNDING")
         else:
@@ -1907,6 +2009,7 @@ class PnlRecoCexAdapter:
         self._symbols_provider = symbols_provider
         self._retry_policy = BackoffPolicy.from_cfg(getattr(cfg, "retry", None))
         self._rl = RateLimiter(getattr(cfg, "rl", None))
+        self._warned_cfg_keys: Set[str] = set()
 
         # TODO (quand tu voudras): initialiser ici les clients REST/HTTP
         # par CEX pour récupérer les trades/fills du jour.
@@ -1946,6 +2049,23 @@ class PnlRecoCexAdapter:
         window_until_ms = int(dt_end_utc.timestamp() * 1000) - 1
         return window_since_ms, window_until_ms
 
+    def _warn_once(self, key: str, msg: str) -> None:
+        if key in self._warned_cfg_keys:
+            return
+        self._warned_cfg_keys.add(key)
+        log.warning(msg)
+
+    def _resolve_api_base(self, name: str, *, default: str, legacy_root: str | None = None) -> str:
+        bf_cfg = getattr(self.cfg, "balances", self.cfg)
+        if bf_cfg is not None and hasattr(bf_cfg, name):
+            return str(getattr(bf_cfg, name))
+        if legacy_root and hasattr(self.cfg, legacy_root):
+            self._warn_once(
+                f"{name}_legacy_root",
+                f"[PnLReco] {legacy_root} is deprecated; use balances.{name}",
+            )
+            return str(getattr(self.cfg, legacy_root))
+        return default
     async def _fetch_empty_pnl(self, exchange: str) -> dict:
         await self._rl.acquire(exchange, "pnl_reco", timeout=2.0)
         return {"fills": [], "fees": [], "transfers": []}
@@ -2016,7 +2136,11 @@ class PnlRecoCexAdapter:
             degrade_for_symbols = not symbols_to_query or provider is None
 
         async def _fetch_binance(creds: dict, since_ms: int, until_ms: int, symbols: List[str]) -> List[dict]:
-            api_base = getattr(self.cfg, "binance_rest_base", getattr(self, "BINANCE_API", "https://api.binance.com"))
+            api_base = self._resolve_api_base(
+                "binance_rest_base",
+                default=getattr(self, "BINANCE_API", "https://api.binance.com"),
+                legacy_root="binance_rest_base",
+            )
             url = f"{api_base}/api/v3/myTrades"
             headers = {"X-MBX-APIKEY": creds.get("api_key", "")}
             trades: List[dict] = []
@@ -2051,8 +2175,11 @@ class PnlRecoCexAdapter:
             return trades
 
         async def _fetch_coinbase(creds: dict, since_ms: int, until_ms: int) -> List[dict]:
-            api_base = getattr(self.cfg, "coinbase_rest_base",
-                               getattr(self, "COINBASE_API", "https://api.coinbase.com"))
+            api_base = self._resolve_api_base(
+                "coinbase_api_base",
+                default=getattr(self, "COINBASE_API", "https://api.coinbase.com"),
+                legacy_root="coinbase_rest_base",
+            )
             url = f"{api_base}/api/v3/brokerage/orders/historical/fills"
             product_filter = getattr(getattr(self.cfg, "g", object()), "pnl_reco_product_ids", None)
             cursor: Optional[str] = None
@@ -2086,7 +2213,11 @@ class PnlRecoCexAdapter:
             return fills
 
         async def _fetch_bybit(creds: dict, since_ms: int, until_ms: int, symbols: List[str]) -> List[dict]:
-            api_base = getattr(self.cfg, "bybit_rest_base", getattr(self, "BYBIT_API", "https://api.bybit.com"))
+            api_base = self._resolve_api_base(
+                "bybit_api_base",
+                default=getattr(self, "BYBIT_API", "https://api.bybit.com"),
+                legacy_root="bybit_rest_base",
+            )
             url = f"{api_base}/v5/execution/list"
             executions: List[dict] = []
             async with aiohttp.ClientSession() as sess:
@@ -2283,7 +2414,3 @@ class PnlRecoCexAdapter:
 
         payload = outcome.result if isinstance(outcome.result, dict) else {}
         return payload
-
-
-
-

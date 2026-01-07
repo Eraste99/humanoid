@@ -363,12 +363,53 @@ except Exception:
 
 
 class LoggerHistoriqueManager:
+    @staticmethod
+    def _build_tracker_config_from_lhm_cfg(lhm_cfg) -> TrackerConfig:
+        return TrackerConfig(
+            history_limit=int(getattr(lhm_cfg, "tracker_history_limit", 6000)),
+            rotation_interval=int(getattr(lhm_cfg, "tracker_rotation_interval", 1800)),
+            max_active=int(getattr(lhm_cfg, "tracker_max_active", 10)),
+            pause_secs=int(getattr(lhm_cfg, "tracker_pause_secs", 600)),
+            min_daily_volume_usdc=float(getattr(lhm_cfg, "tracker_min_daily_volume_usdc", 500_000.0)),
+            slippage_bad_thr=float(getattr(lhm_cfg, "tracker_slippage_bad_thr", 0.005)),
+            e2e_latency_bad_ms=int(getattr(lhm_cfg, "tracker_e2e_latency_bad_ms", 1200)),
+            window_opp_freq_s=int(getattr(lhm_cfg, "tracker_window_opp_freq_s", 600)),
+            window_score_s=int(getattr(lhm_cfg, "tracker_window_score_s", 1800)),
+            window_daily_s=int(getattr(lhm_cfg, "tracker_window_daily_s", 86400)),
+            w_opp_score=float(getattr(lhm_cfg, "tracker_w_opp_score", 0.6)),
+            w_spread_net=float(getattr(lhm_cfg, "tracker_w_spread_net", 1.0)),
+            w_volume=float(getattr(lhm_cfg, "tracker_w_volume", 0.00001)),
+            w_latency_penalty=float(getattr(lhm_cfg, "tracker_w_latency_penalty", 0.003)),
+            penalty_trade_fail=float(getattr(lhm_cfg, "tracker_penalty_trade_fail", 10.0)),
+            penalty_slippage=float(getattr(lhm_cfg, "tracker_penalty_slippage", 5.0)),
+            penalty_vol_modere=float(getattr(lhm_cfg, "tracker_penalty_vol_modere", 5.0)),
+            penalty_vol_eleve=float(getattr(lhm_cfg, "tracker_penalty_vol_eleve", 10.0)),
+            bonus_low_vol=float(getattr(lhm_cfg, "tracker_bonus_low_vol", 2.0)),
+            bonus_high_freq=float(getattr(lhm_cfg, "tracker_bonus_high_freq", 10.0)),
+            bias_ttl_s=int(getattr(lhm_cfg, "tracker_bias_ttl_s", 1500)),
+            bonus_mode_TT=float(getattr(lhm_cfg, "tracker_bonus_mode_TT", 2.0)),
+            bonus_mode_TM=float(getattr(lhm_cfg, "tracker_bonus_mode_TM", 1.5)),
+            bonus_mode_REB=float(getattr(lhm_cfg, "tracker_bonus_mode_REB", 0.5)),
+            ema_alpha=float(getattr(lhm_cfg, "tracker_ema_alpha", 0.2)),
+            ema_slip_alpha=float(getattr(lhm_cfg, "tracker_ema_slip_alpha", 0.2)),
+            route_latency_penalty_scale=float(getattr(lhm_cfg, "tracker_route_latency_penalty_scale", 0.002)),
+            route_win_bonus=float(getattr(lhm_cfg, "tracker_route_win_bonus", 1.0)),
+            route_fail_penalty=float(getattr(lhm_cfg, "tracker_route_fail_penalty", 2.0)),
+            max_active_TT=getattr(lhm_cfg, "tracker_max_active_TT", None),
+            max_active_TM=getattr(lhm_cfg, "tracker_max_active_TM", None),
+            max_active_REB=getattr(lhm_cfg, "tracker_max_active_REB", None),
+            max_active_MM=getattr(lhm_cfg, "tracker_max_active_MM", None),
+            mm_w_pnl=float(getattr(lhm_cfg, "tracker_mm_w_pnl", 0.001)),
+            mm_w_winrate=float(getattr(lhm_cfg, "tracker_mm_w_winrate", 20.0)),
+            mm_penalty_latency=float(getattr(lhm_cfg, "tracker_mm_penalty_latency", 1.5)),
+            mm_penalty_slippage=float(getattr(lhm_cfg, "tracker_mm_penalty_slippage", 1.0)),
+            constrain_universe_by_mode=bool(getattr(lhm_cfg, "tracker_constrain_universe_by_mode", False)),
+        )
     def __init__(
         self,
         cfg,
         out_dir: str,
         *,
-        tracker_config=None,            # ex: TrackerConfig
         trade_filter=None,
         trade_batch_size: int = 30,
         trade_flush_interval: float = 0.35,
@@ -382,23 +423,28 @@ class LoggerHistoriqueManager:
 
         self.cfg = cfg
         self.out_dir = out_dir
+        if not hasattr(self.cfg, "lhm") or getattr(self.cfg, "lhm", None) is None:
+            raise ValueError("cfg.lhm is required to initialize LoggerHistoriqueManager")
+        L = self.cfg.lhm
         # --- Storage monitor path (piloté par BotConfig) ---
         # LHM_STORAGE_PATH (cfg.lhm.storage_path) si présent, sinon out_dir.
         # NOTE: si c'est un fichier, le monitor prendra son dossier via _resolve_storage_path().
-        try:
-            L = getattr(self.cfg, "lhm", None)
-            self._storage_path = str(getattr(L, "storage_path", None) or self.out_dir or ".")
-        except Exception:
-            self._storage_path = str(self.out_dir or ".")
+        self._storage_path = str(getattr(L, "storage_path", None) or self.out_dir or ".")
 
         # Cap queue JSONL (Pivot BotConfig)
-        # Source de vérité: cfg.lhm.jsonl_queue_cap (compat: cfg.lhm.LHM_JSONL_QUEUE_CAP puis cfg.LHM_JSONL_QUEUE_CAP)
-        L = getattr(self.cfg, "lhm", self.cfg)
-        raw_cap = getattr(L, "jsonl_queue_cap", None)
-        if raw_cap is None:
-            raw_cap = getattr(L, "LHM_JSONL_QUEUE_CAP", None)
-        self._jsonl_queue_cap = _safe_int(raw_cap, getattr(L, "LHM_JSONL_QUEUE_CAP", 5000))
-
+        # Source de vérité: cfg.lhm.LHM_JSONL_QUEUE_CAP
+        legacy_jsonl_queue_cap = getattr(L, "jsonl_queue_cap", None)
+        if legacy_jsonl_queue_cap is not None:
+            logger.warning(
+                "cfg.lhm.jsonl_queue_cap is deprecated; use cfg.lhm.LHM_JSONL_QUEUE_CAP instead"
+            )
+            if legacy_jsonl_queue_cap != getattr(L, "LHM_JSONL_QUEUE_CAP", None):
+                logger.warning(
+                    "cfg.lhm.jsonl_queue_cap (%s) differs from cfg.lhm.LHM_JSONL_QUEUE_CAP (%s); using LHM_JSONL_QUEUE_CAP",
+                    legacy_jsonl_queue_cap,
+                    getattr(L, "LHM_JSONL_QUEUE_CAP", None),
+                )
+        self._jsonl_queue_cap = _safe_int(getattr(L, "LHM_JSONL_QUEUE_CAP", 5000), 5000)
         # -------- Tags globaux (déploiement/profil/pacer) --------
         self._deployment_mode = str(getattr(self.cfg.g, "deployment_mode", "EU_ONLY"))
         self._pod_region      = str(getattr(self.cfg.g, "pod_region", "EU"))
@@ -406,12 +452,12 @@ class LoggerHistoriqueManager:
         self._pacer_mode      = str(getattr(self.cfg.g, "pacer_mode", "NORMAL")).upper()
 
         # -------- Paramètres LHM (source de vérité) ---------------
-        L = self.cfg.lhm
+
         # Bornes et batching des files streams
         self._q_stream_max   = int(getattr(L, "LHM_Q_STREAM_MAX", 20_000))
         self._stream_batch   = int(getattr(L, "LHM_STREAM_BATCH", 256))
         self._drop_when_full = bool(getattr(L, "LHM_DROP_WHEN_FULL", True))
-        self._high_watermark = float(getattr(L, "LHM_HIGH_WATERMARK_RATIO", 0.80))
+        self._high_watermark = float(getattr(L, "LHM_HIGH_WATERMARK_RATIO", 0.85))
         self._plateau_s      = int(getattr(L, "LHM_MAX_QUEUE_PLATEAU_S", 60))
         self._opportunity_queue_max = int(
             getattr(L, "LHM_OPPORTUNITY_QUEUE_MAX", min(self._q_stream_max, 5000))
@@ -500,7 +546,8 @@ class LoggerHistoriqueManager:
         # -------- I/O & trackers ---------------------------------
         db_dir = str(Path(out_dir))
         self._writer = LogWriter(db_dir=db_dir, ops_retention_days=self._ops_retention_days)
-        self._tracker = PairHistoryTracker(tracker_config)
+        self._tracker_cfg = self._build_tracker_config_from_lhm_cfg(L)
+        self._tracker = PairHistoryTracker(self._tracker_cfg)
         try:
             self._tracker.rotation_logger = getattr(self, "log_rotation_decision", None)
         except Exception:
@@ -510,9 +557,9 @@ class LoggerHistoriqueManager:
             trade_filter=trade_filter or (lambda _t: True),
             batch_size=int(getattr(L, "LHM_TRADE_BATCH_SIZE", trade_batch_size)),
             flush_interval=float(getattr(L, "LHM_TRADE_FLUSH_INTERVAL_S", trade_flush_interval)),
-            queue_maxsize=int(getattr(L, "LHM_Q_STREAM_MAX", 20000)),
-            drop_when_full=bool(getattr(L, "LHM_DROP_WHEN_FULL", True)),
-            high_watermark_ratio=float(getattr(L, "LHM_HIGH_WATERMARK_RATIO", 0.85)),
+            queue_maxsize=self._q_stream_max,
+            drop_when_full=self._drop_when_full,
+            high_watermark_ratio=self._high_watermark,
             critical_streams=list(self._logging_critical_streams) or None,
         )
         self._trade_logger.set_event_sink(self._on_event_sink)
@@ -574,7 +621,7 @@ class LoggerHistoriqueManager:
         self._started = False
         self._rotation_task = None  # type: asyncio.Task | None
         # rotate_every_s > tracker_config.rotation_interval > fallback 3600s
-        _tracker_rot = getattr(getattr(self._tracker, "cfg", object()), "rotation_interval", 3600.0)
+        _tracker_rot = getattr(self._tracker_cfg, "rotation_interval", 3600.0)
         self._rotate_interval = float(rotate_every_s if rotate_every_s is not None else _tracker_rot)
 
         # -------- Backpressure & priorité de streams --------------
@@ -2358,9 +2405,13 @@ class LoggerHistoriqueManager:
         try:
             cfg = getattr(self, "cfg", None)
             g_cfg = getattr(cfg, "g", None) if cfg is not None else None
-            enable_jp = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else bool(
-                getattr(cfg, "enable_jp", False)
-            )
+            g_enable = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else False
+            cfg_enable = getattr(cfg, "enable_jp", None) if cfg is not None else None
+            if cfg_enable is not None and bool(cfg_enable) != g_enable:
+                logger.warning(
+                    "cfg.enable_jp is deprecated and differs from cfg.g.enable_jp; using cfg.g.enable_jp"
+                )
+            enable_jp = g_enable
         except Exception:
             enable_jp = False
         if region == "JP" and not enable_jp:
