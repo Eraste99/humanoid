@@ -46,9 +46,25 @@ DEPLOYMENT_MODES = {mode.value for mode in DeploymentMode}
 class _Env:
     TRUE = {"1","true","yes","on","y","t"}
     FALSE = {"0","false","no","off","n","f"}
+    _deprecated: Dict[str, str] = {
+        # Clés fantômes (aucun effet runtime)
+        "CONFIG_OVERRIDES": "ignored (cfg.overrides not consumed)",
+        "DISCOVERY_ENABLED_EXCHANGES": "ignored (discovery follows ENABLED_EXCHANGES)",
+    }
+
+    _deprecated_noted: set = set()
 
     @staticmethod
     def get(name: str, default: Optional[str]=None) -> Optional[str]:
+        if name in _Env._deprecated:
+            if name not in _Env._deprecated_noted and os.getenv(name) is not None:
+                logging.getLogger(__name__).warning(
+                    "Env %s is deprecated and ignored; %s",
+                    name,
+                    _Env._deprecated.get(name) or "remove it from configuration",
+                )
+                _Env._deprecated_noted.add(name)
+            return default
         val = os.getenv(name)
         return val if val is not None else default
 
@@ -638,7 +654,7 @@ class ScannerCfg:
     mm_seed_pairs: Tuple[str, ...] = ()
     mm_depth_min_quote: float = 200.0
     mm_qpos_max_ahead_quote: float = 5000.0
-    mm_min_net_bps: float = 0.6
+    mm_min_net_bps: float = 0.0006
     mm_hedge_cost_bps: float = 3.0
     mm_vol_bps_max: float = 40.0
 
@@ -980,7 +996,7 @@ class RiskManagerCfg:
     daily_strategy_budget_quote: Dict[str, float] = field(default_factory=dict)
     daily_budget_reset_interval_s: float = 86400.0
     decision_log_path: str = ""
-    preempt_mm_for_tt_tm: bool = True
+    preempt_mm_for_tt_tm: bool = False
     per_strategy_notional_cap: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
     # Paramètres REB — version globale + variantes profilées (optionnelles).
@@ -1722,7 +1738,7 @@ class BotConfig:
     @staticmethod
     def from_env() -> "BotConfig":
         cfg = BotConfig()
-
+        # Helper to centralize détection de collisions entre clés aliasées
         # --- Charger Globaux ---
         g = cfg.g
         _pod_region_env = _Env.get("POD_REGION", None)
@@ -1818,6 +1834,18 @@ class BotConfig:
 
         _conflict_or_warn("VOL_SLIP_TTL", "SLIP_TTL_S", field="vol_slip_ttl", prefer="VOL_SLIP_TTL")
         _conflict_or_warn("VOL_SLIP_TTL", "VOL_TTL_S", field="vol_slip_ttl", prefer="VOL_SLIP_TTL")
+        _conflict_or_warn(
+            "TM_EXPOSURE_TTL_MS",
+            "ENGINE_TM_EXPOSURE_TTL_MS",
+            field="tm_exposure_ttl_ms",
+            prefer="TM_EXPOSURE_TTL_MS",
+        )
+        _conflict_or_warn(
+            "TM_EXPOSURE_TTL_HEDGE_RATIO",
+            "TM_NEUTRAL_HEDGE_RATIO",
+            field="tm_exposure_ttl_hedge_ratio",
+            prefer="TM_EXPOSURE_TTL_HEDGE_RATIO",
+        )
         if _pod_region_env is None and _region_alias_env is not None:
             logging.getLogger(__name__).warning(
                 "REGION (legacy) utilisé faute de POD_REGION; privilégier POD_REGION",
@@ -1874,18 +1902,7 @@ class BotConfig:
             "RESTART_WEBHOOK_HMAC_KEY", cfg.alerting.webhook.hmac_secret
         )
         cfg.alerting.webhook.timeout_s = _Env.get_float("RESTART_WEBHOOK_TIMEOUT_S", cfg.alerting.webhook.timeout_s)
-        overrides_raw = _Env.get("CONFIG_OVERRIDES", None)
-        if overrides_raw:
-            try:
-                parsed = json.loads(overrides_raw)
-                if not isinstance(parsed, list):
-                    raise ConfigError("CONFIG_PARSE_ERROR", "CONFIG_OVERRIDES")
-                cfg.overrides = [x for x in parsed if isinstance(x, dict)]
-            except ConfigError:
-                raise
-            except Exception:
-                raise ConfigError("CONFIG_PARSE_ERROR", "CONFIG_OVERRIDES") from None
-
+        _Env.get("CONFIG_OVERRIDES", None)  # trigger warning if set (deprecated/no-op)
         # --- Router cfg ---------------------------------------------------
         cfg.router.coalesce_window_ms = _Env.get_int("ROUTER_COALESCE_WINDOW_MS", cfg.router.coalesce_window_ms)
         cfg.router.stale_ms = _Env.get_int("ROUTER_STALE_MS", cfg.router.stale_ms)
@@ -2631,12 +2648,7 @@ class BotConfig:
         if q_allowed:
             cfg.discovery.quotes_allowed = [q.upper() for q in q_allowed]
 
-        ex_enabled = _Env.get_list(
-            "DISCOVERY_ENABLED_EXCHANGES",
-            cfg.discovery.enabled_exchanges or cfg.g.enabled_exchanges,
-        )
-        if ex_enabled:
-            cfg.discovery.enabled_exchanges = [e.upper() for e in ex_enabled]
+        _Env.get("DISCOVERY_ENABLED_EXCHANGES", None)  # trigger warning if set (deprecated/no-op)
 
         # Whitelists / blacklists paires
         cfg.discovery.whitelist = _Env.get_list("DISCOVERY_WHITELIST", cfg.discovery.whitelist)

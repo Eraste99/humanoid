@@ -270,6 +270,9 @@ class RPCServer:
         self._admin_enabled = getattr_bool(cfg, "rpc_admin_enabled", False)
         self._admin_token = admin_token or getattr_str(cfg, "rpc_admin_token", None)
         self._strict_validation = getattr_bool(cfg, "rpc_strict_validation", False)
+        g_cfg = getattr(cfg, "g", None)
+        mode = str(getattr(g_cfg, "mode", "DRY_RUN") or "DRY_RUN").upper()
+        self._prod_armed = bool(mode == "PROD" and bool(getattr(g_cfg, "live_trading_armed", False)))
         self._status_handler = None
 
     # ---------- API wrappers (conformes à la spec, utiles en tests) ----------
@@ -655,22 +658,34 @@ class RPCServer:
 
     def _validate_submit_payload(self, body: dict) -> dict:
         try:
-            model = validate_submit_bundle_lite(body)
+            model = validate_submit_bundle_lite(body, prod=self._prod_armed)
             data = model.model_dump() if hasattr(model, "model_dump") else getattr(model, "dict", lambda **_: {})(
                 exclude_none=False)
+            if data.get("_schema_invalid"):
+                _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="SubmitBundleRequest")
+                reason = data.get("_schema_reason") or data.get("reason_code") or "invalid submit_bundle payload"
+                raise web.HTTPBadRequest(text=str(reason))
             if self._strict_validation:
                 return data
             return data
+        except web.HTTPBadRequest:
+            raise
         except Exception:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="SubmitBundleRequest")
             raise web.HTTPBadRequest(text="invalid submit_bundle payload")
 
     def _validate_cancel_payload(self, body: dict) -> dict:
         try:
-            model = validate_cancel_lite(body)
+            model = validate_cancel_lite(body, prod=self._prod_armed)
             data = model.model_dump() if hasattr(model, "model_dump") else getattr(model, "dict", lambda **_: {})(
                 exclude_none=False)
+            if data.get("_schema_invalid"):
+                _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="CancelRequest")
+                reason = data.get("_schema_reason") or data.get("reason_code") or "invalid cancel payload"
+                raise web.HTTPBadRequest(text=str(reason))
             return data
+        except web.HTTPBadRequest:
+            raise
         except Exception:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="CancelRequest")
             raise web.HTTPBadRequest(text="invalid cancel payload")
@@ -848,7 +863,10 @@ class RpcSubmitter(ExecutionSubmitter):
         self.rpc_client = rpc_client
 
     async def submit_bundle(self, payload: dict) -> dict:
-        validated = validate_submit_bundle_lite(payload)
+        g_cfg = getattr(self.rpc_client.cfg, "g", None)
+        mode = str(getattr(g_cfg, "mode", "DRY_RUN") or "DRY_RUN").upper()
+        prod = bool(mode == "PROD" and bool(getattr(g_cfg, "live_trading_armed", False)))
+        validated = validate_submit_bundle_lite(payload, prod=prod)
         data = validated.model_dump() if hasattr(validated, "model_dump") else validated.dict(exclude_none=False)
         idem = data.get("meta", {}).get("idempotency_key") or data.get("idempotency_key")
         return await self.rpc_client.call("submit_bundle", body=data, idempotency_key=idem)

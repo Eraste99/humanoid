@@ -113,12 +113,26 @@ class _NoopAlerts:
     async def prompt_ack(self, reason: str, timeout_s: int = 180) -> Any:
         class _R: ack = False
         return _R()
-
+def _alerts_is_ok(alerts: Any) -> tuple[bool, str]:
+    if alerts is None:
+        return False, "alert_sink_missing"
+    if isinstance(alerts, _NoopAlerts):
+        return False, "alert_sink_noop"
+    enabled = getattr(alerts, "_enabled", None)
+    if enabled is not None and not bool(enabled):
+        return False, "alert_sink_disabled"
+    sink = getattr(alerts, "_sink", None)
+    if sink is None and hasattr(alerts, "_sink"):
+        return False, "alert_sink_missing"
+    return True, "ok"
 def _load_alert_dispatcher(cfg) -> Any:
     try:
         # Si un dispatcher projet existe, on l'utilise en priorité
         from modules.observability_pacer import AlertDispatcher  # type: ignore
-        return AlertDispatcher(cfg)
+        try:
+            return AlertDispatcher(cfg)
+        except TypeError:
+            return AlertDispatcher()
     except Exception:
         # Fallback Telegram natif si token dispo via configuration
         tcfg = getattr(cfg, "telegram", None)
@@ -830,7 +844,16 @@ async def main() -> None:
     # Alertes
     alerts = _load_alert_dispatcher(cfg)
     state["alerts"] = alerts
-    await alerts.start()
+    notification_ok = True
+    notification_detail = "ok"
+    try:
+        await alerts.start()
+    except Exception as exc:
+        notification_ok = False
+        notification_detail = f"alert_start_error:{exc}"
+        log.exception("[Main] alert dispatcher start failed")
+    if notification_ok:
+        notification_ok, notification_detail = _alerts_is_ok(alerts)
 
     # Budgets
     ws_budget   = RestartBudget.from_cfg(cfg, kind="ws")
@@ -841,15 +864,42 @@ async def main() -> None:
     state["full_budget"] = full_budget
 
     # Sink status → CWD courant
+    boot_notify_cooldown_s = 30.0
+    boot_notify_state = {"last": None, "last_ts": 0.0}
     def status_sink(payload):
+        result = None
         cwd = state.get("cwd")
         if cwd and hasattr(cwd, "on_child_event"):
             with contextlib.suppress(Exception):
-                return cwd.on_child_event(payload)
-        return None
+                result = cwd.on_child_event(payload)
+        try:
+            if payload.get("component") == "boot":
+                status = str(payload.get("status") or "")
+                if status in ("boot.ready", "boot.degraded"):
+                    new_state = "READY" if status == "boot.ready" else "DEGRADED"
+                    now = time.time()
+                    if new_state != boot_notify_state["last"] and (
+                            now - boot_notify_state["last_ts"]) >= boot_notify_cooldown_s:
+                        reasons = payload.get("payload", {}) or {}
+                        msg = f"[Boot] transition {new_state}"
+                        if reasons:
+                            msg = f"{msg} — {reasons}"
+                        if new_state == "READY":
+                            asyncio.create_task(alerts.notify_info(msg))
+                        else:
+                            asyncio.create_task(alerts.notify_warn(msg))
+                        boot_notify_state["last"] = new_state
+                        boot_notify_state["last_ts"] = now
+        except Exception:
+            pass
+        return result
 
     # Boot (barrière READY)
     boot = Boot(cfg)
+    boot.state["notification_ok"] = bool(notification_ok)
+    boot.state["notify_state"] = {"ok": bool(notification_ok), "detail": notification_detail}
+    if not notification_ok and mode_value == "PROD" and bool(cfg.g.live_trading_armed):
+        boot._mark_degraded("BOOT_DEP_MISSING", where="notification")
     boot._status_sink = status_sink
     # [OBS-SUPERVISEUR INIT] — Observabilité côté superviseur (pas dans Boot)
     # Contexte & probes (idempotentes)
@@ -883,6 +933,10 @@ async def main() -> None:
     BOT_STATE.set(1)  # STARTING
     ctx = await boot.run()
     await boot.boot_complete.wait()
+    if not notification_ok and mode_value == "PROD" and bool(cfg.g.live_trading_armed):
+        rm = getattr(ctx, "rm", None)
+        if rm and hasattr(rm, "_set_trading_state"):
+            rm._set_trading_state("BLOCKED", reason="TRADING_NOT_READY")
     BOT_STATE.set(2)  # READY
     log.info("[Boot] READY — contexte en ligne")
     state.update({

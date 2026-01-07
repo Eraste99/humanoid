@@ -235,6 +235,7 @@ class Boot:
             "degraded": False,
             "reasons": [],  # warmup_pairs_missing, balances_stale, rpc_unavailable, warmup_timeout
             "timestamps": {},
+            "notification_ok": None,
         }
 
         # Tâches périodiques
@@ -689,6 +690,7 @@ class Boot:
 
     def get_status(self) -> Dict[str, Any]:
         s = dict(self.state)
+        s["reasons"] = list(s.get("reasons") or [])
         s.update({
             # Service-ready (historique)
             "ready": self.ready_all.is_set(),
@@ -709,6 +711,23 @@ class Boot:
             "discovered": len(self.ctx.discovered_pairs),
             "module_state": dict(self._module_state),
         })
+        try:
+            g_cfg = getattr(self.cfg, "g", None)
+            s["trading_armed"] = bool(getattr(g_cfg, "live_trading_armed", False)) if g_cfg is not None else False
+        except Exception:
+            s["trading_armed"] = False
+
+        obs_ready = None
+        try:
+            prom_ready = getattr(obs_metrics, "prom_ready", None)
+            if callable(prom_ready):
+                obs_ready = bool(prom_ready())
+        except Exception:
+            obs_ready = False
+        if obs_ready is not None:
+            s["obs_ready"] = bool(obs_ready)
+            if not obs_ready and "OBS_METRICS_UNAVAILABLE" not in s["reasons"]:
+                s["reasons"].append("OBS_METRICS_UNAVAILABLE")
 
         rc = self._get_router_ready_pairs_count()
         if rc is not None:
@@ -768,7 +787,8 @@ class Boot:
             s["trading_ready"] = bool(eng_ok and rm_ok and tstate == "READY")
         except Exception:
             s["trading_ready"] = False
-
+        s["trading_enabled"] = bool(s.get("trading_ready"))
+        s["state"] = "READY" if bool(s.get("ready_all")) and not bool(s.get("degraded")) else "DEGRADED"
         return s
 
     def set_status_callback(self, callback) -> None:

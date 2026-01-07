@@ -2312,8 +2312,16 @@ class StatusHTTPServer:
 
             # 2) Safety: if boot is degraded, trading is not ready
             if bool(st.get("degraded")):
-                ok = False
-                fail_reasons.append("boot_degraded")
+                reasons = st.get("reasons") or []
+                if isinstance(reasons, list) and reasons:
+                    metrics_only = all(str(r) == "OBS_METRICS_UNAVAILABLE" for r in reasons)
+                else:
+                    metrics_only = False
+                if not metrics_only:
+                    ok = False
+                    fail_reasons.append("boot_degraded")
+                else:
+                    st["boot_degraded_metrics_only"] = True
 
             # 3) Micro-durcissement: private_ws wiring check ONLY if private_ws feature is enabled
             private_ws_enabled = False

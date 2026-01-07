@@ -382,6 +382,15 @@ class LoggerHistoriqueManager:
 
         self.cfg = cfg
         self.out_dir = out_dir
+        # --- Storage monitor path (piloté par BotConfig) ---
+        # LHM_STORAGE_PATH (cfg.lhm.storage_path) si présent, sinon out_dir.
+        # NOTE: si c'est un fichier, le monitor prendra son dossier via _resolve_storage_path().
+        try:
+            L = getattr(self.cfg, "lhm", None)
+            self._storage_path = str(getattr(L, "storage_path", None) or self.out_dir or ".")
+        except Exception:
+            self._storage_path = str(self.out_dir or ".")
+
         # Cap queue JSONL (Pivot BotConfig)
         # Source de vérité: cfg.lhm.jsonl_queue_cap (compat: cfg.lhm.LHM_JSONL_QUEUE_CAP puis cfg.LHM_JSONL_QUEUE_CAP)
         L = getattr(self.cfg, "lhm", self.cfg)
@@ -694,6 +703,15 @@ class LoggerHistoriqueManager:
         self._init_jsonl_streams()
 
         await self._spawn_streams_worker()
+        # 5) Storage monitor (best-effort) — met à jour les métriques disque / storage
+        try:
+            # Met à jour le global pour cohérence (même si on passe path explicitement)
+            global LHM_STORAGE_PATH
+            LHM_STORAGE_PATH = getattr(self, "_storage_path", None)
+            start_storage_monitor(path=LHM_STORAGE_PATH, period_s=60.0)
+        except Exception:
+            logger.exception("start: storage monitor spawn failed")
+
         # 4) Rotation loop PairHistoryTracker -> write_pair_history (best-effort)
         try:
             if getattr(self, "_rotate_interval", 0.0) and float(self._rotate_interval) > 0.0:
@@ -786,6 +804,7 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("stop: jsonl drain barrier failed")
 
+
         # 4) Arrêt worker JSONL (maintenant seulement)
         self._running = False
         t = getattr(self, "_streams_task", None)
@@ -796,8 +815,13 @@ class LoggerHistoriqueManager:
             except Exception:
                 pass
         self._streams_task = None
+        # 5) Stop storage monitor (best-effort)
+        try:
+            await stop_storage_monitor()
+        except Exception:
+            logger.exception("stop: storage monitor stop failed")
 
-        # 5) Drain + stop DB lane (single-writer)
+        # 6) Drain + stop DB lane (single-writer)
         try:
             await self._db_lane_barrier(timeout_s=5.0)
         except Exception:

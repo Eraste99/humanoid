@@ -562,6 +562,199 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(bool(cfg.LIVE_TRADING_ARMED))
             self.assertTrue(bool(cfg.g.live_trading_armed))
 
+    async def test_01b_ci2_strict_contracts_and_staleness(self) -> None:
+        """CI-2 STRICT — contracts idempotence + staleness UNKNOWN≠OK."""
+        if not _strict_enabled():
+            self.skipTest("CI1 profile skips strict contracts/staleness")
+        require_contract(self, payloads_mod is not None, "payloads module missing")
+        if payloads_mod is None:
+            return
+
+        with self.subTest("validate_submit_bundle_lite requires idempotency in PROD+armed"):
+            validate_submit_bundle_lite = getattr(payloads_mod, "validate_submit_bundle_lite", None)
+            require_contract(self, callable(validate_submit_bundle_lite), "validate_submit_bundle_lite missing")
+            if not callable(validate_submit_bundle_lite):
+                return
+            payload = {
+                "mode": "SIM",
+                "tif": "IOC",
+                "legs": [{
+                    "exchange": "BINANCE",
+                    "alias": "TT",
+                    "side": "BUY",
+                    "symbol": "BTC-USDC",
+                    "price": 100.0,
+                    "qty": 0.01,
+                }],
+                "notional_quote": {"ccy": "USDC", "amount": 10.0},
+            }
+            model = validate_submit_bundle_lite(payload, prod=True)
+            data = model.model_dump() if hasattr(model, "model_dump") else model.dict(exclude_none=False)
+            self.assertTrue(bool(data.get("_schema_invalid")), f"expected _schema_invalid: {data}")
+            self.assertEqual(str(data.get("_schema_reason")), "RPC_MISSING_IDEMPOTENCY_KEY")
+
+        with self.subTest("validate_cancel_lite requires idempotency in PROD+armed"):
+            validate_cancel_lite = getattr(payloads_mod, "validate_cancel_lite", None)
+            require_contract(self, callable(validate_cancel_lite), "validate_cancel_lite missing")
+            if not callable(validate_cancel_lite):
+                return
+            cancel_model = validate_cancel_lite({"order_id": "ORD-1"}, prod=True)
+            cancel_data = cancel_model.model_dump() if hasattr(cancel_model, "model_dump") else cancel_model.dict(
+                exclude_none=False)
+            self.assertTrue(bool(cancel_data.get("_schema_invalid")), f"expected _schema_invalid: {cancel_data}")
+            self.assertEqual(str(cancel_data.get("_schema_reason")), "RPC_MISSING_IDEMPOTENCY_KEY")
+
+        with self.subTest("staleness strict: UNKNOWN != OK (balances/slip/vol)"):
+            cfg = modules.bot_config.BotConfig()
+            cfg.g.mode = "PROD"
+            cfg.g.live_trading_armed = True
+            cfg.rm.ff_trading_state_unified = True
+            cfg.g.deployment_mode = "EU_ONLY"
+            cfg.g.capital_profile = "NANO"
+            cfg.g.enabled_exchanges = ["BINANCE"]
+
+            RiskManager = getattr(rm_mod, "RiskManager", None)
+            require_contract(self, RiskManager is not None, "RiskManager absent")
+            if RiskManager is None:
+                return
+
+            class _StubBalanceFetcher:
+                def get_balances_freshness_status(self):
+                    return {"status": "UNKNOWN", "ready": False, "reason_code": "RM_BALANCE_TTL_BLOCK"}
+
+            class _StubVolMonitor:
+                def get_current_metrics(self, _pair):
+                    return {}
+
+                def get_current_thresholds(self, _pair):
+                    return {}
+
+            class _StubVolManager:
+                def get_current_metrics(self, _pair=None):
+                    return {"age_s": 999.0}
+
+            class _StubSlippage:
+                def get_status(self):
+                    return {"age_s": 999.0}
+
+            class _StubSimulator:
+                def set_event_sink(self, *_args, **_kwargs):
+                    return None
+
+            class _StubEngine:
+                ready_event = asyncio.Event()
+
+            _StubEngine.ready_event.set()
+
+            rm = RiskManager(
+                bot_cfg=cfg,
+                config=cfg,
+                exchanges=cfg.g.enabled_exchanges,
+                symbols=["BTCUSDC"],
+                balance_fetcher=_StubBalanceFetcher(),
+                volatility_monitor=_StubVolMonitor(),
+                volatility_manager=_StubVolManager(),
+                slippage_handler=_StubSlippage(),
+                simulator=_StubSimulator(),
+                get_orderbooks_callback=lambda: {},
+                execution_engine=_StubEngine(),
+                loops_config={
+                    "orderbooks_interval": 10.0,
+                    "balances_interval": 10.0,
+                    "rebal_interval": 10.0,
+                    "volatility_interval": 10.0,
+                    "fee_sync_interval": 120.0,
+                },
+                ready_event=asyncio.Event(),
+            )
+            rm._last_books_snapshot_ts = time.time()
+            rm._last_balances_ts = time.time()
+            rm._maybe_update_trading_ready()
+
+            reasons = rm._readiness.get("reasons", [])
+            self.assertFalse(rm.trading_ready_event.is_set())
+            self.assertNotEqual(rm.get_trading_state(), "READY")
+            self.assertIn("slip_unknown_or_stale", reasons)
+            self.assertIn("vol_unknown_or_stale", reasons)
+            self.assertTrue(
+                any(r in reasons for r in ("RM_BALANCE_TTL_BLOCK", "BALANCE_STALE")),
+                f"missing balance stale reason: {reasons}",
+            )
+
+        with self.subTest("caps path does not preempt MM on TT/TM overflow"):
+            cfg = modules.bot_config.BotConfig()
+            cfg.g.mode = "PROD"
+            cfg.g.live_trading_armed = True
+            cfg.g.enabled_exchanges = ["BINANCE"]
+
+            RiskManager = getattr(rm_mod, "RiskManager", None)
+            require_contract(self, RiskManager is not None, "RiskManager absent")
+            if RiskManager is None:
+                return
+
+            class _StubBalanceFetcher:
+                def get_balances_freshness_status(self):
+                    return {"status": "OK", "ready": True, "reason_code": "OK"}
+
+            class _StubVolMonitor:
+                def get_current_metrics(self, _pair):
+                    return {}
+
+                def get_current_thresholds(self, _pair):
+                    return {}
+
+            class _StubVolManager:
+                def get_current_metrics(self, _pair=None):
+                    return {"age_s": 0.0}
+
+            class _StubSlippage:
+                def get_status(self):
+                    return {"age_s": 0.0}
+
+            class _StubSimulator:
+                def set_event_sink(self, *_args, **_kwargs):
+                    return None
+
+            class _StubEngine:
+                ready_event = asyncio.Event()
+
+            _StubEngine.ready_event.set()
+
+            rm = RiskManager(
+                bot_cfg=cfg,
+                config=cfg,
+                exchanges=cfg.g.enabled_exchanges,
+                symbols=["BTCUSDC"],
+                balance_fetcher=_StubBalanceFetcher(),
+                volatility_monitor=_StubVolMonitor(),
+                volatility_manager=_StubVolManager(),
+                slippage_handler=_StubSlippage(),
+                simulator=_StubSimulator(),
+                get_orderbooks_callback=lambda: {},
+                execution_engine=_StubEngine(),
+                loops_config={
+                    "orderbooks_interval": 10.0,
+                    "balances_interval": 10.0,
+                    "rebal_interval": 10.0,
+                    "volatility_interval": 10.0,
+                    "fee_sync_interval": 120.0,
+                },
+                ready_event=asyncio.Event(),
+            )
+            rm.per_strategy_notional_cap = {"TT": {"BINANCE": 1.0}}
+            rm.preempt_mm_for_tt_tm = True
+            rm.ff_enforce_preemption = True
+            preempted = {"called": False}
+
+            async def _cancel_open_mm_quotes_on_exchange(*_args, **_kwargs):
+                preempted["called"] = True
+                return 0
+
+            rm._cancel_open_mm_quotes_on_exchange = _cancel_open_mm_quotes_on_exchange
+            rm._apply_caps_and_preempt_legacy("TT", "BINANCE", 10.0)
+            await asyncio.sleep(0)
+            self.assertFalse(preempted["called"], "TT/TM caps overflow must not preempt MM")
+
         # 3) Contract tests OFFLINE — WebSocketsClients (backoff policy only, no network)
         with self.subTest("websockets_clients contract (backoff policy)"):
             wc = importlib.import_module("modules.websockets_clients")

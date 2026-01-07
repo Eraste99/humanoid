@@ -3722,17 +3722,17 @@ class RiskManager:
 
     def _apply_caps_and_preempt_cex(self, strategy: str, ex: str, desired_notional: float) -> float:
         """
-        Applique le cap notionnel par (stratégie,CEX). Si TT/TM dépasse:
-          - préempte MM sur ce CEX (si autorisé), puis tronque à cap.
+        Applique le cap notionnel par (stratégie,CEX). Si dépassement:
+          - préempte MM sur ce CEX uniquement pour hedge (si autorisé), puis tronque à cap.
         """
         cap = float(((self.per_strategy_notional_cap or {}).get(strategy, {}) or {}).get(str(ex).upper(), float("inf")))
         if desired_notional <= cap:
             return max(0.0, desired_notional)
-        if strategy in ("TT", "TM", "REB", "HEDGE") and (
+        if str(strategy or "").upper() in ("HEDGE", "PANIC_HEDGE") and (
                 self.preempt_mm_for_tt_tm or getattr(self, "ff_enforce_preemption", False)
         ):
             try:
-                reason = self._mm_preempt_reason(strategy)
+                reason = self._mm_preempt_reason("HEDGE")
                 asyncio.create_task(
                     self._cancel_open_mm_quotes_on_exchange(ex, reason=reason)
                 )
@@ -4005,7 +4005,7 @@ class RiskManager:
 
         Comportement historique :
         - lecture de per_strategy_notional_cap,
-        - éventuelle préemption des MM si TT/TM dépasse le cap.
+        - préemption MM réservée au hedge si cap dépassé.
         """
         cap = float(
             ((self.per_strategy_notional_cap or {}).get(strategy, {}) or {}).get(
@@ -4014,11 +4014,11 @@ class RiskManager:
         )
         if desired_notional <= cap:
             return max(0.0, desired_notional)
-        if strategy in ("TT", "TM", "REB", "HEDGE") and (
+        if str(strategy or "").upper() in ("HEDGE", "PANIC_HEDGE") and (
                 getattr(self, "preempt_mm_for_tt_tm", False) or getattr(self, "ff_enforce_preemption", False)
         ):
             try:
-                reason = self._mm_preempt_reason(strategy)
+                reason = self._mm_preempt_reason("HEDGE")
                 asyncio.create_task(
                     self._cancel_open_mm_quotes_on_exchange(ex, reason=reason)
                 )
@@ -11091,14 +11091,17 @@ class RiskManager:
             or (op.get("from") or {}).get("alias")
             or op.get("alias_from")
             or op.get("alias")
-            or "TT"
+
         ).upper()
         to_alias = str(
             op.get("to_alias")
             or (op.get("to") or {}).get("alias")
             or op.get("alias_to")
-            or ("TM" if from_alias == "TT" else "TT")
+
         ).upper()
+        if not from_alias or not to_alias:
+            logger.warning("[RiskManager] overlay internal transfer missing aliases: %s", op)
+            return
 
         if from_ex and to_ex and from_ex == to_ex and asset:
             transfer_op = {
@@ -11108,6 +11111,7 @@ class RiskManager:
                 "ccy": asset,
                 "amount": abs(notional),
             }
+            transfer_op["transfer_id"] = TransferController.canonical_transfer_id(transfer_op)
 
             from_wallet = (op.get("from") or {}).get("wallet") or op.get("from_wallet")
             to_wallet = (op.get("to") or {}).get("wallet") or op.get("to_wallet")
@@ -11372,6 +11376,18 @@ class RiskManager:
         bal_ttl = float(getattr(self, "_balance_ttl_s_normal", 60.0) or 60.0)
         books_ready = book_age <= max_book_age
         balances_ready = bal_age <= bal_ttl
+        balances_status = None
+        balances_reason_code = None
+        mbf = getattr(self, "balance_fetcher", None)
+        if mbf and hasattr(mbf, "get_balances_freshness_status"):
+            try:
+                freshness = mbf.get_balances_freshness_status() or {}
+                balances_status = str(freshness.get("status") or "").upper()
+                balances_reason_code = freshness.get("reason_code")
+                if balances_status in ("UNKNOWN", "BLOCK"):
+                    balances_ready = False
+            except Exception:
+                balances_ready = False
         scanner_required = bool(getattr(rm_cfg, "trading_ready_require_scanner_hook", False))
         scanner_ready = True
         if scanner_required:
@@ -11384,8 +11400,62 @@ class RiskManager:
             readiness_reasons.append("books_stale")
         if not balances_ready:
             readiness_reasons.append("balances_stale")
+        if balances_status in ("UNKNOWN", "BLOCK"):
+            reason_code = normalize_reason_code(balances_reason_code or "BALANCE_STALE") or "BALANCE_STALE"
+            if reason_code not in readiness_reasons:
+                readiness_reasons.append(reason_code)
+                inc_blocked("rm", reason_code, None)
         if not scanner_ready:
             readiness_reasons.append("scanner_hook_missing")
+        slip_ready = True
+        slip_reason = "slip_unknown_or_stale"
+        try:
+            slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s",
+                                       getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0)))
+        except Exception:
+            slip_ttl_s = float(getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0))
+        slip = getattr(self, "slippage_handler", None)
+        if slip and hasattr(slip, "get_status"):
+            try:
+                slip_status = slip.get_status() or {}
+                slip_age = slip_status.get("age_s")
+                if slip_age is None or (isinstance(slip_age, float) and not math.isfinite(slip_age)):
+                    slip_ready = False
+                else:
+                    slip_ready = float(slip_age) <= float(slip_ttl_s)
+            except Exception:
+                slip_ready = False
+        else:
+            slip_ready = False
+        if not slip_ready:
+            if slip_reason not in readiness_reasons:
+                readiness_reasons.append(slip_reason)
+                inc_blocked("rm", slip_reason, None)
+
+        vol_ready = True
+        vol_reason = "vol_unknown_or_stale"
+        try:
+            vol_ttl_s = float(getattr(getattr(self.bot_cfg, "vol", None), "ttl_s",
+                                      getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0)))
+        except Exception:
+            vol_ttl_s = float(getattr_float(self.cfg, "VOL_SNAPSHOT_TTL_S", 5.0))
+        vm = getattr(self, "vol_manager", None)
+        if vm and hasattr(vm, "get_current_metrics"):
+            try:
+                vol_meta = vm.get_current_metrics(None) or {}
+                vol_age = vol_meta.get("age_s", vol_meta.get("last_age_s"))
+                if vol_age is None or (isinstance(vol_age, float) and not math.isfinite(vol_age)):
+                    vol_ready = False
+                else:
+                    vol_ready = float(vol_age) <= float(vol_ttl_s)
+            except Exception:
+                vol_ready = False
+        else:
+            vol_ready = False
+        if not vol_ready:
+            if vol_reason not in readiness_reasons:
+                readiness_reasons.append(vol_reason)
+                inc_blocked("rm", vol_reason, None)
         unified = bool(getattr(rm_cfg, "ff_trading_state_unified", False))
         blocked_reason = None
         degraded_reason = None
@@ -11427,6 +11497,8 @@ class RiskManager:
             "books": books_ready,
             "balances": balances_ready,
             "scanner": scanner_ready,
+            "slippage": slip_ready,
+            "volatility": vol_ready,
             "reasons": readiness_reasons,
         })
 
@@ -11615,7 +11687,8 @@ class RiskManager:
         try:
             transfer_id = payload.get("transfer_id") or ev.get("transfer_id")
             if not transfer_id:
-                transfer_id = self._transfer_controller.canonical_transfer_id(payload)
+                logger.warning("[RiskManager] transfer event missing transfer_id: %s", ev)
+                return
             existing_state = {}
             try:
                 existing_state = self._transfer_controller._states.get(transfer_id) or {}
@@ -11668,12 +11741,15 @@ class RiskManager:
         impacted_aliases: list[str] = []
 
         if subtype == "wallet":
-            alias = str(payload.get("alias") or ev.get("alias") or "TT").upper()
+            alias = str(payload.get("alias") or ev.get("alias") or "").upper()
             if alias:
                 impacted_aliases.append(alias)
         elif subtype == "subaccount":
-            from_alias = str(payload.get("from_alias") or "TT").upper()
-            to_alias = str(payload.get("to_alias") or ev.get("alias") or "TM").upper()
+            from_alias = str(payload.get("from_alias") or "").upper()
+            to_alias = str(payload.get("to_alias") or "").upper()
+            if not from_alias or not to_alias:
+                logger.warning("[RiskManager] transfer event missing aliases: %s", ev)
+                return
             if from_alias:
                 impacted_aliases.append(from_alias)
             if to_alias and to_alias != from_alias:
@@ -11840,7 +11916,10 @@ class RiskManager:
             }
             expected_id = TransferController.canonical_transfer_id(payload)
             transfer_id = op.get("transfer_id")
-            if transfer_id and transfer_id != expected_id:
+            if not transfer_id:
+                logger.warning("[RiskManager] wallet transfer missing transfer_id for %s", ex)
+                return
+            if transfer_id != expected_id:
                 logger.warning(
                     "[RiskManager] wallet transfer_id mismatch (%s != %s) for %s",
                     transfer_id,
@@ -11848,7 +11927,7 @@ class RiskManager:
                     ex,
                 )
                 return
-            payload["transfer_id"] = transfer_id or expected_id
+            payload["transfer_id"] = transfer_id
             outcome = await self._transfer_controller.submit(
                 payload=payload,
                 submit_fn=_submit,
@@ -11857,17 +11936,25 @@ class RiskManager:
             if outcome.get("status") == "SUBMITTED":
                 await self._alert(
                     "RiskManager",
-                    f"✅ Internal WALLET transfer {ex}[{alias}] {from_wallet}→{to_wallet} {amount} {ccy}",
+                    f"✅ Internal WALLET transfer {ex}[{alias}] {from_wallet}→{to_wallet} {amount} {ccy} "
+                    f"(transfer_id={transfer_id})",
                 )
         except Exception:
             logger.exception("[RiskManager] internal wallet transfer failed")
 
     async def _exec_internal_subaccount_transfer(self, op: Dict[str, Any]) -> None:
         ex = str(op.get("exchange")).upper()
-        from_alias = str(op.get("from_alias") or "TT").upper()
-        to_alias = str(op.get("to_alias") or "TM").upper()
+        from_alias = str(op.get("from_alias") or "").upper()
+        to_alias = str(op.get("to_alias") or "").upper()
+        if not from_alias or not to_alias:
+            logger.warning("[RiskManager] subaccount transfer missing aliases for %s", ex)
+            return
         ccy = str(op.get("ccy") or "USDC").upper()
         amount = float(op.get("amount") or op.get("amount_usdc") or 0.0)
+        transfer_id = op.get("transfer_id")
+        if not transfer_id:
+            logger.warning("[RiskManager] subaccount transfer missing transfer_id for %s", ex)
+            return
         client = self.transfer_clients.get(ex)
         if not client:
             logger.warning("[RiskManager] no transfer client for %s", ex)
@@ -11894,7 +11981,7 @@ class RiskManager:
                 "to_alias": to_alias,
                 "ccy": ccy,
                 "amount": amount,
-                "transfer_id": op.get("transfer_id"),
+                "transfer_id": transfer_id,
             }
             outcome = await self._transfer_controller.submit(
                 payload=payload,
@@ -11904,7 +11991,8 @@ class RiskManager:
             if outcome.get("status") == "SUBMITTED":
                 await self._alert(
                     "RiskManager",
-                    f"✅ Internal SUBACCOUNT transfer {ex} {from_alias}→{to_alias} {amount} {ccy}",
+                    f"✅ Internal SUBACCOUNT transfer {ex} {from_alias}→{to_alias} {amount} {ccy} "
+                    f"(transfer_id={transfer_id})",
                 )
                 if getattr_bool(self.cfg, "dry_run", False):
                     self.adjust_virtual_balance(ex, from_alias, ccy, -amount)
@@ -14189,7 +14277,7 @@ class RiskManager:
         P2: scheduler multi-branches TT/TM/MM simultanés + caps notionnels et préemption MM,
             REB lock par combo, shadow non-bloquant.
         - TTL-strict slip/vol (2s/5s)
-        - Caps par (branche,CEX) via _apply_caps_and_preempt (legacy opp-level, préempte MM sur TT/TM si nécessaire)
+        - Caps par (branche,CEX) via _apply_caps_and_preempt (legacy opp-level, préemption MM réservée au hedge)
         - REB: lock combo et exécute TM neutral
         """
         now = time.time()

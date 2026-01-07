@@ -490,7 +490,9 @@ class OpportunityScanner:
         # throttles rotation MM (si activée côté RM/Engine)
         self._last_rotation_ts = 0.0
         self._rotation_period_s = 2.0
-        if bool(getattr(self.cfg, "mm_rotation_enabled", False)):
+        # IMPORTANT: knobs rotation vivent dans cfg.scanner.*, pas au top-level cfg
+        if bool(getattr(s, "mm_rotation_enabled", False)):
+
             self._rot_mm = _Rotation(
                 primary_n=int(getattr(s, "mm_rotation_primary_n", 4)),
                 audition_m=int(getattr(s, "mm_rotation_audition_m", 4)),
@@ -578,24 +580,33 @@ class OpportunityScanner:
 
     def _should_consider_mm_for_pair(self, pair: str) -> bool:
         """
-        Détermine si la paire est éligible au MM:
-        - kill-switch global cfg.enable_maker_maker doit être ON,
-        - si pair dans mm_seed_pairs → toujours True,
-        - sinon tier de la paire doit appartenir à mm_allowed_tiers
-          (fallback CORE/PRIMARY) et ne pas être bannie par la rotation,
-        - si rotation activée, la paire doit être promue (primary/audition).
+        Éligibilité MM (couche scanner/hints, "soft") :
+
+        - Gate dur: RM doit autoriser le MM (cfg.rm.enable_maker_maker)
+        - Seed pairs: cfg.scanner.mm_seed_pairs => True immédiat
+        - Sinon: on autorise sur tiers CORE/PRIMARY (déduit de l'univers actuel)
+        - Si rotation activée: la paire doit être dans rot.primary ou rot.audition
+          et ne doit pas être bannie
         """
-        cfg = self.cfg
-        if not bool(getattr(cfg, "enable_maker_maker", False)):
+        s = getattr(self.cfg, "scanner", None)
+        rm_cfg = getattr(self.cfg, "rm", None)
+
+        # Fail-closed si cfg incomplet
+        if s is None or rm_cfg is None:
+            return False
+
+        # Gate dur côté RM (c'est RM qui décide si le MM existe, scanner ne fait que des hints)
+        if not bool(getattr(rm_cfg, "enable_maker_maker", False)):
             return False
 
         p = _norm_pair(pair)
-        allowed_tiers = getattr(cfg, "mm_allowed_tiers", None) or ["CORE", "PRIMARY"]
-        allowed_tiers = [str(t).upper() for t in allowed_tiers]
-        seed_pairs = { _norm_pair(x) for x in (getattr(cfg, "mm_seed_pairs", []) or []) }
+
+        # Seeds explicites (pilotage opérateur)
+        seed_pairs = {_norm_pair(x) for x in (getattr(s, "mm_seed_pairs", ()) or ())}
         if p in seed_pairs:
             return True
 
+        # Déterminer le tier de la paire selon l'univers actuel
         tier = "AUDITION"
         if p in getattr(self, "_core_pairs", set()):
             tier = "CORE"
@@ -604,31 +615,21 @@ class OpportunityScanner:
         elif p in getattr(self, "_sandbox_pairs", set()):
             tier = "SANDBOX"
 
-        if tier not in allowed_tiers:
+        # Sans knob "allowed_tiers" dans BotConfig, on reste conservateur:
+        # hints MM autorisés uniquement sur CORE/PRIMARY par défaut.
+        if tier not in ("CORE", "PRIMARY"):
             return False
 
-        # --- PATCH 4.2 : garde-fou univers MM via LHM / PairHistory ---
-        try:
-            mgr = getattr(self, "logger_historique_manager", None)
-            if mgr is not None and hasattr(mgr, "get_active_pairs"):
-                # vue PairHistory "top MM"
-                mm_active = set(mgr.get_active_pairs("MM") or [])
-                # si PairHistory ne fournit rien, on ne restreint pas
-                if mm_active and (p not in mm_active) and (p not in seed_pairs):
-                    return False
-        except Exception:
-            # Best-effort: en cas de problème on retombe sur le comportement legacy
-            try:
-                self.logger.exception("[Scanner][MM] mm_guard_by_pairhistory failed", exc_info=True)
-            except Exception:
-                pass
-        # --- fin PATCH 4.2 ---
-
-        rot = getattr(self, "_rot_mm", None)
-        if rot:
-            if getattr(rot, "is_banned", lambda _p: False)(p):
+        # Si rotation activée, on exige la promotion (primary/audition) et pas de ban
+        if bool(getattr(s, "mm_rotation_enabled", False)):
+            rot = getattr(self, "_rot_mm", None)
+            if rot is None:
                 return False
-            return (p in getattr(rot, "primary", [])) or (p in getattr(rot, "audition", []))
+            if rot.is_banned(p):
+                return False
+            if (p not in rot.primary) and (p not in rot.audition):
+                return False
+
         return True
 
     def _record_rejection(
@@ -1529,7 +1530,7 @@ class OpportunityScanner:
         Score MM : combine net_bps estimé, proba de fill bilatérale (queue vs depth) et pénalité vol.
         Quote-agnostic : toutes les grandeurs de profondeur/queue sont en notional QUOTE.
         """
-        cfg = self.cfg
+        s = self.cfg.scanner
 
         vol_ema = float(self._vol_ema.get(pair, 0.0))
 
@@ -1540,15 +1541,15 @@ class OpportunityScanner:
 
         # Fallbacks de config : *_quote puis *_usd (rétro-compat)
         depth_min_quote = float(
-            getattr(cfg, "mm_depth_min_quote",
-                    getattr(cfg, "mm_depth_min_usd", 7500.0))
+            getattr(s, "mm_depth_min_quote",
+                    getattr(s, "mm_depth_min_usd", 7500.0))
         )
         qpos_max_quote = float(
-            getattr(cfg, "mm_qpos_max_ahead_quote",
-                    getattr(cfg, "mm_qpos_max_ahead_usd", 5000.0))
+            getattr(s, "mm_qpos_max_ahead_quote",
+                    getattr(s, "mm_qpos_max_ahead_usd", 5000.0))
         )
         mm_min_net_bps = float(
-            getattr(cfg, "mm_min_net_bps", 0.0005)  # 5 bps par défaut (0.0005 en fraction)
+            getattr(s, "mm_min_net_bps", 0.0005)  # 5 bps par défaut (0.0005 en fraction)
         ) * 1e4
 
         def _expected_net_bps_mm(a_price: float, b_price: float) -> float:
@@ -1556,7 +1557,7 @@ class OpportunityScanner:
                 return float("-inf")
             mid = (a_price + b_price) / 2.0
             brut = abs(a_price - b_price) / max(mid, 1e-12)
-            hedge_cost_bps = float(getattr(cfg, "mm_hedge_cost_bps", 5.0))
+            hedge_cost_bps = float(getattr(s, "mm_hedge_cost_bps", 5.0))
             return (brut - hedge_cost_bps / 1e4) * 1e4
 
         net_bps = _expected_net_bps_mm(maker_px_a, maker_px_b)
@@ -1565,7 +1566,7 @@ class OpportunityScanner:
         # Scanner = couche "soft" : on coupe les opportunités MM si la vol EMA dépasse
         # un seuil dédié (cfg.mm_vol_bps_max), mais le RM garde la main sur la décision
         # finale et les caps par profil.
-        mm_vol_max = float(getattr(cfg, "mm_vol_bps_max", self.vol_soft_cap_bps))
+        mm_vol_max = float(getattr(s, "mm_vol_bps_max", self.vol_soft_cap_bps))
         if vol_ema > mm_vol_max:
             eligible = False
         elif dA < depth_min_quote or dB < depth_min_quote:
@@ -1601,7 +1602,7 @@ class OpportunityScanner:
             "vol_bps_ema": vol_ema,
             "net_bps": net_bps,
             "p_both": p_both,
-            "ttl_ms": int(getattr(cfg, "mm_ttl_ms", 2200)),
+            "ttl_ms": int(getattr(s, "mm_ttl_ms", 2200)),
         }
         return score, hints
 

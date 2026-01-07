@@ -115,6 +115,12 @@ class AlertDispatcher:
         with self._lock:
             self._sink = sink
 
+    async def start(self) -> None:
+        return
+
+    async def stop(self) -> None:
+        return
+
     # --- anti-spam -----------------------------------------------------------
 
     def _allow(self, code: str, severity: str, min_interval_s: float) -> bool:

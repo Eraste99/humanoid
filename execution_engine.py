@@ -4436,15 +4436,13 @@ class ExecutionEngine:
 
 
         # 2) Backpressure technique: queue globale et éventuelle concurrence par branche
-        if bool(getattr(self.config, "ff_enforce_preemption", False)):
-            preempt_by = "HEDGE" if is_fast_lane else branch
-            if preempt_by in ("TT", "TM", "REB", "HEDGE"):
-                combo = self._bundle_combo_signature(bundle)
-                if combo:
-                    try:
-                        await self._preempt_mm_for_pair([combo[1], combo[2]], combo[0], preempt_by)
-                    except Exception:
-                        logging.exception("Unhandled exception while preempting MM before submit")
+        if bool(getattr(self.config, "ff_enforce_preemption", False)) and is_fast_lane:
+            combo = self._bundle_combo_signature(bundle)
+            if combo:
+                try:
+                    await self._preempt_mm_for_pair([combo[1], combo[2]], combo[0], "HEDGE")
+                except Exception:
+                    logging.exception("Unhandled exception while preempting MM before submit")
         queue_max_cfg = int(getattr(self.config, "engine_queue_max", 0) or 0)
         queue_max = getattr(self.order_queue, "maxsize", 0) or queue_max_cfg or 0
         depth = int(self.order_queue.qsize())
@@ -5217,9 +5215,11 @@ class ExecutionEngine:
         kind = str(meta.get("kind") or "").upper()
         flow_kind = str(meta.get("flow_kind") or "").lower()
         branch = str(meta.get("branch") or "").upper()
+        is_mm = branch == "MM" or kind == "MAKER_MM"
+        if is_mm:
+            return kind == "CANCEL" or flow_kind == "cancel"
         return (
-                branch == "MM"
-                or kind in ("MAKER", "MAKER_MM", "MAKER_TM", "CANCEL")
+                kind in ("MAKER", "MAKER_TM", "CANCEL")
                 or flow_kind in ("maker", "cancel")
         )
 
@@ -5582,22 +5582,33 @@ class ExecutionEngine:
         self._ensure_ready()
 
         ex = str(job.get("exchange") or "").upper()
-        from_alias = str(job.get("from_alias") or "TT").upper()
-        to_alias = str(job.get("to_alias") or "TT").upper()
+        transfer_id = job.get("transfer_id")
+        from_alias = str(job.get("from_alias") or "").upper()
+        to_alias = str(job.get("to_alias") or "").upper()
         amt = float(job.get("amount_usdc") or job.get("amount") or 0.0)
         ccy = str(job.get("ccy") or "USDC").upper()
+        if not transfer_id:
+            report_nonfatal("ExecutionEngine", "internal_transfer_missing_transfer_id", None,
+                            phase="_handle_internal_transfer")
+            logger.warning("[Engine] internal_transfer missing transfer_id: %s", job)
+            return
+        if not from_alias or not to_alias:
+            report_nonfatal("ExecutionEngine", "internal_transfer_missing_alias", None,
+                            phase="_handle_internal_transfer")
+            logger.warning("[Engine] internal_transfer missing aliases: %s", job)
+            return
         if amt <= 0:
             return
         if getattr(self.config, "dry_run", True):
             try:
                 self.risk_manager.adjust_virtual_balance(ex, from_alias, ccy, -amt)
                 self.risk_manager.adjust_virtual_balance(ex, to_alias, ccy, +amt)
-                logger.info("↔️  Transfer interne %s: %s→%s  %.2f %s", ex, from_alias, to_alias, amt, ccy)
+                logger.info("↔️  Transfer interne %s [%s]: %s→%s  %.2f %s", ex, transfer_id, from_alias, to_alias, amt, ccy)
             except Exception:
                 logger.exception("[Engine] adjust_virtual_balance failed")
         else:
             logger.info(
-                "↔️  (LIVE) Transfer interne %s: %s→%s  %.2f %s (stub)", ex, from_alias, to_alias, amt, ccy
+                "↔️  (LIVE) Transfer interne %s [%s]: %s→%s  %.2f %s (stub)", ex, transfer_id, from_alias, to_alias, amt, ccy
             )
 
     def _best_price_from_rm(self, exchange: str, pair_key: str, side: str) -> Tuple[float, Optional[int]]:
@@ -7236,16 +7247,21 @@ class ExecutionEngine:
         Gate avant submit:
           - Mutes actifs (TM/MM) par paire
           - Volatilité (soft/hard) avec freeze/mute branche
-          - Profondeur minimale en QUOTE via _depth_quote_available(...), makers-only
+          - Profondeur minimale en QUOTE via _depth_quote_available(...)
+            - TM/MM : mute branche + penalize_pair
+            - TT     : drop (pas de mute TT), + penalize_pair
         True => continuer, False => drop (le call-site journalise).
         """
         # --- helpers conf (zéro dur) ---
         cfg = getattr(self, "config", None)
 
         def _cfg(name, default):
-            if cfg is None: return default
-            if hasattr(cfg, name): return getattr(cfg, name)
-            if isinstance(cfg, dict): return cfg.get(name, default)
+            if cfg is None:
+                return default
+            if hasattr(cfg, name):
+                return getattr(cfg, name)
+            if isinstance(cfg, dict):
+                return cfg.get(name, default)
             return default
 
         try:
@@ -7254,9 +7270,11 @@ class ExecutionEngine:
             meta_b = sell_leg.get("meta") or {}
             is_maker_a = bool(meta_a.get("maker", False))
             is_maker_b = bool(meta_b.get("maker", False))
-            # branche: MM (= deux makers), TM (= un seul maker)
+
+            # branche: MM (= deux makers), TM (= un seul maker), TT (= deux takers)
             is_mm = is_maker_a and is_maker_b
             is_tm = (is_maker_a ^ is_maker_b)
+            is_tt = (not is_tm) and (not is_mm)
 
             # --- mutes actifs (TM/MM) ---
             if is_tm and self._is_muted("TM", pair_key):
@@ -7284,10 +7302,12 @@ class ExecutionEngine:
                     self._mute_branch("MM", pair_key, float(_cfg("circuit_mute_s_mm", 180.0)), reason="vol_soft")
                     return False
 
-            # --- shallow book (en QUOTE) — makers only ---
-            if is_tm or is_mm:
+            # --- shallow book (en QUOTE) — TT/TM/MM ---
+            # NOTE: on contrôle la profondeur "consommable" côté ASK (BUY) et BID (SELL).
+            if is_tt or is_tm or is_mm:
                 # paramètres
-                max_lvls = int(_cfg("depth_check_max_levels", 3))
+                max_lvls = int(_cfg("depth_check_max_levels", _cfg("depth_levels_check", 3)))
+                min_q_tt = float(_cfg("depth_min_quote_tt", 200.0))
                 min_q_tm = float(_cfg("depth_min_quote_tm", 500.0))
                 min_q_mm = float(_cfg("depth_min_quote_mm", 1000.0))
                 allow_shlw = bool(_cfg("allow_shallow_books", False))
@@ -7302,25 +7322,43 @@ class ExecutionEngine:
                 sym_sell = sell_leg.get("symbol") or sell_leg.get("pair")
                 q_sell = float(self._depth_quote_available(ex_sell, sym_sell, "SELL", max_levels=max_lvls))
 
-                min_needed = min_q_mm if is_mm else min_q_tm
+                if is_mm:
+                    min_needed = min_q_mm
+                elif is_tm:
+                    min_needed = min_q_tm
+                else:
+                    min_needed = min_q_tt
+
                 shallow = (q_buy < min_needed) or (q_sell < min_needed)
 
                 if shallow and not allow_shlw:
-                    # mute la branche concernée, pénalise la paire côté RM
+                    # TM/MM : mute la branche concernée ; TT : pas de mute TT (drop seulement)
                     if is_mm:
                         self._mute_branch("MM", pair_key, float(_cfg("circuit_mute_s_mm", 300.0)), reason="shallow")
-                    else:
+                    elif is_tm:
                         self._mute_branch("TM", pair_key, float(_cfg("circuit_mute_s_tm", 300.0)), reason="shallow")
+
+                    # pénalise la paire côté RM (best-effort)
                     try:
                         pen = getattr(self, "risk_manager", None)
                         if pen and hasattr(pen, "penalize_pair"):
                             pen.penalize_pair(pair_key, reason="shallow_book")
                     except Exception:
                         pass
+
                     return False
 
             # tout est vert
             return True
+
+        except Exception:
+            # En cas d’exception inattendue: prudence → ne pas exécuter
+            try:
+                if getattr(self, "log", None):
+                    self.log.exception("_pre_trade_circuits failed")
+            except Exception:
+                pass
+            return False
 
         except Exception:
             # En cas d’exception inattendue: prudence → ne pas exécuter
@@ -9603,22 +9641,37 @@ class ExecutionEngine:
             return {"status": "simulated", "exchange": "Coinbase", "clientOrderId": client_id}
 
         assert self._session, "ClientSession not started"
-        if isinstance(symbol, dict):
-            order_dict = symbol
+
+        # Backward-compat: accepter un dict "order" en entrée
+        if isinstance(product_id, dict):
+            order_dict = product_id
             meta = meta or (side if isinstance(side, dict) else None) or {}
-            symbol = order_dict.get("symbol") or order_dict.get("product_id") or order_dict.get("pair") or ""
+
+            # IMPORTANT: ici c'est product_id, pas "symbol"
+            product_id = (
+                    order_dict.get("product_id")
+                    or order_dict.get("symbol")
+                    or order_dict.get("pair")
+                    or ""
+            )
             side = order_dict.get("side", side)
+
             try:
                 qty = float(order_dict.get("quantity") or order_dict.get("qty") or order_dict.get("size") or qty)
             except Exception:
-                qty = qty
+                # on garde la valeur existante
+                pass
+
             try:
                 price = float(order_dict.get("price") or price)
             except Exception:
-                price = price
+                # on garde la valeur existante
+                pass
+
             client_id = order_dict.get("clientOrderId") or order_dict.get("client_order_id") or client_id
             tif = order_dict.get("time_in_force") or tif
             maker = bool(order_dict.get("post_only", maker))
+
         if not await self._acquire_rl(self._rl_for("COINBASE", lane) or self._rl_coinbase_order, "COINBASE", lane=lane,
                                       meta=meta):
             raise EngineSubmitError("RATE_LIMIT_TIMEOUT")
