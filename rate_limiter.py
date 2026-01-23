@@ -8,7 +8,6 @@ import threading
 import time
 from contracts.errors import RateLimitTimeoutError
 from typing import Any, Awaitable, Callable, Optional, Dict, Tuple
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 class TokenBucket:
     """
@@ -312,28 +311,27 @@ class RateLimiter:
     def __init__(self, cfg_rl: Any):
         self.cfg = cfg_rl
 
-        # list(): notre getattr_list n'a pas de default custom → fallback avec "or ..."
-        self._priorities = getattr_list(self.cfg, 'priorities') or ['hedge', 'cancel', 'maker']
+        self._priorities = list(getattr(self.cfg, 'priorities', [])) or ['hedge', 'cancel', 'maker']
 
-        self._fair = getattr_bool(self.cfg, 'fair', True)
-        self._name_prefix = getattr_str(self.cfg, 'name_prefix', 'RL')
+        self._fair = bool(getattr(self.cfg, 'fair', True))
+        self._name_prefix = str(getattr(self.cfg, 'name_prefix', 'RL'))
 
         # durées en secondes → float
-        self._min_sleep_s = getattr_float(self.cfg, 'min_sleep_s', 0.005)
-        self._max_sleep_s = getattr_float(self.cfg, 'max_sleep_s', 0.05)
+        self._min_sleep_s = float(getattr(self.cfg, 'min_sleep_s', 0.005))
+        self._max_sleep_s = float(getattr(self.cfg, 'max_sleep_s', 0.05))
 
         # rate/burst
-        self._default_rate = getattr_float(self.cfg, 'default_rate_per_s', 9.0)
-        self._default_burst = getattr_int(self.cfg, 'default_burst', 10)
+        self._default_rate = float(getattr(self.cfg, 'default_rate_per_s', 9.0))
+        self._default_burst = int(getattr(self.cfg, 'default_burst', 10))
 
         # dicts: notre getattr_dict prend (obj, name) uniquement (default = {})
-        self._rate_ex_kind: Dict[str, Dict[str, float]] = getattr_dict(self.cfg, 'hard_caps_rps_by_exchange_kind')
-        self._rate_ex: Dict[str, float] = getattr_dict(self.cfg, 'hard_caps_rps_by_exchange')
-        self._rate_kind: Dict[str, float] = getattr_dict(self.cfg, 'hard_caps_rps_by_kind')
+        self._rate_ex_kind: Dict[str, Dict[str, float]] = dict(getattr(self.cfg, 'hard_caps_rps_by_exchange_kind', {}))
+        self._rate_ex: Dict[str, float] = dict(getattr(self.cfg, 'hard_caps_rps_by_exchange', {}))
+        self._rate_kind: Dict[str, float] = dict(getattr(self.cfg, 'hard_caps_rps_by_kind', {}))
 
-        self._burst_ex_kind: Dict[str, Dict[str, int]] = getattr_dict(self.cfg, 'bursts_by_exchange_kind')
-        self._burst_ex: Dict[str, int] = getattr_dict(self.cfg, 'bursts_by_exchange')
-        self._burst_kind: Dict[str, int] = getattr_dict(self.cfg, 'bursts_by_kind')
+        self._burst_ex_kind: Dict[str, Dict[str, int]] = dict(getattr(self.cfg, 'bursts_by_exchange_kind', {}))
+        self._burst_ex: Dict[str, int] = dict(getattr(self.cfg, 'bursts_by_exchange', {}))
+        self._burst_kind: Dict[str, int] = dict(getattr(self.cfg, 'bursts_by_kind', {}))
 
         self._buckets: Dict[Tuple[str, str], TokenBucket] = {}
 

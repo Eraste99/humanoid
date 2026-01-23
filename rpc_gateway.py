@@ -29,6 +29,7 @@ import logging
 import ssl
 import time
 import random
+import hashlib
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional, NamedTuple, Dict
 
@@ -73,6 +74,7 @@ from modules.bot_config import BotConfig
 from contracts.payloads import validate_submit_bundle_lite, validate_cancel_lite
 import modules.obs_metrics as obs  # on accède par getattr avec fallback no-op
 
+logger = logging.getLogger("rpc_gateway")
 
 # ---------- Metrics helpers (tolérants si les constantes n'existent pas encore) ----------
 
@@ -795,6 +797,19 @@ class RPCServer:
                 parts.append(f"{k}:{v}")
         return "|".join(parts) if parts else None
 
+    def _sanitize_idempotency_key(self, key: Optional[str]) -> Optional[str]:
+        if not key:
+            return None
+        try:
+            key = str(key).strip()
+        except Exception:
+            return None
+        if not key:
+            return None
+        if len(key) > 256:
+            key = key[:256]
+        return key
+
     def _extract_idempotency_key(
             self,
             request: web.Request,
@@ -813,6 +828,14 @@ class RPCServer:
         if isinstance(body, dict):
             idem = self._derive_idem_key_from_payload(body)
             idem = self._sanitize_idempotency_key(idem)
+            if idem:
+                return idem
+            try:
+                payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                digest = hashlib.sha256(payload).hexdigest()
+                idem = self._sanitize_idempotency_key(f"payload:{digest}")
+            except Exception:
+                idem = None
             if idem:
                 return idem
 

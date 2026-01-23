@@ -5628,8 +5628,8 @@ class RiskManager:
         Vérifie la « légalité » minimale d'un bundle.
         """
         if not isinstance(bundle, dict):
-            return False
-        return False, BUNDLE_ILLEGAL
+
+            return False, BUNDLE_ILLEGAL
 
         meta = bundle.get("meta") or {}
         branch = ""
@@ -16637,7 +16637,9 @@ class RiskManager:
                         inc_rm_reject(reason="SIM_CACHE_MISS", pair=pair)
                     except Exception:
                         pass
-                    return decision_ctx
+                    if decision_ctx is not None:
+                        decision_ctx["simulator_cache_miss"] = True
+                    return None
 
                 # Fallback sur FragmentationPolicy si sim absent/bypass
                 frag_plan = FragmentationPolicy.build(
