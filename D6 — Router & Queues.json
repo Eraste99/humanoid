@@ -6,7 +6,7 @@
   "editable": true,
   "style": "dark",
   "tags": ["bot", "router", "queues"],
-  "refresh": "10s",
+  "refresh": "15s",
   "time": { "from": "now-6h", "to": "now" },
   "fiscalYearStartMonth": 1,
   "graphTooltip": 1,

@@ -229,44 +229,44 @@ async def run_eod(
     finally:
         await lhm.stop()
 
-        # Écriture du rapport
-        since_ms, until_ms = _resolve_window(local_day, region_effective)
-        pnl_reco = result.get("pnl_reconciliation") if isinstance(result, dict) else {}
-        report = dict(result or {})
-        report.setdefault("region", region_effective)
-        report.setdefault("day_local", local_day)
-        report.setdefault("window_since_ms", pnl_reco.get("window_since_ms") or since_ms)
-        report.setdefault("window_until_ms", pnl_reco.get("window_until_ms") or until_ms)
-        if isinstance(pnl_reco, dict):
-            report.setdefault("pnl_reconciliation", pnl_reco)
-        report.setdefault(
-            "cutoff_definition",
-            f"local_day[{region_effective}] -> UTC window",
-        )
-        report.setdefault(
-            "thresholds",
-            {
-                "abs_diff_quote": getattr(lhm, "_pnl_reco_tol_abs_quote", None),
-                "ratio_diff": getattr(lhm, "_pnl_reco_tol_pct", None),
-            },
-        )
+    # Écriture du rapport
+    since_ms, until_ms = _resolve_window(local_day, region_effective)
+    pnl_reco = result.get("pnl_reconciliation") if isinstance(result, dict) else {}
+    report = dict(result or {})
+    report.setdefault("region", region_effective)
+    report.setdefault("day_local", local_day)
+    report.setdefault("window_since_ms", pnl_reco.get("window_since_ms") or since_ms)
+    report.setdefault("window_until_ms", pnl_reco.get("window_until_ms") or until_ms)
+    if isinstance(pnl_reco, dict):
+        report.setdefault("pnl_reconciliation", pnl_reco)
+    report.setdefault(
+        "cutoff_definition",
+        f"local_day[{region_effective}] -> UTC window",
+    )
+    report.setdefault(
+        "thresholds",
+        {
+            "abs_diff_quote": getattr(lhm, "_pnl_reco_tol_abs_quote", None),
+            "ratio_diff": getattr(lhm, "_pnl_reco_tol_pct", None),
+        },
+    )
 
 
-        report.setdefault("conventions", {"base_ccy": "USDC", "quote_ccy": "USDC"})
+    report.setdefault("conventions", {"base_ccy": "USDC", "quote_ccy": "USDC"})
 
-        if output_path:
-            try:
-                _atomic_write_json(Path(output_path), report)
-                logger.info("EOD report written to %s", output_path)
-            except Exception:
-                logger.exception("Failed to write EOD report to %s", output_path)
-        else:
-            # stdout pour les usages en CLI simple / dev
-            json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+    if output_path:
+        try:
+            _atomic_write_json(Path(output_path), report)
+            logger.info("EOD report written to %s", output_path)
+        except Exception:
+            logger.exception("Failed to write EOD report to %s", output_path)
+    else:
+        # stdout pour les usages en CLI simple / dev
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
-        return report
+    return report
 
 # Backward compatibility alias
 async def run_eod_pnl_reconciliation(**kwargs):
@@ -341,10 +341,22 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _setup_logging(level: str) -> None:
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    try:
+        sys.path.append(os.getcwd())
+        from boot import configure_logging
+        # On fabrique une config factice pour passer le niveau
+        class FakeCfg:
+            class FakeObs:
+                def __init__(self, lvl): self.log_level = lvl
+            def __init__(self, lvl): self.obs = self.FakeObs(lvl)
+        
+        configure_logging(FakeCfg(level))
+    except Exception:
+        # Fallback si boot.py n'est pas accessible
+        logging.basicConfig(
+            level=getattr(logging, level.upper(), logging.INFO),
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

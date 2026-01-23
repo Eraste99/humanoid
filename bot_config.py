@@ -28,7 +28,7 @@ from contracts import payloads as contracts
 # Taxonomie canonique (branches / profils capital)
 # ------------------------------
 # Utilisées comme référence unique par RiskManager, ExecutionEngine, etc.
-ALLOWED_BRANCHES = ("TT", "TM", "MM", "REB")
+ALLOWED_BRANCHES = ("TT", "TM", "MM", "MM_MONO", "MM_CROSS", "REB")
 ALLOWED_CAPITAL_PROFILES = ("NANO", "MICRO", "SMALL", "MID", "LARGE")
 class DeploymentMode(str, enum.Enum):
     EU_ONLY = "EU_ONLY"
@@ -66,7 +66,14 @@ class _Env:
                 _Env._deprecated_noted.add(name)
             return default
         val = os.getenv(name)
-        return val if val is not None else default
+        if val is None:
+            return default
+
+        # Nettoyage des commentaires de fin de ligne et espaces
+        if "#" in val:
+            val = val.split("#")[0]
+        val = val.strip()
+        return val if val else default
 
     @staticmethod
     def get_bool(name: str, default: bool=False) -> bool:
@@ -123,6 +130,16 @@ class _Env:
         return [t.strip() for t in str(v).split(separator) if t.strip()]
 
     @staticmethod
+    def get_list_float(name: str, default: Optional[List[float]]=None) -> List[float]:
+        v = _Env.get_list(name)
+        if not v:
+            return list(default or [])
+        try:
+            return [float(x) for x in v]
+        except Exception:
+            return list(default or [])
+
+    @staticmethod
     def get_dict(name: str, default: Optional[Dict[str, Any]]=None) -> Dict[str, Any]:
         v = _Env.get(name)
         if v is None:
@@ -149,6 +166,17 @@ class _Env:
             return list(default or [])
         try:
             x = json.loads(v)
+            if isinstance(x, list):
+                routes = []
+                for item in x:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        routes.append((str(item[0]), str(item[1])))
+                return routes
+        except Exception:
+            pass
+        # python literal
+        try:
+            x = ast.literal_eval(v)
             if isinstance(x, list):
                 routes = []
                 for item in x:
@@ -242,6 +270,7 @@ class Globals:
         "EUR":  {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
     })
 
+    frontload_enabled: bool = True
     frontload_weights: List[float] = field(default_factory=lambda: [0.50,0.35,0.15])
     frontload_group_size: int = 3
     min_fragment_quote: Dict[str, float] = field(default_factory=lambda: {"USDC":200.0, "EUR":200.0})
@@ -261,6 +290,18 @@ class Globals:
         "backend": "",                # ex: redis://host:6379/0
         "namespace": "prod-eu-us",
         "on_violation": "cancel",     # cancel|skip|widen
+        "band_width_ticks": 1,
+        "ttl_ms_binance": 200,
+        "ttl_ms_bybit": 200,
+        "ttl_ms_coinbase": 200,
+        "strategy_tm": "reprice",
+        "strategy_mm": "delay",
+        "reprice_ticks_tm": 1,
+        "reprice_ticks_mm": 1,
+        "delay_ms_tm": 60.0,
+        "delay_ms_mm": 90.0,
+        "pods_coord_url": None,
+        "pods_coord_namespace": "ac",
     })
 
     pacer_mode: str = "NORMAL"
@@ -273,12 +314,17 @@ class Globals:
     full_restart_cap_per_hour: Optional[int] = None
     full_restart_cooldown_s: Optional[int] = None
     full_restart_mute_s: Optional[int] = None
+    restart_escalate_after_fails: int = 5
+    restart_escalate_delay_s: float = 300.0
+    restart_max_downtime_s: float = 3600.0
     feature_switches: Dict[str,bool] = field(default_factory=lambda: {
         "private_ws": False,
         "balance_fetcher": False,
         "engine_real": False,
         "simulator": True,
     })
+    log_dir: str = "logs"
+    history_dir: str = "history"
 # --- Observabilité / Alerting ---
 
 @dataclass
@@ -290,6 +336,14 @@ class ObservabilityCfg:
     enable_obs_port: bool = False
     obs_port: int = 9108
 
+    # Latency Tracing (End-to-End)
+    enable_latency_tracing: bool = True
+    latency_sampling_rate: float = 1.0
+    enable_segment_metrics_router: bool = True
+    enable_segment_metrics_scanner: bool = True
+    enable_segment_metrics_rm: bool = True
+    enable_segment_metrics_engine: bool = True
+
 @dataclass
 class BootCfg:
     scanner_proxy_mode: str = "REJECT"  # STRICT_ORDER | BUFFER | REJECT
@@ -297,6 +351,7 @@ class BootCfg:
 
 @dataclass
 class TelegramCfg:
+    enabled: bool = True
     bot_token: str = ""
     allowed_user_ids: List[int] = field(default_factory=list)
     chat_id_info: Optional[str] = None
@@ -410,7 +465,23 @@ class WsPublicCfg:
     staleness_slo_s: Optional[float] = None
     disabled_exchanges: List[str] = field(default_factory=list)
 
+    # NEW: Parité de connexion par exchange
+    connect_timeout_s_by_ex: Dict[str, int] = field(default_factory=dict)
+    read_timeout_s_by_ex: Dict[str, int] = field(default_factory=dict)
+    ping_interval_s_by_ex: Dict[str, int] = field(default_factory=dict)
+    pong_timeout_s_by_ex: Dict[str, int] = field(default_factory=dict)
+
+    # P0: Décimation Coinbase L2 (Hz)
+    coinbase_l2_max_hz: float = 20.0
+    # P0: Décimation Bybit L2 (Hz)
+    bybit_l2_max_hz: float = 20.0
+
 # --- Watchdogs ---
+@dataclass
+class LHMWatchdogCfg:
+    LHM_SLO_PIPELINE_LAG_MAX_SECONDS_TARGET: float = 5.0
+    LHM_SLO_DROPPED_TRADES_BUDGET: float = 0.0
+
 @dataclass
 class WatchdogCfg:
     interval_s: float = 2.0
@@ -419,6 +490,16 @@ class WatchdogCfg:
     persistence_cycles: int = 3
     notify_only_default: bool = True
 
+    # Champs pour CentralWatchdog (CWConfig)
+    mode: str = "MANUAL"
+    dedup_ttl_s: int = 10
+    rate_limit_rps: float = 1.0
+    rate_burst: int = 5
+    reminder_every_s: int = 300
+    status_history_size: int = 500
+    lhm: LHMWatchdogCfg = field(default_factory=LHMWatchdogCfg)
+
+    # Watchdogs individuels
     router_interval_s: float = 2.0
     router_health_stale_ms: int = 1300
     router_health_min_coverage_ratio: float = 0.80
@@ -754,6 +835,16 @@ class RiskManagerCfg:
         "USDC": {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
         "EUR":  {"TT":0.60, "TM":0.35, "MM":0.00, "REB":0.05},
     })
+    # --- SPLIT (EU/US) : thresholds & caps ---
+    # Utilisé par le RM pour détecter une dérive SPLIT (latence/skew/stale) et appliquer une pénalité/cutover.
+    split_breach_thr_base_ms: float = 180.0
+    split_breach_thr_skew_ms: float = 40.0
+    split_breach_thr_stale_ms: float = 1300.0
+    split_breach_min_s: float = 3.0
+    split_fallback_cooldown_s: float = 60.0
+    split_restore_stable_s: float = 20.0
+    split_penalty_bps_max: float = 6.0
+
 
 
 
@@ -763,11 +854,11 @@ class RiskManagerCfg:
 
     # Inflight globaux "trading" (TT + TM + MM), par profil de capital.
     inflight_trading_by_profile: Dict[str, int] = field(default_factory=lambda: {
-        "NANO": 2,
-        "MICRO": 4,
-        "SMALL": 8,
-        "MID": 16,
-        "LARGE": 32,
+        "NANO": 5,
+        "MICRO": 8,
+        "SMALL": 12,
+        "MID": 24,
+        "LARGE": 48,
     })
 
     # Répartition des caps par branche TRADING (TT/TM/MM) pour chaque profil.
@@ -775,15 +866,15 @@ class RiskManagerCfg:
     #   TT_cap + TM_cap + MM_cap <= inflight_trading_by_profile[profile]
     caps_trading_by_profile: Dict[str, Dict[str, int]] = field(default_factory=lambda: {
         # NANO : 2 inflights globaux => TT=1, TM=1, MM=0 (MM désactivé en bootstrap)
-        "NANO":  {"TT": 1, "TM": 1, "MM": 0},
+        "NANO":  {"TT": 2, "TM": 2, "MM": 1},
         # MICRO : 4 inflights globaux => TT=2, TM=1, MM=1
-        "MICRO": {"TT": 2, "TM": 1, "MM": 1},
+        "MICRO": {"TT": 3, "TM": 3, "MM": 2},
         # SMALL : 8 inflights globaux => TT=3, TM=3, MM=1
-        "SMALL": {"TT": 3, "TM": 3, "MM": 1},
+        "SMALL": {"TT": 5, "TM": 5, "MM": 2},
         # MID : 16 inflights globaux => TT=6, TM=5, MM=3
-        "MID":   {"TT": 6, "TM": 5, "MM": 3},
+        "MID":   {"TT": 10, "TM": 10, "MM": 4},
         # LARGE : 32 inflights globaux => TT=12, TM=10, MM=6
-        "LARGE": {"TT": 12, "TM": 10, "MM": 6},
+        "LARGE": {"TT": 20, "TM": 20, "MM": 8},
     })
 
     # Caps REB — nombre de bundles de rebalancing simultanés par profil.
@@ -801,6 +892,14 @@ class RiskManagerCfg:
     mbf_glue_stop_timeout_s: float = 1.0
     shutdown_dump_task_stacks: bool = True
     shutdown_stack_limit: int = 10
+    rm_capital_move_threshold_usdc: float = 50.0
+    rm_capital_move_refresh_max_delay_s: float = 300.0
+    rm_capital_move_refresh_mode: str = "AUTO"
+    rm_capital_drift_threshold_pct: float = 0.05
+    rm_ws_balance_resync_min_interval_s: float = 60.0
+    rebal_lock_ttl_s: float = 15.0
+    inv_soft_drift_pct: float = 1.5
+    inv_hard_drift_pct: float = 5.0
 
     # Readiness / callbacks
     trading_ready_require_scanner_hook: bool = False
@@ -811,7 +910,7 @@ class RiskManagerCfg:
     # Config audit
     audit_config_on_start: bool = True
     strict_config: bool = False
-    ff_fail_closed_caps: bool = False
+    ff_fail_closed_caps: bool = True
     ff_enforce_preemption: bool = False
     ff_hedge_fast_lane: bool = False
     ff_tm_enabled: bool = False
@@ -923,6 +1022,19 @@ class RiskManagerCfg:
     mm_min_p_both: float = 0.0
     mm_min_net_bps: float = 0.0005
     mm_hedge_cost_bps: float = 5.0
+
+    # -- MM MONO (Mono-CEX) --
+    mm_mono_alias_name: str = "MM_MONO"
+    mm_mono_reb_inventory_soft_pct: float = 5.0
+    mm_mono_reb_inventory_hard_pct: float = 15.0
+    mm_mono_reb_inventory_critical_pct: float = 25.0
+
+    # -- MM CROSS (Cross-CEX) --
+    mm_cross_alias_name: str = "MM_CROSS"
+    mm_cross_reb_inventory_soft_pct: float = 5.0
+    mm_cross_reb_inventory_hard_pct: float = 12.0
+    mm_cross_reb_inventory_critical_pct: float = 20.0
+
     mm_delta_soft_usd: float = 2000.0
     mm_delta_hard_usd: float = 5000.0
     mm_delta_by_asset: Dict[str, Dict] = field(default_factory=dict)
@@ -1049,6 +1161,9 @@ class SimulatorCfg:
     sim_prime_multibucket_k: int = 3
     sim_book_fingerprint_mode: str = "TOP_AND_SUMMARY"
     sim_book_fingerprint_levels: int = 5
+    sim_timeout_each_s: float = 1.2
+    sim_cb_coalescing_ms: float = 10.0
+    sim_split_mode: str = "EU_ONLY"
     sim_mm_hints_interval_ms: int = 500
     sim_mm_hints_levels: int = 5
     sim_outputs_required_by_branch: Dict[str, List[str]] = field(default_factory=lambda: {
@@ -1117,8 +1232,11 @@ class EnginePacerKnobs:
             "drain_sev": 240.0,
         },
     })
+
+@dataclass
 class EngineCfg:
     pacer_min_ms: int = 2
+    pacer_init_ms: int = 0
     pacer_max_ms: int = 25
     pacer_jitter_ms: int = 2
     # Pacer : cibles régionales *strictement* bornées par les caps RM/Engine (down-clamp only).
@@ -1188,11 +1306,12 @@ class EngineCfg:
     )
 
     tt_max_skew_ms: int = 35
+    tt_max_drift_bps: float = 10.0
     order_timeout_s: int = 3
     http_timeout_s: float = 5.0
     idempotency_ttl_s: float = 60.0
     ff_enforce_client_oid_deterministic: bool = False
-    ff_fail_closed_idempotence: bool = False
+    ff_fail_closed_idempotence: bool = True
     idempotence_on: bool = True
     ff_hedge_fast_lane: bool = False
     ff_enforce_preemption: bool = False
@@ -1214,6 +1333,7 @@ class EngineCfg:
     maker_pad_ticks: int = 2
     tm_max_open_makers: int = 3
 
+    frontload_enabled: bool = True
     frontload_weights: List[float] = field(default_factory=lambda: [0.50,0.35,0.15])
     frontload_group_size: int = 3
     min_fragment_quote: Dict[str,float] = field(default_factory=lambda: {"USDC":200.0, "EUR":200.0})
@@ -1222,15 +1342,91 @@ class EngineCfg:
     anchor_halve_guard_ms: int = 300
     max_price_deviation_pct: float = 0.50
 
-    mm_hysteresis_s: float = 0.600
+    mm_hysteresis_ms: int = 600
+    mm_ttl_ms: int = 2200
     mm_min_quote_lifetime_ms: int = 400
+    mm_allow_auto_hedge: bool = False
+    mm_hedge_schedule: List[float] = field(default_factory=lambda: [0.33, 0.66, 1.0])
+    mm_use_progressive_hedge: bool = False
+    mm_hedge_final_ratio: float = 1.0
+    mm_dual_engine_enabled: bool = True
+    mm_single_inventory_enabled: bool = True
+    mm_scale_on_tt_tm: float = 0.6
+    mm_pad_boost_on_tt_tm: int = 1
+    mm_place_rate_limit_per_pair: int = 10
+    mm_cancel_rate_limit_per_pair: int = 20
+    mm_cancel_budget_per_pair_min: int = 60
+    mm_cancel_budget_exhausted_penalty_lifetime_mult: float = 2.0
+    mm_cancel_budget_exhausted_penalty_pad_ticks: int = 2
+    mm_cross_ttl_ms: int = 3000
+    mm_cross_hedge_schedule: List[float] = field(default_factory=lambda: [0.5, 1.0])
+    mm_cross_panic_after_ms: int = 5000
+    mm_cross_defensive_pad_ticks: int = 3
+    mm_cross_defensive_lifetime_mult: float = 1.5
+    mm_cross_429_threshold: float = 0.05
+    mm_variants: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     vol_soft_cap_bps: float = 45.0
     vol_hard_cap_bps: float = 80.0
     freeze_tm_on_vol: bool = True
+    freeze_mm_on_vol: bool = True
     depth_min_quote_tt: float = 200.0
     depth_min_quote_tm: float = 500.0
     depth_min_quote_mm: float = 1000.0
     depth_levels_check: int = 3
+    shallow_book_blocks_tm: bool = True
+    shallow_book_blocks_mm: bool = True
+
+    # TT Policy
+    tt_policy_version: str = "v1"
+    tt_submit_mode: str = "adaptive"
+    tt_tif_policy: str = "IOC"
+    tt_tif_last_slice: str = "FOK"
+    tt_ack_p95_staggered_threshold_ms: float = 150.0
+    tt_stop_edge_floor_bps: float = -100.0
+    tt_ack_slo_ms: float = 1000.0
+    tt_time_budget_ms: float = 5000.0
+    tt_require_private_ws_healthy: bool = True
+    tt_max_router_age_ms: float = 5000.0
+    tt_max_book_age_ms: float = 5000.0
+    tt_private_ws_max_lag_ms: float = 2000.0
+    tt_group_concurrency_by_pacer: Dict[str, int] = field(default_factory=lambda: {"NORMAL": 3, "CONSTRAINED": 1, "SEVERE": 1})
+
+    # TM Policy
+    tm_policy_version: str = "v1"
+    tm_quote_lifetime_min_ms: float = 500.0
+    tm_ladder_levels: int = 1
+    tm_ladder_step_ticks: float = 1.0
+    tm_replace_drift_ticks: float = 2.0
+    tm_replace_max_age_ms: int = 2500
+    tm_replace_budget: int = 10
+    tm_cancel_budget: int = 10
+    tm_retry_budget: int = 3
+    tm_time_budget_ms: float = 5000.0
+    tm_qpos_fail_mode: str = "block"
+    tm_qpos_guard_hysteresis_ms: int = 1000
+    tm_qpos_guard_release_ratio: float = 0.8
+    tm_panic_trigger_ack_p95_ms: float = 500.0
+    tm_panic_hedge_ratio: float = 1.1
+    tm_panic_hedge_ttl_ms: int = 500
+    tm_vol_cap_bps: float = 500.0
+    tm_stop_edge_floor_bps_delta: float = -100.0
+    tm_require_private_ws_healthy: bool = True
+    tm_fallback_mode: str = "ioc_only"
+    tm_hedge_order_type: str = "IOC"
+    tm_revalidate_before_place: bool = True
+    tm_revalidate_every_s: float = 0.0
+    tm_maker_order_type: str = "GTC_POSTONLY"
+    tm_spiral_breaker_429: bool = True
+
+    # MM Policy
+    mm_policy_version: str = "v1"
+    mm_require_private_ws_healthy: bool = True
+    mm_pad_ticks_base: float = 1.0
+    mm_size_factor_base: float = 1.0
+    mm_requote_min_ticks: float = 1.0
+    mm_min_net_bps: float = 5.0
+    mm_qpos_max_ahead_usd: float = 10000.0
+
     price_band_bps_floor: float = 15.0
     price_band_bps_cap: float = 50.0
     vol_price_band_k: float = 0.6
@@ -1240,6 +1436,9 @@ class EngineCfg:
     circuit_mute_max_s: float = 900.0
     circuit_mute_s_tm: float = 300.0
     circuit_mute_s_mm: float = 300.0
+    ready_autoset_on_start: bool = False
+    ready_poll_every_s: float = 2.0
+    require_private_ws_in_dry_run: bool = False
 
 # --- Private WS Hub ---
 @dataclass
@@ -1253,9 +1452,18 @@ class PrivateWSHubCfg:
     ff_pws_strict_dedup_enforced: bool = False
     ff_pws_disable_auto_wiring_prod: bool = True
     pws_drop_policy: str = "DROP_NEW"  # DROP_NEW | DROP_OLDEST
+    PWS_CONNECT_TIMEOUT_S: int = 10
+    PWS_READ_TIMEOUT_S: int = 30
     PWS_PING_INTERVAL_S: int = 20
     PWS_PONG_TIMEOUT_S: int = 10
     PWS_HEARTBEAT_MAX_GAP_S: int = 30
+    
+    # NEW: Parité de connexion par exchange pour WS privés
+    connect_timeout_s_by_ex: Dict[str, int] = field(default_factory=dict)
+    read_timeout_s_by_ex: Dict[str, int] = field(default_factory=dict)
+    ping_interval_s_by_ex: Dict[str, int] = field(default_factory=dict)
+    pong_timeout_s_by_ex: Dict[str, int] = field(default_factory=dict)
+
     PWS_STABLE_RESET_S: int = 30
     PWS_JITTER_MS: int = 2
     PWS_BACKOFF_BASE_MS: int = 500
@@ -1276,6 +1484,8 @@ class RebalancingCfg:
     # Utilisé par le chantier M6-B (REB via hints, RM → Simu → Engine)
     rebal_quantum_min_quote: float = 50.0
     rebal_internal_transfer_threshold: float = 250.0
+    # Seuil de cash minimal par quote avant déclenchement rebalançage intra-CEX
+    rebal_min_cash_per_quote: Dict[str, float] = field(default_factory=lambda: {"USDC": 1000.0, "EUR": 1000.0})
     # Cadence REB max (opérations/min). Doit rester bornée par inflight_rebal
     # multiplié par un ratio simple (cf. _sanity_check_rm_caps, ratio=3 par défaut).
     rebal_max_ops_per_min: int = 6
@@ -1324,6 +1534,12 @@ class BalanceFetcherCfg:
     ENABLE_WS_BALANCE_MERGE: bool = False
     ws_reco_miss_rate_thr_per_min: float = 30.0
     ws_reco_resync_age_thr_s: float = 6 * 3600.0
+    reco_miss_burst_threshold: int = 5
+    reco_miss_recent_threshold: int = 5
+    reco_alias_resync_max_age_s: float = 6 * 3600.0
+    # Readiness: état minimal exigé pour considérer le BalanceFetcher “READY”.
+    # Les valeurs usuelles dans la stack: UNKNOWN < DEGRADED < READY.
+    balances_ready_min_state: str = "DEGRADED"
 
 
 # --- Slippage Handler ---
@@ -1487,7 +1703,7 @@ class LoggerCfg:
     LHM_DROP_WHEN_FULL: bool = False
     LHM_HIGH_WATERMARK_RATIO: float = 0.85
     LHM_MAX_QUEUE_PLATEAU_S: int = 3
-    ff_fail_closed_logging: bool = False
+    ff_fail_closed_logging: bool = True
     ff_logging_critical_streams: List[str] = field(default_factory=lambda: [
         "trade_fsm",
         "private_plane",
@@ -1500,7 +1716,7 @@ class LoggerCfg:
         "trades",
     ])
     ff_truth_model_enabled: bool = False
-    ff_truth_fail_closed: bool = False
+    ff_truth_fail_closed: bool = True
     LHM_MM_SAMPLING_QUOTES: float = 0.05
     LHM_MM_SAMPLING_CANCELS: float = 0.02
     LHM_DROP_LOG_SAMPLE_RATE: float = 0.1
@@ -1714,10 +1930,6 @@ class BotConfig:
             return "EU_ONLY"
         return str(val).upper()
 
-        val = getattr(self.g, "deployment_mode", "EU_ONLY")
-        if not val:
-            return "EU_ONLY"
-        return str(val).upper()
 
     @property
     def telegram(self) -> TelegramCfg:
@@ -1808,13 +2020,16 @@ class BotConfig:
         g.min_usdc = _Env.get_float("MIN_USDC", g.min_usdc)
         g.wallet_alias_by_quote = _Env.get_dict("WALLET_ALIAS_BY_QUOTE", g.wallet_alias_by_quote)
         g.min_notional_by_exchange_quote = _Env.get_dict("MIN_NOTIONAL_BY_EXCHANGE_QUOTE", g.min_notional_by_exchange_quote)
+        g.frontload_enabled = _Env.get_bool("FRONTLOAD_ENABLED", getattr(g, "frontload_enabled", True))
         _enable_branches_env = _Env.get("ENABLE_BRANCHES", None)
         g.enable_branches = _Env.get_dict("ENABLE_BRANCHES", g.enable_branches)
         g.branch_priority = _Env.get_list("BRANCH_PRIORITY", g.branch_priority)
         g.branch_budgets_quote = _Env.get_dict("BRANCH_BUDGETS_QUOTE", g.branch_budgets_quote)
 
         g.frontload_weights = [float(x) for x in _Env.get_list("FRONTLOAD_WEIGHTS", g.frontload_weights)]
-        g.min_fragment_quote = {k: float(v) for k,v in _Env.get_dict("MIN_FRAGMENT_QUOTE", g.min_fragment_quote).items()}
+        env_min_frag = _Env.get_dict("MIN_FRAGMENT_QUOTE", None)
+        if env_min_frag:
+            g.min_fragment_quote = {str(k).upper(): float(v) for k, v in env_min_frag.items()}
         g.guards = _Env.get_dict("GUARDS", g.guards)
         _vol_slip_ttl_env = _Env.get("VOL_SLIP_TTL", None)
 
@@ -1843,6 +2058,21 @@ class BotConfig:
         )
 
         g.ac = _Env.get_dict("AC_CONFIG", g.ac)
+        # Overrides individuels Anti-Crossing
+        g.ac["enabled"] = _Env.get_bool("AC_ENABLED", g.ac.get("enabled", True))
+        g.ac["band_width_ticks"] = _Env.get_int("AC_BAND_WIDTH_TICKS", g.ac.get("band_width_ticks", 1))
+        g.ac["ttl_ms"] = _Env.get_float("AC_TTL_MS", g.ac.get("ttl_ms", 200.0))
+        g.ac["ttl_ms_binance"] = _Env.get_float("AC_TTL_MS_BINANCE", g.ac.get("ttl_ms_binance", g.ac["ttl_ms"]))
+        g.ac["ttl_ms_bybit"] = _Env.get_float("AC_TTL_MS_BYBIT", g.ac.get("ttl_ms_bybit", g.ac["ttl_ms"]))
+        g.ac["ttl_ms_coinbase"] = _Env.get_float("AC_TTL_MS_COINBASE", g.ac.get("ttl_ms_coinbase", g.ac["ttl_ms"]))
+        g.ac["strategy_tm"] = _Env.get("AC_STRATEGY_TM", g.ac.get("strategy_tm", "reprice"))
+        g.ac["strategy_mm"] = _Env.get("AC_STRATEGY_MM", g.ac.get("strategy_mm", "delay"))
+        g.ac["reprice_ticks_tm"] = _Env.get_int("AC_REPRICE_TICKS_TM", g.ac.get("reprice_ticks_tm", 1))
+        g.ac["reprice_ticks_mm"] = _Env.get_int("AC_REPRICE_TICKS_MM", g.ac.get("reprice_ticks_mm", 1))
+        g.ac["delay_ms_tm"] = _Env.get_float("AC_DELAY_MS_TM", g.ac.get("delay_ms_tm", 60.0))
+        g.ac["delay_ms_mm"] = _Env.get_float("AC_DELAY_MS_MM", g.ac.get("delay_ms_mm", 90.0))
+        g.ac["pods_coord_url"] = _Env.get("PODS_COORD_URL", g.ac.get("pods_coord_url"))
+        g.ac["pods_coord_namespace"] = _Env.get("PODS_COORD_NAMESPACE", g.ac.get("pods_coord_namespace", "ac"))
         g.mode = _Env.get("MODE", g.mode)
         g.live_trading_armed = _Env.get_bool("LIVE_TRADING_ARMED", g.live_trading_armed)
         g.restart_mode = _Env.get("RESTART_MODE", g.restart_mode)
@@ -1862,6 +2092,9 @@ class BotConfig:
         g.full_restart_cap_per_hour = _get_int_opt("FULL_RESTART_CAP_PER_HOUR", g.full_restart_cap_per_hour)
         g.full_restart_cooldown_s = _get_int_opt("FULL_RESTART_COOLDOWN_S", g.full_restart_cooldown_s)
         g.full_restart_mute_s = _get_int_opt("FULL_RESTART_MUTE_S", g.full_restart_mute_s)
+        g.restart_escalate_after_fails = _Env.get_int("RESTART_ESCALATE_AFTER_FAILS", g.restart_escalate_after_fails)
+        g.restart_escalate_delay_s = _Env.get_float("RESTART_ESCALATE_DELAY_S", g.restart_escalate_delay_s)
+        g.restart_max_downtime_s = _Env.get_float("RESTART_MAX_DOWNTIME_S", g.restart_max_downtime_s)
 
         # 👇 Ajoute ce bloc de compat
         if str(g.mode).upper() in ("DEV", "DEVELOPMENT"):
@@ -1908,6 +2141,14 @@ class BotConfig:
         g.pod_region = str(g.pod_region or "EU").upper()
         g.deployment_mode = str(g.deployment_mode or "SPLIT").upper()
         g.feature_switches = _Env.get_dict("FEATURE_SWITCHES", g.feature_switches)
+        g.log_dir = _Env.get("LOG_DIR", g.log_dir)
+        g.history_dir = _Env.get("HISTORY_DIR", g.history_dir)
+        g.rm_capital_move_threshold_usdc = _Env.get_float("RM_CAPITAL_MOVE_THRESHOLD_USDC", cfg.rm.rm_capital_move_threshold_usdc)
+        g.rm_capital_move_refresh_max_delay_s = _Env.get_float("RM_CAPITAL_MOVE_REFRESH_MAX_DELAY_S", cfg.rm.rm_capital_move_refresh_max_delay_s)
+        g.rm_capital_move_refresh_mode = _Env.get("RM_CAPITAL_MOVE_REFRESH_MODE", cfg.rm.rm_capital_move_refresh_mode)
+        g.rm_capital_drift_threshold_pct = _Env.get_float("RM_CAPITAL_DRIFT_THRESHOLD_PCT", cfg.rm.rm_capital_drift_threshold_pct)
+        g.rm_ws_balance_resync_min_interval_s = _Env.get_float("RM_WS_BALANCE_RESYNC_MIN_INTERVAL_S", cfg.rm.rm_ws_balance_resync_min_interval_s)
+        cfg.rm.rebal_lock_ttl_s = _Env.get_float("REBAL_LOCK_TTL_S", cfg.rm.rebal_lock_ttl_s)
         # --- Observabilité / Alerting ---
         cfg.obs.strict_obs = _Env.get_bool("STRICT_OBS", cfg.obs.strict_obs)
         cfg.obs.log_level = _Env.get("LOG_LEVEL", cfg.obs.log_level)
@@ -1917,25 +2158,38 @@ class BotConfig:
         )
         cfg.obs.enable_obs_port = _Env.get_bool("OBS_ENABLE_9108", cfg.obs.enable_obs_port)
         cfg.obs.obs_port = _Env.get_int("OBS_PORT", cfg.obs.obs_port)
+
+        # Latency Tracing
+        cfg.obs.enable_latency_tracing = _Env.get_bool("ENABLE_LATENCY_TRACING", cfg.obs.enable_latency_tracing)
+        cfg.obs.latency_sampling_rate = _Env.get_float("LATENCY_SAMPLING_RATE", cfg.obs.latency_sampling_rate)
+        cfg.obs.enable_segment_metrics_router = _Env.get_bool("ENABLE_SEGMENT_METRICS_ROUTER", cfg.obs.enable_segment_metrics_router)
+        cfg.obs.enable_segment_metrics_scanner = _Env.get_bool("ENABLE_SEGMENT_METRICS_SCANNER", cfg.obs.enable_segment_metrics_scanner)
+        cfg.obs.enable_segment_metrics_rm = _Env.get_bool("ENABLE_SEGMENT_METRICS_RM", cfg.obs.enable_segment_metrics_rm)
+        cfg.obs.enable_segment_metrics_engine = _Env.get_bool("ENABLE_SEGMENT_METRICS_ENGINE", cfg.obs.enable_segment_metrics_engine)
         cfg.boot.scanner_proxy_mode = _Env.get("BOOT_SCANNER_PROXY_MODE", cfg.boot.scanner_proxy_mode)
         cfg.boot.scanner_proxy_buffer_maxlen = _Env.get_int(
             "BOOT_SCANNER_PROXY_BUFFER_MAXLEN", cfg.boot.scanner_proxy_buffer_maxlen
         )
 
+        cfg.alerting.telegram.enabled = _Env.get_bool("TELEGRAM_ENABLE", cfg.alerting.telegram.enabled)
         cfg.alerting.telegram.bot_token = _Env.get("TELEGRAM_BOT_TOKEN", cfg.alerting.telegram.bot_token)
+        if not cfg.alerting.telegram.bot_token:
+            cfg.alerting.telegram.enabled = False
+            logging.getLogger(__name__).info("Telegram désactivé (TOKEN manquant)")
         cfg.alerting.telegram.allowed_user_ids = [
             int(x)
             for x in _Env.get_list("TELEGRAM_ALLOWED_USER_IDS", cfg.alerting.telegram.allowed_user_ids)
             if str(x).strip()
         ]
+        _generic_chat_id = _Env.get("TELEGRAM_CHAT_ID", None)
         cfg.alerting.telegram.chat_id_info = _Env.get(
-            "TELEGRAM_CHAT_ID_INFO", cfg.alerting.telegram.chat_id_info
+            "TELEGRAM_CHAT_ID_INFO", cfg.alerting.telegram.chat_id_info or _generic_chat_id
         )
         cfg.alerting.telegram.chat_id_warn = _Env.get(
-            "TELEGRAM_CHAT_ID_WARN", cfg.alerting.telegram.chat_id_warn
+            "TELEGRAM_CHAT_ID_WARN", cfg.alerting.telegram.chat_id_warn or _generic_chat_id
         )
         cfg.alerting.telegram.chat_id_crit = _Env.get(
-            "TELEGRAM_CHAT_ID_CRIT", cfg.alerting.telegram.chat_id_crit
+            "TELEGRAM_CHAT_ID_CRIT", cfg.alerting.telegram.chat_id_crit or _generic_chat_id
         )
         cfg.alerting.telegram.ack_pin = _Env.get("TELEGRAM_ACK_PIN", cfg.alerting.telegram.ack_pin)
         cfg.alerting.telegram.require_ack = _Env.get_bool(
@@ -2037,6 +2291,26 @@ class BotConfig:
             "WS_DISABLED_EXCHANGES", cfg.ws_public.disabled_exchanges
         )
         cfg.ws_public.read_timeout_s = _Env.get_int("WS_READ_TIMEOUT_S", cfg.ws_public.read_timeout_s)
+        cfg.ws_public.coinbase_l2_max_hz = _Env.get_float(
+            "COINBASE_L2_MAX_HZ", cfg.ws_public.coinbase_l2_max_hz
+        )
+        cfg.ws_public.bybit_l2_max_hz = _Env.get_float(
+            "BYBIT_L2_MAX_HZ", cfg.ws_public.bybit_l2_max_hz
+        )
+
+        # NEW: Parité de connexion par exchange (BINANCE_WS_CONNECT_TIMEOUT_S, etc.)
+        for ex in ["BINANCE", "BYBIT", "COINBASE"]:
+            v_conn = _Env.get_int(f"{ex}_WS_CONNECT_TIMEOUT_S", None)
+            if v_conn is not None: cfg.ws_public.connect_timeout_s_by_ex[ex] = v_conn
+            
+            v_read = _Env.get_int(f"{ex}_WS_READ_TIMEOUT_S", None)
+            if v_read is not None: cfg.ws_public.read_timeout_s_by_ex[ex] = v_read
+            
+            v_ping = _Env.get_int(f"{ex}_WS_PING_INTERVAL_S", None)
+            if v_ping is not None: cfg.ws_public.ping_interval_s_by_ex[ex] = v_ping
+            
+            v_pong = _Env.get_int(f"{ex}_WS_PONG_TIMEOUT_S", None)
+            if v_pong is not None: cfg.ws_public.pong_timeout_s_by_ex[ex] = v_pong
         # Budget journalier par stratégie (en quote, ex: {"TT": 1_000_000, "TM": 500_000})
         cfg.rm.daily_strategy_budget_quote = _Env.get_dict(
             "DAILY_STRATEGY_BUDGET_QUOTE", cfg.rm.daily_strategy_budget_quote
@@ -2316,8 +2590,11 @@ class BotConfig:
             "DISCOVERY_MIN_QUOTE_VOLUME_EUR",
             cfg.discovery.min_quote_volume_eur
         )
-        # --- Discovery toggles & liste ---
+        # Discovery : Quotes autorisées (USDC, USDT, EUR)
+        cfg.discovery.quotes_allowed = _Env.get_list("DISCOVERY_QUOTES", ["USDC", "USDT", "EUR"])
         cfg.discovery.enabled = _Env.get_bool("DISCOVERY_ENABLED", cfg.discovery.enabled)
+        cfg.discovery.top_n = _Env.get_int("DISCOVERY_TOP_N", cfg.discovery.top_n)
+        cfg.discovery.min_24h_volume_usd = _Env.get_float("DISCOVERY_MIN_24H_VOLUME_USD", cfg.discovery.min_24h_volume_usd)
         cfg.discovery.whitelist = _Env.get_list("DISCOVERY_WHITELIST", cfg.discovery.whitelist)
         cfg.discovery.blacklist = _Env.get_list("DISCOVERY_BLACKLIST", cfg.discovery.blacklist)
         # soglie per-quote (opzionali)
@@ -2358,7 +2635,6 @@ class BotConfig:
         if inv is None:
             inv = getattr(cfg.rm, "inventory_cap_quote", 1500.0)
         cfg.rm.inventory_cap_quote = float(inv)
-        setattr(cfg, "inventory_cap_quote", cfg.rm.inventory_cap_quote)
 
         buf = _float_or_none("MIN_BUFFER_QUOTE")
         if buf is None:
@@ -2366,7 +2642,6 @@ class BotConfig:
         if buf is None:
             buf = getattr(cfg.rm, "min_buffer_quote", 0.0)
         cfg.rm.min_buffer_quote = float(buf)
-        setattr(cfg, "min_buffer_quote", cfg.rm.min_buffer_quote)
         # TTL balances par alias (OK / DEGRADED / BLOCKED)
         cfg.rm.balance_ttl_s_normal = _Env.get_float(
             "RM_BALANCE_TTL_S_NORMAL",
@@ -2380,6 +2655,8 @@ class BotConfig:
             "RM_BALANCE_TTL_S_BLOCK",
             getattr(cfg.rm, "balance_ttl_s_block", 600.0),
         )
+        cfg.rm.inv_soft_drift_pct = _Env.get_float("INV_SOFT_DRIFT_PCT", cfg.rm.inv_soft_drift_pct)
+        cfg.rm.inv_hard_drift_pct = _Env.get_float("INV_HARD_DRIFT_PCT", cfg.rm.inv_hard_drift_pct)
         policy_raw = _Env.get(
             "RM_BALANCE_UNKNOWN_POLICY",
             getattr(cfg.rm, "balance_unknown_policy", "DEGRADED"),
@@ -2398,19 +2675,6 @@ class BotConfig:
         )
         if isinstance(retry_policy, dict):
             cfg.rm.transfer_retry_policy = retry_policy
-        # Compat racine + aliases legacy
-        cfg.RM_BALANCE_TTL_S_NORMAL = cfg.rm.balance_ttl_s_normal
-        cfg.RM_BALANCE_TTL_S_DEGRADED = cfg.rm.balance_ttl_s_degraded
-        cfg.RM_BALANCE_TTL_S_BLOCK = cfg.rm.balance_ttl_s_block
-        cfg.RM_BALANCE_UNKNOWN_POLICY = cfg.rm.balance_unknown_policy
-        cfg.TRANSFER_SUBMITTED_TIMEOUT_S = cfg.rm.transfer_submitted_timeout_s
-        cfg.TRANSFER_RETRY_POLICY = cfg.rm.transfer_retry_policy
-        setattr(cfg.rm, "RM_BALANCE_TTL_S_NORMAL", cfg.rm.balance_ttl_s_normal)
-        setattr(cfg.rm, "RM_BALANCE_TTL_S_DEGRADED", cfg.rm.balance_ttl_s_degraded)
-        setattr(cfg.rm, "RM_BALANCE_TTL_S_BLOCK", cfg.rm.balance_ttl_s_block)
-        setattr(cfg.rm, "RM_BALANCE_UNKNOWN_POLICY", cfg.rm.balance_unknown_policy)
-        setattr(cfg.rm, "TRANSFER_SUBMITTED_TIMEOUT_S", cfg.rm.transfer_submitted_timeout_s)
-        setattr(cfg.rm, "TRANSFER_RETRY_POLICY", cfg.rm.transfer_retry_policy)
 
 
         # Alias critiques (accélération des modes SEVERE)
@@ -2641,26 +2905,30 @@ class BotConfig:
                     "ENGINE_PACER_TARGETS region %s ignored (unknown tag)", region
                 )
         cfg.engine.pacer_targets = pacer_targets_canon
-        cfg.rm.split_breach_thr_base_ms = _Env.get_float(
-            "RM_SPLIT_BREACH_THR_BASE_MS", cfg.rm.split_breach_thr_base_ms
+
+        # --- SPLIT breach knobs (CORRECT: écrire dans rm_knobs, pas dans cfg.rm) ---
+        rm_knobs = cfg.rm.switch_knobs
+
+        rm_knobs.split_breach_thr_base_ms = _Env.get_float(
+            "RM_SPLIT_BREACH_THR_BASE_MS", rm_knobs.split_breach_thr_base_ms
         )
-        cfg.rm.split_breach_thr_skew_ms = _Env.get_float(
-            "RM_SPLIT_BREACH_THR_SKEW_MS", cfg.rm.split_breach_thr_skew_ms
+        rm_knobs.split_breach_thr_skew_ms = _Env.get_float(
+            "RM_SPLIT_BREACH_THR_SKEW_MS", rm_knobs.split_breach_thr_skew_ms
         )
-        cfg.rm.split_breach_thr_stale_ms = _Env.get_float(
-            "RM_SPLIT_BREACH_THR_STALE_MS", cfg.rm.split_breach_thr_stale_ms
+        rm_knobs.split_breach_thr_stale_ms = _Env.get_float(
+            "RM_SPLIT_BREACH_THR_STALE_MS", rm_knobs.split_breach_thr_stale_ms
         )
-        cfg.rm.split_breach_min_s = _Env.get_float(
-            "RM_SPLIT_BREACH_MIN_S", cfg.rm.split_breach_min_s
+        rm_knobs.split_breach_min_s = _Env.get_float(
+            "RM_SPLIT_BREACH_MIN_S", rm_knobs.split_breach_min_s
         )
-        cfg.rm.split_fallback_cooldown_s = _Env.get_float(
-            "RM_SPLIT_FALLBACK_COOLDOWN_S", cfg.rm.split_fallback_cooldown_s
+        rm_knobs.split_fallback_cooldown_s = _Env.get_float(
+            "RM_SPLIT_FALLBACK_COOLDOWN_S", rm_knobs.split_fallback_cooldown_s
         )
-        cfg.rm.split_restore_stable_s = _Env.get_float(
-            "RM_SPLIT_RESTORE_STABLE_S", cfg.rm.split_restore_stable_s
+        rm_knobs.split_restore_stable_s = _Env.get_float(
+            "RM_SPLIT_RESTORE_STABLE_S", rm_knobs.split_restore_stable_s
         )
-        cfg.rm.split_penalty_bps_max = _Env.get_float(
-            "RM_SPLIT_PENALTY_BPS_MAX", cfg.rm.split_penalty_bps_max
+        rm_knobs.split_penalty_bps_max = _Env.get_float(
+            "RM_SPLIT_PENALTY_BPS_MAX", rm_knobs.split_penalty_bps_max
         )
 
         # Profils de sécurité pour les flows (optionnel, sert de carte de priorisation)
@@ -2817,6 +3085,15 @@ class BotConfig:
                 v = float(cfg.SCANNER_GLOBAL_EVAL_HZ)
             except Exception:
                 v = float(getattr(sc, "scanner_global_eval_hz", 200.0))
+            
+            # Clamp et Warning pour HZ absurde (Macro 7-Diagnostic)
+            # Un HZ > 100k est souvent une erreur de config ou va saturer un seul coeur CPU
+            if v > 100000:
+                logging.getLogger(__name__).warning(
+                    "[Config] SCANNER_GLOBAL_EVAL_HZ=%.0f est excessivement élevé. Clamp à 100000.", v
+                )
+                v = 100000.0
+
             sc.scanner_global_eval_hz = v
             cfg.scanner_global_eval_hz = v
             cfg.SCANNER_HZ = {
@@ -2856,35 +3133,6 @@ class BotConfig:
                     except Exception:
                         pass
 
-        _legacy_branches = {
-            "tt": _Env.get("ENABLE_TT", None),
-            "tm": _Env.get("ENABLE_TM", None),
-            "mm": _Env.get("ENABLE_MM", None),
-            "reb": _Env.get("ENABLE_REB", None),
-        }
-        if any(v is not None for v in _legacy_branches.values()):
-            cfg._note_config_error("CONFIG_SCHEMA_INVALID", "enable_branches")
-            logging.getLogger(__name__).warning(
-                "Legacy ENABLE_TT/TM/MM/REB détectés; ENABLE_BRANCHES reste la source canonique",
-            )
-            if _enable_branches_env is None:
-                g.enable_branches = dict(g.enable_branches)
-                if _legacy_branches["tt"] is not None:
-                    g.enable_branches["tt"] = _Env.get_bool(
-                        "ENABLE_TT", g.enable_branches.get("tt", cfg.rm.enable_tt)
-                    )
-                if _legacy_branches["tm"] is not None:
-                    g.enable_branches["tm"] = _Env.get_bool(
-                        "ENABLE_TM", g.enable_branches.get("tm", cfg.rm.enable_tm)
-                    )
-                if _legacy_branches["mm"] is not None:
-                    g.enable_branches["mm"] = _Env.get_bool(
-                        "ENABLE_MM", g.enable_branches.get("mm", cfg.rm.enable_mm)
-                    )
-                if _legacy_branches["reb"] is not None:
-                    g.enable_branches["reb"] = _Env.get_bool(
-                        "ENABLE_REB", g.enable_branches.get("reb", cfg.rm.enable_reb)
-                    )
         cfg.rm.enable_maker_maker = _Env.get_bool("ENABLE_MAKER_MAKER", cfg.rm.enable_maker_maker)
         cfg.rm.ff_fail_closed_caps = _Env.get_bool(
             "RM_FF_FAIL_CLOSED_CAPS",
@@ -3044,14 +3292,13 @@ class BotConfig:
         if neutral_hr_env is None:
             neutral_hr_env = _Env.get_float(
                 "TM_NEUTRAL_HEDGE_RATIO",
-                getattr(cfg.rm, "tm_neutral_hedge_ratio", cfg.engine.tm_exposure_ttl_hedge_ratio),
+                getattr(cfg.rm, "tm_exposure_ttl_hedge_ratio", cfg.engine.tm_exposure_ttl_hedge_ratio),
             )
         neutral_hr = float(neutral_hr_env)
 
         # Propagation NEUTRAL (TTL hedge ratio) vers RM + Engine
         cfg.engine.tm_exposure_ttl_hedge_ratio = neutral_hr
-        setattr(cfg.rm, "tm_exposure_ttl_hedge_ratio", neutral_hr)
-        cfg.rm.tm_neutral_hedge_ratio = neutral_hr  # compat legacy
+        cfg.rm.tm_exposure_ttl_hedge_ratio = neutral_hr
 
         # NON-NEUTRAL: TM_NN_HEDGE_RATIO (canonique)
         nn_hr = _Env.get_float(
@@ -3115,6 +3362,9 @@ class BotConfig:
         cfg.sim.sim_prime_multibucket_k = _Env.get_int(
             "SIM_PRIME_MULTIBUCKET_K", cfg.sim.sim_prime_multibucket_k
         )
+        cfg.sim.sim_timeout_each_s = _Env.get_float("SIM_TIMEOUT_EACH_S", cfg.sim.sim_timeout_each_s)
+        cfg.sim.sim_cb_coalescing_ms = _Env.get_float("SIM_CB_COALESCING_MS", cfg.sim.sim_cb_coalescing_ms)
+        cfg.sim.sim_split_mode = _Env.get("SIM_SPLIT_MODE", cfg.sim.sim_split_mode)
         cfg.sim.sim_book_fingerprint_mode = str(
             _Env.get("SIM_BOOK_FINGERPRINT_MODE", cfg.sim.sim_book_fingerprint_mode)
         ).upper()
@@ -3150,8 +3400,21 @@ class BotConfig:
         )
 
         cfg.engine.tt_max_skew_ms = _Env.get_int("ENGINE_TT_MAX_SKEW_MS", cfg.engine.tt_max_skew_ms)
-        cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
-        cfg.engine.tt_max_skew_ms = _Env.get_int("ENGINE_TT_MAX_SKEW_MS", cfg.engine.tt_max_skew_ms)
+        cfg.engine.tt_max_drift_bps = _Env.get_float("ENGINE_TT_MAX_DRIFT_BPS", cfg.engine.tt_max_drift_bps)
+        cfg.engine.tt_policy_version = _Env.get("ENGINE_TT_POLICY_VERSION", cfg.engine.tt_policy_version)
+        cfg.engine.tt_submit_mode = _Env.get("ENGINE_TT_SUBMIT_MODE", cfg.engine.tt_submit_mode)
+        cfg.engine.tt_tif_policy = _Env.get("ENGINE_TT_TIF_POLICY", cfg.engine.tt_tif_policy)
+        cfg.engine.tt_tif_last_slice = _Env.get("ENGINE_TT_TIF_LAST_SLICE", cfg.engine.tt_tif_last_slice)
+        cfg.engine.tt_ack_p95_staggered_threshold_ms = _Env.get_float("ENGINE_TT_ACK_P95_STAGGERED_THRESHOLD_MS", cfg.engine.tt_ack_p95_staggered_threshold_ms)
+        cfg.engine.tt_stop_edge_floor_bps = _Env.get_float("ENGINE_TT_STOP_EDGE_FLOOR_BPS", cfg.engine.tt_stop_edge_floor_bps)
+        cfg.engine.tt_ack_slo_ms = _Env.get_float("ENGINE_TT_ACK_SLO_MS", cfg.engine.tt_ack_slo_ms)
+        cfg.engine.tt_time_budget_ms = _Env.get_float("ENGINE_TT_TIME_BUDGET_MS", cfg.engine.tt_time_budget_ms)
+        cfg.engine.tt_require_private_ws_healthy = _Env.get_bool("ENGINE_TT_REQUIRE_PRIVATE_WS_HEALTHY", cfg.engine.tt_require_private_ws_healthy)
+        cfg.engine.tt_max_router_age_ms = _Env.get_float("ENGINE_TT_MAX_ROUTER_AGE_MS", cfg.engine.tt_max_router_age_ms)
+        cfg.engine.tt_max_book_age_ms = _Env.get_float("ENGINE_TT_MAX_BOOK_AGE_MS", cfg.engine.tt_max_book_age_ms)
+        cfg.engine.tt_private_ws_max_lag_ms = _Env.get_float("ENGINE_TT_PRIVATE_WS_MAX_LAG_MS", cfg.engine.tt_private_ws_max_lag_ms)
+        cfg.engine.tt_group_concurrency_by_pacer = _Env.get_dict("ENGINE_TT_GROUP_CONCURRENCY_BY_PACER", cfg.engine.tt_group_concurrency_by_pacer)
+
         cfg.engine.order_timeout_s = _Env.get_int("ENGINE_ORDER_TIMEOUT_S", cfg.engine.order_timeout_s)
         cfg.engine.http_timeout_s = _Env.get_float("ENGINE_HTTP_TIMEOUT_S", cfg.engine.http_timeout_s)
 
@@ -3163,7 +3426,29 @@ class BotConfig:
         cfg.engine.tm_exposure_ttl_ms = ttl_ms_global
         setattr(cfg.rm, "tm_exposure_ttl_ms", ttl_ms_global)
 
-        cfg.engine.tm_queuepos_max_eta_ms = _Env.get_int("ENGINE_TM_QPOS_MAX_ETA_MS", cfg.engine.tm_queuepos_max_eta_ms)
+        cfg.engine.tm_policy_version = _Env.get("ENGINE_TM_POLICY_VERSION", cfg.engine.tm_policy_version)
+        cfg.engine.tm_quote_lifetime_min_ms = _Env.get_float("ENGINE_TM_QUOTE_LIFETIME_MIN_MS", cfg.engine.tm_quote_lifetime_min_ms)
+        cfg.engine.tm_ladder_levels = _Env.get_int("ENGINE_TM_LADDER_LEVELS", cfg.engine.tm_ladder_levels)
+        cfg.engine.tm_ladder_step_ticks = _Env.get_float("ENGINE_TM_LADDER_STEP_TICKS", cfg.engine.tm_ladder_step_ticks)
+        cfg.engine.tm_replace_drift_ticks = _Env.get_float("ENGINE_TM_REPLACE_DRIFT_TICKS", cfg.engine.tm_replace_drift_ticks)
+        cfg.engine.tm_replace_max_age_ms = _Env.get_int("ENGINE_TM_REPLACE_MAX_AGE_MS", cfg.engine.tm_replace_max_age_ms)
+        cfg.engine.tm_replace_budget = _Env.get_int("ENGINE_TM_REPLACE_BUDGET", cfg.engine.tm_replace_budget)
+        cfg.engine.tm_cancel_budget = _Env.get_int("ENGINE_TM_CANCEL_BUDGET", cfg.engine.tm_cancel_budget)
+        cfg.engine.tm_retry_budget = _Env.get_int("ENGINE_TM_RETRY_BUDGET", cfg.engine.tm_retry_budget)
+        cfg.engine.tm_time_budget_ms = _Env.get_float("ENGINE_TM_TIME_BUDGET_MS", cfg.engine.tm_time_budget_ms)
+        cfg.engine.tm_qpos_fail_mode = _Env.get("ENGINE_TM_QPOS_FAIL_MODE", cfg.engine.tm_qpos_fail_mode)
+        cfg.engine.tm_qpos_guard_hysteresis_ms = _Env.get_int("ENGINE_TM_QPOS_GUARD_HYSTERESIS_MS", cfg.engine.tm_qpos_guard_hysteresis_ms)
+        cfg.engine.tm_qpos_guard_release_ratio = _Env.get_float("ENGINE_TM_QPOS_GUARD_RELEASE_RATIO", cfg.engine.tm_qpos_guard_release_ratio)
+        cfg.engine.tm_panic_trigger_ack_p95_ms = _Env.get_float("ENGINE_TM_PANIC_TRIGGER_ACK_P95_MS", cfg.engine.tm_panic_trigger_ack_p95_ms)
+        cfg.engine.tm_panic_hedge_ratio = _Env.get_float("ENGINE_TM_PANIC_HEDGE_RATIO", cfg.engine.tm_panic_hedge_ratio)
+        cfg.engine.tm_panic_hedge_ttl_ms = _Env.get_int("ENGINE_TM_PANIC_HEDGE_TTL_MS", cfg.engine.tm_panic_hedge_ttl_ms)
+        cfg.engine.tm_stop_edge_floor_bps_delta = _Env.get_float("ENGINE_TM_STOP_EDGE_FLOOR_BPS_DELTA", cfg.engine.tm_stop_edge_floor_bps_delta)
+        cfg.engine.tm_require_private_ws_healthy = _Env.get_bool("ENGINE_TM_REQUIRE_PRIVATE_WS_HEALTHY", cfg.engine.tm_require_private_ws_healthy)
+        cfg.engine.tm_fallback_mode = _Env.get("ENGINE_TM_FALLBACK_MODE", cfg.engine.tm_fallback_mode)
+        cfg.engine.tm_hedge_order_type = _Env.get("ENGINE_TM_HEDGE_ORDER_TYPE", cfg.engine.tm_hedge_order_type)
+        cfg.engine.tm_revalidate_before_place = _Env.get_bool("ENGINE_TM_REVALIDATE_BEFORE_PLACE", cfg.engine.tm_revalidate_before_place)
+        cfg.engine.tm_maker_order_type = _Env.get("ENGINE_TM_MAKER_ORDER_TYPE", cfg.engine.tm_maker_order_type)
+        cfg.engine.tm_spiral_breaker_429 = _Env.get_bool("ENGINE_TM_SPIRAL_BREAKER_429", cfg.engine.tm_spiral_breaker_429)
 
         cfg.engine.tm_queuepos_max_eta_ms = _Env.get_int("ENGINE_TM_QPOS_MAX_ETA_MS", cfg.engine.tm_queuepos_max_eta_ms)
 
@@ -3231,38 +3516,10 @@ class BotConfig:
         pacer_knobs.weight_lag = _Env.get_float("ENGINE_PACER_WEIGHT_LAG", pacer_knobs.weight_lag)
         pacer_knobs.weight_err = _Env.get_float("ENGINE_PACER_WEIGHT_ERR", pacer_knobs.weight_err)
         pacer_knobs.weight_drain = _Env.get_float("ENGINE_PACER_WEIGHT_DRAIN", pacer_knobs.weight_drain)
-        pacer_min_ms_env = _Env.get("ENGINE_PACER_MIN_MS")
-        pacer_max_ms_env = _Env.get("ENGINE_PACER_MAX_MS")
-        pacer_init_ms_env = _Env.get("ENGINE_PACER_INIT_MS")
-        pacer_jitter_ms_env = _Env.get("ENGINE_PACER_JITTER_MS")
-        pacer_min_ms_legacy = _Env.get("ENGINE_PACER_MIN")
-        pacer_max_ms_legacy = _Env.get("ENGINE_PACER_MAX")
-        pacer_init_ms_legacy = _Env.get("ENGINE_PACER_INIT")
-        pacer_jitter_ms_legacy = _Env.get("ENGINE_PACER_JITTER")
-        if pacer_min_ms_env is not None and pacer_min_ms_legacy is not None and pacer_min_ms_env != pacer_min_ms_legacy:
-            logging.getLogger(__name__).warning(
-                "env collision on ENGINE_PACER_MIN_MS vs ENGINE_PACER_MIN; using ENGINE_PACER_MIN_MS"
-            )
-        if pacer_max_ms_env is not None and pacer_max_ms_legacy is not None and pacer_max_ms_env != pacer_max_ms_legacy:
-            logging.getLogger(__name__).warning(
-                "env collision on ENGINE_PACER_MAX_MS vs ENGINE_PACER_MAX; using ENGINE_PACER_MAX_MS"
-            )
-        if pacer_init_ms_env is not None and pacer_init_ms_legacy is not None and pacer_init_ms_env != pacer_init_ms_legacy:
-            logging.getLogger(__name__).warning(
-                "env collision on ENGINE_PACER_INIT_MS vs ENGINE_PACER_INIT; using ENGINE_PACER_INIT_MS"
-            )
-        if pacer_jitter_ms_env is not None and pacer_jitter_ms_legacy is not None and pacer_jitter_ms_env != pacer_jitter_ms_legacy:
-            logging.getLogger(__name__).warning(
-                "env collision on ENGINE_PACER_JITTER_MS vs ENGINE_PACER_JITTER; using ENGINE_PACER_JITTER_MS"
-            )
-        cfg.engine.pacer_min_ms = _Env.get_int("ENGINE_PACER_MIN_MS",
-                                               _Env.get_int("ENGINE_PACER_MIN", cfg.engine.pacer_min_ms))
-        cfg.engine.pacer_max_ms = _Env.get_int("ENGINE_PACER_MAX_MS",
-                                               _Env.get_int("ENGINE_PACER_MAX", cfg.engine.pacer_max_ms))
-        cfg.engine.pacer_init_ms = _Env.get_int("ENGINE_PACER_INIT_MS",
-                                                _Env.get_int("ENGINE_PACER_INIT", cfg.engine.pacer_init_ms))
-        cfg.engine.pacer_jitter_ms = _Env.get_int("ENGINE_PACER_JITTER_MS",
-                                                  _Env.get_int("ENGINE_PACER_JITTER", cfg.engine.pacer_jitter_ms))
+        cfg.engine.pacer_min_ms = _Env.get_int("ENGINE_PACER_MIN_MS", cfg.engine.pacer_min_ms)
+        cfg.engine.pacer_max_ms = _Env.get_int("ENGINE_PACER_MAX_MS", cfg.engine.pacer_max_ms)
+        cfg.engine.pacer_init_ms = _Env.get_int("ENGINE_PACER_INIT_MS", cfg.engine.pacer_init_ms)
+        cfg.engine.pacer_jitter_ms = _Env.get_int("ENGINE_PACER_JITTER_MS", cfg.engine.pacer_jitter_ms)
         targets_override = _Env.get_dict("ENGINE_PACER_DEFAULT_TARGETS", {})
         if targets_override:
             try:
@@ -3285,7 +3542,72 @@ class BotConfig:
         cfg.engine.circuit_mute_s_tm = _Env.get_float("ENGINE_CIRCUIT_MUTE_S_TM", cfg.engine.circuit_mute_s_tm)
         cfg.engine.circuit_mute_s_mm = _Env.get_float("ENGINE_CIRCUIT_MUTE_S_MM", cfg.engine.circuit_mute_s_mm)
 
-        # Ticket 10 — capacité technique Engine (workers / inflight par CEX)
+        # TT Policy
+        cfg.engine.tt_policy_version = _Env.get("ENGINE_TT_POLICY_VERSION", cfg.engine.tt_policy_version)
+        cfg.engine.tt_submit_mode = _Env.get("ENGINE_TT_SUBMIT_MODE", cfg.engine.tt_submit_mode)
+        cfg.engine.tt_tif_policy = _Env.get("ENGINE_TT_TIF_POLICY", cfg.engine.tt_tif_policy)
+        cfg.engine.tt_stop_edge_floor_bps = _Env.get_float("ENGINE_TT_STOP_EDGE_FLOOR_BPS", cfg.engine.tt_stop_edge_floor_bps)
+        cfg.engine.tt_ack_slo_ms = _Env.get_float("ENGINE_TT_ACK_SLO_MS", cfg.engine.tt_ack_slo_ms)
+        cfg.engine.tt_time_budget_ms = _Env.get_float("ENGINE_TT_TIME_BUDGET_MS", cfg.engine.tt_time_budget_ms)
+        cfg.engine.tt_require_private_ws_healthy = _Env.get_bool("ENGINE_TT_REQUIRE_PRIVATE_WS_HEALTHY", cfg.engine.tt_require_private_ws_healthy)
+        cfg.engine.tt_max_router_age_ms = _Env.get_float("ENGINE_TT_MAX_ROUTER_AGE_MS", cfg.engine.tt_max_router_age_ms)
+        cfg.engine.tt_max_book_age_ms = _Env.get_float("ENGINE_TT_MAX_BOOK_AGE_MS", cfg.engine.tt_max_book_age_ms)
+        cfg.engine.tt_private_ws_max_lag_ms = _Env.get_float("ENGINE_TT_PRIVATE_WS_MAX_LAG_MS", cfg.engine.tt_private_ws_max_lag_ms)
+        cfg.engine.tt_group_concurrency_by_pacer = _Env.get_dict("ENGINE_TT_GROUP_CONCURRENCY_BY_PACER", cfg.engine.tt_group_concurrency_by_pacer)
+
+        # TM Policy
+        cfg.engine.tm_policy_version = _Env.get("ENGINE_TM_POLICY_VERSION", cfg.engine.tm_policy_version)
+        cfg.engine.tm_quote_lifetime_min_ms = _Env.get_float("ENGINE_TM_QUOTE_LIFETIME_MIN_MS", cfg.engine.tm_quote_lifetime_min_ms)
+        cfg.engine.tm_ladder_levels = _Env.get_int("ENGINE_TM_LADDER_LEVELS", cfg.engine.tm_ladder_levels)
+        cfg.engine.tm_ladder_step_ticks = _Env.get_float("ENGINE_TM_LADDER_STEP_TICKS", cfg.engine.tm_ladder_step_ticks)
+        cfg.engine.tm_replace_drift_ticks = _Env.get_float("ENGINE_TM_REPLACE_DRIFT_TICKS", cfg.engine.tm_replace_drift_ticks)
+        cfg.engine.tm_replace_max_age_ms = _Env.get_int("ENGINE_TM_REPLACE_MAX_AGE_MS", cfg.engine.tm_replace_max_age_ms)
+        cfg.engine.tm_time_budget_ms = _Env.get_float("ENGINE_TM_TIME_BUDGET_MS", cfg.engine.tm_time_budget_ms)
+        cfg.engine.tm_qpos_fail_mode = _Env.get("ENGINE_TM_QPOS_FAIL_MODE", cfg.engine.tm_qpos_fail_mode)
+        cfg.engine.tm_qpos_guard_hysteresis_ms = _Env.get_int("ENGINE_TM_QPOS_GUARD_HYSTERESIS_MS", cfg.engine.tm_qpos_guard_hysteresis_ms)
+        cfg.engine.tm_qpos_guard_release_ratio = _Env.get_float("ENGINE_TM_QPOS_GUARD_RELEASE_RATIO", cfg.engine.tm_qpos_guard_release_ratio)
+        cfg.engine.tm_panic_trigger_ack_p95_ms = _Env.get_float("ENGINE_TM_PANIC_TRIGGER_ACK_P95_MS", cfg.engine.tm_panic_trigger_ack_p95_ms)
+        cfg.engine.tm_panic_hedge_ratio = _Env.get_float("ENGINE_TM_PANIC_HEDGE_RATIO", cfg.engine.tm_panic_hedge_ratio)
+        cfg.engine.tm_panic_hedge_ttl_ms = _Env.get_int("ENGINE_TM_PANIC_HEDGE_TTL_MS", cfg.engine.tm_panic_hedge_ttl_ms)
+        cfg.engine.tm_stop_edge_floor_bps_delta = _Env.get_float("ENGINE_TM_STOP_EDGE_FLOOR_BPS_DELTA", cfg.engine.tm_stop_edge_floor_bps_delta)
+        cfg.engine.tm_require_private_ws_healthy = _Env.get_bool("ENGINE_TM_REQUIRE_PRIVATE_WS_HEALTHY", cfg.engine.tm_require_private_ws_healthy)
+        cfg.engine.tm_fallback_mode = _Env.get("ENGINE_TM_FALLBACK_MODE", cfg.engine.tm_fallback_mode)
+        cfg.engine.tm_hedge_order_type = _Env.get("ENGINE_TM_HEDGE_ORDER_TYPE", cfg.engine.tm_hedge_order_type)
+        cfg.engine.tm_revalidate_before_place = _Env.get_bool("ENGINE_TM_REVALIDATE_BEFORE_PLACE", cfg.engine.tm_revalidate_before_place)
+        cfg.engine.tm_revalidate_every_s = _Env.get_float("ENGINE_TM_REVALIDATE_EVERY_S", cfg.engine.tm_revalidate_every_s)
+        cfg.engine.tm_maker_order_type = _Env.get("ENGINE_TM_MAKER_ORDER_TYPE", cfg.engine.tm_maker_order_type)
+
+        # MM Policy
+        cfg.engine.mm_policy_version = _Env.get("ENGINE_MM_POLICY_VERSION", cfg.engine.mm_policy_version)
+        cfg.engine.mm_require_private_ws_healthy = _Env.get_bool("ENGINE_MM_REQUIRE_PRIVATE_WS_HEALTHY", cfg.engine.mm_require_private_ws_healthy)
+        cfg.engine.mm_pad_ticks_base = _Env.get_float("ENGINE_MM_PAD_TICKS_BASE", cfg.engine.mm_pad_ticks_base)
+        cfg.engine.mm_size_factor_base = _Env.get_float("ENGINE_MM_SIZE_FACTOR_BASE", cfg.engine.mm_size_factor_base)
+        cfg.engine.mm_requote_min_ticks = _Env.get_float("ENGINE_MM_REQUOTE_MIN_TICKS", cfg.engine.mm_requote_min_ticks)
+        cfg.engine.mm_min_net_bps = _Env.get_float("ENGINE_MM_MIN_NET_BPS", cfg.engine.mm_min_net_bps)
+        cfg.engine.mm_qpos_max_ahead_usd = _Env.get_float("ENGINE_MM_QPOS_MAX_AHEAD_USD", cfg.engine.mm_qpos_max_ahead_usd)
+        cfg.engine.mm_ttl_ms = _Env.get_int("ENGINE_MM_TTL_MS", cfg.engine.mm_ttl_ms)
+        cfg.engine.mm_hysteresis_ms = _Env.get_int("ENGINE_MM_HYSTERESIS_MS", cfg.engine.mm_hysteresis_ms)
+        cfg.engine.mm_allow_auto_hedge = _Env.get_bool("ENGINE_MM_ALLOW_AUTO_HEDGE", cfg.engine.mm_allow_auto_hedge)
+        cfg.engine.mm_hedge_schedule = _Env.get_list_float("ENGINE_MM_HEDGE_SCHEDULE", cfg.engine.mm_hedge_schedule)
+        cfg.engine.mm_use_progressive_hedge = _Env.get_bool("ENGINE_MM_USE_PROGRESSIVE_HEDGE", cfg.engine.mm_use_progressive_hedge)
+        cfg.engine.mm_hedge_final_ratio = _Env.get_float("ENGINE_MM_HEDGE_FINAL_RATIO", cfg.engine.mm_hedge_final_ratio)
+        cfg.engine.mm_dual_engine_enabled = _Env.get_bool("ENGINE_MM_DUAL_ENGINE_ENABLED", cfg.engine.mm_dual_engine_enabled)
+        cfg.engine.mm_single_inventory_enabled = _Env.get_bool("ENGINE_MM_SINGLE_INVENTORY_ENABLED", cfg.engine.mm_single_inventory_enabled)
+        cfg.engine.mm_scale_on_tt_tm = _Env.get_float("ENGINE_MM_SCALE_ON_TT_TM", cfg.engine.mm_scale_on_tt_tm)
+        cfg.engine.mm_pad_boost_on_tt_tm = _Env.get_int("ENGINE_MM_PAD_BOOST_ON_TT_TM", cfg.engine.mm_pad_boost_on_tt_tm)
+        cfg.engine.mm_place_rate_limit_per_pair = _Env.get_int("ENGINE_MM_PLACE_RATE_LIMIT_PER_PAIR", cfg.engine.mm_place_rate_limit_per_pair)
+        cfg.engine.mm_cancel_rate_limit_per_pair = _Env.get_int("ENGINE_MM_CANCEL_RATE_LIMIT_PER_PAIR", cfg.engine.mm_cancel_rate_limit_per_pair)
+        cfg.engine.mm_cancel_budget_per_pair_min = _Env.get_int("ENGINE_MM_CANCEL_BUDGET_PER_PAIR_MIN", cfg.engine.mm_cancel_budget_per_pair_min)
+        cfg.engine.mm_cancel_budget_exhausted_penalty_lifetime_mult = _Env.get_float("ENGINE_MM_CANCEL_BUDGET_EXHAUSTED_PENALTY_LIFETIME_MULT", cfg.engine.mm_cancel_budget_exhausted_penalty_lifetime_mult)
+        cfg.engine.mm_cancel_budget_exhausted_penalty_pad_ticks = _Env.get_int("ENGINE_MM_CANCEL_BUDGET_EXHAUSTED_PENALTY_PAD_TICKS", cfg.engine.mm_cancel_budget_exhausted_penalty_pad_ticks)
+        cfg.engine.mm_cross_ttl_ms = _Env.get_int("ENGINE_MM_CROSS_TTL_MS", cfg.engine.mm_cross_ttl_ms)
+        cfg.engine.mm_cross_hedge_schedule = _Env.get_list_float("ENGINE_MM_CROSS_HEDGE_SCHEDULE", cfg.engine.mm_cross_hedge_schedule)
+        cfg.engine.mm_cross_panic_after_ms = _Env.get_int("ENGINE_MM_CROSS_PANIC_AFTER_MS", cfg.engine.mm_cross_panic_after_ms)
+        cfg.engine.mm_cross_defensive_pad_ticks = _Env.get_int("ENGINE_MM_CROSS_DEFENSIVE_PAD_TICKS", cfg.engine.mm_cross_defensive_pad_ticks)
+        cfg.engine.mm_cross_defensive_lifetime_mult = _Env.get_float("ENGINE_MM_CROSS_DEFENSIVE_LIFETIME_MULT", cfg.engine.mm_cross_defensive_lifetime_mult)
+        cfg.engine.mm_cross_429_threshold = _Env.get_float("ENGINE_MM_CROSS_429_THRESHOLD", cfg.engine.mm_cross_429_threshold)
+        cfg.engine.mm_variants = _Env.get_dict("ENGINE_MM_VARIANTS", cfg.engine.mm_variants)
+
         cfg.engine.workers_by_profile = _Env.get_dict(
             "ENGINE_WORKERS_BY_PROFILE",
             cfg.engine.workers_by_profile,
@@ -3317,6 +3639,20 @@ class BotConfig:
         cfg.pws.PWS_PING_INTERVAL_S = _Env.get_int("PWS_PING_INTERVAL_S", cfg.pws.PWS_PING_INTERVAL_S)
         cfg.pws.PWS_PONG_TIMEOUT_S = _Env.get_int("PWS_PONG_TIMEOUT_S", cfg.pws.PWS_PONG_TIMEOUT_S)
         cfg.pws.PWS_HEARTBEAT_MAX_GAP_S = _Env.get_int("PWS_HEARTBEAT_MAX_GAP_S", cfg.pws.PWS_HEARTBEAT_MAX_GAP_S)
+
+        # NEW: Parité de connexion par exchange pour WS privés (PWS_BINANCE_CONNECT_TIMEOUT_S, etc.)
+        for ex in ["BINANCE", "BYBIT", "COINBASE"]:
+            v_conn = _Env.get_int(f"PWS_{ex}_CONNECT_TIMEOUT_S", None)
+            if v_conn is not None: cfg.pws.connect_timeout_s_by_ex[ex] = v_conn
+            
+            v_read = _Env.get_int(f"PWS_{ex}_READ_TIMEOUT_S", None)
+            if v_read is not None: cfg.pws.read_timeout_s_by_ex[ex] = v_read
+            
+            v_ping = _Env.get_int(f"PWS_{ex}_PING_INTERVAL_S", None)
+            if v_ping is not None: cfg.pws.ping_interval_s_by_ex[ex] = v_ping
+            
+            v_pong = _Env.get_int(f"PWS_{ex}_PONG_TIMEOUT_S", None)
+            if v_pong is not None: cfg.pws.pong_timeout_s_by_ex[ex] = v_pong
         cfg.pws.PWS_STABLE_RESET_S = _Env.get_int("PWS_STABLE_RESET_S", cfg.pws.PWS_STABLE_RESET_S)
         cfg.pws.PWS_JITTER_MS = _Env.get_int("PWS_JITTER_MS", cfg.pws.PWS_JITTER_MS)
         cfg.pws.PWS_BACKOFF_BASE_MS = _Env.get_int("PWS_BACKOFF_BASE_MS", cfg.pws.PWS_BACKOFF_BASE_MS)
@@ -3353,6 +3689,7 @@ class BotConfig:
         cfg.rebal.rebal_snapshots_error_cooldown_s = _Env.get_float("REBAL_SNAPSHOTS_ERROR_COOLDOWN_S",
                                                                     cfg.rebal.rebal_snapshots_error_cooldown_s)
         cfg.rebal.rebal_quantum_quote_map = _Env.get_dict("REBAL_QUANTUM_QUOTE_MAP", cfg.rebal.rebal_quantum_quote_map)
+        cfg.rebal.rebal_min_cash_per_quote = _Env.get_dict("REBAL_MIN_CASH_PER_QUOTE", cfg.rebal.rebal_min_cash_per_quote)
 
         cfg.balances.refresh_interval_s = _Env.get_int("BF_REFRESH_INTERVAL_S", cfg.balances.refresh_interval_s)
         cfg.balances.ttl_cache_s = _Env.get_int("BF_TTL_CACHE_S", cfg.balances.ttl_cache_s)
@@ -3365,7 +3702,30 @@ class BotConfig:
         cfg.balances.wallet_types = _Env.get_list("BF_WALLET_TYPES", cfg.balances.wallet_types)
         cfg.balances.BF_PACER_EU = _Env.get("BF_PACER_EU", cfg.balances.BF_PACER_EU)
         cfg.balances.BF_PACER_US = _Env.get("BF_PACER_US", cfg.balances.BF_PACER_US)
+        cfg.balances.fee_token_low_watermarks = _Env.get_dict("FEE_TOKEN_LOW_WATERMARKS", cfg.balances.fee_token_low_watermarks)
+        cfg.balances.BF_ALERT_PERIOD_S = _Env.get_int("BF_ALERT_PERIOD_S", cfg.balances.BF_ALERT_PERIOD_S)
+        # WS/private-plane merge & reconcile knobs (pilotables via env)
+        # (BalanceFetcher les consomme via cfg.balances.*)
+        cfg.balances.WS_BAL_TTL_SECONDS = _Env.get_float(
+            "WS_BAL_TTL_SECONDS", cfg.balances.WS_BAL_TTL_SECONDS
+        )
+        cfg.balances.ENABLE_WS_BALANCE_MERGE = _Env.get_bool(
+            "ENABLE_WS_BALANCE_MERGE", cfg.balances.ENABLE_WS_BALANCE_MERGE
+        )
+        cfg.balances.ws_reco_miss_rate_thr_per_min = _Env.get_float(
+            "WS_RECO_MISS_RATE_THR_PER_MIN", cfg.balances.ws_reco_miss_rate_thr_per_min
+        )
+        cfg.balances.ws_reco_resync_age_thr_s = _Env.get_float(
+            "WS_RECO_RESYNC_AGE_THR_S", cfg.balances.ws_reco_resync_age_thr_s
+        )
+        cfg.balances.reco_miss_burst_threshold = _Env.get_int("RECO_MISS_BURST_THRESHOLD", cfg.balances.reco_miss_burst_threshold)
+        cfg.balances.reco_miss_recent_threshold = _Env.get_int("RECO_MISS_RECENT_THRESHOLD", cfg.balances.reco_miss_recent_threshold)
+        cfg.balances.reco_alias_resync_max_age_s = _Env.get_float("RECO_ALIAS_RESYNC_MAX_AGE_S", cfg.balances.reco_alias_resync_max_age_s)
 
+        # Readiness policy (consommé dans balance_fetcher._check_readiness)
+        cfg.balances.balances_ready_min_state = _Env.get(
+            "BALANCES_READY_MIN_STATE", cfg.balances.balances_ready_min_state
+        )
 
         cfg.vol.midprice_to_bps = _Env.get_float("VOL_MIDPRICE_TO_BPS", cfg.vol.midprice_to_bps)
         cfg.vol.to_bps_floor = _Env.get_float("VOL_TO_BPS_FLOOR", cfg.vol.to_bps_floor)
@@ -4044,6 +4404,11 @@ class BotConfig:
             self.engine.anchor_max_staleness_ms = int(
                 eu_latency.get("stale_ms", self.engine.anchor_max_staleness_ms)
             )
+            # Alignment P0: Si on est en EU_ONLY, on s'attend à ce que BINANCE/BYBIT soient en EU
+            # pour éviter le blocage par défaut dans discovery.
+            logging.getLogger(__name__).info("[BotConfig] EU_ONLY mode: forcing BINANCE/BYBIT/COINBASE to EU region")
+            for ex in ["BINANCE", "BYBIT", "COINBASE"]:
+                self.g.exchange_region_map[ex] = "EU"
         elif dm == "JP_ONLY":
             jp_latency = self.g.jp_latency
             self.router.stale_ms = int(jp_latency.get("stale_ms", self.router.stale_ms))
@@ -4057,6 +4422,11 @@ class BotConfig:
             self.engine.anchor_max_staleness_ms = int(
                 jp_latency.get("stale_ms", self.engine.anchor_max_staleness_ms)
             )
+            # En JP_ONLY, on s'assure que BINANCE/BYBIT sont JP (par défaut ils le sont)
+            for ex in ["BINANCE", "BYBIT"]:
+                self.g.exchange_region_map[ex] = "JP"
+            if self.g.exchange_region_map.get("COINBASE") == "US":
+                 self.g.exchange_region_map["COINBASE"] = "JP" # or stay US? US is not blocked.
         # Hub privé choisira ses URLs via PWS_REGION_MAP / engine_pod_map
         self.pws.PWS_REGION_MAP = dict(self.g.engine_pod_map)
 
@@ -4350,6 +4720,22 @@ class BotConfig:
             "RESTART_WEBHOOK_URL": "alerting.webhook.url",
             "RESTART_WEBHOOK_HMAC_KEY": "alerting.webhook.hmac_secret",
             "TELEGRAM_REQUIRE_ACK": "alerting.telegram.require_ack",
+            # BalanceFetcher: WS merge/reconcile & readiness
+            "WS_BAL_TTL_SECONDS": "balances.WS_BAL_TTL_SECONDS",
+            "ws_bal_ttl_seconds": "balances.WS_BAL_TTL_SECONDS",
+
+            "ENABLE_WS_BALANCE_MERGE": "balances.ENABLE_WS_BALANCE_MERGE",
+            "enable_ws_balance_merge": "balances.ENABLE_WS_BALANCE_MERGE",
+
+            "WS_RECO_MISS_RATE_THR_PER_MIN": "balances.ws_reco_miss_rate_thr_per_min",
+            "ws_reco_miss_rate_thr_per_min": "balances.ws_reco_miss_rate_thr_per_min",
+
+            "WS_RECO_RESYNC_AGE_THR_S": "balances.ws_reco_resync_age_thr_s",
+            "ws_reco_resync_age_thr_s": "balances.ws_reco_resync_age_thr_s",
+
+            "BALANCES_READY_MIN_STATE": "balances.balances_ready_min_state",
+            "balances_ready_min_state": "balances.balances_ready_min_state",
+
         }
 
     def _rebuild_flat_cache(self) -> None:
@@ -4464,9 +4850,9 @@ class BotConfig:
 
         # --- TTL balances (déjà injectées par from_env en overlay RM) ---
         # Defaults alignés sur RM_BALANCE_TTL_S_* dans from_env()
-        balances_ttl_s_normal = float(getattr(self, "RM_BALANCE_TTL_S_NORMAL", 60.0))
-        balances_ttl_s_degraded = float(getattr(self, "RM_BALANCE_TTL_S_DEGRADED", 180.0))
-        balances_ttl_s_block = float(getattr(self, "RM_BALANCE_TTL_S_BLOCK", 600.0))
+        balances_ttl_s_normal = float(getattr(self.rm, "balance_ttl_s_normal", 60.0))
+        balances_ttl_s_degraded = float(getattr(self.rm, "balance_ttl_s_degraded", 180.0))
+        balances_ttl_s_block = float(getattr(self.rm, "balance_ttl_s_block", 600.0))
 
         # --- TTL TM exposure / hedge ---
         tm_exposure_ttl_ms = float(getattr(self.engine, "tm_exposure_ttl_ms", 1500.0))

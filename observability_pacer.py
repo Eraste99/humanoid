@@ -194,6 +194,26 @@ class AlertDispatcher:
             except Exception:
                 _alert_log.exception("Alert sink failed for %s", evt.code)
 
+    # --- Compat superviseur (bot_arbitrage.py) ------------------------------
+
+    async def notify_info(self, message: str, *, code: str = "INFO", **labels: str) -> None:
+        self.emit(code=code, severity="INFO", message=message, **labels)
+
+    async def notify_warn(self, message: str, *, code: str = "WARN", **labels: str) -> None:
+        self.emit(code=code, severity="WARNING", message=message, **labels)
+
+    async def notify_crit(self, message: str, *, code: str = "CRIT", **labels: str) -> None:
+        self.emit(code=code, severity="CRIT", message=message, **labels)
+
+    async def prompt_ack(self, reason: str, timeout_s: int = 180):
+        """
+        Compat "MANUAL restart ACK".
+        Sans backend Telegram/commandes, on fail-closed: ack=False.
+        """
+        class _R:
+            ack = False
+        return _R()
+
     # --- Helpers dédiés PnL LHM (M5-B3) --------------------------------------
 
     def alert_pnl_lhm_lag(

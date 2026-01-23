@@ -11,12 +11,11 @@ import plotly.express as px
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from modules.bot_config import BotConfig
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 _cfg = BotConfig.from_env()
-OBS_BASE_URL = getattr_str(_cfg.dashboard, 'OBS_BASE_URL', 'http://localhost:9108').rstrip('/')
-AUTOREFRESH_SEC = getattr_int(getattr(_cfg.dashboard, 'AUTOREFRESH_SEC', None), 10)
-DEMO_MODE = getattr_bool(_cfg.dashboard, 'DEMO_MODE', False)
+OBS_BASE_URL = str(getattr(_cfg.dashboard, 'OBS_BASE_URL', 'http://localhost:9108')).rstrip('/')
+AUTOREFRESH_SEC = int(getattr(getattr(_cfg.dashboard, 'AUTOREFRESH_SEC', None), "AUTOREFRESH_SEC", 10))
+DEMO_MODE = bool(getattr(_cfg.dashboard, 'DEMO_MODE', False))
 SCAN_PATHS = list(getattr(_cfg, 'dashboard_scan_paths', ['/api/scanner/snapshot', '/scanner/snapshot', '/snapshot/scanner']))
 RISK_PATHS = list(getattr(_cfg, 'dashboard_risk_paths', ['/api/risk/snapshot', '/risk/snapshot']))
 ENG_PATHS = list(getattr(_cfg, 'dashboard_engine_paths', ['/api/engine/status', '/engine/status']))

@@ -1939,67 +1939,118 @@ class LogWriter:
                 conn.commit()
                 return 1
 
-    def insert_opportunities_bulk(self, opps: Iterable[Dict[str, Any]]) -> dict:
-        opps = list(opps or [])
+    def insert_opportunities_bulk(self, opportunities) -> int:
+        """
+        Bulk insert best-effort.
+        Robuste aux évolutions de schéma: on intersecte les colonnes présentes (PRAGMA table_info).
+        Retourne le nombre de rows "attempted" (pas strictement rowcount sqlite avec OR IGNORE).
+        """
+        opps = list(opportunities or [])
         if not opps:
             return 0
 
-        # Prépare hors lock (évite de bloquer la DB)
-        rows = []
+        def _safe_float(x, default=0.0):
+            try:
+                return float(x)
+            except Exception:
+                return float(default)
+
+        def _safe_int(x, default=0):
+            try:
+                return int(x)
+            except Exception:
+                return int(default)
+
+        # Candidats (ordre canonique). On filtrera selon le schéma réel.
+        candidate_cols = [
+            "id", "ts", "ts_ms",
+            "pair_key",
+            "buy_ex", "sell_ex",
+            "buy_price", "sell_price",
+            "spread_brut", "spread_net",
+            "volume_possible_usdc",
+            "score",
+            "typ",
+            "trade_mode",
+            "route_id",
+            # colonnes optionnelles (si migrées)
+            "deployment_mode", "pod_region", "capital_profile", "pacer_mode",
+            "raw_json",
+        ]
+
+        prepared = []
+        now = time.time()
         for o in opps:
-            ts_ms = o.get("ts_ms") or int(float(o.get("timestamp", 0.0) or time.time()) * 1000)
-            ts_sec = float(o.get("timestamp") or (float(ts_ms) / 1000.0))
-            rows.append(
-                (
-                    o.get("id"),
-                    ts_sec,
-                    ts_ms,
-                    float(o.get("timestamp", 0.0) or 0.0),
-                    (o.get("pair") or o.get("pair_key")),
-                    self._norm_ex(o.get("buy_exchange") or o.get("buy_ex")),
-                    self._norm_ex(o.get("sell_exchange") or o.get("sell_ex")),
-                    o.get("buy_price"),
-                    o.get("sell_price"),
-                    o.get("spread_brut"),
-                    o.get("spread_net"),
-                    o.get("volume_possible_usdc"),
-                    o.get("score"),
-                    o.get("type"),
-                    o.get("trade_mode"),
-                    o.get("route_id"),
-                    o.get("deployment_mode"),
-                    o.get("pod_region"),
-                    o.get("capital_profile"),
-                    o.get("pacer_mode"),
+            d = dict(o or {})
+            ts = _safe_float(d.get("timestamp", 0.0) or 0.0, default=0.0)
+            if ts <= 0.0:
+                ts = now
+            ts_ms = d.get("ts_ms", None)
+            if ts_ms is None:
+                ts_ms = int(ts * 1000.0)
 
-                    str(o),
-                )
-            )
+            pair_key = d.get("pair_key") or d.get("pair") or d.get("symbol") or ""
+            buy_ex = d.get("buy_ex") or d.get("buy_exchange") or ""
+            sell_ex = d.get("sell_ex") or d.get("sell_exchange") or ""
 
-        def _do() -> int:
+            # id: si absent, on dérive un id déterministe minimal (évite PRIMARY KEY NULL)
+            _id = d.get("id")
+            if not _id:
+                _id = f"op_{_safe_int(ts_ms)}_{pair_key}_{buy_ex}_{sell_ex}"
+
+            prepared.append({
+                "id": str(_id),
+                "ts": _safe_float(ts),
+                "ts_ms": _safe_int(ts_ms),
+                "pair_key": str(pair_key),
+                "buy_ex": str(buy_ex),
+                "sell_ex": str(sell_ex),
+                "buy_price": _safe_float(d.get("buy_price", 0.0)),
+                "sell_price": _safe_float(d.get("sell_price", 0.0)),
+                "spread_brut": _safe_float(d.get("spread_brut", 0.0)),
+                "spread_net": _safe_float(d.get("spread_net", 0.0)),
+                "volume_possible_usdc": _safe_float(d.get("volume_possible_usdc", 0.0)),
+                "score": _safe_float(d.get("score", 0.0)),
+                "typ": str(d.get("typ") or d.get("type") or ""),
+                "trade_mode": str(d.get("trade_mode") or d.get("mode") or ""),
+                "route_id": str(d.get("route_id") or ""),
+                "deployment_mode": str(d.get("deployment_mode") or ""),
+                "pod_region": str(d.get("pod_region") or ""),
+                "capital_profile": str(d.get("capital_profile") or ""),
+                "pacer_mode": str(d.get("pacer_mode") or ""),
+                "raw_json": json.dumps(d, ensure_ascii=False, default=str),
+            })
+
+        def _do():
             with self._lock:
                 self._rotate_if_needed()
-                with self._conn() as conn:
+                conn = self._conn()
+                try:
                     cur = conn.cursor()
-                    before = conn.total_changes
-                    cur.executemany(
-                        """
-                        INSERT OR IGNORE INTO opportunities(
-                            id, ts,ts_ms, pair_key, buy_ex, sell_ex, buy_price, sell_price, spread_brut,
-                            spread_net, volume_possible_usdc, score, typ, trade_mode, route_id,
-                            deployment_mode, pod_region, capital_profile, pacer_mode, raw_json
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        """,
-                        rows,
-                    )
+
+                    # Colonnes réellement présentes
+                    cur.execute("PRAGMA table_info(opportunities)")
+                    present = {r[1] for r in (cur.fetchall() or []) if r and len(r) > 1}
+
+                    cols = [c for c in candidate_cols if c in present]
+                    if not cols:
+                        return 0
+
+                    placeholders = ",".join(["?"] * len(cols))
+                    sql = f"INSERT OR IGNORE INTO opportunities ({','.join(cols)}) VALUES ({placeholders})"
+
+                    rows = [tuple(p.get(c) for c in cols) for p in prepared]
+                    cur.executemany(sql, rows)
                     conn.commit()
-                    inserted = max(0, conn.total_changes - before)
-                    ignored = max(0, len(rows) - inserted)
-                    return {"inserted": int(inserted), "ignored": int(ignored)}
+                    return len(rows)
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
 
         res = self._run_db("opportunities", _do)
-        return res if isinstance(res, dict) else {"inserted": int(res or 0), "ignored": 0}
-
+        return int(res or 0)
 
     def insert_alert(self, module: str, level: str, pair_key: str | None, message: str, ctx: str | None = None) -> None:
         with self._lock:

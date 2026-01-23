@@ -19,7 +19,6 @@ import logging
 import time
 from collections import deque
 from typing import Callable, Awaitable, Optional, Tuple, List, Dict, Any, Set, Deque
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 try:
     from modules.observability_pacer import PACER

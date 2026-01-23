@@ -1,0 +1,538 @@
+{
+  "uid": "strategies-performance",
+  "title": "D11 — Strategies Performance",
+  "schemaVersion": 39,
+  "version": 2,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "strategy", "performance"],
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "query": "arbitrage-bot",
+        "hide": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Global Overview",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Opportunities Emitted (1h)",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (strategy) (increase(opportunities_emitted_total{job=\"$job\"}[1h]))",
+          "legendFormat": "{{strategy}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 24, "h": 4 },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "row",
+      "title": "PnL Performance (Live Day)",
+      "id": 100,
+      "gridPos": { "x": 0, "y": 5, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "Daily PnL by Strategy (USD)",
+      "id": 101,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (branch) (pnl_live_day_usd{job=\"$job\", region=\"UTC\"})",
+          "legendFormat": "{{branch}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 6, "w": 12, "h": 6 },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 0 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Live PnL Evolution (USD)",
+      "id": 102,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (branch) (pnl_live_day_usd{job=\"$job\", region=\"UTC\"})",
+          "legendFormat": "{{branch}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 6, "w": 12, "h": 6 }
+    },
+    {
+      "type": "stat",
+      "title": "Win/Loss Trades by Strategy (24h)",
+      "id": 103,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (branch, result) (increase(trades_live_day_total{job=\"$job\", region=\"UTC\"}[24h]))",
+          "legendFormat": "{{branch}} - {{result}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 12, "w": 24, "h": 4 },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "win": { "text": "WIN", "color": "green" },
+                "loss": { "text": "LOSS", "color": "red" },
+                "flat": { "text": "FLAT", "color": "gray" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Taker-Taker (TT) & Taker-Maker (TM)",
+      "id": 3,
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "TT/TM Emissions Rate",
+      "id": 4,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (strategy) (rate(opportunities_emitted_total{job=\"$job\", strategy=~\"TT|TM|MIXED\"}[$__rate_interval]))",
+          "legendFormat": "{{strategy}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 17, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "TT/TM Rejections",
+      "id": 5,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason, strategy) (rate(scanner_rejected_total{job=\"$job\", strategy=~\"TT|TM|MIXED\"}[$__rate_interval]))",
+          "legendFormat": "{{strategy}} - {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 17, "w": 12, "h": 8 }
+    },
+    {
+      "type": "row",
+      "title": "Market Maker (MM)",
+      "id": 6,
+      "gridPos": { "x": 0, "y": 25, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "MM Hints & Opportunities",
+      "id": 7,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum(rate(opportunities_emitted_total{job=\"$job\", strategy=\"MM\"}[$__rate_interval]))",
+          "legendFormat": "MM Emitted",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(scanner_rejected_total{job=\"$job\", strategy=\"MM\"}[$__rate_interval]))",
+          "legendFormat": "MM Rejected",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 26, "w": 24, "h": 8 }
+    },
+    {
+      "type": "row",
+      "title": "Rebalancing & Internal Transfers",
+      "id": 8,
+      "gridPos": { "x": 0, "y": 34, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Rebalancing Operations Rate",
+      "id": 9,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(rebal_operations_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rebalancing Imbalance (Quote Val)",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange, asset) (rebal_imbalance_gauge{job=\"$job\"})",
+          "legendFormat": "{{exchange}} - {{asset}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 8 }
+    },
+    {
+      "type": "row",
+      "title": "EOD Accounting & PnL Reconciliation",
+      "id": 200,
+      "gridPos": { "x": 0, "y": 43, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "title": "PnL Reconciliation Status",
+      "id": 201,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange, account_alias, state) (pnl_reco_state{job=\"$job\"})",
+          "legendFormat": "{{exchange}}/{{account_alias}} - {{state}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 44, "w": 12, "h": 4 },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": { "text": "ACTIVE", "color": "green" },
+                "0": { "text": "INACTIVE", "color": "gray" }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "EOD Runs (24h)",
+      "id": 202,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (status) (increase(lhm_eod_runs_total{job=\"$job\"}[24h]))",
+          "legendFormat": "EOD {{status}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 44, "w": 12, "h": 4 },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "PnL Abs Diff (CEX vs DB)",
+      "id": 203,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange, account_alias) (pnl_reco_abs_diff_quote{job=\"$job\"})",
+          "legendFormat": "{{exchange}}/{{account_alias}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 48, "w": 12, "h": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "custom": { "drawStyle": "bars" }
+        }
+      }
+    },
+    {
+      "type": "bargauge",
+      "title": "Data Quality: Inferred vs Missing Profit (24h)",
+      "id": 204,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum(increase(derived_net_profit_sign_total{job=\"$job\"}[24h]))",
+          "legendFormat": "Inferred",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(missing_net_profit_total{job=\"$job\"}[24h]))",
+          "legendFormat": "Missing",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 48, "w": 12, "h": 6 },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["sum"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Last Successful EOD",
+      "id": 205,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "lhm_eod_last_success_ts_ms{job=\"$job\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 54, "w": 24, "h": 3 },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "dateTimeAsIso"
+        }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Execution Policy & Slicing",
+      "id": 200,
+      "gridPos": { "x": 0, "y": 25, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Fragmentation Plan Latency p95 (ms)",
+      "id": 201,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (branch, le) (rate(frag_plan_latency_ms_bucket{job=\"$job\"}[$__rate_interval])))",
+          "legendFormat": "{{branch}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 26, "w": 8, "h": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Average Fragments Count",
+      "id": 202,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (branch) (rate(frag_fragments_count_sum{job=\"$job\"}[$__rate_interval])) / sum by (branch) (rate(frag_fragments_count_count{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{branch}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 26, "w": 8, "h": 6 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Abort Reasons / sec",
+      "id": 203,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (branch, reason) (rate(abort_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{branch}}: {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 26, "w": 8, "h": 6 }
+    },
+    {
+      "type": "row",
+      "title": "Market Maker (MM) Detailed Monitoring",
+      "id": 300,
+      "gridPos": { "x": 0, "y": 60, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "MM Inventory Drift (USD)",
+      "id": 301,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (asset) (mm_inventory_drift_usd{job=\"$job\"})",
+          "legendFormat": "{{asset}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 61, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "MM Fill Completion Ratio",
+      "id": 302,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum(rate(mm_fills_both_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "Both Filled (Optimal)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(mm_single_fill_hedged_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "Single Filled + Hedged",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(mm_panic_hedge_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "Panic Hedged",
+          "refId": "C"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 61, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "MM Throttling & Cancellations",
+      "id": 303,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(mm_throttled_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "Throttled: {{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(mm_makers_canceled_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "Canceled: {{reason}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(mm_makers_expired_ttl_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "Expired TTL",
+          "refId": "C"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 69, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "MM Expected vs Realized Capture (bps)",
+      "id": 304,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mm_expected_capture_bps_bucket{job=\"$job\"}[$__rate_interval])))",
+          "legendFormat": "Expected (p50)",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(mm_realized_bps_bucket{job=\"$job\"}[$__rate_interval])))",
+          "legendFormat": "Realized (p50)",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 69, "w": 12, "h": 8 }
+    },
+    {
+      "type": "timeseries",
+      "title": "MM Queue Position Blocks & Aborts",
+      "id": 305,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason, exchange) (rate(mm_qpos_block_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "QPos Block: {{reason}} ({{exchange}})",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(mm_abort_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "MM Abort: {{reason}}",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 77, "w": 24, "h": 8 }
+    }
+  ]
+}

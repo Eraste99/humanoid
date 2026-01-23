@@ -97,7 +97,6 @@ import logging
 import random
 import time
 import asyncio as _asyncio
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.payloads import canonical_transfer_id, normalize_reason_code
 # --- Prometheus metrics (fallback no-op si registre absent) -------------------
 try:
@@ -121,6 +120,7 @@ try:
         PWS_QUEUE_CAP,
         PWS_CALLBACK_ERRORS_TOTAL,
         PWS_ALERT_TOTAL,
+        PWS_BALANCE_EVENTS_TOTAL,
         # AJOUTER dans la liste existante :
         WS_FAILOVER_TOTAL, PWS_POOL_SIZE,
 
@@ -151,6 +151,7 @@ except Exception:  # pragma: no cover
     PWS_QUEUE_CAP = _NoopMetric()
     PWS_ALERT_TOTAL = _NoopMetric()
     PWS_CALLBACK_ERRORS_TOTAL = _NoopMetric()
+    PWS_BALANCE_EVENTS_TOTAL = _NoopMetric()
 
 log = logging.getLogger("PrivateWSHub")
 log.setLevel(logging.INFO)
@@ -278,20 +279,28 @@ class _BaseWSClient:
 
             pws = _PWSStub()
 
-        self._queue_max = getattr_int(pws, "PWS_QUEUE_MAXLEN", 5000)
-        self._sat_ratio = getattr_float(pws, "PWS_QUEUE_SATURATION_RATIO", 0.85)
-        self._sat_ratio = getattr_float(pws, "PWS_QUEUE_SATURATION_RATIO", 0.90)
-        self._ping_s = getattr_int(pws, "PWS_PING_INTERVAL_S", 20)
-        self._pong_to_s = getattr_int(pws, "PWS_PONG_TIMEOUT_S", 10)
-        self._hb_max_gap = getattr_int(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30)
-        self._stable_reset_s = getattr_int(pws, "PWS_STABLE_RESET_S", 30)
-        self._jitter_ms = getattr_int(pws, "PWS_JITTER_MS", 2)
-        self._bo_base_ms = getattr_int(pws, "PWS_BACKOFF_BASE_MS", 500)
-        self._bo_max_ms = getattr_int(pws, "PWS_BACKOFF_MAX_MS", 20_000)
+        self._queue_max = int(getattr(pws, "PWS_QUEUE_MAXLEN", 5000))
+        self._sat_ratio = float(getattr(pws, "PWS_QUEUE_SATURATION_RATIO", 0.90))
+        self._ping_s = int(getattr(pws, "PWS_PING_INTERVAL_S", 20))
+        self._pong_to_s = int(getattr(pws, "PWS_PONG_TIMEOUT_S", 10))
+        self._hb_max_gap = int(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30))
+        self._stable_reset_s = int(getattr(pws, "PWS_STABLE_RESET_S", 30))
+        self._jitter_ms = int(getattr(pws, "PWS_JITTER_MS", 2))
+        self._bo_base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 500))
+        self._bo_max_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 20_000))
 
         # dérivés pratiques
         self._bo_base_s = self._bo_base_ms / 1000.0
         self._bo_max_s = self._bo_max_ms / 1000.0
+
+        # --- Parité de connexion par exchange ---
+        self._connect_timeout_s = int(getattr(pws, "PWS_CONNECT_TIMEOUT_S", 10))
+        self._read_timeout_s    = int(getattr(pws, "PWS_READ_TIMEOUT_S", 30))
+
+        self._connect_timeout_s_by_ex = dict(getattr(pws, "connect_timeout_s_by_ex", {}))
+        self._read_timeout_s_by_ex    = dict(getattr(pws, "read_timeout_s_by_ex", {}))
+        self._ping_interval_s_by_ex   = dict(getattr(pws, "ping_interval_s_by_ex", {}))
+        self._pong_timeout_s_by_ex    = dict(getattr(pws, "pong_timeout_s_by_ex", {}))
 
         # --- garde DRY_RUN/PROD (si cfg.g présent) ---
         g = getattr(self.cfg, "g", None) if self.cfg is not None else None
@@ -317,12 +326,30 @@ class _BaseWSClient:
         raise ValueError(f"unknown callback role={role}")
 
 
+    def _ws_connect_kwargs(self) -> Dict[str, Any]:
+        """Arguments unifiés pour session.ws_connect avec parité par exchange."""
+        ex = self.exchange
+        ping = self._ping_interval_s_by_ex.get(ex, self._ping_s)
+        read = self._read_timeout_s_by_ex.get(ex, self._read_timeout_s)
+        return {
+            "heartbeat": float(ping),
+            "receive_timeout": float(read),
+            "compress": 0
+        }
+
+    def _get_connect_timeout(self) -> float:
+        return float(self._connect_timeout_s_by_ex.get(self.exchange, self._connect_timeout_s))
+
     async def start(self):
-        import aiohttp, asyncio
+        import aiohttp, asyncio, socket
         if self._running:
             return
         self._running = True
-        self._session = aiohttp.ClientSession(trust_env=True)
+        self._session = aiohttp.ClientSession(
+            trust_env=True,
+            connector=aiohttp.TCPConnector(family=socket.AF_INET, force_close=True, enable_cleanup_closed=True),
+            timeout=aiohttp.ClientTimeout(total=None, connect=self._get_connect_timeout(), sock_connect=self._get_connect_timeout())
+        )
         # TODO: ouvrir la bonne URL selon self._region_map[self.exchange]
         self._task = asyncio.create_task(self._run())
 
@@ -389,6 +416,20 @@ class _BaseWSClient:
                 self._callback(ev)
             except Exception:
                 log.exception("[%s:%s] callback error", self.exchange, self.alias)
+
+    def _emit_balance(self, delta: Dict[str, float], wallet_type: Optional[str] = None, is_authoritative: bool = False) -> None:
+        """
+        Émet un delta de balance vers le Hub (pour routage vers MBF).
+        """
+        self._emit({
+            "type": "balance_delta",
+            "exchange": self.exchange,
+            "alias": self.alias,
+            "delta": delta,
+            "wallet_type": wallet_type,
+            "is_authoritative": is_authoritative,
+            "ts_local": _now()
+        })
 
     def get_status(self) -> Dict[str, Any]:
         return {
@@ -544,6 +585,32 @@ class BinanceUserStream(_BaseWSClient):
                     "ts": ts_loc,
                 })
 
+    def _handle_balance_update(self, msg: dict) -> None:
+        """
+        Gère les événements outboundAccountPosition et balanceUpdate de Binance.
+        """
+        etype = msg.get("e")
+        delta = {}
+        if etype == "outboundAccountPosition":
+            # Liste des actifs avec leurs soldes free/locked
+            for b in msg.get("B", []):
+                asset = str(b.get("a", "")).upper()
+                free = _safe_float(b.get("f"))
+                # locked = _safe_float(b.get("l"))
+                delta[asset] = free
+        elif etype == "balanceUpdate":
+            # Delta sur un actif spécifique (souvent dépôt/retrait/transfert)
+            asset = str(msg.get("a", "")).upper()
+            # d = _safe_float(msg.get("d")) # Binance balanceUpdate envoie le delta net
+            # On ne peut pas facilement convertir un delta net en solde absolu ici
+            # sans le solde précédent. Mais MBF peut le gérer s'il est capable de resync.
+            # Pour l'instant, on ignore balanceUpdate car outboundAccountPosition est
+            # envoyé après chaque mouvement impactant le solde.
+            return
+
+        if delta:
+            self._emit_balance(delta, wallet_type="SPOT", is_authoritative=True)
+
     async def _run_ws(self) -> None:
         assert self._session and self._listen_key
 
@@ -558,7 +625,7 @@ class BinanceUserStream(_BaseWSClient):
             base = self._ws_bases[self._ws_ix % len(self._ws_bases)]
             url = f"{base}/ws/{self._listen_key}"
             try:
-                async with self._session.ws_connect(url, heartbeat=heartbeat_s) as ws:
+                async with self._session.ws_connect(url, **self._ws_connect_kwargs()) as ws:
                     self._ws = ws
                     log.info("[BINANCE:%s] WS connected (%s)", self.alias, base)
                     backoff = base_s  # reset après une connexion OK
@@ -568,6 +635,8 @@ class BinanceUserStream(_BaseWSClient):
                                 js = json.loads(msg.data)
                                 if js.get("e") == "executionReport":
                                     self._handle_exec_report(js)
+                                elif js.get("e") in ("outboundAccountPosition", "balanceUpdate"):
+                                    self._handle_balance_update(js)
                             except Exception:
                                 log.exception("[BINANCE:%s] parse error", self.alias)
                         elif msg.type == aiohttp.WSMsgType.ERROR:
@@ -770,14 +839,14 @@ class BybitPrivateWS(_BaseWSClient):
         while self._running:
             base = self._ws_urls[self._ws_ix % len(self._ws_urls)]
             try:
-                async with self._session.ws_connect(base, heartbeat=heartbeat_s) as ws:
+                async with self._session.ws_connect(base, **self._ws_connect_kwargs()) as ws:
                     self._ws = ws
                     ts_ms = int(_now() * 1000)
                     sign = self._sign(ts_ms, self.api_key, self.secret)
                     await ws.send_json(
                         {"op": "auth", "args": [self.api_key, ts_ms, sign, "5000"]}
                     )
-                    await ws.send_json({"op": "subscribe", "args": ["order"]})
+                    await ws.send_json({"op": "subscribe", "args": ["order", "wallet"]})
                     log.info("[BYBIT:%s] WS connected & subscribed (%s)", self.alias, base)
                     backoff_s = base_s
 
@@ -787,7 +856,8 @@ class BybitPrivateWS(_BaseWSClient):
                                 js = json.loads(msg.data)
                                 if js.get("op") in ("auth", "subscribe"):
                                     continue
-                                if str(js.get("topic", "")).startswith("order"):
+                                topic = str(js.get("topic", ""))
+                                if topic.startswith("order"):
                                     data = js.get("data") or []
                                     if isinstance(data, dict):
                                         data = [data]
@@ -823,6 +893,17 @@ class BybitPrivateWS(_BaseWSClient):
                                             self._maybe_emit_fill(event, row, filled_cum)
                                         except Exception:
                                             continue
+                                elif topic.startswith("wallet"):
+                                    data = js.get("data") or []
+                                    if isinstance(data, dict):
+                                        data = [data]
+                                    for row in data:
+                                        # Bybit wallet envoie souvent une liste de "coin"
+                                        for c in row.get("coin", []):
+                                            asset = str(c.get("coin", "")).upper()
+                                            available = _safe_float(c.get("availableToWithdraw") or c.get("walletBalance"))
+                                            if asset:
+                                                self._emit_balance({asset: available}, wallet_type=row.get("accountType", "UNIFIED"), is_authoritative=True)
                             except Exception:
                                 continue
                         elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
@@ -1267,6 +1348,8 @@ class PrivateWSHub:
         # Callbacks wiring (RM / Engine / observers)
         self._callback = on_event
         self._rm_callback: Optional[Callable[[dict], None]] = None
+        self._on_balance_delta_cb: Optional[Callable[[str, str, Dict[str, float], Optional[str]], None]] = None
+        self._on_wallet_snapshot_cb: Optional[Callable[[str, str, str, Dict[str, float]], None]] = None
         self._observers: List[Callable[[dict], Any]] = []
         # Indicateur compat: True si _rm_callback a été déduit automatiquement
         # à partir d'un précédent callback "engine" (mode test uniquement).
@@ -1316,13 +1399,22 @@ class PrivateWSHub:
             self._bybit_ws_priv     = "wss://stream.bybit.com/v5/private"
             self._coinbase_api_base = "https://api.coinbase.com"
 
-        # Clients par alias
+        # Feature flag pour les balances WS (Ticket P0-PWS-01)
+        self._ff_balance_ws = bool(getattr(pws_cfg, "PWS_BALANCE_WS_ENABLED", False))
+        self._balance_ws_allowlist = list(getattr(pws_cfg, "PWS_BALANCE_WS_ALLOWLIST", []))
+
+        # 1) Comptes par alias
+        # P0: Chargement automatique depuis config si absent (Ticket P0-BOOT-KEYS)
+        self.binance_accounts = binance_accounts if binance_accounts is not None else getattr(self.config, "binance_accounts", {})
+        self.bybit_accounts = bybit_accounts if bybit_accounts is not None else getattr(self.config, "bybit_accounts", {})
+        self.coinbase_at_accounts = coinbase_at_accounts if coinbase_at_accounts is not None else getattr(self.config, "coinbase_at_accounts", {})
+
         self.binance_by_alias: Dict[str, BinanceUserStream] = {}
         self.bybit_by_alias: Dict[str, BybitPrivateWS] = {}
         self.cb_poller_by_alias: Dict[str, CoinbaseATPoller] = {}
         self.cb_ack_ws_by_alias: Dict[str, CoinbaseOrdersWS] = {}
 
-        # 1) Clients explicites passés au ctor
+        # 2) Clients explicites passés au ctor par coinbase_ws_ack_clients
         for al, cfg in (coinbase_ws_ack_clients or {}).items():
             alias = _upper(al)
             ws_urls_cfg = cfg.get("ws_urls")
@@ -1349,21 +1441,18 @@ class PrivateWSHub:
             c.register_callback(self._dispatch(alias, "COINBASE"))
             self.cb_ack_ws_by_alias[alias] = c
 
-        # 2) Auto-instanciation par config (flag) pour les mêmes alias que le poller
+        # 3) Auto-instanciation par config (flag) pour les mêmes alias que le poller
         try:
             if int(getattr(self.config, "cb_ack_ws_enabled", 0)):
                 default_urls = getattr(self.config, "coinbase_ws_orders_urls", None) \
                                or ["wss://advanced-trade-ws.coinbase.com"]
-                for al in list(self.cb_poller_by_alias.keys()):
-                    alias = _upper(al)
+                for alias in list(self.cb_poller_by_alias.keys()):
                     if alias in self.cb_ack_ws_by_alias:
                         continue
                     c = CoinbaseOrdersWS(self.config, alias=alias, ws_urls=default_urls)
-
                     c.register_callback(self._dispatch(alias, "COINBASE"))
                     self.cb_ack_ws_by_alias[alias] = c
         except Exception:
-            # pas bloquant
             pass
 
         # Transferts
@@ -1371,12 +1460,11 @@ class PrivateWSHub:
         if transfer_clients:
             self.connect_transfer_clients(transfer_clients)
 
-
-        # Instantiation par alias — TT/TM/MM ou autre
-        for al, creds in (binance_accounts or {}).items():
+        # 4) Instantiation par alias — TT/TM/MM ou autre
+        for al, creds in self.binance_accounts.items():
             alias = _upper(al)
             c = BinanceUserStream(
-                self.config,  # cfg = BotConfig ou équivalent
+                self.config,
                 alias=alias,
                 api_key=creds["api_key"],
                 rest_base=self._binance_rest_base,
@@ -1385,9 +1473,7 @@ class PrivateWSHub:
             c.register_callback(self._dispatch(alias, "BINANCE"))
             self.binance_by_alias[alias] = c
 
-        # === Clients Bybit par alias (multi-endpoints supportés) ===============
-        # === Clients Bybit par alias (multi-endpoints supportés) ===============
-        for al, creds in (bybit_accounts or {}).items():
+        for al, creds in self.bybit_accounts.items():
             alias = _upper(al)
             urls_cfg = getattr(self.config, "bybit_ws_private_urls", None)
             if urls_cfg and isinstance(urls_cfg, (list, tuple)) and len(urls_cfg) > 0:
@@ -1409,7 +1495,7 @@ class PrivateWSHub:
             c.register_callback(self._dispatch(alias, "BYBIT"))
             self.bybit_by_alias[alias] = c
 
-        for al, cfg in (coinbase_at_accounts or {}).items():
+        for al, cfg in self.coinbase_at_accounts.items():
             alias = _upper(al)
             c = CoinbaseATPoller(
                 alias=alias,
@@ -1422,85 +1508,62 @@ class PrivateWSHub:
             self.cb_poller_by_alias[alias] = c
 
         # === P0: QoS / queues / heartbeats - init unique (après création des clients) ===
-        # Alias compat (le reste du code lit 'self.cfg')
         self.cfg = self.config
-        # Source de vérité PWS : cfg.pws uniquement
         self._pws_cfg = pws_cfg
 
-
-        # Priorités QoS (plus petit = plus prioritaire)
-        if not hasattr(self, "_priority_map"):
-            self._priority_map = {"fill": 0, "ack": 1, "reject": 2, "other": 3}
-        pws = self._pws_cfg
+        # Priorités QoS
+        self._priority_map = {"fill": 0, "ack": 1, "reject": 2, "other": 3}
+        
         # Files par (exchange, alias)
-        if not hasattr(self, "_queues"):
-            from collections import defaultdict, deque
-            qmax = int(getattr(pws, "PWS_QUEUE_MAXLEN", 5000))
-            self._queue_max = qmax
-            self._queues = defaultdict(deque)
-
-        if not hasattr(self, "_queue_max"):
-            self._queue_max = int(getattr(pws, "PWS_QUEUE_MAXLEN", 5000))
+        self._queue_max = int(getattr(pws_cfg, "PWS_QUEUE_MAXLEN", 5000))
+        self._queues = defaultdict(deque)
 
         # Heartbeats
-        if not hasattr(self, "_last_hb"):
-            self._last_hb = {}
+        self._last_hb = {}
 
-        # Paramètres ping/backoff (défauts sûrs)
-
-        self._ping_interval_s = float(getattr(pws, "PWS_PING_INTERVAL_S", 20.0))
-        self._pong_timeout_s = float(getattr(pws, "PWS_PONG_TIMEOUT_S", 10.0))
-        self._backoff_base_ms = int(getattr(pws, "PWS_BACKOFF_BASE_MS", 500))
-        self._backoff_max_ms = int(getattr(pws, "PWS_BACKOFF_MAX_MS", 20_000))
-        self._critical_drop_seen = bool(getattr(self, "_critical_drop_seen", False))
-        self._last_critical_drop_reason = getattr(self, "_last_critical_drop_reason", None)
-        self._last_critical_drop_ts = float(getattr(self, "_last_critical_drop_ts", 0.0) or 0.0)
-        self._ff_no_drop_critical_enforced = bool(
-            getattr(pws, "ff_pws_no_drop_critical_enforced", False)
-        )
-        self._ff_strict_dedup_enforced = bool(
-            getattr(pws, "ff_pws_strict_dedup_enforced", False)
-        )
-        self._drop_policy = str(getattr(pws, "pws_drop_policy", "DROP_NEW")).upper()
-        self._disable_auto_wiring_prod = bool(getattr(pws, "ff_pws_disable_auto_wiring_prod", True))
+        # Paramètres ping/backoff
+        self._ping_interval_s = float(getattr(pws_cfg, "PWS_PING_INTERVAL_S", 20.0))
+        self._pong_timeout_s = float(getattr(pws_cfg, "PWS_PONG_TIMEOUT_S", 10.0))
+        self._backoff_base_ms = int(getattr(pws_cfg, "PWS_BACKOFF_BASE_MS", 500))
+        self._backoff_max_ms = int(getattr(pws_cfg, "PWS_BACKOFF_MAX_MS", 20_000))
+        
+        self._critical_drop_seen = False
+        self._last_critical_drop_reason = None
+        self._last_critical_drop_ts = 0.0
+        
+        self._ff_no_drop_critical_enforced = bool(getattr(pws_cfg, "ff_pws_no_drop_critical_enforced", False))
+        self._ff_strict_dedup_enforced = bool(getattr(pws_cfg, "ff_pws_strict_dedup_enforced", False))
+        
+        self._drop_policy = str(getattr(pws_cfg, "pws_drop_policy", "DROP_NEW")).upper()
+        self._disable_auto_wiring_prod = bool(getattr(pws_cfg, "ff_pws_disable_auto_wiring_prod", True))
+        
         g_cfg = getattr(self.cfg, "g", None) if self.cfg is not None else None
         self._prod_mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD"
 
-        # Pools WS par région (optionnel, valeur non bloquante si métrique absente)
+        # Pools WS par région
         try:
             from modules.obs_metrics import PWS_POOL_SIZE
-            PWS_POOL_SIZE.labels(region="EU").set(float(getattr(pws, "PWS_POOL_SIZE_EU", 1)))
-            PWS_POOL_SIZE.labels(region="US").set(float(getattr(pws, "PWS_POOL_SIZE_US", 1)))
+            PWS_POOL_SIZE.labels(region="EU").set(float(getattr(pws_cfg, "PWS_POOL_SIZE_EU", 1)))
+            PWS_POOL_SIZE.labels(region="US").set(float(getattr(pws_cfg, "PWS_POOL_SIZE_US", 1)))
         except Exception:
-          pass
+            pass
 
-        try:
-            eu_size = int(getattr(pws, "PWS_POOL_SIZE_EU", 1))
-            us_size = int(getattr(pws, "PWS_POOL_SIZE_US", 1))
-        except Exception:
-            eu_size, us_size = 1, 1
+        eu_size = int(getattr(pws_cfg, "PWS_POOL_SIZE_EU", 1))
+        us_size = int(getattr(pws_cfg, "PWS_POOL_SIZE_US", 1))
 
         if eu_size <= 0 or us_size <= 0:
-            raise RuntimeError(
-                "Invalid PWS pool size: PWS_POOL_SIZE_EU and PWS_POOL_SIZE_US must be > 0"
-            )
+            raise RuntimeError("Invalid PWS pool size: PWS_POOL_SIZE_EU and PWS_POOL_SIZE_US must be > 0")
 
         self._pools: Dict[str, asyncio.Semaphore] = {
             "EU": asyncio.Semaphore(max(1, eu_size)),
             "US": asyncio.Semaphore(max(1, us_size)),
         }
-        # Alias compat
         self._pools_by_region = self._pools
 
-        # Mapping région (clé "EX:ALIAS" > "EX" > défaut "EU")
-        self._region_map: Dict[str, str] = dict(getattr(pws, "PWS_REGION_MAP", {}) or {})
-
-        # Gap heartbeat PWS (SLO privé par exchange + fallback global)
+        self._region_map: Dict[str, str] = dict(getattr(pws_cfg, "PWS_REGION_MAP", {}) or {})
         self._pws_gap_slo_by_ex: Dict[str, float] = {}
-        self._pws_gap_slo_default: float = float(getattr(pws, "PWS_HEARTBEAT_MAX_GAP_S", 30.0))
+        self._pws_gap_slo_default: float = float(getattr(pws_cfg, "PWS_HEARTBEAT_MAX_GAP_S", 30.0))
         self._refresh_pws_gap_slo_from_slo()
-
-        # Health state par (exchange, alias)
         self._pws_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
         # ------------------------- QoS / métriques / drain -------------------------
@@ -1578,6 +1641,9 @@ class PrivateWSHub:
         critical = self._is_critical_event(ev)
         label = "queue_full_critical" if critical else "queue_full_other"
         try:
+            from modules.obs_metrics import PWS_HUB_DROPPED_TOTAL
+            if PWS_HUB_DROPPED_TOTAL:
+                PWS_HUB_DROPPED_TOTAL.labels(exchange=exchange, reason=reason).inc()
             PWS_DROPPED_TOTAL.labels(exchange, alias, label).inc()
         except Exception:
             pass
@@ -1605,6 +1671,30 @@ class PrivateWSHub:
             ev["status"] = "FILL"
 
         etype = str(ev.get("type") or "").lower()
+
+        # Ticket P0-PWS-01: Routage des deltas de balance vers MBF
+        if etype == "balance_delta":
+            try:
+                PWS_BALANCE_EVENTS_TOTAL.labels(exchange=exu, alias=alu, type="delta").inc()
+            except Exception:
+                pass
+            if self._ff_balance_ws:
+                # Vérifie l'allowlist si définie
+                allowed = True
+                if self._balance_ws_allowlist:
+                    key_str = f"{exu}.{alu}"
+                    if key_str not in self._balance_ws_allowlist and exu not in self._balance_ws_allowlist:
+                        allowed = False
+                
+                if allowed and self._on_balance_delta_cb:
+                    try:
+                        delta = ev.get("delta") or {}
+                        wtype = ev.get("wallet_type")
+                        is_auth = bool(ev.get("is_authoritative", False))
+                        self._on_balance_delta_cb(exu, alu, delta, wtype, is_authoritative=is_auth)
+                    except Exception:
+                        log.exception("[PrivateWSHub] balance_delta callback error")
+            return
 
         # Normalise exchange/alias dans l'événement
         ev.setdefault("exchange", exu)
@@ -1736,7 +1826,15 @@ class PrivateWSHub:
 
         # Drain minimal (double émission dans _pws_drain_one)
         try:
+            drain_start = _t.time()
             self._pws_drain_one(key)
+            drain_ms = (_t.time() - drain_start) * 1000.0
+            try:
+                from modules.obs_metrics import PWS_LATENCY_DRAIN_MS
+                if PWS_LATENCY_DRAIN_MS:
+                    PWS_LATENCY_DRAIN_MS.labels(exchange=exu).observe(drain_ms)
+            except Exception:
+                pass
         except Exception:
             log.exception("[PrivateWSHub] drain_one error")
 
@@ -2136,6 +2234,14 @@ class PrivateWSHub:
 
         if kind == "observer":
             self._observers.append(cb)
+            return
+
+        if kind in ("balance", "balances"):
+            self._on_balance_delta_cb = cb
+            return
+
+        if kind in ("wallet_snapshot", "wallets"):
+            self._on_wallet_snapshot_cb = cb
             return
 
         raise ValueError(f"unknown callback role={role!r}")
@@ -2573,6 +2679,37 @@ class PrivateWSHub:
         except Exception as e:
             return False, None, f"{type(e).__name__}: {e}"
 
+    async def _trigger_wallet_refresh(self, exchange: str, alias: str) -> None:
+        """
+        Déclenche une demande de snapshot wallets après un transfert réussi,
+        et propage les résultats vers le callback 'wallet_snapshot' (MBF).
+        """
+        if not self._on_wallet_snapshot_cb:
+            return
+
+        try:
+            # Récupère le snapshot depuis les transfer_clients
+            snap = await self.get_wallets_snapshot()
+            if not snap:
+                return
+
+            exu = _upper(exchange)
+            alu = _upper(alias)
+
+            # Si on a des données pour cet exchange
+            if exu in snap:
+                per_alias = snap[exu]
+                # On propage les données pour tous les alias trouvés (souvent juste un)
+                # ou on filtre par alu si nécessaire. Ici on préfère tout donner au MBF.
+                for a, wallets in per_alias.items():
+                    for wtype, balances in wallets.items():
+                        try:
+                            self._on_wallet_snapshot_cb(exu, a, wtype, balances)
+                        except Exception:
+                            log.exception("[PrivateWSHub] Error in wallet_snapshot callback")
+        except Exception:
+            log.exception("[PrivateWSHub] _trigger_wallet_refresh failed")
+
     def _emit_transfer_event(
             self,
             *,
@@ -2688,6 +2825,14 @@ class PrivateWSHub:
             "error": error,
             "ts": _now(),
         }
+
+        # Ticket P1-WALLET-01: Pipeline automatique après transfert réussi
+        if ev["status"] in ("OK", "SUCCESS", "SETTLED", "COMPLETED"):
+            try:
+                import asyncio
+                asyncio.create_task(self._trigger_wallet_refresh(ev["exchange"], ev["alias"]))
+            except Exception:
+                pass
 
         try:
             PWS_TRANSFERS_TOTAL.labels(

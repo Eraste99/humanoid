@@ -24,12 +24,13 @@ les attributs min_backoff/base_backoff/max_backoff + next_delay/last_backoff.
 """
 
 from __future__ import annotations
-import json
+from modules.utils import json_utils as json
 import time
 import random
 import socket
 import logging
 import asyncio
+import heapq
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 from collections import defaultdict, OrderedDict, deque
@@ -37,8 +38,10 @@ from dataclasses import dataclass
 import websockets  # pip install websockets
 from modules.retry_policy import with_retry, awith_retry, BackoffPolicy, ErrKind
 # --- imports locaux (pas d'effets globaux) ---
-import asyncio, json, random
-from contracts.payloads import MarketEvent
+import asyncio, random, time, socket
+from modules.utils import json_utils as json
+# from contracts.payloads import MarketEvent # Removed for CPU optimization (Hot Path)
+import aiohttp
 
 
 # --- Prometheus: WS reconnect/backoff (fallback no-op si absent) ---
@@ -198,6 +201,10 @@ class WebSocketExchangeClient:
         self.loop = loop
         self.verbose = bool(verbose)
         self.shard_id = str(shard_id)
+        # logger (évite crash silencieux dans start/_supervisor/listeners)
+        self.log = logger
+        self.name = f"ws_public_{self.shard_id}"
+
 
         # --- contexte région / mode (pod) ---
         # Source: BotConfig / Boot (pas de heuristique locale ici)
@@ -234,6 +241,12 @@ class WebSocketExchangeClient:
         self._pong_timeout_s    = int(getattr(wscfg, "pong_timeout_s", 10))
         self._auto_resubscribe  = bool(getattr(wscfg, "auto_resubscribe", True))
         self._max_retries       = int(getattr(wscfg, "max_retries", 0))
+
+        # --- Parité de connexion par exchange ---
+        self._connect_timeout_s_by_ex = dict(getattr(wscfg, "connect_timeout_s_by_ex", {}))
+        self._read_timeout_s_by_ex    = dict(getattr(wscfg, "read_timeout_s_by_ex", {}))
+        self._ping_interval_s_by_ex   = dict(getattr(wscfg, "ping_interval_s_by_ex", {}))
+        self._pong_timeout_s_by_ex    = dict(getattr(wscfg, "pong_timeout_s_by_ex", {}))
 
         # --- orchestrateur / univers ---
         self.pairs = list(pairs)
@@ -339,11 +352,22 @@ class WebSocketExchangeClient:
         self._last_publish_by_exchange: Dict[str, float] = defaultdict(float)
         self._bp_last_log_ts: Dict[str, float] = defaultdict(float)
         now_ms = int(time.time() * 1000)
+        # 0 = jamais reçu (fail-closed : staleness doit monter tant qu'aucun frame)
         self._last_recv_ts_ms: Dict[str, int] = {
-            "BINANCE": now_ms,
-            "COINBASE": now_ms,
-            "BYBIT": now_ms,
+            "BINANCE": 0,
+            "COINBASE": 0,
+            "BYBIT": 0,
         }
+        # P0: Décimation Coinbase L2 (Hz -> ms)
+        cb_l2_hz = float(getattr(wscfg, "coinbase_l2_max_hz", 20.0))
+        self._coinbase_l2_interval_ms = 1000.0 / cb_l2_hz if cb_l2_hz > 0 else 0
+        self._coinbase_l2_last_emit_ms: Dict[str, int] = {}
+
+        # P0: Décimation Bybit L2 (Hz -> ms)
+        bb_l2_hz = float(getattr(wscfg, "bybit_l2_max_hz", 20.0))
+        self._bybit_l2_interval_ms = 1000.0 / bb_l2_hz if bb_l2_hz > 0 else 0
+        self._bybit_l2_last_emit_ms: Dict[str, int] = {}
+
         self._disabled_last_note_ts: Dict[str, float] = defaultdict(float)
         self._staleness_task: Optional["asyncio.Task"] = None
         self._control_events_pending: Deque[Dict[str, Any]] = deque(maxlen=64)
@@ -359,13 +383,35 @@ class WebSocketExchangeClient:
             # fallback simple si non présente
             self._inv_map = {}
 
-    def _ws_connect_kwargs(self) -> Dict[str, float]:
-        return {
-            "ping_interval": self._ping_interval_s,
-            "ping_timeout": self._pong_timeout_s,
-            "close_timeout": self._read_timeout_s,
-            "open_timeout": self._connect_timeout_s,
+    def _ws_connect_kwargs(self, exchange: str) -> Dict[str, Any]:
+        """
+        Renvoie les arguments pour session.ws_connect(...) avec parité entre CEX.
+        Prend en compte les overrides spécifiques par exchange.
+        """
+        ex = exchange.upper()
+        
+        # Fallbacks : exchange-specific -> global defaults
+        ping_interval = self._ping_interval_s_by_ex.get(ex, self._ping_interval_s)
+        read_timeout  = self._read_timeout_s_by_ex.get(ex, self._read_timeout_s)
+        
+        # Configuration de base aiohttp
+        kwargs = {
+            "heartbeat": float(ping_interval),
+            "receive_timeout": float(read_timeout),
+            "compress": 0,       # HFT: désactive la compression (gain CPU)
         }
+        
+        # Spécificités par exchange
+        if ex == "BINANCE":
+            # Note: v5.spot est conservé par parité avec le code pré-existant, 
+            # bien que ce soit inhabituel pour Binance.
+            kwargs["protocols"] = ("v5.spot",)
+            
+        return kwargs
+
+    def _get_connect_timeout(self, exchange: str) -> float:
+        ex = exchange.upper()
+        return float(self._connect_timeout_s_by_ex.get(ex, self._connect_timeout_s))
     def _unsubscribe_impl(self, batch: List[str]) -> None:
         # Hook d’implémentation spécifique CEX si nécessaire.
         # Par défaut, les listeners reconstruisent la souscription côté serveur → no-op ici.
@@ -621,20 +667,31 @@ class WebSocketExchangeClient:
 
     # ------------------- mapping utils -------------------
     def _rebuild_inv_map(self):
-        self._inv_map = {
-            "binance":  {v.get("binance"):  k for k, v in self.pair_mapping.items() if v.get("binance")},
-            "coinbase": {v.get("coinbase"): k for k, v in self.pair_mapping.items() if v.get("coinbase")},
-            "bybit":    {v.get("bybit"):    k for k, v in self.pair_mapping.items() if v.get("bybit")},
-        }
+        self._inv_map = {}
+        for ex in ("binance", "coinbase", "bybit"):
+            self._inv_map[ex] = {}
+            for pk, mapping in self.pair_mapping.items():
+                sym = mapping.get(ex)
+                if sym and isinstance(sym, str):
+                    self._inv_map[ex][sym.upper()] = pk
+        
+        self.log.info("[WS] Inverse mapping rebuilt: BYBIT keys=%s", list(self._inv_map.get("bybit", {}).keys()))
 
     def _note_drop(self, exchange: str, *, reason: str, kind: str) -> None:
-        ws_public_note_event_dropped(
-            exchange=exchange,
-            region=getattr(self, "region", "EU"),
-            deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
-            reason=reason,
-            kind=kind,
-        )
+        try:
+            from modules.obs_metrics import ws_public_note_event_dropped
+            ws_public_note_event_dropped(
+                exchange=exchange,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=str(getattr(self.cfg, "MODE", "PROD")).upper(),
+                reason=reason,
+                kind=kind,
+            )
+        except Exception:
+            pass
+        self._out_queue_drops[exchange.upper()] += 1
+        self._out_queue_last_drop_reason[exchange.upper()] = reason
+        self._out_queue_last_drop_ts[exchange.upper()] = time.time()
 
     def _note_ok(self, exchange: str, *, kind: str) -> None:
         ws_public_note_event_ok(
@@ -644,8 +701,10 @@ class WebSocketExchangeClient:
             kind=kind,
         )
 
-    @staticmethod
-    def _normalize_ts_ms(raw_ts: Any, recv_ts_ms: int) -> int:
+    def _normalize_ts_ms(self, raw_ts: Any, recv_ts_ms: int) -> int:
+        # P0 : Prise en compte du décalage d'horloge pour la mesure de fraîcheur
+        offset = int(getattr(self, "_clock_offset_ms", 0))
+        
         if raw_ts is None:
             return int(recv_ts_ms)
         if isinstance(raw_ts, str):
@@ -658,7 +717,7 @@ class WebSocketExchangeClient:
                     dt = datetime.fromisoformat(iso)
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
-                    return int(dt.timestamp() * 1000)
+                    return int(dt.timestamp() * 1000) - offset
                 except Exception:
                     return int(recv_ts_ms)
             try:
@@ -670,8 +729,8 @@ class WebSocketExchangeClient:
         except Exception:
             return int(recv_ts_ms)
         if ts_val < 1e12:
-            return int(ts_val * 1000)
-        return int(ts_val)
+            return int(ts_val * 1000) - offset
+        return int(ts_val) - offset
 
     def _exchange_region_disabled(self, exchange: str, pair_key: Optional[str] = None) -> bool:
         if getattr(self.cfg, "g", None) is not None:
@@ -688,10 +747,29 @@ class WebSocketExchangeClient:
         return False
 
     def unify_pair_key(self, exchange_symbol: str, exchange: str) -> Optional[str]:
-        return self._inv_map.get(exchange.lower(), {}).get(exchange_symbol)
+        # P0: Forcer tout en majuscules pour le matching
+        ex_low = str(exchange).lower()
+        sym_up = str(exchange_symbol).upper()
+        res = self._inv_map.get(ex_low, {}).get(sym_up)
+        
+        if not res and ex_low == "bybit":
+            # On ne loggue que si on a vraiment reçu un symbole (pas une chaîne vide)
+            if sym_up:
+                self.log.warning("[WS][BYBIT] REJET: Symbole '%s' inconnu. Dispos: %s", 
+                                 sym_up, list(self._inv_map.get("bybit", {}).keys()))
+        return res
 
     def _note_frame_received(self, exchange: str, recv_ts_ms: int) -> None:
         self._last_recv_ts_ms[exchange.upper()] = int(recv_ts_ms)
+        try:
+            from modules.obs_metrics import ws_public_note_frame_received
+            ws_public_note_frame_received(
+                exchange=exchange,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=str(getattr(self.cfg, "MODE", "PROD")).upper()
+            )
+        except Exception:
+            pass
 
     def _exchange_disabled_by_flag(self, exchange: str) -> bool:
         wscfg = getattr(self.cfg, "ws_public", None)
@@ -717,8 +795,12 @@ class WebSocketExchangeClient:
                     continue
                 if self._exchange_disabled_by_flag(ex):
                     continue
-                last_ms = self._last_recv_ts_ms.get(ex, now_ms)
-                staleness_s = max(0.0, (now_ms - last_ms) / 1000.0)
+                last_ms = int(self._last_recv_ts_ms.get(ex, 0) or 0)
+                if last_ms <= 0:
+                    staleness_s = 1e9  # jamais reçu => stale massif
+                else:
+                    staleness_s = max(0.0, (now_ms - last_ms) / 1000.0)
+
                 ws_public_staleness(
                     ex,
                     region=getattr(self, "region", "EU"),
@@ -821,52 +903,99 @@ class WebSocketExchangeClient:
         l1 = self._l1[ex].get(ex_symbol)
         if not l1:
             return
+
         bid, ask, ex_ts = l1
         if bid <= 0 or ask <= 0 or ask < bid:
             self._note_drop(ex, reason="schema_mismatch", kind="emit")
             return
-        bids, asks, l2_ts = self._l2[ex].get(ex_symbol, ([], [], ex_ts))
+
+        bids, asks, _l2_ts = self._l2[ex].get(ex_symbol, ([], [], None))
+
+        # DRY_RUN: autorise l'émission sur L1-only pour ne pas "geler" le démarrage.
+        is_actually_dry = str(getattr(self.cfg, "MODE", "")).upper() == "DRY_RUN"
+        if not bids and not asks and not is_actually_dry:
+            # PROD: L2 obligatoire
+            return
+
         now_ms = int(time.time() * 1000)
         ex_ts_norm = self._normalize_ts_ms(ex_ts, now_ms)
         lat = (now_ms - ex_ts_norm) if ex_ts_norm else None
+
+        # ---- P0: métrique fraîcheur (cache le callable pour éviter import/try à chaque event)
+        if lat is not None:
+            fn = getattr(self, "_obs_ws_public_note_event_received", None)
+            if fn is None:
+                try:
+                    from modules.obs_metrics import ws_public_note_event_received as _fn  # type: ignore
+                    fn = _fn
+                except Exception:
+                    fn = False
+                setattr(self, "_obs_ws_public_note_event_received", fn)
+
+            if fn:
+                try:
+                    fn(
+                        exchange=ex,
+                        region=getattr(self, "region", "EU"),
+                        deployment_mode=str(getattr(self.cfg, "MODE", "PROD")).upper(),
+                        latency_ms=float(lat),
+                    )
+                except Exception:
+                    pass
+
         pk = self.unify_pair_key(ex_symbol, ex)
         if not pk:
             WS_SYMBOL_UNMAPPED_TOTAL.labels(exchange=ex).inc()
             self._note_drop(ex, reason="unknown_pair", kind="emit")
             self._unmapped_seen[ex] += 1
             return
+
+        # ---- HOT PATH: suppression du INFO spammy.
+        # Optionnel: debug *échantillonné* (ne sort que si LOG_LEVEL=DEBUG + verbose=True)
+        if getattr(self, "verbose", False) and ex == "BYBIT":
+            c = getattr(self, "_bybit_emit_ok_ctr", 0) + 1
+            self._bybit_emit_ok_ctr = c
+            if c <= 3 or (c % 5000 == 0):
+                self.log.debug("[WS][BYBIT] emit ok: %s -> %s (lat_ms=%s)", ex_symbol, pk, lat)
+
         if self._exchange_region_disabled(ex, pk):
             self._note_drop(ex, reason="region_disabled_jp", kind="emit")
             return
+
         self.last_update[ex][pk] = now_ms
         self.latency[ex][pk] = lat
+
         try:
-            event = MarketEvent(
-                exchange=ex,
-                pair_key=pk,
-                ex_symbol=ex_symbol,
-                best_bid=float(bid),
-                best_ask=float(ask),
-                bid_volume=float(bids[0][1]) if bids else 0.0,
-                ask_volume=float(asks[0][1]) if asks else 0.0,
-                orderbook={"bids": bids, "asks": asks} if (bids or asks) else {},
-                exchange_ts_ms=int(ex_ts_norm) if ex_ts_norm else None,
-                recv_ts_ms=now_ms,
-                latency_ms=lat,
-                active=True,
-            ).model_dump(exclude_none=True)
-            event["shard"] = self.shard_id
+            # HOT PATH: On évite l'instanciation Pydantic (MarketEvent) pour gagner du CPU.
+            # On construit directement le dictionnaire plat attendu par le Router.
+            event = {
+                "exchange": ex,
+                "pair_key": pk,
+                "ex_symbol": ex_symbol,
+                "best_bid": float(bid),
+                "best_ask": float(ask),
+                "bid_volume": float(bids[0][1]) if bids else 0.0,
+                "ask_volume": float(asks[0][1]) if asks else 0.0,
+                "orderbook": {"bids": bids, "asks": asks} if (bids or asks) else {},
+                "exchange_ts_ms": int(ex_ts_norm) if ex_ts_norm else None,
+                "recv_ts_ms": now_ms,
+                "recv_mono_ns": time.monotonic_ns(),
+                "latency_ms": lat,
+                "active": True,
+                "shard": "S0",
+                "publish_ts_ms": int(time.time() * 1000)
+            }
         except Exception:
-            logger.exception("[WS] market event validation failed", extra={"exchange": ex, "symbol": ex_symbol})
-            self._note_drop(ex, reason="schema_mismatch", kind="emit")
+            logger.exception("[WS] market event construction failed", extra={"exchange": ex, "symbol": ex_symbol})
+            self._note_drop(ex, reason="construction_error", kind="emit")
             return
 
         key = (ex, ex_symbol, int(ex_ts_norm or 0))
         if key in self._seen_events:
             self._note_drop(ex, reason="dedup", kind="emit")
             return
+
         self._seen_events[key] = True
-        # LRU bornée
         if len(self._seen_events) > self._seen_max:
             self._seen_events.popitem(last=False)
 
@@ -875,13 +1004,17 @@ class WebSocketExchangeClient:
             now = time.time()
             if (now - self._bp_last_log_ts[ex]) >= 1.0:
                 logger.warning(
-                    '[WS] out_queue saturated (exchange=%s, symbol=%s) — event dropped',
+                    "[WS] out_queue saturated (exchange=%s, symbol=%s) — event dropped",
                     ex,
                     ex_symbol,
                 )
                 self._bp_last_log_ts[ex] = now
 
     async def _publish_event(self, payload: Dict[str, Any], *, exchange: str, reason: str) -> bool:
+        """
+        HFT rule: when the out_queue is saturated, keep the newest market event.
+        Drop oldest to make room and ensure freshness.
+        """
         try:
             self.out_queue.put_nowait(payload)
             self._note_out_success(exchange)
@@ -889,17 +1022,27 @@ class WebSocketExchangeClient:
         except asyncio.QueueFull:
             pass
 
-        timeout = max(0.0, float(self._out_queue_put_timeout_s))
-        if timeout == 0.0:
-            self._note_backpressure(exchange, reason="queue_full")
-            return False
-        try:
-            await asyncio.wait_for(self.out_queue.put(payload), timeout=timeout)
-            self._note_out_success(exchange)
-            return True
-        except asyncio.TimeoutError:
-            self._note_backpressure(exchange, reason="queue_full")
-            return False
+        # If it's a market event (emit), we MUST prioritize freshness.
+        # Drop oldest events to make room for the latest one.
+        if reason == "emit":
+            # We drop a few to avoid constant oscillation if the consumer is slow
+            for _ in range(5):
+                try:
+                    self.out_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            
+            try:
+                self.out_queue.put_nowait(payload)
+                self._note_out_success(exchange)
+                return True
+            except asyncio.QueueFull:
+                # Still full? (high concurrency). Fail closed.
+                pass
+
+        # Fallback for control events or if queue is still full
+        self._note_backpressure(exchange, reason="queue_full")
+        return False
 
     def _note_out_success(self, exchange: str) -> None:
         now = time.time()
@@ -960,107 +1103,70 @@ class WebSocketExchangeClient:
 
     # ======================= BINANCE listener =======================
     async def _binance_listener_chunk(self, pairs_subset: List[str]):
-        if self._exchange_disabled_by_flag("BINANCE"):
-            self._maybe_note_disabled("BINANCE")
-            return
-        syms = []
-        for p in pairs_subset:
-            if self._exchange_region_disabled("BINANCE", p):
-                self._note_drop("BINANCE", reason="region_disabled_jp", kind="subscribe")
-                continue
-            if self.pair_mapping.get(p, {}).get("binance"):
-                syms.append(self.get_symbol(p, "binance").lower())
-            if not syms:
-                self._note_drop("BINANCE", reason="unknown_pair", kind="subscribe")
-                return
-        streams = "/".join([f"{s}@bookTicker" for s in syms] +
-                           [f"{s}@depth{self.depth_level}@{self.binance_interval_ms}ms" for s in syms])
+        if self._exchange_disabled_by_flag("BINANCE"): return
+        syms = [self.get_symbol(p, "binance").lower() for p in pairs_subset if self.pair_mapping.get(p, {}).get("binance")]
+        if not syms: return
+        # P0: On donne la priorité au bookTicker pour une latence minimale (HFT)
+        # bookTicker est instantané, contrairement aux flux @depth qui sont limités en fréquence
+        streams = "/".join([f"{s}@bookTicker" for s in syms] + [f"{s}@depth5@100ms" for s in syms])
         url = f"{self.BINANCE_WS_BASE}?streams={streams}"
+        
+        self.log.info("[WS][BINANCE] Tentative de connexion WebSocket vers %s", url)
+        conn_timeout = self._get_connect_timeout("BINANCE")
         while self._running:
             did_close = False
             try:
-                async with websockets.connect(url, **self._ws_connect_kwargs()) as ws:
-                    _set_tcp_nodelay(ws)
-                    self.on_open(exchange="BINANCE")  # reset backoff + resub
-                    self._metrics_conn_open("BINANCE")
-
-                    async for raw in ws:
-                        recv_ts_ms = int(time.time() * 1000)
-                        self._note_frame_received("BINANCE", recv_ts_ms)
-                        try:
-                            msg = self._json_loads(raw)
-                        except Exception:
-                            self._note_drop("BINANCE", reason="parse_error", kind="frame")
-                            continue
-                        data = msg.get("data") or {}
-                        stream = (msg.get("stream") or "").lower()
-                        ex_symbol = stream.split("@")[0].upper() if "@" in stream else data.get("s", " ").upper()
-                        if not ex_symbol:
-                            self._note_drop("BINANCE", reason="schema_mismatch", kind="frame")
-                            continue
-                        recv_ts_ms = int(time.time() * 1000)
-                        if data.get("e") == "bookTicker":
-                            try:
-                                bid = float(data.get("b") or data.get("B") or 0)
-                                ask = float(data.get("a") or data.get("A") or 0)
-                                if bid <= 0 or ask <= 0:
-                                    self._note_drop("BINANCE", reason="schema_mismatch", kind="l1")
-                                    continue
-                            except Exception:
-                                self._note_drop("BINANCE", reason="parse_error", kind="l1")
-                                continue
-                            ex_ts = self._normalize_ts_ms(data.get("T") or data.get("E"), recv_ts_ms)
-                            self._l1["BINANCE"][ex_symbol] = (bid, ask, ex_ts)
-                            await self._emit_if_ready("BINANCE", ex_symbol)
-                            continue
-                        if "bids" in data and "asks" in data:
-
-                            bids = [(float(px), float(q)) for px, q, *_ in data.get("bids", [])]
-                            asks = [(float(px), float(q)) for px, q, *_ in data.get("asks", [])]
-                            ex_ts = self._normalize_ts_ms(data.get("T") or data.get("E"), recv_ts_ms)
-                            bids = bids[: self.depth_level]
-                            asks = asks[: self.depth_level]
-                            self._l2["BINANCE"][ex_symbol] = (bids, asks, ex_ts)
-                            await self._emit_if_ready("BINANCE", ex_symbol)
-                            continue
-                        self._note_drop("BINANCE", reason="schema_mismatch", kind="frame")
+                # P0: Forcer IPv4 et désactiver le buffering TCP pour Low Latency (HFT)
+                connector = aiohttp.TCPConnector(family=socket.AF_INET, force_close=True, enable_cleanup_closed=True)
+                timeout = aiohttp.ClientTimeout(total=None, connect=conn_timeout, sock_connect=conn_timeout)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    # nodelay=True supprime l'algorithme de Nagle (indispensable HFT)
+                    async with session.ws_connect(url, **self._ws_connect_kwargs("BINANCE")) as ws:
+                        self.log.info("[WS][BINANCE] CONNECTÉ à %s", url)
+                        self.on_open(exchange="BINANCE")
+                        self._metrics_conn_open("BINANCE")
+                        async for msg in ws:
+                            recv_ts_ms = int(time.time() * 1000)
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                self._note_frame_received("BINANCE", recv_ts_ms)
+                                try:
+                                    payload = json.loads(msg.data)
+                                    if "stream" not in payload: continue
+                                    data = payload.get("data") or {}
+                                    stream = (payload.get("stream") or "").lower()
+                                    ex_symbol = stream.split("@")[0].upper() if "@" in stream else data.get("s", " ").upper()
+                                    
+                                    if stream.endswith("@bookticker"):
+                                        bid, ask = float(data.get("b") or 0), float(data.get("a") or 0)
+                                        if bid > 0 and ask > 0:
+                                            ex_ts = self._normalize_ts_ms(data.get("T") or data.get("E"), recv_ts_ms)
+                                            self._l1["BINANCE"][ex_symbol] = (bid, ask, ex_ts)
+                                            await self._emit_if_ready("BINANCE", ex_symbol)
+                                    elif "@depth" in stream or ("bids" in data and "asks" in data):
+                                        bids = [(float(px), float(q)) for px, q, *_ in data.get("bids", [])][:self.depth_level]
+                                        asks = [(float(px), float(q)) for px, q, *_ in data.get("asks", [])][:self.depth_level]
+                                        ex_ts = self._normalize_ts_ms(data.get("T") or data.get("E"), recv_ts_ms)
+                                        self._l2["BINANCE"][ex_symbol] = (bids, asks, ex_ts)
+                                        await self._emit_if_ready("BINANCE", ex_symbol)
+                                except Exception: continue
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                self.log.warning("[WS][BINANCE] Connexion fermée/erreur (type=%s)", msg.type)
+                                break
             except Exception as e:
-                self._queue_control_event({
-                    "__ws_error__": True,
-                    "exchange": "BINANCE",
-                    "reason": "listener_error",
-                    "error": str(e),
-                    "ts_ms": int(time.time() * 1000),
-                })
-                # backoff unifié (une seule fois)
-                self.on_close();
-                did_close = True
-                self._metrics_conn_closed("BINANCE")
-                await self._sleep_backoff("BINANCE", reason="backoff")
-
+                self.log.error("[WS][BINANCE] Erreur de connexion: %s", repr(e))
+                if not self._running: break
+                await self._sleep_backoff("BINANCE", reason=str(e))
             finally:
-                # si reload demandé -> fin immédiate sans double on_close()
-                if self._reload_event.is_set():
-                    return
                 if not did_close:
                     self.on_close()
                     self._metrics_conn_closed("BINANCE")
 
     # ======================= COINBASE listener =======================
     async def _coinbase_listener_chunk(self, pairs_subset: List[str]):
-        if self._exchange_disabled_by_flag("COINBASE"):
-            self._maybe_note_disabled("COINBASE")
-            return
-        prods = []
-        for p in pairs_subset:
-            if self._exchange_region_disabled("COINBASE", p):
-                self._note_drop("COINBASE", reason="region_disabled_jp", kind="subscribe")
-                continue
-            if self.pair_mapping.get(p, {}).get("coinbase"):
-                prods.append(self.get_symbol(p, "coinbase"))
-
-        if not prods:
-            return
+        if self._exchange_disabled_by_flag("COINBASE"): return
+        prods = [self.get_symbol(p, "coinbase") for p in pairs_subset if self.pair_mapping.get(p, {}).get("coinbase")]
+        if not prods: return
+        
         sub = {
             "type": "subscribe",
             "product_ids": prods,
@@ -1069,93 +1175,72 @@ class WebSocketExchangeClient:
                 {"name": "level2", "product_ids": prods},
             ],
         }
+        
+        self.log.info("[WS][COINBASE] Connexion WebSocket vers %s", self.COINBASE_WS)
+        conn_timeout = self._get_connect_timeout("COINBASE")
         while self._running:
             did_close = False
             try:
-                async with websockets.connect(self.COINBASE_WS, **self._ws_connect_kwargs()) as ws:
-                    _set_tcp_nodelay(ws)
-                    self.on_open(exchange="COINBASE")
-                    self._metrics_conn_open("COINBASE")
+                # Utilisation de aiohttp pour Coinbase avec timeouts unifiés
+                connector = aiohttp.TCPConnector(family=socket.AF_INET, force_close=True, enable_cleanup_closed=True)
+                timeout = aiohttp.ClientTimeout(total=None, connect=conn_timeout, sock_connect=conn_timeout)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.ws_connect(self.COINBASE_WS, **self._ws_connect_kwargs("COINBASE")) as ws:
+                        self.on_open(exchange="COINBASE")
+                        self._metrics_conn_open("COINBASE")
+                        await ws.send_json(sub)
+                        
+                        l2_book: Dict[str, Dict[str, Dict[float, float]]] = defaultdict(lambda: {"bids": {}, "asks": {}})
+                        
+                        async for msg in ws:
+                            recv_ts_ms = int(time.time() * 1000)
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                self._note_frame_received("COINBASE", recv_ts_ms)
+                                try:
+                                    data = self._json_loads(msg.data)
+                                    t = data.get("type")
+                                    
+                                    if t in ("subscriptions", "heartbeat", "status"): continue
+                                    pid = data.get("product_id")
+                                    if not pid: continue
 
-                    await ws.send(json.dumps(sub))
-                    l2_book: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: {"bids": {}, "asks": {}})
-                    async for raw in ws:
-                        recv_ts_ms = int(time.time() * 1000)
-                        self._note_frame_received("COINBASE", recv_ts_ms)
-                        try:
-                            msg = self._json_loads(raw)
-                        except Exception:
-                            self._note_drop("COINBASE", reason="parse_error", kind="frame")
-                            continue
-                        t = msg.get("type")
-                        pid = msg.get("product_id")
-                        if not pid:
-                            self._note_drop("COINBASE", reason="schema_mismatch", kind="frame")
-                            continue
-                        recv_ts_ms = int(time.time() * 1000)
-                        if t == "ticker":
-                            try:
-                                best_bid = msg.get("best_bid")
-                                best_ask = msg.get("best_ask")
-                                if best_bid is None or best_ask is None:
-                                    self._note_drop("COINBASE", reason="schema_mismatch", kind="l1")
-                                    continue
-                                bid = float(best_bid)
-                                ask = float(best_ask)
-                                if bid <= 0 or ask <= 0:
-                                    self._note_drop("COINBASE", reason="schema_mismatch", kind="l1")
-                                    continue
-                            except Exception:
-                                self._note_drop("COINBASE", reason="parse_error", kind="l1")
-                                continue
-                            ex_ts = self._normalize_ts_ms(msg.get("time"), recv_ts_ms)
-                            self._l1["COINBASE"][pid] = (bid, ask, ex_ts)
-                            await self._emit_if_ready("COINBASE", pid)
-                            continue
-                        if t in ("snapshot", "l2update"):
-                            if t == "snapshot":
-                                book = l2_book[pid]
-                                book["bids"] = {px: float(sz) for px, sz in msg.get("bids", [])}
-                                book["asks"] = {px: float(sz) for px, sz in msg.get("asks", [])}
-                                ex_ts = self._normalize_ts_ms(msg.get("time"), recv_ts_ms)
-                            else:
-                                book = l2_book[pid]
-                                ex_ts = self._normalize_ts_ms(msg.get("time"), recv_ts_ms)
-                                for chg in msg.get("changes", []):
-                                    side, px, sz = chg
-                                    if side == "buy":
-                                        if float(sz) == 0.0:
-                                            book["bids"].pop(px, None)
+                                    if t == "ticker":
+                                        bid, ask = float(data.get("best_bid") or 0), float(data.get("best_ask") or 0)
+                                        if bid > 0 and ask > 0:
+                                            ex_ts = self._normalize_ts_ms(data.get("time"), recv_ts_ms)
+                                            self._l1["COINBASE"][pid] = (bid, ask, ex_ts)
+                                            await self._emit_if_ready("COINBASE", pid)
+                                    elif t in ("snapshot", "l2update"):
+                                        if t == "snapshot":
+                                            l2_book[pid]["bids"] = {float(px): float(sz) for px, sz in data.get("bids", [])}
+                                            l2_book[pid]["asks"] = {float(px): float(sz) for px, sz in data.get("asks", [])}
                                         else:
-                                            book["bids"][px] = float(sz)
-                                    else:
-                                        if float(sz) == 0.0:
-                                            book["asks"].pop(px, None)
-                                        else:
-                                            book["asks"][px] = float(sz)
-                            bids = sorted(((float(px), float(sz)) for px, sz in l2_book[pid]["bids"].items()),
-                                          key=lambda x: x[0], reverse=True)[: self.depth_level]
-                            asks = sorted(((float(px), float(sz)) for px, sz in l2_book[pid]["asks"].items()),
-                                          key=lambda x: x[0])[: self.depth_level]
-                            self._l2["COINBASE"][pid] = (bids, asks, ex_ts)
-                            await self._emit_if_ready("COINBASE", pid)
-                            continue
-                        self._note_drop("COINBASE", reason="schema_mismatch", kind="frame")
+                                            for side, price, size in data.get("changes", []):
+                                                side_key = "bids" if side == "buy" else "asks"
+                                                p_f, s_f = float(price), float(size)
+                                                if s_f == 0: l2_book[pid][side_key].pop(p_f, None)
+                                                else: l2_book[pid][side_key][p_f] = s_f
+                                        
+                                        # P0: Décimation (Throttling) pour éviter de trier le carnet sur chaque message
+                                        last_emit = self._coinbase_l2_last_emit_ms.get(pid, 0)
+                                        if t == "snapshot" or (recv_ts_ms - last_emit) >= self._coinbase_l2_interval_ms:
+                                            ex_ts = self._normalize_ts_ms(data.get("time"), recv_ts_ms)
+                                            # P0: Optimisation Top-of-Book via heapq (O(M log N) vs O(M log M))
+                                            # On récupère uniquement les N meilleurs niveaux (heapq garantit l'ordre)
+                                            bids = heapq.nlargest(self.depth_level, l2_book[pid]["bids"].items(), key=lambda x: x[0])
+                                            asks = heapq.nsmallest(self.depth_level, l2_book[pid]["asks"].items(), key=lambda x: x[0])
+                                            
+                                            self._l2["COINBASE"][pid] = (bids, asks, ex_ts)
+                                            await self._emit_if_ready("COINBASE", pid)
+                                            self._coinbase_l2_last_emit_ms[pid] = recv_ts_ms
+                                except Exception: continue
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
             except Exception as e:
-                self._queue_control_event({
-                    "__ws_error__": True,
-                    "exchange": "COINBASE",
-                    "reason": "listener_error",
-                    "error": str(e),
-                    "ts_ms": int(time.time() * 1000),
-                })
-                self.on_close();
-                did_close = True
-                self._metrics_conn_closed("COINBASE")
-                await self._sleep_backoff("COINBASE", reason="backoff")
+                self.log.error("[WS][COINBASE] Erreur de connexion: %s", repr(e))
+                if not self._running: break
+                await self._sleep_backoff("COINBASE", reason=str(e))
             finally:
-                if self._reload_event.is_set():
-                    return
                 if not did_close:
                     self.on_close()
                     self._metrics_conn_closed("COINBASE")
@@ -1163,96 +1248,206 @@ class WebSocketExchangeClient:
     # ======================= BYBIT listener =======================
     async def _bybit_listener_chunk(self, pairs_subset: List[str]):
         if self._exchange_disabled_by_flag("BYBIT"):
-            self._maybe_note_disabled("BYBIT")
             return
-        syms = []
-        for p in pairs_subset:
-            if self._exchange_region_disabled("BYBIT", p):
-                self._note_drop("BYBIT", reason="region_disabled_jp", kind="subscribe")
-                continue
-            if self.pair_mapping.get(p, {}).get("bybit"):
-                syms.append(self.get_symbol(p, "bybit"))
+
+        # P0: Tracer les symboles Bybit au démarrage
+        syms = [self.get_symbol(p, "bybit") for p in pairs_subset if self.pair_mapping.get(p, {}).get("bybit")]
+        self.log.info("[WS][BYBIT] Démarrage listener pour symboles: %s (pairs_subset=%s)", syms, pairs_subset)
         if not syms:
+            self.log.warning("[WS][BYBIT] Aucune paire éligible trouvée pour BYBIT dans %s", pairs_subset)
             return
-        args = [f"tickers.{s}" for s in syms] + [f"orderbook.50.{s}" for s in syms]
-        sub = {"op": "subscribe", "args": args}
+
+        url = self.BYBIT_WS_SPOT
+
+        # Bybit V5: limite "args size <= 10" sur subscribe.
+        max_args = int(getattr(self.cfg.ws_public, "bybit_subscribe_max_args", 10))
+
+        # Topics (tickers + L2)
+        topics = [f"tickers.{s}" for s in syms] + [f"orderbook.50.{s}" for s in syms]
+        batches = list(self._chunks(topics, max_args))
+
+        self.log.info("[WS][BYBIT] Connexion WebSocket vers %s", url)
+        conn_timeout = self._get_connect_timeout("BYBIT")
         while self._running:
             did_close = False
             try:
-                async with websockets.connect(self.BYBIT_WS_SPOT, **self._ws_connect_kwargs()) as ws:
-                    _set_tcp_nodelay(ws)
-                    self.on_open(exchange="BYBIT")
-                    self._metrics_conn_open("BYBIT")
+                # P0: Forcer IPv4 et désactiver le buffering TCP pour Low Latency (HFT)
+                connector = aiohttp.TCPConnector(family=socket.AF_INET, force_close=True, enable_cleanup_closed=True)
+                timeout = aiohttp.ClientTimeout(total=None, connect=conn_timeout, sock_connect=conn_timeout)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    # Protocols et timeouts ajustés pour Bybit V5
+                    async with session.ws_connect(url, **self._ws_connect_kwargs("BYBIT")) as ws:
+                        self.log.info("[WS][BYBIT] CONNECTÉ à %s", url)
+                        self.on_open(exchange="BYBIT")
+                        self._metrics_conn_open("BYBIT")
 
-                    await ws.send(self._json_dumps(sub))
-                    async for raw in ws:
-                        recv_ts_ms = int(time.time() * 1000)
-                        self._note_frame_received("BYBIT", recv_ts_ms)
-                        try:
-                            msg = self._json_loads(raw)
-                        except Exception:
-                            self._note_drop("BYBIT", reason="parse_error", kind="frame")
-                            continue
-                        topic = msg.get("topic") or ""
-                        data = msg.get("data")
-                        if not topic or data is None:
-                            self._note_drop("BYBIT", reason="schema_mismatch", kind="frame")
-                            continue
-                        parts = topic.split(".")
-                        if len(parts) < 2:
-                            self._note_drop("BYBIT", reason="schema_mismatch", kind="frame")
-                            continue
-                        ch, sym = parts[0], parts[-1]
-                        recv_ts_ms = int(time.time() * 1000)
-                        if ch == "tickers":
-                            d = data if isinstance(data, dict) else (data[0] if data else {})
-                            bid = float(d.get("bid1Price", 0.0) or d.get("bidPrice", 0.0))
-                            ask = float(d.get("ask1Price", 0.0) or d.get("askPrice", 0.0))
-                            if bid <= 0 or ask <= 0:
-                                self._note_drop("BYBIT", reason="schema_mismatch", kind="l1")
-                                continue
-                            ex_ts = self._normalize_ts_ms(d.get("ts"), recv_ts_ms)
-                            self._l1["BYBIT"][sym] = (bid, ask, ex_ts)
-                            await self._emit_if_ready("BYBIT", sym)
-                            continue
-                        if ch == "orderbook":
-                            d = data if isinstance(data, dict) else (data[0] if data else {})
-                            bids = [(float(px), float(sz)) for px, sz, *_ in d.get("b", [])][: self.depth_level]
-                            asks = [(float(px), float(sz)) for px, sz, *_ in d.get("a", [])][: self.depth_level]
-                            ex_ts = self._normalize_ts_ms(d.get("ts"), recv_ts_ms)
-                            self._l2["BYBIT"][sym] = (bids, asks, ex_ts)
-                            await self._emit_if_ready("BYBIT", sym)
-                            continue
-                        self._note_drop("BYBIT", reason="schema_mismatch", kind="frame")
+                        self.log.info(
+                            "[WS][BYBIT] Envoi souscriptions: total_topics=%d batches=%d max_args=%d",
+                            len(topics), len(batches), max_args
+                        )
+
+                        # Envoi en batches <= max_args (sinon Bybit rejette "args size >10")
+                        for i, batch in enumerate(batches, start=1):
+                            try:
+                                self._rl_sub_bucket.acquire(1)
+                            except Exception:
+                                self.log.exception("[WS][BYBIT] RL acquire (sub) failed")
+
+                            sub = {"op": "subscribe", "args": batch}
+                            if self.verbose:
+                                self.log.debug("[WS][BYBIT] subscribe batch %d/%d: %s", i, len(batches), batch)
+                            await ws.send_json(sub)
+
+                            # Petit pacing (évite burst)
+                            await asyncio.sleep(0.02)
+
+                        # P0: Tracer les 3 premières frames brutes de Bybit pour voir le format exact
+                        bybit_debug_count = 0
+                        l2_book: Dict[str, Dict[str, Dict[float, float]]] = defaultdict(lambda: {"bids": {}, "asks": {}})
+                        
+                        async for msg in ws:
+                            recv_ts_ms = int(time.time() * 1000)
+
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                if bybit_debug_count < 3:
+                                    self.log.info("[WS][BYBIT] RAW FRAME #%d: %s", bybit_debug_count, msg.data[:200])
+                                    bybit_debug_count += 1
+
+                                self._note_frame_received("BYBIT", recv_ts_ms)
+
+                                try:
+                                    data = self._json_loads(msg.data)
+
+                                    # P0: Extraire le timestamp à la racine (standard Bybit V5)
+                                    ts_root = data.get("ts")
+
+                                    # P0: Calibration temporelle Bybit
+                                    if ts_root and not hasattr(self, "_clock_offset_ms"):
+                                        try:
+                                            diff = int(ts_root) - int(time.time() * 1000)
+                                            if abs(diff) > 1000:
+                                                self._clock_offset_ms = diff
+                                                self.log.info("[WS][BYBIT] Calibration horloge: Offset=%dms", diff)
+                                        except Exception:
+                                            pass
+
+                                    # Conf de souscription / erreurs
+                                    op = data.get("op")
+                                    if op == "subscribe":
+                                        success = data.get("success")
+                                        ret_msg = data.get("ret_msg", "")
+                                        if success:
+                                            self.log.info("[WS][BYBIT] Souscription réussie: %s",
+                                                          data.get("req_id", ""))
+                                        else:
+                                            self.log.error("[WS][BYBIT] Échec souscription: %s", ret_msg)
+                                            # Fatal: on relance la connexion (sinon connexion "vivante" mais sans data)
+                                            raise RuntimeError(f"BYBIT subscribe failed: {ret_msg}")
+                                        continue
+
+                                    topic = data.get("topic") or ""
+                                    payload = data.get("data")
+
+                                    if self.verbose:
+                                        self.log.debug(
+                                            "[WS][BYBIT] Frame: topic=%s data_keys=%s",
+                                            topic,
+                                            list(payload.keys()) if isinstance(payload, dict) else "list",
+                                        )
+
+                                    if not topic or payload is None:
+                                        continue
+
+                                    parts = topic.split(".")
+                                    if len(parts) < 2:
+                                        continue
+
+                                    ch, sym = parts[0], parts[-1]
+
+                                    if ch == "tickers":
+                                        d = payload if isinstance(payload, dict) else (payload[0] if payload else {})
+                                        bid = float(d.get("bid1Price") or d.get("bidPrice") or 0.0)
+                                        ask = float(d.get("ask1Price") or d.get("askPrice") or 0.0)
+
+                                        if bid > 0 and ask > 0:
+                                            ex_ts = self._normalize_ts_ms(ts_root or d.get("ts"), recv_ts_ms)
+                                            self._l1["BYBIT"][sym] = (bid, ask, ex_ts)
+                                            await self._emit_if_ready("BYBIT", sym)
+                                        else:
+                                            # Fallback depuis L2 si dispo
+                                            l2 = self._l2["BYBIT"].get(sym)
+                                            if l2:
+                                                bids, asks, _ = l2
+                                                if bids and asks:
+                                                    bid, ask = bids[0][0], asks[0][0]
+                                                    ex_ts = self._normalize_ts_ms(ts_root or d.get("ts"), recv_ts_ms)
+                                                    self._l1["BYBIT"][sym] = (bid, ask, ex_ts)
+                                                    await self._emit_if_ready("BYBIT", sym)
+                                                    continue
+
+                                            if self.verbose:
+                                                self.log.info(
+                                                    "[WS][BYBIT] Ticker incomplet pour %s (L1 absent, L2 absent)", sym)
+
+                                    elif ch == "orderbook":
+                                        type_msg = data.get("type") # "snapshot" or "delta"
+                                        d = payload if isinstance(payload, dict) else (payload[0] if payload else {})
+                                        
+                                        if type_msg == "snapshot":
+                                            l2_book[sym]["bids"] = {float(px): float(sz) for px, sz, *_ in d.get("b", [])}
+                                            l2_book[sym]["asks"] = {float(px): float(sz) for px, sz, *_ in d.get("a", [])}
+                                        else:
+                                            # Delta update
+                                            for px, sz, *_ in d.get("b", []):
+                                                p_f, s_f = float(px), float(sz)
+                                                if s_f == 0: l2_book[sym]["bids"].pop(p_f, None)
+                                                else: l2_book[sym]["bids"][p_f] = s_f
+                                            for px, sz, *_ in d.get("a", []):
+                                                p_f, s_f = float(px), float(sz)
+                                                if s_f == 0: l2_book[sym]["asks"].pop(p_f, None)
+                                                else: l2_book[sym]["asks"][p_f] = s_f
+
+                                        # P0: Throttling (Décimation) Bybit L2
+                                        last_emit = self._bybit_l2_last_emit_ms.get(sym, 0)
+                                        if type_msg == "snapshot" or (recv_ts_ms - last_emit) >= self._bybit_l2_interval_ms:
+                                            ex_ts = self._normalize_ts_ms(ts_root or d.get("ts"), recv_ts_ms)
+                                            # P0: Extraction optimisée via heapq
+                                            bids = heapq.nlargest(self.depth_level, l2_book[sym]["bids"].items(), key=lambda x: x[0])
+                                            asks = heapq.nsmallest(self.depth_level, l2_book[sym]["asks"].items(), key=lambda x: x[0])
+                                            
+                                            self._l2["BYBIT"][sym] = (bids, asks, ex_ts)
+                                            await self._emit_if_ready("BYBIT", sym)
+                                            self._bybit_l2_last_emit_ms[sym] = recv_ts_ms
+
+                                except Exception:
+                                    continue
+
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+
             except Exception as e:
-                self._queue_control_event({
-                    "__ws_error__": True,
-                    "exchange": "BYBIT",
-                    "reason": "listener_error",
-                    "error": str(e),
-                    "ts_ms": int(time.time() * 1000),
-                })
-                self.on_close();
-                did_close = True
-                self._metrics_conn_closed("BYBIT")
-                await self._sleep_backoff("BYBIT", reason="backoff")
+                self.log.error("[WS][BYBIT] Erreur de connexion: %s", repr(e))
+                if not self._running:
+                    break
+                await self._sleep_backoff("BYBIT", reason=str(e))
+
             finally:
-                if self._reload_event.is_set():
-                    return
                 if not did_close:
                     self.on_close()
                     self._metrics_conn_closed("BYBIT")
 
     # ======================= supervisor =======================
     async def _supervisor(self) -> None:
-        """Boucle de supervision: (re)construit/annule les listeners selon
-        `self.pairs`, gère reloads et pannes inattendues.
-        """
+        """Boucle de supervision pour les flux publics."""
+        self.log.info("[WS] Supervision démarrée")
+        
         while self._running:
             # Construire sous-listes par exchange selon présence du symbole
             binance_pairs = [p for p in self.pairs if self.pair_mapping.get(p, {}).get("binance")]
             coinbase_pairs = [p for p in self.pairs if self.pair_mapping.get(p, {}).get("coinbase")]
             bybit_pairs   = [p for p in self.pairs if self.pair_mapping.get(p, {}).get("bybit")]
+            self.log.info("[WS] Supervision tick: BINANCE:%d, COINBASE:%d, BYBIT:%d", 
+                        len(binance_pairs), len(coinbase_pairs), len(bybit_pairs))
 
             # Créer les tâches listeners
             self.tasks = []
@@ -1268,7 +1463,7 @@ class WebSocketExchangeClient:
                 for subset in self._chunks(bybit_pairs, self.bybit_chunk_size):
                     if subset:
                         self.tasks.append(asyncio.create_task(self._bybit_listener_chunk(subset)))
-
+            
             if not self.tasks:
                 # Rien à faire; attendre un reload ou l'arrêt
                 for ex in self.enabled_exchanges:
@@ -1293,13 +1488,11 @@ class WebSocketExchangeClient:
             self.tasks.clear()
 
             if reload_fut in done:
-                # Soft reload demandé
+                self.log.info("[WS] Supervision: rechargement demandé")
                 self._reload_event.clear()
-                # Loop immédiat pour re-chunk
-                continue
-
-            # Sinon: panne/fin inattendue d'un listener → petit backoff
-            await asyncio.sleep(self._supervisor_backoff_s)
+            else:
+                self.log.warning("[WS] Supervision: une tâche listener s'est arrêtée, redémarrage dans 5s")
+                await asyncio.sleep(self._supervisor_backoff_s)
 
     # ======================= lifecycle =======================
     # --- à mettre dans WebSocketExchangeClient ------------------------------------
@@ -1310,24 +1503,42 @@ class WebSocketExchangeClient:
         Démarre le superviseur en tâche de fond (non bloquant).
         Attend un handshake rapide via ready_event, puis rend la main.
         """
+        # Défense absolue: ne jamais crasher sur self.log absent
+        if not hasattr(self, "log") or self.log is None:
+            self.log = logger
+        if not hasattr(self, "name"):
+            self.name = f"ws_public_{getattr(self, 'shard_id', 'S0')}"
+
         if getattr(self, "_running", False):
             return
         self._running = True
 
-        # Event de readiness (créé si absent)
         if not hasattr(self, "ready_event"):
             self.ready_event = asyncio.Event()
 
-        # Lancer le superviseur en tâche
-        self._supervisor_task = asyncio.create_task(self._supervisor(),
-                                                    name=f"{getattr(self, 'name', 'ws')}-supervisor")
-        self._staleness_task = asyncio.create_task(self._staleness_loop(),
-                                                   name=f"{getattr(self, 'name', 'ws')}-staleness")
-        # Attente best-effort d’un handshake rapide (subscription ack / open)
+        self.log.info("[WS] start() called for exchanges=%s pairs=%s", self.enabled_exchanges, self.pairs)
+
+        def _cb(task: asyncio.Task) -> None:
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                self.log.exception("[WS] background task crashed")
+
+        self._supervisor_task = asyncio.create_task(self._supervisor(), name=f"{self.name}-supervisor")
+        self._supervisor_task.add_done_callback(_cb)
+
+        self._staleness_task = asyncio.create_task(self._staleness_loop(), name=f"{self.name}-staleness")
+        self._staleness_task.add_done_callback(_cb)
+
         try:
             await asyncio.wait_for(self.ready_event.wait(), timeout=float(wait_ready))
         except asyncio.TimeoutError:
-            logger.warning("[WS] Ready timeout après %.1fs — on continue quand même.", wait_ready)
+            self.log.warning("[WS] Ready timeout après %.1fs — on continue quand même.", wait_ready)
+        except Exception:
+            self.log.exception("[WS] error waiting for readiness")
+
 
     async def stop(self) -> None:
         """Arrêt idempotent avec join propre de la tâche superviseur."""
@@ -1373,6 +1584,14 @@ class WebSocketExchangeClient:
             delay = float(self.compute_backoff())
             try:
                 self._metrics_reconnect(exchange, delay, reason=reason)
+                from modules.obs_metrics import ws_public_note_backoff
+                ws_public_note_backoff(
+                    exchange=exchange,
+                    region=getattr(self, "region", "EU"),
+                    deployment_mode=str(getattr(self.cfg, "MODE", "PROD")).upper(),
+                    reason=reason,
+                    duration_s=delay
+                )
             except Exception:
                 pass
             await asyncio.sleep(delay)

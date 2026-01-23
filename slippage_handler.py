@@ -30,7 +30,6 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, Any, Callable, List, Optional, Tuple
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 logger = logging.getLogger("SlippageHandler")
 
@@ -165,8 +164,8 @@ class SlippageHandler:
 
         # --------- TTL / Heartbeat / Seuils par quote (depuis cfg) ---------
         # (Les args __init__ ne proposent pas TTL/heartbeat, donc cfg -> direct)
-        self._ttl_s = getattr_int(s, "ttl_s", 2)
-        self._heartbeat_s = getattr_int(s, "heartbeat_s", 1)
+        self._ttl_s = int(getattr(s, "ttl_s", 2))
+        self._heartbeat_s = int(getattr(s, "heartbeat_s", 1))
         self._use_vwap_depth = bool(getattr(s, "use_vwap_depth", True))
         # max slippage “dur” autorisé par quote (bps)
         self._max_bps_by_quote = dict(getattr(s, "max_bps_by_quote", {"USDC": 12.0, "EUR": 14.0}))
@@ -226,6 +225,10 @@ class SlippageHandler:
 
         # --------- Bus internes (consommateurs de flux slip par CEX) ---------
         self._bus_tasks: Dict[str, asyncio.Task] = {}
+        # --------- Optimisation P0: Cache p95 (Hot Path) ---------
+        self._p95_cache: Dict[str, float] = {}
+        self._last_p95_calc_s = 0.0
+        self._p95_calc_interval = 1.0  # recalcul 1Hz
 
     # Petits helpers (inchangés)
     def ttl_seconds(self) -> int:
@@ -382,6 +385,38 @@ class SlippageHandler:
                 dq.popleft()
             if not dq:
                 self._history.pop(sym, None)
+                self._p95_cache.pop(sym, None)
+        
+        # Recalcul des percentiles à cadence fixe (1 Hz)
+        if now_s - self._last_p95_calc_s >= self._p95_calc_interval:
+            self._update_p95_cache(now_s)
+
+    def _update_p95_cache(self, now_s: float) -> None:
+        """Recalcule les p95 pour toutes les paires actives (O(N) amorti)."""
+        self._last_p95_calc_s = now_s
+        lo_cut = now_s - self._dyn_window.total_seconds()
+        
+        for pk, dq in self._history.items():
+            try:
+                # On ne prend que les valeurs de la fenêtre glissante
+                vals = [v for (ts, v) in dq if ts >= lo_cut]
+                if len(vals) < 20:
+                    continue
+                
+                # Tri une fois par seconde au lieu de chaque event
+                vals.sort()
+                k = int(round(0.95 * (len(vals) - 1)))
+                p95 = vals[max(0, min(len(vals) - 1, k))]
+                self._p95_cache[pk] = float(p95)
+                
+                # Métriques (optionnel, sample)
+                try:
+                    if SLIP_P95_BPS:
+                        SLIP_P95_BPS.labels(pair=pk).set(float(p95) * 1e4)
+                except Exception:
+                    pass
+            except Exception:
+                continue
 
     def _append_history(self, symbol: str, slip: float, now_s: Optional[float] = None) -> None:
         if slip is None:
@@ -719,31 +754,38 @@ class SlippageHandler:
     # -------------------------- Seuil dynamique -------------------------------
     def get_dynamic_threshold(self, symbol: str, *, strategy: Optional[str] = None) -> float:
         try:
-            now_s = time.time()
-            dq = self._history.get(self._norm_pair(symbol))
-            if not dq:
-                return max(self._dyn_min_floor, self.slippage_threshold)
+            pk = self._norm_pair(symbol)
+            p95 = self._p95_cache.get(pk)
+            
+            if p95 is None:
+                # Fallback sur calcul à la demande uniquement si cache vide
+                dq = self._history.get(pk)
+                if not dq or len(dq) < 20:
+                    return max(self._dyn_min_floor, self.slippage_threshold)
+                
+                now_s = time.time()
+                lo_cut = now_s - self._dyn_window.total_seconds()
+                window_vals = [v for (ts, v) in dq if ts >= lo_cut]
+                if len(window_vals) < 20:
+                    return max(self._dyn_min_floor, self.slippage_threshold)
+                window_vals.sort()
+                k = int(round(0.95 * (len(window_vals) - 1)))
+                p95 = window_vals[max(0, min(len(window_vals) - 1, k))]
+                self._p95_cache[pk] = p95
+
             q = self._infer_quote(symbol)
             if not q:
-                inc_blocked("slippage_handler", "quote_unknown", self._norm_pair(symbol))
                 return max(self._dyn_min_floor, self.slippage_threshold)
+            
             strat = str(strategy or self._default_strategy or "TT").upper()
-            if strat not in ("TT", "TM", "MM", "REB"):
-                inc_blocked("slippage_handler", "strategy_unknown", self._norm_pair(symbol))
-                return max(self._dyn_min_floor, self.slippage_threshold)
-            lo_cut = now_s - self._dyn_window.total_seconds()
-            window_vals = [v for (ts, v) in dq if ts >= lo_cut]
-            if len(window_vals) < 20:
-                return max(self._dyn_min_floor, self.slippage_threshold)
-            window_vals.sort()
-            k = int(round(0.95 * (len(window_vals) - 1)))
-            p95 = window_vals[max(0, min(len(window_vals) - 1, k))]
+            
             ratio = None
             try:
                 ratio = (getattr(self.cfg.g, "branch_budgets_quote", {}) or {}).get(q, {}).get(strat)
             except Exception:
                 ratio = None
             scale = 1.0 / float(ratio) if isinstance(ratio, (int, float)) and ratio > 0 else 1.0
+            
             return max(self._dyn_min_floor, p95 * self._dyn_factor * scale)
         except Exception:
             return max(self._dyn_min_floor, self.slippage_threshold)
@@ -1053,6 +1095,9 @@ class SlippageHandler:
         ttl = self._resolve_ttl_s(ex, ttl_s)
 
         # --- Application du TTL sur les snapshots -------------------------------
+        mode_upper = str(getattr(getattr(self, "cfg", None), "MODE", "PROD")).upper()
+        is_dry = (mode_upper == "DRY_RUN")
+
         if side is None:
             vals: list[float] = []
             for s in ("buy", "sell"):
@@ -1064,6 +1109,11 @@ class SlippageHandler:
                         vals.append(float(v))
                     else:
                         self._note_drop("ttl_expired", ex, pk)
+            
+            if not vals and is_dry:
+                # P0: Fallback simulateur pour ne pas bloquer les opportunités au démarrage
+                return 1.0 # 1 bps par défaut
+                
             if not vals:
                 return None
             slip = max(vals)
@@ -1076,7 +1126,10 @@ class SlippageHandler:
 
         v = bps.get((ex, pk, str(side).lower()))
         t = tsd.get((ex, pk))
-        if v is None or t is None:
+        
+        if (v is None or t is None):
+            if is_dry:
+                return 1.0
             return None
 
         age = now - float(t)
@@ -1089,6 +1142,10 @@ class SlippageHandler:
                     self._note_drop("max_bps_exceeded", ex, pk)
                     return None
             return slip
+        
+        if is_dry:
+            return 1.0
+            
         self._note_drop("ttl_expired", ex, pk)
         return None
 

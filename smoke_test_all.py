@@ -752,7 +752,9 @@ class SmokeInstitutionalAll(unittest.IsolatedAsyncioTestCase):
                 return 0
 
             rm._cancel_open_mm_quotes_on_exchange = _cancel_open_mm_quotes_on_exchange
-            rm._apply_caps_and_preempt_legacy("TT", "BINANCE", 10.0)
+            # Test caps (Bundle-centric)
+            fake_bundle = {"type": "bundle", "legs": [{"side": "BUY", "exchange": "BINANCE"}]}
+            rm._apply_caps_and_preempt(fake_bundle, caps_local={})
             await asyncio.sleep(0)
             self.assertFalse(preempted["called"], "TT/TM caps overflow must not preempt MM")
 

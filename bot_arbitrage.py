@@ -136,7 +136,7 @@ def _load_alert_dispatcher(cfg) -> Any:
     except Exception:
         # Fallback Telegram natif si token dispo via configuration
         tcfg = getattr(cfg, "telegram", None)
-        if tcfg and tcfg.bot_token:
+        if tcfg and tcfg.bot_token and tcfg.enabled:
             try:
                 return TelegramAlerts(cfg)
             except Exception:
@@ -158,13 +158,17 @@ class TelegramAlerts(_NoopAlerts):
       TELEGRAM_CHAT_ID_INFO/TELEGRAM_CHAT_ID_WARN/TELEGRAM_CHAT_ID_CRIT (facultatifs)
     """
     def __init__(self, cfg):
+        tcfg = getattr(cfg, "telegram", None)
+        if tcfg and not tcfg.enabled:
+            self._enabled = False
+            return
+
         try:
             import aiohttp  # noqa: F401
         except Exception:
             self._enabled = False
             return
         self._enabled = True
-        tcfg = getattr(cfg, "telegram", None)
         self._token = "" if tcfg is None else tcfg.bot_token or ""
         allowed = [] if tcfg is None else tcfg.allowed_user_ids or []
         self._allowed = set(int(x) for x in allowed)
@@ -360,20 +364,10 @@ class TelegramAlerts(_NoopAlerts):
 # Logging
 # -----------------------------------------------------------------------------
 log = logging.getLogger("arbitrage.main")
-_DEFAULT_LOG_LEVEL = "INFO"
-
 
 def _configure_logging(cfg: Any) -> None:
-    level = _DEFAULT_LOG_LEVEL
-    try:
-        level = getattr(cfg.obs, "log_level", _DEFAULT_LOG_LEVEL) or _DEFAULT_LOG_LEVEL
-    except Exception:
-        level = _DEFAULT_LOG_LEVEL
-
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+    from boot import configure_logging
+    configure_logging(cfg)
 
 
 
@@ -590,7 +584,11 @@ class ConnectivityGuard:
                 fn = self.ws.reconnect
                 await fn() if inspect.iscoroutinefunction(fn) else await asyncio.to_thread(fn)
             else:
-                raise RuntimeError("Aucune méthode reload/reconnect disponible")
+                # Pas d'API de reload/reconnect: ce n'est pas fatal -> soft-fail sans stacktrace
+                self.metrics.guard_trigger("ws_reload_unsupported")
+                await self.alerts.notify_warn("[Guard] WS reload indisponible (pas de reload/reconnect)")
+                return False
+
             self.metrics.guard_trigger("ws_reload")
             self.metrics.inc_ws_restart("ok")
             await self.alerts.notify_info("[Guard] WS soft-reload déclenché")
@@ -660,6 +658,9 @@ async def graceful_stop_ctx(ctx, alerts, boot=None, timeout_s: float = 12.0) -> 
             with contextlib.suppress(Exception):
                 await alerts.notify_info("[Main] Contexte arrêté proprement (Boot.stop)")
             return True
+    except asyncio.CancelledError:
+        # Arrêt normal (annulation des boucles internes) : ne pas crasher le main
+        return True
     except Exception as e:
         log.warning("[Main] Boot.stop() a échoué: %s — fallback legacy", e)
 
@@ -719,11 +720,34 @@ async def _stop_supervision(guard, guard_task, cwd_task):
 # CWD init (instance, wiring, sinks, task)
 # -----------------------------------------------------------------------------
 def _init_cwd(ctx):
-    cwd = CentralWatchdog()           # signature correcte: pas d'arguments
+    cwd = CentralWatchdog()
     _wire_cwd_children(cwd, ctx)
-    with contextlib.suppress(Exception): cwd.attach_telegram_from_env()  # sans arg
-    with contextlib.suppress(Exception): cwd.attach_webhook_from_env()   # sans arg
-    cwd_task = asyncio.create_task(cwd.run(), name="cwd.run")
+    with contextlib.suppress(Exception): cwd.attach_telegram_from_env()
+    with contextlib.suppress(Exception): cwd.attach_webhook_from_env()
+
+    # Choix robuste: run() sinon start() sinon loop()
+    coro = None
+    try:
+        if hasattr(cwd, "run") and callable(getattr(cwd, "run")):
+            coro = cwd.run()
+        elif hasattr(cwd, "start") and callable(getattr(cwd, "start")):
+            # CW.start() est sync, mais on peut l'encapsuler si besoin
+            # ici on cherche prioritairement une coroutine pour create_task
+            cwd.start()
+        elif hasattr(cwd, "loop") and callable(getattr(cwd, "loop")):
+            coro = cwd.loop()
+    except Exception as e:
+        log.error("[Main] CWD coro init failed: %s", e)
+
+    async def _noop():
+        while True:
+            await asyncio.sleep(3600)
+
+    if coro is None or not asyncio.iscoroutine(coro):
+        # On garantit une coroutine valide pour create_task (évite TypeError: got None)
+        coro = _noop()
+
+    cwd_task = asyncio.create_task(coro, name="cwd.run")
     return cwd, cwd_task
 
 def _wire_telegram_commands(alerts, state: Dict[str, Any]):
@@ -813,6 +837,17 @@ async def main() -> None:
     # Obs
     metrics = _metrics_factory()
     metrics.set_deployment_info(region, dep_mode, cap_profile)
+    
+    # P0: Optimisation HFT et démarrage des sondes précises
+    try:
+        from modules.obs_metrics import optimize_gc, start_loop_lag_probe, start_time_skew_probe
+        optimize_gc()
+        asyncio.create_task(start_loop_lag_probe(period_s=0.1), name="loop_lag_probe")
+        # start_time_skew_probe() reste threadé car il fait du réseau bloquant
+        start_time_skew_probe()
+    except Exception:
+        log.exception("[Main] Échec initialisation optimisations HFT")
+
     # State supervisé unique
     state: Dict[str, Any] = {
         "boot": None,
@@ -907,20 +942,34 @@ async def main() -> None:
     mode_cfg = getattr(cfg, "DEPLOYMENT_MODE", "EU_ONLY")
     set_region(region_cfg)
     set_deployment_mode(mode_cfg)
-    start_loop_lag_probe()
+    # P0: Démarrage correct des sondes asynchrones
+    asyncio.create_task(start_loop_lag_probe(), name="loop_lag_probe")
     start_time_skew_probe()
 
-    # Politique: 9110 unique (ready/status/metrics), 9108 optionnel selon cfg.obs
+    # Politique: 9110 = endpoint STABLE (ready/status/metrics). 9108 peut exister, mais ne doit JAMAIS casser 9110.
     status_port = int(getattr(cfg.obs, "status_port", 9110))
     obs_enable_9108 = bool(getattr(cfg.obs, "enable_obs_port", False))
     obs_port = int(getattr(cfg.obs, "obs_port", 9108))
-    include_metrics_on_9110 = bool(getattr(cfg.obs, "expose_metrics_on_status", True)) and not obs_enable_9108
 
+    # IMPORTANT: /metrics:9110 dépend uniquement de expose_metrics_on_status
+    include_metrics_on_9110 = bool(getattr(cfg.obs, "expose_metrics_on_status", True))
+
+    import logging
+    logging.getLogger("arbitrage.main").info(
+        "[OBS] status_port=%s include_metrics_on_9110=%s obs_enable_9108=%s obs_port=%s expose_metrics_on_status=%s",
+        status_port,
+        include_metrics_on_9110,
+        obs_enable_9108,
+        obs_port,
+        bool(getattr(cfg.obs, "expose_metrics_on_status", True)),
+    )
 
     # Démarre UN seul StatusHTTPServer (et y branche le Boot)
+    from modules.obs_metrics import _init_default_labels
+    _init_default_labels()
     status_http = StatusHTTPServer(port=status_port, include_metrics=include_metrics_on_9110)
     status_http.set_boot(boot)
-    await status_http.start()
+    status_http.start_in_thread()
 
     # Si on veut /metrics dédié sur 9108, on le démarre ici (sinon on n’a QUE 9110)
     obs = None
@@ -931,6 +980,12 @@ async def main() -> None:
     # Signalisation d’état du bot (superviseur)
     BOT_STARTUPS_TOTAL.inc()
     BOT_STATE.set(1)  # STARTING
+
+    # [FORCE_DEBUG_NO_ALERTS] Désactive l'alerting pour debug observability.
+    if alerts and hasattr(alerts, "_enabled"):
+        alerts._enabled = False
+        log.info("[DEBUG] Alerting dispatcher disabled (force_debug_no_alerts=1)")
+
     ctx = await boot.run()
     await boot.boot_complete.wait()
     if not notification_ok and mode_value == "PROD" and bool(cfg.g.live_trading_armed):

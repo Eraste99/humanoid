@@ -1,0 +1,255 @@
+{
+  "uid": "hft-internal-latency-v2",
+  "title": "D10 — HFT Internal Latency",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": ["bot", "hft", "latency", "internal", "pipeline"],
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "graphTooltip": 1,
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "selected": true, "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Router Segment",
+      "id": 1,
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Router Processing (ms)",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"router_proc\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(latency_pipeline_ms_bucket{segment=\"router_proc\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p50",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Router -> Scanner Queue (ms)",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(latency_pipeline_ms_bucket{segment=\"router_to_scanner_queue\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"router_to_scanner_queue\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p95",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Scanner Segment",
+      "id": 4,
+      "gridPos": { "x": 0, "y": 8, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Scanner Internal Queue (ms)",
+      "id": 5,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"scanner_internal_queue\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 9, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Scanner Decision/Proc (ms)",
+      "id": 6,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"scanner_proc\"}[1m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(latency_pipeline_ms_bucket{segment=\"scanner_proc\"}[1m])) by (le))",
+          "legendFormat": "p50",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 9, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Risk Manager & Engine Segment",
+      "id": 7,
+      "gridPos": { "x": 0, "y": 16, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Scanner to RM Queue (ms)",
+      "id": 8,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"scanner_to_rm_queue\"}[1m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 17, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "RM Decision (ms)",
+      "id": 9,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"rm_proc\"}[1m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 17, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "RM to Engine Queue (ms)",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"rm_to_engine_queue\"}[1m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 17, "w": 8, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Engine Internals",
+      "id": 11,
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Engine Internal Queue Delay (ms)",
+      "id": 12,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(latency_pipeline_ms_bucket{segment=\"engine_queue_delay\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p99",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"engine_queue_delay\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p95",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 25, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Engine Execution/Proc (ms)",
+      "id": 13,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(latency_pipeline_ms_bucket{segment=\"engine_proc\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p95",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.5, sum(rate(latency_pipeline_ms_bucket{segment=\"engine_proc\"}[1m])) by (le, exchange))",
+          "legendFormat": "{{exchange}} p50",
+          "refId": "B"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 25, "w": 12, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "ms", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    },
+    {
+      "type": "row",
+      "title": "Backlogs & Health",
+      "id": 14,
+      "gridPos": { "x": 0, "y": 32, "w": 24, "h": 1 },
+      "collapsed": false
+    },
+    {
+      "type": "timeseries",
+      "title": "Pipeline Backlogs (count)",
+      "id": 15,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pipeline_backlog",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 33, "w": 24, "h": 7 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } }
+      }
+    }
+  ]
+}

@@ -33,17 +33,7 @@ EventSink = Callable[[str, Dict[str, Any]], None]
 def _now() -> float:  # utilitaire local (si besoin)
     return time.time()
 
-# Placeholders no-op (compat avec les appels existants .labels/.observe/.inc/.set)
-class _NoMetric:
-    def labels(self, *a, **k): return self
-    def observe(self, *a, **k): return
-    def inc(self, *a, **k): return
-    def set(self, *a, **k): return
-
-# Noms attendus par le code existant — tous no-op ici
-REBAL_PLAN_BUILD_MS    = _NoMetric()
-REBAL_OPERATIONS_TOTAL = _NoMetric()
-REBAL_SNAPSHOTS_AGE_S  = _NoMetric()
+from modules.obs_metrics import REBAL_PLAN_BUILD_MS, REBAL_OPERATIONS_TOTAL, REBAL_SNAPSHOTS_AGE_S, REBAL_IMBALANCE_GAUGE
 
 # ---------------------------------------------------------------------
 # Helpers
@@ -105,6 +95,14 @@ class RebalancingManager:
     - Le module retourne : un **plan de hints** priorisés, avec anti-thrash.
     """
 
+    def set_drift_thresholds(self, soft: float, hard: float) -> None:
+        """
+        P0: Mise à jour dynamique des seuils pour garantir l'étagement entre le RM et le REB.
+        """
+        self.soft_drift_pct = float(soft)
+        self.hard_drift_pct = float(hard)
+        log.info("[REB] Inventory thresholds updated: SOFT=%.2f%%, HARD=%.2f%%", soft, hard)
+
     # ----------- Construction / configuration -----------
     def __init__(
         self,
@@ -112,6 +110,8 @@ class RebalancingManager:
         rm,  # RiskManager parent (gardé pour compat ; non utilisé pour I/O)
         # --- Devises / seuils
         min_cash_per_quote: Optional[Dict[str, float]] = None,  # {"USDC":1000.0,"EUR":1000.0}
+        soft_drift_pct: float = 1.0,
+        hard_drift_pct: float = 5.0,
         min_crypto_value_usdc: float = 1000.0,
 
         # --- Périmètre
@@ -146,28 +146,52 @@ class RebalancingManager:
         self.cfg = getattr(rm, "config", None) or getattr(rm, "cfg", None)
         if self.cfg is None:
             raise ValueError("rm config is required to initialize RebalancingManager")
-        reb_cfg = getattr(self.cfg, "reb", None)
+        # Parent / cfg (source de vérité), mais ce module reste passif.
+        self.rm = rm
+        self.cfg = getattr(rm, "config", None) or getattr(rm, "cfg", None)
+        if self.cfg is None:
+            raise ValueError("rm config is required to initialize RebalancingManager")
+
+        # ✅ Canonique : BotConfig expose cfg.rebal.* (pas cfg.reb.*)
+        # ✅ Compat : accepter cfg.reb si encore présent (legacy), et créer un alias cfg.reb -> cfg.rebal si possible.
+        reb_cfg = getattr(self.cfg, "rebal", None) or getattr(self.cfg, "reb", None)
+        if getattr(self.cfg, "reb", None) is None and getattr(self.cfg, "rebal", None) is not None:
+            try:
+                setattr(self.cfg, "reb", getattr(self.cfg, "rebal"))
+            except Exception:
+                # cfg peut être frozen/slots → pas bloquant, on garde reb_cfg local
+                pass
+
         rm_cfg = getattr(self.cfg, "rm", None)
         sim_cfg = getattr(self.cfg, "sim", None)
         g = getattr(self.cfg, "g", None)
+
         if rm_cfg is None:
             raise ValueError("cfg.rm is required to initialize RebalancingManager")
         if reb_cfg is None:
-            raise ValueError("cfg.reb is required to initialize RebalancingManager")
+            raise ValueError("cfg.rebal (or legacy cfg.reb) is required to initialize RebalancingManager")
+        if sim_cfg is None:
+            raise ValueError("cfg.sim is required to initialize RebalancingManager")
+        if g is None:
+            raise ValueError("cfg.g is required to initialize RebalancingManager")
+
         if sim_cfg is None:
             raise ValueError("cfg.sim is required to initialize RebalancingManager")
         if g is None:
             raise ValueError("cfg.g is required to initialize RebalancingManager")
 
     # Devises / seuils
-        quote_ccys = list((getattr(g, "min_fragment_quote", None) or {}).keys()) or ["USDC", "EUR"]
+        quote_ccys = list((getattr(g, "min_fragment_quote", None) or {}).keys()) or ["USDC", "USDT", "EUR"]
         self.quote_ccys = _norm_list_upper(
             quote_ccys,
-
-          ["USDC", "EUR"]
-    )
-
-        self.min_cash_per_quote = {k.upper(): float(v) for k, v in (min_cash_per_quote or {"USDC": 1000.0, "EUR": 1000.0}).items()}
+            ["USDC", "USDT", "EUR"]
+        )
+        self.quote_currencies = list(self.quote_ccys)  # compat alias (utilisé plus bas)
+        self.min_cash_per_quote = {k.upper(): float(v) for k, v in (
+                min_cash_per_quote
+                or getattr(reb_cfg, "rebal_min_cash_per_quote", None)
+                or {"USDC": 1000.0, "USDT": 1000.0, "EUR": 1000.0}
+        ).items()}
         self.min_crypto_value_usdc = float(min_crypto_value_usdc)
 
         # Périmètre (avec fallbacks cfg)
@@ -181,7 +205,9 @@ class RebalancingManager:
             "ATOM","XLM","ALGO","FIL","LDO","APE","BNB"
         ])]
 
-        # Stratégie (legacy conservés)
+        # Stratégie (avec seuils étagés RM)
+        self.soft_drift_pct = float(soft_drift_pct)
+        self.hard_drift_pct = float(hard_drift_pct)
         self.history_limit = int(history_limit)
         self.target_diff_quote = float(target_diff_quote)
         if internal_transfer_threshold is None:
@@ -752,17 +778,19 @@ class RebalancingManager:
                         continue
                     if a not in self.enabled_assets:
                         continue
-                    val = self._value_in_quote(ex, a, _to_f(qty), "USDC")
+                    # On utilise la quote primaire du bot comme référence de valeur
+                    primary_q = str(getattr(self.cfg.g, "primary_quote", "USDC")).upper()
+                    val = self._value_in_quote(ex, a, _to_f(qty), primary_q)
                     if 0 < val < self.min_crypto_value_usdc:
                         out["CRYPTO"].setdefault(ex, {}).setdefault(alias, {})[a] = round(val, 2)
                         has_crypto_need = True
 
-                has_overlay_need = any(abs(v) > 0.0 for v in (out["OVERLAY"] or {}).values())
+        has_overlay_need = any(abs(v) > 0.0 for v in (out["OVERLAY"] or {}).values())
 
-                if not (has_cash_need or has_crypto_need or has_overlay_need):
-                    return None
+        if not (has_cash_need or has_crypto_need or has_overlay_need):
+            return None
 
-                return out
+        return out
     # --- 1) Intra-wallet (SPOT/FUNDING vers preferred_wallet) ---
     def _plan_intra_wallet_transfers(self) -> List[Dict[str, Any]]:
         plans: List[Dict[str, Any]] = []
@@ -885,20 +913,27 @@ class RebalancingManager:
         topups: List[Dict[str, Any]] = []
         for ex, per_alias in (crypto_imb.items()):
             for alias, assets in (per_alias or {}).items():
-                for asset, val_usdc in (assets or {}).items():
-                    pk_usdc = f"{_norm(asset)}USDC"
-                    bid, ask = self._rm_top_of_book(ex, pk_usdc)
+                for asset, val_quote in (assets or {}).items():
+                    # Utiliser la quote appropriée pour le topup
+                    quote = "USDC"
+                    for q in ["USDC", "USDT", "EUR"]:
+                        if asset.endswith(q): # Rare pour un asset, mais on gère au cas où
+                            quote = q
+                            break
+                    
+                    pk_quote = f"{_norm(asset)}{quote}"
+                    bid, ask = self._rm_top_of_book(ex, pk_quote)
                     price = ask or bid
                     if price > 0:
-                        deficit = max(self.min_crypto_value_usdc - float(val_usdc), 0.0)
+                        deficit = max(self.min_crypto_value_usdc - float(val_quote), 0.0)
                         qty = round(deficit / price, 6) if deficit > 0 else 0.0
                         if qty > 0:
                             topups.append({
                                 "type": "crypto_topup_hint",
                                 "exchange": _norm(ex), "alias": _norm(alias),
                                 "asset": _norm(asset), "qty": qty,
-                                "valuation_quote": "USDC",
-                                "value_quote": round(float(val_usdc), 2),
+                                "valuation_quote": quote,
+                                "value_quote": round(float(val_quote), 2),
                                 "target_value_quote": self.min_crypto_value_usdc,
                                 "priority": "CRYPTO", "ttl_s": self.rebal_hint_ttl_s,
                                 "created_ts": _now(), "reason": "small_pocket",
@@ -999,11 +1034,16 @@ class RebalancingManager:
 
         # Observabilité (compteurs)
         try:
-            REBAL_OPERATIONS_TOTAL.labels(op="overlay_comp_hint").inc(len(sel_overlay))
-            REBAL_OPERATIONS_TOTAL.labels(op="wallet_transfer").inc(len(sel_wallet))
-            REBAL_OPERATIONS_TOTAL.labels(op="internal_transfer").inc(len(sel_internal))
-            REBAL_OPERATIONS_TOTAL.labels(op="crypto_topup_hint").inc(len(sel_crypto))
+            REBAL_OPERATIONS_TOTAL.labels(type="overlay_comp_hint", exchange="all").inc(len(sel_overlay))
+            REBAL_OPERATIONS_TOTAL.labels(type="wallet_transfer", exchange="all").inc(len(sel_wallet))
+            REBAL_OPERATIONS_TOTAL.labels(type="internal_transfer", exchange="all").inc(len(sel_internal))
+            REBAL_OPERATIONS_TOTAL.labels(type="crypto_topup_hint", exchange="all").inc(len(sel_crypto))
             REBAL_PLAN_BUILD_MS.observe(plan["t_ms"])
+            
+            # Gauge de déséquilibre
+            for ex, assets in imbalance.get("by_exchange", {}).items():
+                for asset, val in assets.items():
+                    REBAL_IMBALANCE_GAUGE.labels(exchange=ex, asset=asset).set(float(val))
         except Exception:
             pass
 
@@ -1078,6 +1118,7 @@ class RebalancingManager:
         fee_to_pct: Optional[float] = None,
         slip_from_pct: Optional[float] = None,
         slip_to_pct: Optional[float] = None,
+        size_quote: Optional[float] = None,
     ) -> float:
         """
         Estime le net (bps) d'un cross-CEX en tenant compte du spread, fees et slippage.
@@ -1109,19 +1150,45 @@ class RebalancingManager:
             fn = getattr(self.rm, "get_fee_pct", None) if self.rm else None
             if callable(fn):
                 try:
-                    return max(0.0, float(fn(ex, pk, role)))
+                    prud = None
+                    if hasattr(self.rm, "get_prudence_key"):
+                        prud = self.rm.get_prudence_key(pk)
+                    return max(0.0, float(fn(ex, pk, role, prudence_key=prud)))
                 except Exception:
                     return 0.0
             return 0.0
 
         def _slip_pct(ex: str, side: str) -> float:
-            fn = getattr(self.rm, "get_slippage", None) if self.rm else None
+            # On cherche d'abord le slippage spécifique au REB (P95)
+            fn_reb = getattr(self.rm, "get_slippage_for_rebal", None)
+            fn_std = getattr(self.rm, "get_slippage", None)
+            fn = fn_reb or fn_std
+            
+            slip = 0.0
             if callable(fn):
                 try:
-                    return max(0.0, float(fn(ex, pk, side)))
+                    slip = max(0.0, float(fn(ex, pk, side)))
                 except Exception:
-                    return 0.0
-            return 0.0
+                    slip = 0.0
+            
+            # Proxy de liquidité minimal: ne peut pas être inférieur au spread bid-ask absolu
+            # (Si le spread est de 5bps, le slippage ne peut pas être de 2bps)
+            spread_abs = abs(sell_bid - buy_ask) / mid
+            slip = max(slip, spread_abs)
+
+            # Majoration par taille (Buckets)
+            if size_quote and size_quote > 0:
+                # Lecture de la config ou defaults
+                cfg_reb = getattr(self.cfg, "rebal", None) if hasattr(self, "cfg") else None
+                m10k = float(getattr(cfg_reb, "slip_mult_10k", 1.5) if cfg_reb else 1.5)
+                m50k = float(getattr(cfg_reb, "slip_mult_50k", 3.0) if cfg_reb else 3.0)
+                
+                if size_quote >= 50000:
+                    slip *= m50k
+                elif size_quote >= 10000:
+                    slip *= m10k
+            
+            return slip
 
         cost_pct = 0.0
         cost_pct += max(0.0, float(fee_from_pct)) if fee_from_pct is not None else _fee_pct(sell_ex, "taker")
@@ -1143,6 +1210,9 @@ class RebalancingManager:
         for op in plan.get("overlay_comp") or []:
             base = dict(op or {})
             ops.append({**base, "type": "overlay_compensation"})
+            try:
+                REBAL_OPERATIONS_TOTAL.labels(type="overlay_compensation", exchange=base.get("exchange", "n/a")).inc()
+            except Exception: pass
 
         # Transferts entre wallets (SPOT/FUNDING/DERIV ...)
         for w in plan.get("wallet_transfers") or []:
@@ -1150,10 +1220,16 @@ class RebalancingManager:
             # On force le type attendu par le RM
             self._ensure_transfer_id(base, "internal_wallet_transfer")
             ops.append({**base, "type": "internal_wallet_transfer"})
+            try:
+                REBAL_OPERATIONS_TOTAL.labels(type="internal_wallet_transfer", exchange=base.get("exchange", "n/a")).inc()
+            except Exception: pass
 
         # Transferts intra-CEX entre alias (TT/TM/MM...)
         for it in plan.get("internal_transfers") or []:
             base = dict(it or {})
+            try:
+                REBAL_OPERATIONS_TOTAL.labels(type="internal_subaccount_transfer", exchange=base.get("exchange", "n/a")).inc()
+            except Exception: pass
 
             # Normalisation des alias
             from_alias = base.pop("from_alias", None)

@@ -14,7 +14,6 @@ import plotly.graph_objects as go
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 from modules.bot_config import BotConfig
-from rm_compat import as_int_or, as_float_or, as_dict_or_empty
 TRI_CEX_DEFAULT = ['BINANCE', 'BYBIT', 'COINBASE']
 
 def detect_latest_db(db_dir: Path | str='logs') -> str | None:
@@ -555,8 +554,8 @@ def main():
     cfg = BotConfig()
     logs_dir = Path(getattr(cfg, 'dashboard_logs_dir', getattr(cfg, 'logs_dir', 'logs')))
     default_db = getattr(cfg, 'dashboard_db_path', None) or detect_latest_db(logs_dir) or str(logs_dir / 'trades_log.db')
-    default_limit = as_int_or(getattr(cfg, 'dashboard_limit', None), 20000)
-    default_refresh = as_int_or(getattr(cfg, 'dashboard_refresh_s', None), 5)
+    default_limit = int(getattr(cfg, 'dashboard_limit', 20000) or 20000)
+    default_refresh = int(getattr(cfg, 'dashboard_refresh_s', 5) or 5)
     tri_cex: List[str] = list(getattr(cfg, 'dashboard_exchanges', getattr(cfg, 'tri_cex', TRI_CEX_DEFAULT)))
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--db', default=str(default_db))

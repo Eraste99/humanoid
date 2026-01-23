@@ -34,17 +34,25 @@ from __future__ import annotations
           (USDC *ou* EUR). Les noms legacy sont conservés pour compat.
     """
 import asyncio, time, inspect
-import time, uuid, random
-import hashlib,json
+import uuid, random
+import hashlib, json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
 from modules.bot_config import RmSwitchKnobs
 from dataclasses import fields
 from typing import Dict, Any, List, Optional, Tuple
-from modules.obs_metrics import inc_blocked, set_transfer_inflight, inc_transfer_fsm_event
+from modules.obs_metrics import (
+    inc_blocked,
+    set_transfer_inflight,
+    inc_transfer_fsm_event,
+    RM_RESERVED_FUNDS_ACTIVE,
+    record_pipeline_latency,
+    set_pipeline_backlog,
+    should_trace_latency,
+)
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
 from modules.obs_metrics import TIME_SKEW_MS
 from contracts.payloads import (
     make_submit_bundle,
@@ -60,6 +68,7 @@ from modules.retry_policy import BackoffPolicy, awith_retry
 from dataclasses import dataclass, asdict
 import json
 from contracts import payloads as fraglib
+from modules.dynamic_execution_simulator import FragmentationPolicy
 
 from typing import Any, Dict, List, Optional, Callable, Tuple, Set, Iterable
 from types import SimpleNamespace
@@ -183,6 +192,7 @@ RM_REASON_PRIORITY = (
     "MM_HINTS_GUARD_QPOS",
     "MM_HINTS_GUARD_DEPTH",
     "MM_HINTS_GUARD_P_BOTH",
+    "MM_STALE_BOOK_DUAL",
 
     "MM_COLLAT_CRIT",
     "MM_REB_CRITICAL",
@@ -235,7 +245,6 @@ ENGINE_NACK_429 = "ENGINE_NACK_429"
 ENGINE_NACK_5XX = "ENGINE_NACK_5XX"
 
 
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from modules.risk_manager.rebalancing_manager import RebalancingManager
 from modules.risk_manager.volatility_manager import VolatilityManager
 from modules.risk_manager.slippage_and_fees_collector import SlippageAndFeesCollector
@@ -273,13 +282,14 @@ except Exception:
 
 
 from modules.obs_metrics import (
-    mark_books_fresh, mark_balances_fresh, inc_rm_reject,
+    mark_books_fresh, mark_balances_fresh, inc_rm_reject, inc_rm_skip,
     set_rm_paused_count, set_dynamic_min, REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
     get_counter, get_gauge, safe_inc, safe_set, safe_observe,
     RM_SHUTDOWN_SECONDS, RM_SHUTDOWN_TIMEOUT_TOTAL, RM_SHUTDOWN_PENDING_TASKS,
-    RM_TRADING_READY, RM_DEP_READY, RM_CALLBACK_LATENCY_MS,
+    RM_PIPELINE_READY, RM_TRADING_READY, RM_DEP_READY, RM_CALLBACK_LATENCY_MS,
     RM_CALLBACK_DROPS_TOTAL, RM_CALLBACK_INFLIGHT,
 )
+
 from modules.bot_config import ALLOWED_BRANCHES, ALLOWED_CAPITAL_PROFILES
 
 
@@ -317,10 +327,6 @@ RM_CAP_BRANCH_DISABLED = "RM_CAP_BRANCH_DISABLED"
 RM_CAP_COMBO_EXCEEDED = "RM_CAP_COMBO_EXCEEDED"
 
 # --- Metrics (caps path hygiene) -------------------------------------------
-RM_CAPS_LEGACY_CALLS_TOTAL = get_counter(
-    "rm_caps_legacy_calls_total",
-    "Legacy opportunity-level caps/preemption path invocations",
-)
 RM_CAPS_BUNDLE_CALLS_TOTAL = get_counter(
     "rm_caps_bundle_calls_total",
     "Bundle-level caps/preemption path invocations",
@@ -975,11 +981,13 @@ class TransferController:
             policy: Optional[BackoffPolicy] = None,
             logger_historique_manager=None,
             submitted_timeout_s: float = 300.0,
+            rate_limiter: Optional[Any] = None,
     ) -> None:
         self._policy = policy or BackoffPolicy()
         self._states: Dict[str, Dict[str, Any]] = {}
         self._lhm = logger_historique_manager
         self._submitted_timeout_s = float(submitted_timeout_s or 300.0)
+        self._rate_limiter = rate_limiter
         self._order = {
             "REQUESTED": 0,
             "PREPARED": 1,
@@ -1074,10 +1082,15 @@ class TransferController:
             return
         now_ms = int(time.time() * 1000)
         for transfer_id, state in list(self._states.items()):
-            if state.get("state") not in {"SUBMITTED", "REQUESTED", "PREPARED"}:
+            cur_state = state.get("state")
+            if cur_state not in {"SUBMITTED", "REQUESTED", "PREPARED"}:
                 continue
+            
             expires = state.get("expires_ts_ms")
             if expires is not None and int(expires) <= now_ms:
+                # AJOUT P0: Avant de fail-close, on pourrait tenter un refresh REST final
+                # Mais ici TransferController est passif (data class). 
+                # On délègue la décision de polling à RiskManager.
                 try:
                     op_id = self._op_id(transfer_id)
                     self._fail_stuck(
@@ -1088,6 +1101,12 @@ class TransferController:
                     )
                 except Exception:
                     logger.exception("[TransferController] failed to fail-close stuck transfer")
+
+    def list_pending_transfer_ids(self) -> List[str]:
+        return [tid for tid, st in (self._states or {}).items() if st.get("state") == "SUBMITTED"]
+
+    def get_transfer_payload(self, transfer_id: str) -> Optional[Dict[str, Any]]:
+        return self._states.get(transfer_id, {}).get("payload")
 
     def _persist_state(
         self,
@@ -1238,6 +1257,8 @@ class TransferController:
 
         state_payload = self._state_payload(payload)
         expires_ts_ms = int(time.time() * 1000 + (self._submitted_timeout_s * 1000.0))
+        ex = str(payload.get("exchange") or venue.split(":")[0]).upper()
+
         self._transition(
             transfer_id=transfer_id,
             new_state="REQUESTED",
@@ -1250,7 +1271,41 @@ class TransferController:
             payload=state_payload,
             expires_ts_ms=expires_ts_ms,
         )
+
+        # Rate limiting (internal transfers often have strict quotas)
+        start_wait = time.perf_counter()
+        if self._rate_limiter:
+            try:
+                # "transfer" kind used by default for internal moves
+                await self._rate_limiter.acquire(ex, "transfer")
+            except Exception:
+                pass
+
+        rl_wait_ms = (time.perf_counter() - start_wait) * 1000.0
+        if rl_wait_ms > 0:
+            try:
+                from modules.obs_metrics import REBAL_TRANSFER_RL_WAIT_MS
+                if REBAL_TRANSFER_RL_WAIT_MS:
+                    REBAL_TRANSFER_RL_WAIT_MS.labels(exchange=ex).observe(rl_wait_ms)
+            except Exception:
+                pass
+
+        t_start_xfer = time.perf_counter()
         outcome = await awith_retry(submit_fn, venue=venue, policy=self._policy)
+        t_lat_ms = (time.perf_counter() - t_start_xfer) * 1000.0
+
+        # Observabilité fine
+        try:
+            from modules.obs_metrics import REBAL_OPERATIONS_TOTAL, REBAL_TRANSFER_LATENCY_MS
+            op_type = str(payload.get("type") or "unknown")
+            status_label = "SUCCESS" if outcome.ok else "FAILED"
+            if REBAL_OPERATIONS_TOTAL:
+                REBAL_OPERATIONS_TOTAL.labels(type=op_type, exchange=ex, status=status_label).inc()
+            if REBAL_TRANSFER_LATENCY_MS:
+                REBAL_TRANSFER_LATENCY_MS.labels(exchange=ex, type=op_type).observe(t_lat_ms)
+        except Exception:
+            pass
+
         if outcome.ok:
 
             self._transition(
@@ -1368,63 +1423,23 @@ class RiskManager:
         )
         return live_mode and bool(getattr(g_cfg, "live_trading_armed", False))
 
+    def _is_mm_family(self, branch: str, kind: str = "") -> bool:
+        br = str(branch or "").upper()
+        k = str(kind or "").upper()
+        # MM_MONO, MM_CROSS commencent par MM_
+        return br == "MM" or br.startswith("MM_") or k == "MAKER_MM"
+
     def _should_raise_config_conflict(self) -> bool:
         return self._rm_strict_config() and self._rm_live_armed()
 
     def _warn_rm_alias(self, key: str, msg: str) -> None:
-        if key in self._rm_alias_warnings:
-            return
-        self._rm_alias_warnings.add(key)
-        logger.warning("[RiskManager] %s", msg)
+        if not hasattr(self, "_rm_alias_warnings"):
+            self._rm_alias_warnings = set()
+        if key not in self._rm_alias_warnings:
+            self._rm_alias_warnings.add(key)
+            logging.getLogger(__name__).warning("[RiskManager] %s", msg)
 
-    def _get_rm_knob(
-            self,
-            name: str,
-            *,
-            legacy: str | None = None,
-            default=None,
-            cast=None,
-    ):
-        """Resolve RM knob with legacy alias handling.
 
-        Legacy mappings (non-exhaustive):
-          - TM_EXPOSURE_TTL_MS -> rm.tm_exposure_ttl_ms
-          - VOL_SNAPSHOT_TTL_S / DEGRADED_VOL_TTL_S -> rm.vol_snapshot_ttl_s / rm.degraded_vol_ttl_s
-          - TOB_MAX_AGE_S -> rm.tob_max_age_s
-          - TM_QUEUEPOS_MAX_AHEAD_USD / TM_QUEUEPOS_MAX_ETA_MS -> rm.tm_queuepos_max_ahead_usd / rm.tm_queuepos_max_eta_ms
-          - DEGRADED_* -> rm.degraded_* (ratios/penalties)
-          - FEE_SNAPSHOT_TTL_S / FEE_TOLERATED_AGE_S -> rm.fee_snapshot_ttl_s / rm.fee_tolerated_age_s
-          - ENABLE_FEE_TOKEN_RESERVES_CHECK -> rm.enable_fee_token_reserves_check
-        """
-        missing = object()
-        rm_cfg = self._rm_cfg()
-        cfg_root = getattr(self, "_cfg_root", None) or getattr(self, "cfg", None)
-        val = getattr(rm_cfg, name, missing) if rm_cfg is not None else missing
-        legacy_val = getattr(cfg_root, legacy, missing) if legacy and cfg_root is not None else missing
-
-        if val is not missing and legacy_val is not missing and val != legacy_val:
-            msg = f"config mismatch for {name}: rm.{name}={val} legacy.{legacy}={legacy_val}"
-            if self._should_raise_config_conflict():
-                raise RuntimeError(msg)
-            self._warn_rm_alias(f"{name}_conflict", msg)
-
-        if val is not missing:
-            result = val
-        elif legacy_val is not missing:
-            msg = f"legacy config {legacy} is deprecated; use rm.{name} instead"
-            if self._should_raise_config_conflict():
-                raise RuntimeError(msg)
-            self._warn_rm_alias(f"{name}_legacy", msg)
-            result = legacy_val
-        else:
-            result = default
-
-        if cast is not None:
-            try:
-                return cast(result)
-            except Exception:
-                return result
-        return result
     def _resolve_rm_param(self, names: tuple | str, default=None):
         if isinstance(names, str):
             names = (names,)
@@ -1463,6 +1478,36 @@ class RiskManager:
 
         return default
 
+    def _get_rm_knob(self, name: str, legacy: str = None, default: Any = None) -> Any:
+        try:
+            rm_cfg = self._rm_cfg()
+            if rm_cfg is not None:
+                val = getattr(rm_cfg, name, None)
+                if val is not None:
+                    return val
+                if legacy:
+                    val = getattr(rm_cfg, legacy, None)
+                    if val is not None:
+                        return val
+
+            if hasattr(self, "_switch_knobs") and self._switch_knobs:
+                val = getattr(self._switch_knobs, name, None)
+                if val is not None:
+                    return val
+
+            cfg_obj = getattr(self, "_cfg_root", None) or getattr(self, "cfg", None)
+            if cfg_obj is not None:
+                if legacy:
+                    val = getattr(cfg_obj, legacy, None)
+                    if val is not None:
+                        return val
+                val = getattr(cfg_obj, name, None)
+                if val is not None:
+                    return val
+        except Exception:
+            pass
+        return default
+
     def _load_rm_runtime_policy(self) -> None:
         raw_budgets = self._resolve_rm_param("daily_strategy_budget_quote", {}) or {}
         self.daily_strategy_budget_quote = {
@@ -1487,6 +1532,47 @@ class RiskManager:
         self.inventory_cap_quote = float(inv_cap)
         self.inventory_cap_usd = self.inventory_cap_quote
         self.min_buffer_quote = float(self._resolve_rm_param("min_buffer_quote", 0.0))
+
+        # P0: Coordonner les seuils de rééquilibrage pour éviter les oscillations
+        # RiskManager (Passif) : On désactive un leg dès que le drift dépasse SOFT (ex: 1%)
+        # RebalancingManager (Actif) : On déclenche un transfert dès que le drift dépasse HARD (ex: 5%)
+        # Ces valeurs sont chargées depuis BotConfig.rm.inventory_limits si dispo
+        self.inv_soft_drift_pct = float(self._resolve_rm_param(("inv_soft_drift_pct", "INV_SOFT_DRIFT_PCT"), 1.5))
+        self.inv_hard_drift_pct = float(self._resolve_rm_param(("inv_hard_drift_pct", "INV_HARD_DRIFT_PCT"), 5.0))
+        
+        # On injecte ces seuils dans le RebalancingManager s'il est branché
+        if hasattr(self, "rebalancing") and self.rebalancing:
+            try:
+                self.rebalancing.set_drift_thresholds(soft=self.inv_soft_drift_pct, hard=self.inv_hard_drift_pct)
+            except Exception:
+                pass
+
+        # Hystérésis inventaire (DUAL <-> SINGLE)
+        self.inv_band_hi_usd = float(self._resolve_rm_param("inv_band_hi_usd", 250.0))
+        self.inv_band_lo_usd = float(self._resolve_rm_param("inv_band_lo_usd", 100.0))
+        self.inv_state_min_seconds = float(self._resolve_rm_param("inv_state_min_seconds", 10.0))
+
+        # Paramètres Anti-stuck (SINGLE mode)
+        self.single_stuck_t1_s = float(self._resolve_rm_param("single_stuck_t1_s", 30.0))
+        self.single_stuck_t2_s = float(self._resolve_rm_param("single_stuck_t2_s", 60.0))
+        self.single_max_time_s = float(self._resolve_rm_param("single_max_time_s", 120.0))
+
+        # Paramètres agressivité Phase 2
+        self.mm_single_aggressive_pad_ticks = float(self._resolve_rm_param("mm_single_aggressive_pad_ticks", 0.0))
+        self.mm_single_aggressive_size_factor = float(self._resolve_rm_param("mm_single_aggressive_size_factor", 1.2))
+
+        # Budget cancel minimal (SINGLE mode)
+        self.mm_single_min_quote_lifetime_ms = int(self._resolve_rm_param("mm_single_min_quote_lifetime_ms", 1000))
+        self.mm_single_cancel_budget = int(self._resolve_rm_param("mm_single_cancel_budget", 30))
+
+        # Seuil imbalance adverse
+        self.mm_single_imbalance_threshold = float(self._resolve_rm_param("mm_single_imbalance_threshold", 0.6))
+
+        # MM Cross strict p_both
+        self.mm_p_both_min_cross = float(self._resolve_rm_param("mm_p_both_min_cross", 0.8))
+
+        # État courant : (ex, alias, asset) -> {"mode": "DUAL"|"SINGLE", "last_transition": ts}
+        self.mm_inventory_mode_state: Dict[tuple[str, str, str], Dict[str, Any]] = {}
 
     def __init__(
             self,
@@ -1514,6 +1600,7 @@ class RiskManager:
             fee_sync_interval: Optional[float] = None,
             # Clients de transfert (par CEX)
             transfer_clients: Optional[Dict[str, Any]] = None,
+            rate_limiter: Optional[Any] = None,
             # Readiness (nouveau)
             ready_event: asyncio.Event | None = None,
             history_logger: Optional[Callable[[Dict[str, Any]], Any]] = None,
@@ -1593,6 +1680,22 @@ class RiskManager:
             getattr(getattr(self.cfg, "rm", None), "combo_cap_window_s", 120.0) or 120.0
         )
         self._combo_inflight_notional: Dict[str, List[Tuple[float, float]]] = {}
+        # Ticket P0-RM-CAPMOVE-01: Réservations de balance pour éliminer les ghost funds (keyed by transfer_id)
+        self._reserved_balances: Dict[str, Dict[str, Any]] = {}
+        # Ticket P0-RM-RESYNC-01: Historique pour plafond global de resync
+        self._resync_history: Dict[str, deque] = {}
+        self._boot_ts = time.time()
+
+        # EWMA Imbalance (exchange, pair) -> float
+        self._mm_imbalance_ewma: Dict[tuple[str, str], float] = {}
+        self._mm_imbalance_alpha = float(self._resolve_rm_param("mm_imbalance_alpha", 0.3))
+
+        # Optimisation P1: Cache de snapshot balances pour le hot path (Scanner)
+        self._balances_cache: Dict[str, Dict[str, Any]] = {}
+        self._last_balances_ts: float = 0.0
+        # Intervalle de rafraîchissement du cache balances interne (RM)
+        self._balances_cache_interval_s = 0.200 # 200ms
+
         g_cfg = _cfg_g(self)
         self.capital_profile = str(getattr(g_cfg, "capital_profile", "SMALL") or "SMALL").upper()
         # --- Résumé des caps globaux par profil (Macro 3 / M3-A) ---
@@ -1712,9 +1815,23 @@ class RiskManager:
         }
 
         # --- MM rebalancing ladder (mono-CEX + intra + cross) ---
+        self.mm_mono_alias_name = str(getattr(self.bot_cfg, "mm_mono_alias_name", "MM_MONO") or "MM_MONO").upper()
+        self.mm_cross_alias_name = str(getattr(self.bot_cfg, "mm_cross_alias_name", "MM_CROSS") or "MM_CROSS").upper()
+
         self.mm_reb_inventory_soft_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_soft_pct", 5.0)
         self.mm_reb_inventory_hard_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_hard_pct", 15.0)
         self.mm_reb_inventory_critical_pct = _cfg_float(self.bot_cfg, "mm_reb_inventory_critical_pct", 25.0)
+
+        # Seuils spécifiques Mono
+        self.mm_mono_reb_soft = _cfg_float(self.bot_cfg, "mm_mono_reb_inventory_soft_pct", self.mm_reb_inventory_soft_pct)
+        self.mm_mono_reb_hard = _cfg_float(self.bot_cfg, "mm_mono_reb_inventory_hard_pct", self.mm_reb_inventory_hard_pct)
+        self.mm_mono_reb_critical = _cfg_float(self.bot_cfg, "mm_mono_reb_inventory_critical_pct", self.mm_reb_inventory_critical_pct)
+
+        # Seuils spécifiques Cross
+        self.mm_cross_reb_soft = _cfg_float(self.bot_cfg, "mm_cross_reb_inventory_soft_pct", self.mm_reb_inventory_soft_pct)
+        self.mm_cross_reb_hard = _cfg_float(self.bot_cfg, "mm_cross_reb_inventory_hard_pct", self.mm_reb_inventory_hard_pct)
+        self.mm_cross_reb_critical = _cfg_float(self.bot_cfg, "mm_cross_reb_inventory_critical_pct", self.mm_reb_inventory_critical_pct)
+
         self.mm_reb_inventory_min_notional_usd = _cfg_float(
             self.bot_cfg, "mm_reb_inventory_min_notional_usd", 200.0
         )
@@ -1923,6 +2040,7 @@ class RiskManager:
                 getattr(getattr(self.cfg, "rm", None), "mode_tick_interval_s", 1.0),
             )
         )
+        self.ready_event = ready_event or asyncio.Event()
         self._last_fee_sync = 0.0
 
         # Rebalancing orchestration (TTL/cooldown)
@@ -1951,6 +2069,7 @@ class RiskManager:
             policy=BackoffPolicy.from_cfg(retry_cfg),
             logger_historique_manager=self._lhm_manager,
             submitted_timeout_s=transfer_timeout_s,
+            rate_limiter=rate_limiter,
         )
         try:
             now_ms = int(time.time() * 1000)
@@ -2026,13 +2145,16 @@ class RiskManager:
         # Dry-run : soldes virtuels (USDC & EUR / exchange / alias)
         self._virtual_balances: Dict[str, Dict[str, Dict[str, float]]] = {}
         if bool(getattr(self.cfg, "dry_run", False)):
-            default_usdc = _cfg_float(self.cfg,"dry_usdc_per_account", 2000.0)
+            # P0: Augmenter radicalement les fonds virtuels pour ne pas brider les tests
+            # On passe de 2000 à 1,000,000 USDC/EUR/USDT
+            default_usdc = _cfg_float(self.cfg,"dry_usdc_per_account", 1000000.0)
             default_eur = _cfg_float(self.cfg,"dry_eur_per_account", default_usdc)
+            default_usdt = _cfg_float(self.cfg,"dry_usdt_per_account", default_usdc)
 
             for ex in self.exchanges:
                 self._virtual_balances[ex] = {
-                    "TT": {"USDC": default_usdc, "EUR": default_eur},
-                    "TM": {"USDC": default_usdc, "EUR": default_eur},
+                    "TT": {"USDC": default_usdc, "EUR": default_eur, "USDT": default_usdt},
+                    "TM": {"USDC": default_usdc, "EUR": default_eur, "USDT": default_usdt},
                 }
             # 👉 normalise/merge une seule fois
             self.seed_virtual_balances(self._virtual_balances, overwrite=True)
@@ -2050,17 +2172,29 @@ class RiskManager:
         self.get_orderbooks_callback = None  # sera branché par le boot
 
         # Readiness
+        # -------------------- Readiness (PIPELINE_READY vs TRADING_READY) --------------------
+        # ready_event           : "loops started" (orchestrateur vivant)
+        # pipeline_ready_event  : dépendances OK (engine/books/balances/slip/vol/scanner) => bot opérationnel infra
+        # trading_ready_event   : pipeline_ready + autorisation live (armed + kill_switch off + dry_run off) + trading_state READY
         self.ready_event: asyncio.Event = ready_event or asyncio.Event()
+        self.pipeline_ready_event: asyncio.Event = asyncio.Event()
         self.trading_ready_event: asyncio.Event = asyncio.Event()
+
         self._readiness: Dict[str, Any] = {
             "engine": False,
             "books": False,
             "balances": False,
             "scanner": True,
+            "slippage": False,
+            "volatility": False,
+            "pipeline_ready": False,
+            "trading_allowed": False,
+            "trading_ready": False,
             "reasons": [],
         }
         self._last_books_snapshot_ts: float = 0.0
         self._last_balances_ts: float = 0.0
+
 
         # Callback dispatch
         self._cb_tasks: Set[asyncio.Task] = set()
@@ -2194,6 +2328,8 @@ class RiskManager:
 
         # Throttle pour les demandes de resync balances ciblées (par alias)
         self._alias_last_resync_request_ts: Dict[Tuple[str, str], float] = {}
+        # Coalescence : une seule task de resync en vol par alias
+        self._alias_resync_inflight: Set[Tuple[str, str]] = set()
 
         # Suivi de dérive entre capital virtuel (RM) et réel (MBF)
         self._last_capital_drift_pct: float = 0.0
@@ -2295,6 +2431,76 @@ class RiskManager:
             return min(base_cap, buffers_cap)
         return base_cap
 
+    def _sync_reserved_metrics(self) -> None:
+        """Met à jour la jauge RM_RESERVED_FUNDS_ACTIVE à partir des réservations en cours."""
+        if not getattr(self, "_reserved_balances", None):
+            return
+
+        totals: Dict[Tuple[str, str, str], float] = {}
+        for res in self._reserved_balances.values():
+            key = (res["exchange"], res["alias"], res["ccy"])
+            totals[key] = totals.get(key, 0.0) + res["amount"]
+
+        # On devrait idéalement pouvoir faire un reset() mais Prometheus ne le permet pas facilement par label.
+        # On va mettre à 0 les clés connues qui ne sont plus dans totals si on avait un cache, 
+        # mais ici on va juste mettre à jour les actifs. 
+        # Pour faire propre, on peut garder la liste des labels déjà vus.
+        if not hasattr(self, "_reserved_metrics_seen"):
+            self._reserved_metrics_seen: Set[Tuple[str, str, str]] = set()
+
+        for key, val in totals.items():
+            try:
+                RM_RESERVED_FUNDS_ACTIVE.labels(exchange=key[0], alias=key[1], ccy=key[2]).set(val)
+                self._reserved_metrics_seen.add(key)
+            except Exception:
+                pass
+
+        # Clean up des anciens qui sont tombés à 0
+        for key in list(self._reserved_metrics_seen):
+            if key not in totals:
+                try:
+                    RM_RESERVED_FUNDS_ACTIVE.labels(exchange=key[0], alias=key[1], ccy=key[2]).set(0.0)
+                    self._reserved_metrics_seen.remove(key)
+                except Exception:
+                    pass
+
+    def _apply_reservations_to_pockets(self, pockets: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Applique les réservations de balance (Ticket P0-RM-CAPMOVE-01) sur un dictionnaire 'pockets_by_quote'.
+        Utilise effective_available = max(0, available - reserved).
+        """
+        if not pockets or not getattr(self, "_reserved_balances", None):
+            return pockets
+
+        now = time.time()
+        # On travaille sur une copie profonde pour éviter de polluer le cache MBF si passé par ref
+        import copy
+        pockets = copy.deepcopy(pockets)
+
+        for tid, res in list(self._reserved_balances.items()):
+            # Nettoyage auto des expirés au passage
+            if now > res.get("deadline", 0):
+                self._reserved_balances.pop(tid, None)
+                continue
+        
+        self._sync_reserved_metrics()
+
+        for tid, res in self._reserved_balances.items():
+            ex = res["exchange"]
+            alias = res["alias"]
+            ccy = res["ccy"]
+            amount = res["amount"]
+
+            if ex in pockets and alias in pockets[ex] and ccy in pockets[ex][alias]:
+                node = pockets[ex][alias][ccy]
+                if isinstance(node, dict):
+                    orig = float(node.get("available", node.get("total", 0.0)))
+                    node["available"] = max(0.0, orig - amount)
+                else:
+                    orig = float(node or 0.0)
+                    pockets[ex][alias][ccy] = max(0.0, orig - amount)
+        return pockets
+
     def _refresh_capital_from_buffers(self, *, mode: str = "merged") -> None:
         """
         Helper interne : rafraîchit la vue capital à partir du MultiBalanceFetcher.
@@ -2311,6 +2517,9 @@ class RiskManager:
             return
 
         pockets = snapshot.get("pockets_by_quote", {}) or {}
+        # Ticket P0-RM-CAPMOVE-01: Appliquer les réservations (virtual debit)
+        pockets = self._apply_reservations_to_pockets(pockets)
+
         capital_buffers: Dict[str, Dict[str, Dict[str, float]]] = {}
         total_usdc = 0.0
 
@@ -2621,7 +2830,9 @@ class RiskManager:
         if not alias_u:
             return False
         cfg_mm_alias = str(getattr(self, "mm_alias", "MM") or "MM").upper()
-        return "MM" in alias_u or alias_u == cfg_mm_alias
+        cfg_mm_mono = str(getattr(self, "mm_mono_alias_name", "MM_MONO") or "MM_MONO").upper()
+        cfg_mm_cross = str(getattr(self, "mm_cross_alias_name", "MM_CROSS") or "MM_CROSS").upper()
+        return "MM" in alias_u or alias_u in {cfg_mm_alias, cfg_mm_mono, cfg_mm_cross}
 
     def _rm_mm_delta_status_for_asset(self, asset: str) -> Optional[Dict[str, Any]]:
         """
@@ -2636,7 +2847,8 @@ class RiskManager:
         try:
             meta = event.get("meta") or {}
             branch = str(meta.get("branch") or meta.get("strategy") or meta.get("kind") or "").upper()
-            if branch not in {"MM", "MAKER_MM"}:
+            kind = str(meta.get("kind") or "").upper()
+            if not self._is_mm_family(branch, kind):
                 return
 
             symbol = event.get("symbol") or meta.get("pair") or meta.get("symbol")
@@ -3263,11 +3475,7 @@ class RiskManager:
             return True, "no_fee_token_policy"
 
         if (
-                self._get_rm_knob(
-                    "enable_fee_token_reserves_check",
-                    legacy="ENABLE_FEE_TOKEN_RESERVES_CHECK",
-                    default=False,
-                )
+                getattr(self.cfg.rm, "enable_fee_token_reserves_check", False)
                 is False
         ):
             return True, "disabled"
@@ -3432,7 +3640,7 @@ class RiskManager:
             pass
         if INVENTORY_USD:
             try:
-                INVENTORY_USD.labels(exu, q).set(self.virt_balances[exu][q])
+                INVENTORY_USD.labels(exchange=exu, quote=q).set(self.virt_balances[exu][q])
             except Exception:
                 logging.exception("Unhandled exception")
         return True
@@ -3445,7 +3653,7 @@ class RiskManager:
         self.virt_balances.setdefault(exu, {})[q] = new_val
         try:
             if INVENTORY_USD:
-                INVENTORY_USD.labels(exu, q).set(new_val)
+                INVENTORY_USD.labels(exchange=exu, quote=q).set(new_val)
         except Exception:
             logging.exception("Unhandled exception")
 
@@ -3470,7 +3678,8 @@ class RiskManager:
     def _handle_mm_budget_event(self, ev: Dict[str, Any]) -> None:
         meta = ev.get("meta") or {}
         branch = str(meta.get("branch") or meta.get("strategy") or meta.get("kind") or "").upper()
-        if branch not in {"MM", "MAKER_MM"}:
+        kind = str(meta.get("kind") or "").upper()
+        if not self._is_mm_family(branch, kind):
             return
 
         status = str(ev.get("status") or meta.get("status") or meta.get("state") or "").upper()
@@ -3617,7 +3826,7 @@ class RiskManager:
         """
         try:
             route_sfc = self._norm_route_for_sfc(route, pair_key=(route.get("pair") or route.get("pair_key")))
-            slip_kind = getattr_str(self.cfg, "sfc_slippage_source", "ewma")
+            slip_kind = str(getattr(self.cfg, "sfc_slippage_source", "ewma"))
 
             pct = float(self.slip_collector.get_total_cost_pct(
                 route_sfc,
@@ -3935,7 +4144,7 @@ class RiskManager:
                         branch_enabled = bool(getattr(self.cfg, "enable_tt", getattr(self, "enable_tt", True)))
                     elif branch_u == "TM":
                         branch_enabled = bool(getattr(self.cfg, "enable_tm", getattr(self, "enable_tm", True)))
-                    elif branch_u == "MM":
+                    elif self._is_mm_family(branch_u):
                         branch_enabled = bool(getattr(self, "enable_mm", False))
                     elif branch_u == "REB":
                         branch_enabled = bool(getattr(self.cfg, "enable_reb", getattr(self, "enable_reb", True)))
@@ -3948,7 +4157,9 @@ class RiskManager:
                 else:
                     caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
                     prof_caps = caps_by_profile.get(profile_u) or caps_by_profile.get("LARGE", {})
-                    inflight_cap = int(prof_caps.get(branch_u, 0) or 0)
+                    # Normalisation MM pour l'accès aux caps de profil
+                    lookup_branch = "MM" if self._is_mm_family(branch_u) else branch_u
+                    inflight_cap = int(prof_caps.get(lookup_branch, 0) or 0)
                 if not branch_enabled:
                     inflight_cap = 0
             except Exception:
@@ -4016,48 +4227,14 @@ class RiskManager:
 
     # === /RM: capital net & profil ===
 
-    def _apply_caps_and_preempt(self, *args, **kwargs):
-        """Helper central Ticket 10 — API unique des caps.
-
-        Deux usages coexistent pour compatibilité :
-
-        - Legacy (niveau opportunité) :
-          _apply_caps_and_preempt(strategy, ex, desired_notional) -> float
-
-        - Nouveau (niveau bundle) :
-          _apply_caps_and_preempt(bundle, caps_local, eligible, profile) -> (ok: bool, reason: str)
-
-        La branche legacy continue d'exister pour ne pas casser le flux Scanner→RM,
-        mais la décision « caps business vs backpressure Engine » se fait désormais
-        au niveau bundle via caps_local.
+    def _apply_caps_and_preempt_legacy(self, strategy: str, ex: str, desired_notional: float) -> float:
         """
-        # Nouveau contrat bundle-centric (chemin recommandé) : premier argument = bundle (dict)
-        if args and isinstance(args[0], dict):
-            bundle = args[0]
-            caps_local = args[1] if len(args) > 1 else {}
-            eligible = args[2] if len(args) > 2 else None
-            profile = args[3] if len(args) > 3 else None
-            safe_inc(
-                RM_CAPS_BUNDLE_CALLS_TOTAL,
-                "rm_caps_bundle_calls_total",
-                "rm._apply_caps_and_preempt",
-            )
-            return self._apply_caps_and_preempt_bundle(bundle, caps_local, eligible, profile)
+        Adaptateur legacy (Opp-level) pour compatibilité ascendante.
+        Utilise la logique historique _apply_caps_and_preempt_cex.
+        """
+        return self._apply_caps_and_preempt_cex(strategy, ex, desired_notional)
 
-        # Fallback : ancien contrat (strategy, ex, desired_notional)
-        if len(args) >= 3:
-            strategy, ex, desired_notional = args[0], args[1], args[2]
-            safe_inc(
-                RM_CAPS_LEGACY_CALLS_TOTAL,
-                "rm_caps_legacy_calls_total",
-                "rm._apply_caps_and_preempt",
-            )
-        else:
-            # Appel incohérent : on renvoie 0.0 pour rester conservateur.
-            return 0.0
-        return self._apply_caps_and_preempt_legacy(strategy, ex, desired_notional)
-
-    def _maybe_fire_mm_inventory_single(self, opp: Dict[str, Any], reason: str) -> None:
+    def _maybe_fire_mm_inventory_single(self, opp: Dict[str, Any], reason: str, branch: str = "MM") -> None:
         """Déclenche un maker inventaire vers l'Engine via la file standard."""
         if not getattr(self, "mm_inventory_enabled", False):
             return
@@ -4067,38 +4244,35 @@ class RiskManager:
             return
         pk = self._norm_pair(pair)
 
-
         ex = (opp.get("buy_ex") or opp.get("sell_ex") or "").upper()
         if not ex:
             return
 
-
         snap = getattr(self, "balances", None) or {}
         base = self._pair_base(pk)
 
+        # On utilise le branch pour trouver l'alias correct si non fourni dans opp
+        alias = opp.get("alias") or branch
 
         try:
-            base_pos = float((snap.get(ex, {}).get(base) or {}).get("free", 0.0))
+            base_pos = float((snap.get(ex, {}).get(alias) or {}).get(base) or {}).get("free", 0.0)
         except Exception:
             base_pos = 0.0
-
 
         bid, ask = getattr(self, "get_top_of_book", lambda *a: (0.0, 0.0))(ex, pk)
         mid = (float(bid) + float(ask)) / 2.0 if (bid and ask) else 0.0
         inv_usd = base_pos * mid
 
-
         notional_target = float(getattr(self, "notional_usd", 0.0) or opp.get("notional_usdc") or 0.0)
         if notional_target <= 0:
             notional_target = abs(inv_usd)
+        
         skew_pct = 100.0 * inv_usd / notional_target if notional_target else 0.0
         max_skew = float(getattr(self, "mm_inventory_max_skew_pct", 15.0) or 0.0)
         min_notional = float(getattr(self, "mm_inventory_notional_usd", 0.0) or 0.0)
 
         if abs(skew_pct) < max_skew or abs(inv_usd) < min_notional:
-
             return
-
 
         maker_side = "SELL" if inv_usd > 0 else "BUY"
         amount_quote = max(abs(inv_usd), 0.0)
@@ -4115,7 +4289,7 @@ class RiskManager:
             "side": maker_side,
             "amount_quote": amount_quote,
             "ttl_ms": ttl_ms,
-            "meta": {"branch": "MM", "mm_mode": "SINGLE", "reason": reason},
+            "meta": {"branch": branch, "mm_mode": "SINGLE", "reason": reason},
         }
 
         try:
@@ -4125,46 +4299,13 @@ class RiskManager:
                 self.log.exception("RM._maybe_fire_mm_inventory_single: failed")
 
 
-    def _apply_caps_and_preempt_legacy(
-            self,
-            strategy: str,
-            ex: str,
-            desired_notional: float,
-    ) -> float:
-        """Legacy — cap notionnel par (stratégie,CEX) au niveau opportunité.
 
-        Chemin hérité (non enrichi) à conserver uniquement pour compatibilité
-        avec le flux Scanner→RM. Ne pas étendre avec de nouveaux caps.
-
-        Comportement historique :
-        - lecture de per_strategy_notional_cap,
-        - préemption MM réservée au hedge si cap dépassé.
-        """
-        cap = float(
-            ((self.per_strategy_notional_cap or {}).get(strategy, {}) or {}).get(
-                str(ex).upper(), float("inf")
-            )
-        )
-        if desired_notional <= cap:
-            return max(0.0, desired_notional)
-        if str(strategy or "").upper() in ("HEDGE", "PANIC_HEDGE") and (
-                getattr(self, "preempt_mm_for_tt_tm", False) or getattr(self, "ff_enforce_preemption", False)
-        ):
-            try:
-                reason = self._mm_preempt_reason("HEDGE")
-                asyncio.create_task(
-                    self._cancel_open_mm_quotes_on_exchange(ex, reason=reason)
-                )
-            except Exception:
-                logging.exception("Unhandled while scheduling MM preempt")
-        return max(0.0, cap)
-
-    def _apply_caps_and_preempt_bundle(
+    def _apply_caps_and_preempt(
             self,
             bundle: Dict[str, Any],
             caps_local: Dict[str, Any],
-            eligible: Any,
-            profile: str,
+            profile: Optional[str] = None,
+            eligible: Any = None,
     ) -> tuple[bool, Dict[str, Any], str]:
         """
         Contrat bundle-centric (Ticket 10) — utilisé par engine_enqueue_bundle.
@@ -4208,7 +4349,9 @@ class RiskManager:
 
         # --- 1) Gating spécifique MM : headroom par paire + virtual wallet -----
         branch_u = str(meta.get("branch") or bundle.get("branch") or bundle.get("strategy") or "").upper()
-        if branch_u in {"MM", "MAKER_MM"}:
+        kind_u = str(meta.get("kind") or bundle.get("kind") or "").upper()
+
+        if self._is_mm_family(branch_u, kind_u):
             profile_u = str(
                 profile
                 or meta.get("profile")
@@ -4554,11 +4697,64 @@ class RiskManager:
             return False, "MM_HINTS_GUARD_DEPTH"
         if qpos_a > mm_qpos_max or qpos_b > mm_qpos_max:
             return False, "MM_HINTS_GUARD_QPOS"
-        if p_both < mm_min_p_both:
-            return False, "MM_HINTS_GUARD_P_BOTH"
         if vol_bps > mm_vol_max:
             return False, "MM_HINTS_GUARD_VOL"
-        # ... garde-fous existants net_bps / depth / qpos / p_both / vol ...
+
+        # Gate Microstructure (Imbalance, Churn, Depth Profile)
+        try:
+            imbalance = hints_mm.get("imbalance") or {}
+            churn = hints_mm.get("churn_rate") or {}
+            dp = hints_mm.get("depth_profile") or {}
+
+            imb_a = float(imbalance.get("A", 0.0))
+            imb_b = float(imbalance.get("B", 0.0))
+            churn_a = float(churn.get("A", 0.0))
+            churn_b = float(churn.get("B", 0.0))
+            dp_a = float(dp.get("A", 0.0))
+            dp_b = float(dp.get("B", 0.0))
+
+            mm_churn_max = float(self._get_rm_knob("mm_churn_max", default=100.0))
+            mm_dp_min = float(self._get_rm_knob("mm_dp_min", default=0.01))
+            mm_imb_max = float(self._get_rm_knob("mm_imb_max", default=0.95))
+
+            if max(churn_a, churn_b) > mm_churn_max:
+                return False, "MM_CHURN_TOO_HIGH"
+            if min(dp_a, dp_b) < mm_dp_min:
+                return False, "MM_DEPTH_PROFILE_FRAGILE"
+            if abs(imb_a) > mm_imb_max or abs(imb_b) > mm_imb_max:
+                return False, "MM_MICROPRICE_ADVERSE"
+        except Exception:
+            pass
+
+        # Fee/Rebate Optimized
+        fee_net_min_bps = float(self._get_rm_knob("mm_fee_net_min_bps", default=-50.0))
+        if net_bps < fee_net_min_bps:
+            return False, "MM_FEE_NET_NEGATIVE"
+
+        # Gate Cross-CEX : staleness + “both healthy” (public + private)
+        strat = str(opp.get("strategy") or "").upper()
+        is_cross = (strat == "MM_CROSS")
+
+        if is_cross:
+            # Stricter p_both pour le cross
+            p_both_min_cross = float(getattr(self, "mm_p_both_min_cross", 0.8))
+            if p_both < p_both_min_cross:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc("mm_cross_blocked_total", reason="MM_CROSS_P_BOTH_TOO_LOW")
+                return False, "MM_CROSS_P_BOTH_TOO_LOW"
+
+            # Private WS health pour les DEUX exchanges
+            buy_ex = str(opp.get("buy_ex") or "").upper()
+            sell_ex = str(opp.get("sell_ex") or "").upper()
+
+            if not self._is_exchange_private_ws_healthy(buy_ex) or \
+                    not self._is_exchange_private_ws_healthy(sell_ex):
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc("mm_cross_blocked_total", reason="MM_CROSS_EX_UNHEALTHY_PRIVATE")
+                return False, "MM_CROSS_EX_UNHEALTHY_PRIVATE"
+
+        if p_both < mm_min_p_both:
+            return False, "MM_HINTS_GUARD_P_BOTH"
 
         if not getattr(self, "mm_dual_guard_enabled", True):
             return True, ""
@@ -4593,6 +4789,27 @@ class RiskManager:
         max_skew = float(getattr(self, "mm_dual_max_skew_pct", self.inventory_skew_max_pct) or 0.0)
         if abs(skew_pct) > max_skew:
             return False, "MM_DUAL_INVENTORY_SKEW_TOO_HIGH"
+
+        # Gate 1 — Staleness strict + fail-closed (spécifique MM DUAL)
+        # Raison : en DUAL, un stale quote = adverse selection quasi garantie.
+        mm_stale_ms_dual = float(getattr(self, "mm_stale_ms_dual", 350.0))
+        mm_mode = (opp.get("meta") or {}).get("mm_mode", "DUAL")
+        if mm_mode == "DUAL":
+            book_age_ms = float(opp.get("book_age_ms") or 0.0)
+            # Vérification par rapport au temps local (fail-closed)
+            import time
+            now_ms = time.time() * 1000.0
+            ts_buy = float(opp.get("ts_buy_ex_ms") or 0.0)
+            ts_sell = float(opp.get("ts_sell_ex_ms") or 0.0)
+            
+            # On prend le max des âges des deux côtés par rapport au temps local
+            age_buy = now_ms - ts_buy if ts_buy > 0 else 0.0
+            age_sell = now_ms - ts_sell if ts_sell > 0 else 0.0
+            
+            if book_age_ms > mm_stale_ms_dual or max(age_buy, age_sell) > mm_stale_ms_dual:
+                if hasattr(self, "obs_inc"):
+                    self.obs_inc("mm_reject_total", reason="MM_STALE_BOOK_DUAL")
+                return False, "MM_STALE_BOOK_DUAL"
 
         return True, ""
 
@@ -4675,8 +4892,6 @@ class RiskManager:
             except Exception:
                 pass
             return False, "MM_DISABLED"
-        if b == "MM" and str(getattr(self, "mm_mode", "MONO") or "MONO").upper() == "CROSS":
-            return False, "MM_MODE_CROSS_UNSUPPORTED"
 
         # 3) Mode SEVERE (PnL guard) : MM = 0, les autres branches passent encore.
         mode = str(getattr(self, "rm_mode", "NORMAL") or "NORMAL").upper()
@@ -4718,19 +4933,48 @@ class RiskManager:
             logging.warning("RM : engine indisponible, drop bundle")
             _record_decision(False, RM_ENGINE_NOT_READY)
             return False
+
+        # 1) BLOCKED/DEGRADED trading_state (private plane / truth) => jamais de bundle Engine
         if str(getattr(self, "trading_state", "READY")).upper() != "READY":
             reason = normalize_reason_code(
                 getattr(self, "trading_state_reason", None) or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
             ) or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
-            logging.warning("RM : trading blocked (%s), drop bundle (trace_id=%s)", reason,
-                            bundle.get("trace_id") or "NA")
+            logging.warning("RM : trading blocked (%s), drop bundle (trace_id=%s)", reason, bundle.get("trace_id") or "NA")
             _record_decision(False, reason)
             return False
-        if getattr(self, "trading_ready_event", None) and not self.trading_ready_event.is_set():
-            reason = normalize_reason_code("TRADING_NOT_READY") or "TRADING_NOT_READY"
-            logging.warning("RM : trading not ready, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
+
+        # 2) PIPELINE_READY gate (permet DRY_RUN infra verte)
+        ev_pipe = getattr(self, "pipeline_ready_event", None) or getattr(self, "trading_ready_event", None)
+        if ev_pipe is not None and (not ev_pipe.is_set()):
+            reason = normalize_reason_code("PIPELINE_NOT_READY") or "PIPELINE_NOT_READY"
+            logging.warning("RM : pipeline not ready, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
             _record_decision(False, reason)
             return False
+
+        # 3) TRADING gate (respect strict des 3 modes)
+        # - DRY_RUN           : on laisse passer (Engine ne doit pas trader réellement)
+        # - PROD + KILL_SWITCH: on bloque net
+        # - FULL PROD (armed) : on laisse passer
+        cfg = getattr(self, "cfg", None)
+        rm_cfg = getattr(cfg, "rm", cfg)
+        g_cfg = getattr(cfg, "g", None)
+
+        dry_run = bool(getattr(rm_cfg, "dry_run", False))
+        kill = bool(getattr(rm_cfg, "global_kill_switch", False)) or bool(getattr(self, "global_kill_switch", False))
+        armed = bool(getattr(g_cfg, "live_trading_armed", False))
+
+        if not dry_run:
+            if kill:
+                reason = normalize_reason_code("GLOBAL_KILL_SWITCH") or "GLOBAL_KILL_SWITCH"
+                logging.warning("RM : kill switch ON, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
+                _record_decision(False, reason)
+                return False
+            if not armed:
+                reason = normalize_reason_code("TRADING_NOT_ARMED") or "TRADING_NOT_ARMED"
+                logging.warning("RM : not armed, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
+                _record_decision(False, reason)
+                return False
+
 
         # Rafraîchit le mode consolidé et ses overlays avant d'exposer au moteur
         try:
@@ -5099,10 +5343,8 @@ class RiskManager:
 
         ok, caps_local, trade_mode = self._apply_caps_and_preempt(
             bundle=bundle,
-            branch=branch,
-            profile=profile,
-            quote=quote,
             caps_local=caps_local,
+            profile=profile,
         )
         if not ok:
             if self._shadow:
@@ -5235,7 +5477,21 @@ class RiskManager:
                 try:
                     loop = asyncio.get_event_loop()
                     if loop.is_running():
-                        accepted = loop.run_until_complete(submitter.submit_bundle(bundle))  # type: ignore
+                        # P0-3: launch task if loop is running to avoid RuntimeError
+                        def _done_cb(fut: asyncio.Task):
+                            try:
+                                res = fut.result()
+                                # On peut logger ici si res indique un échec différé
+                                if isinstance(res, dict) and str(res.get("state")).upper() != "ENGINE_ACCEPTED":
+                                    logging.warning("[RM] Async submit failed: %s", res.get("reason_code"))
+                                    self.obs_inc("rm_engine_reject_total", reason=res.get("reason_code") or "ASYNC_REJECT")
+                            except Exception as e:
+                                logging.error("[RM] Async submit crash: %s", e)
+                                self.obs_inc("rm_engine_reject_total", reason="ASYNC_CRASH")
+
+                        task = asyncio.create_task(submitter.submit_bundle(bundle))
+                        task.add_done_callback(_done_cb)
+                        accepted = True  # Handed over to Engine
                     else:
                         accepted = loop.run_until_complete(submitter.submit_bundle(bundle))  # type: ignore
                 except Exception:
@@ -5765,7 +6021,7 @@ class RiskManager:
             return True
 
         br = str(branch or meta.get("branch") or "").upper()
-        if br in ("HEDGE", "INTERNAL"):
+        if br in ("HEDGE", "INTERNAL") or self._is_mm_family(br):
             return True
 
         return False
@@ -5800,6 +6056,8 @@ class RiskManager:
             return True, None
 
         branch_u = str(branch or "").upper() or "UNKNOWN"
+        if self._is_mm_family(branch_u):
+            branch_u = "MM"
 
         for ex, alias in aliases:
             ex_u = str(ex or "").upper()
@@ -5832,12 +6090,13 @@ class RiskManager:
 
     def _branch_of(self, meta: dict, bundle: dict) -> str:
         b = (meta.get("branch") or bundle.get("branch") or "").upper()
-        if b in ("TT", "TM", "MM"):
-            return b
         k = (meta.get("kind") or bundle.get("kind") or "").upper()
-        if k in ("HEDGE", "TAKER"): return "TT"
-        if k in ("MAKER_TM", "TM"):  return "TM"
-        if k in ("MAKER_MM", "MM"):  return "MM"
+        if b == "TT" or k in ("HEDGE", "TAKER"):
+            return "TT"
+        if b == "TM" or k in ("MAKER_TM", "TM"):
+            return "TM"
+        if self._is_mm_family(b, k):
+            return "MM"
         return "UNKNOWN"
 
     def _is_flow_allowed_under_current_mode(self, meta: dict) -> bool:
@@ -6030,7 +6289,7 @@ class RiskManager:
         self.virt_balances[exu][q] = cur - need
         try:
             if INVENTORY_USD:
-                INVENTORY_USD.labels(exu, q).set(self.virt_balances[exu][q])
+                INVENTORY_USD.labels(exchange=exu, quote=q).set(self.virt_balances[exu][q])
         except Exception:
             logging.exception("Unhandled exception")
         return True
@@ -6171,6 +6430,23 @@ class RiskManager:
                 return any_ok
         return healthy
 
+    def _is_exchange_private_ws_healthy(self, exchange: str) -> bool:
+        """
+        Vérifie la santé du WS privé pour un exchange spécifique.
+        """
+        if not hasattr(self, "_private_ws_status") or not self._private_ws_status:
+            return False
+        
+        subs = self._private_ws_status.get("submodules")
+        if subs and isinstance(subs, dict):
+            ex_status = subs.get(str(exchange).upper())
+            if ex_status and isinstance(ex_status, dict):
+                # Un exchange est sain si au moins un de ses clients (comptes) est sain
+                for sub_status in ex_status.values():
+                    if bool((sub_status or {}).get("healthy", False)):
+                        return True
+        return False
+
     def set_private_ws_health(self, status: Optional[Dict[str, Any]]) -> None:
         healthy = self._derive_private_ws_health(status)
         prev = getattr(self, "private_ws_healthy", None)
@@ -6243,6 +6519,9 @@ class RiskManager:
         try:
             if hasattr(manager, "get_status"):
                 status = manager.get_status() or {}
+                if status.get("logging_broken"):
+                    self.set_logging_fail_closed("LHM_LOGGING_BROKEN")
+                
                 lhm_health = status.get("lhm_health") or {}
                 if isinstance(lhm_health, dict):
                     return lhm_health
@@ -6278,19 +6557,21 @@ class RiskManager:
             unsafe_payload = pws_health.get("last_unsafe_dedup")
         if critical_drop_seen is None and isinstance(status, dict):
             critical_drop_seen = status.get("critical_drop_seen")
+        
         if critical_drop_seen:
-            reason = normalize_reason_code(last_reason or "PWS_QUEUE_BACKPRESSURE_TIMEOUT") \
-                     or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
+            reason = normalize_reason_code(last_reason or "PWS_CRITICAL_DROP") \
+                     or "PWS_CRITICAL_DROP"
             self._pws_critical_drop_seen = True
             self._pws_critical_drop_reason = reason
-            if enforce:
-                if not self._pws_blocked_emitted:
-                    try:
-                        inc_blocked("rm", reason, None)
-                    except Exception:
-                        pass
-                    self._pws_blocked_emitted = True
-                self._set_trading_state("BLOCKED", reason=reason)
+            # P0: On force le blocage si DROP critique détecté (sécurité Private Plane)
+            # On ne dépend plus du feature flag pour le blocage si c'est vraiment critique
+            if not self._pws_blocked_emitted:
+                try:
+                    inc_blocked("rm", reason, None)
+                except Exception:
+                    pass
+                self._pws_blocked_emitted = True
+            self._set_trading_state("BLOCKED", reason=reason)
 
         if unsafe_dedup:
             try:
@@ -6340,9 +6621,10 @@ class RiskManager:
             self.reconciler_wiring_ok = False
             return
 
-        # Branche resync_* depuis l'Engine
+        # Branche resync_* depuis l'Engine et resync_balances depuis le RM
         rec._resync_order = getattr(eng, "resync_order", None)
         rec._resync_alias = getattr(eng, "resync_alias", None)
+        rec._resync_balances = self._schedule_balance_resync_for_alias
 
         missing: List[str] = []
 
@@ -6354,6 +6636,8 @@ class RiskManager:
             missing.append("resync_order")
         if not callable(getattr(rec, "_resync_alias", None)):
             missing.append("resync_alias")
+        if not callable(getattr(rec, "_resync_balances", None)):
+            missing.append("resync_balances")
 
         self.reconciler_wiring_ok = not missing
 
@@ -6377,7 +6661,7 @@ class RiskManager:
         self.virt_balances[exu][q] = cur + add
         try:
             if INVENTORY_USD:
-                INVENTORY_USD.labels(exu, q).set(self.virt_balances[exu][q])
+                INVENTORY_USD.labels(exchange=exu, quote=q).set(self.virt_balances[exu][q])
         except Exception:
             logging.exception("Unhandled exception")
 
@@ -6414,26 +6698,37 @@ class RiskManager:
 
     def _update_inventory_metrics(self) -> None:
         """
-        Pousse INVENTORY_USD(ex,quote) = somme des montants quote (USDC/EUR) sur tous les alias.
-        Appeler après refresh balances et après transferts.
+        Pousse INVENTORY_USD(exchange,quote) = somme des montants quote (USDC/EUR)
+        agrégés sur tous les alias.
+
+        NOTE: Les labels Prometheus doivent matcher exactement obs_metrics.INVENTORY_USD.
         """
         if INVENTORY_USD is None:
             return
+
         try:
             snap = self._balances_snapshot()
-            by_ex_quote = {}  # ex -> quote -> total
+            by_ex_quote: dict[str, dict[str, float]] = {}  # ex -> quote -> total
+
             for ex, accounts in (snap or {}).items():
-                exu = str(ex).upper()
+                exu = str(ex or "UNKNOWN").upper()
                 for _alias, assets in (accounts or {}).items():
+                    if not assets:
+                        continue
                     for q in ("USDC", "EUR"):
                         if q in assets:
                             by_ex_quote.setdefault(exu, {}).setdefault(q, 0.0)
                             by_ex_quote[exu][q] += float(assets.get(q, 0.0))
-            for ex, m in by_ex_quote.items():
+
+            for exu, m in by_ex_quote.items():
                 for q, v in (m or {}).items():
-                    INVENTORY_USD.labels(ex=ex, quote=q).set(float(v))
+                    # ✅ labels EXACTS : exchange, quote
+                    INVENTORY_USD.labels(exchange=exu, quote=q).set(float(v))
+
         except Exception:
-            logging.exception("Unhandled exception")
+            logging.exception("Unhandled exception in _update_inventory_metrics")
+
+        # keep existing behavior
         self.check_capital_drift()
 
     # ------------------------------------------------------------------ #
@@ -6715,6 +7010,13 @@ class RiskManager:
         if not transfer_id:
             return
         tid = str(transfer_id)
+
+        # Ticket P0-RM-CAPMOVE-01: Nettoyage immédiat de la réservation de balance associée
+        if hasattr(self, "_reserved_balances"):
+            if tid in self._reserved_balances:
+                self._reserved_balances.pop(tid, None)
+                self._sync_reserved_metrics()
+
         keys = self._transfer_alias_index.pop(tid, set()) if hasattr(self, "_transfer_alias_index") else set()
         for key in list(keys):
             state = self._alias_capital_move_state.get(key)
@@ -7211,16 +7513,40 @@ class RiskManager:
 
         key = (ex_u, alias_u)
         now = time.time()
-        min_interval = float(
-            getattr(self.cfg, "RM_WS_BALANCE_RESYNC_MIN_INTERVAL_S", 30.0)
-        )
+
+        # Ticket P0-RM-RESYNC-01: Throttle adaptatif (2 vitesses)
+        move_state = getattr(self, "_alias_capital_move_state", {}).get(key)
+        is_moving = move_state and now < float(move_state.get("deadline_ts", 0.0))
+
+        if is_moving:
+            # Mode rapide pendant un capital move (Ticket P0-RM-RESYNC-01)
+            min_interval = float(getattr(self.cfg, "RM_CAPITAL_MOVE_RESYNC_INTERVAL_S", 3.0))
+        else:
+            # Mode normal
+            min_interval = float(getattr(self.cfg, "RM_WS_BALANCE_RESYNC_MIN_INTERVAL_S", 30.0))
+
         last_ts = self._alias_last_resync_request_ts.get(key, 0.0)
         if now - last_ts < max(1.0, min_interval):
             return
 
+        # Plafond global (Ticket P0-RM-RESYNC-01) - max N resyncs par minute par exchange pour éviter 429
+        hist = self._resync_history.setdefault(ex_u, deque(maxlen=100))
+        while hist and now - hist[0] > 60.0:
+            hist.popleft()
+
+        max_per_min = int(getattr(self.cfg, "RM_MAX_RESYNC_PER_MIN", 15))
+        if len(hist) >= max_per_min:
+            return
+
+        hist.append(now)
         self._alias_last_resync_request_ts[key] = now
 
+        # Ticket P0-RM-RESYNC-01: Coalescence (une seule task en vol)
+        if key in self._alias_resync_inflight:
+            return
+
         async def _do_resync() -> None:
+            self._alias_resync_inflight.add(key)
             try:
                 await mbf.resync_balances_for_alias(ex_u, alias_u)
             except Exception:
@@ -7230,6 +7556,8 @@ class RiskManager:
                     alias_u,
                     exc_info=True,
                 )
+            finally:
+                self._alias_resync_inflight.discard(key)
 
         try:
             asyncio.get_running_loop()
@@ -7655,7 +7983,7 @@ class RiskManager:
             except Exception:
                 logger.exception("[RiskManager] mbf_glue.stop() failed")
 
-        tasks = getattr_list(self, "_tasks")
+        tasks = list(getattr(self, "_tasks", []))
         try:
             pending = await self._cancel_and_join(tasks, timeout_s=join_timeout_s, label="rm_loops")
         except Exception:
@@ -8091,9 +8419,11 @@ class RiskManager:
 
             # Horloge
             try:
-                ctx["time_skew_ms"] = float(TIME_SKEW_MS.get())  # import déjà présent dans ton fichier
+                from modules.obs_metrics import get_time_skew_ms
+                ctx["time_skew_ms"] = float(get_time_skew_ms())
             except Exception:
-                ctx["time_skew_ms"] = 0.0
+                # Fail-closed: si on ne peut pas vérifier le skew, on rejette l'opportunité
+                return (False, "RM_CLOCK_SKEW_UNKNOWN", ctx)
             if ctx["time_skew_ms"] > float(self.max_clock_skew_ms):
                 try:
                     TIME_SKEW_MS.set(float(ctx["time_skew_ms"]))
@@ -8322,8 +8652,7 @@ class RiskManager:
 
             if str(status or "").lower() == "skipped":
                 try:
-                    if RM_SKIPS_TOTAL is not None:
-                        RM_SKIPS_TOTAL.labels(str(reason or "")).inc()
+                    inc_rm_skip(str(reason or ""))
                 except Exception:
                     pass
 
@@ -8532,6 +8861,63 @@ class RiskManager:
             pass
 
     # =============================================================================
+    def _canonize_opportunity(self, opp: Dict[str, Any]) -> None:
+        """
+        TICKET P0-1: Adapte l'opportunité (ex-Scanner) pour assurer la compatibilité avec le RM.
+        Unwrap le payload si présent et synchronise les clés critiques (buy_ex, notional_quote).
+        """
+        payload = opp.get("payload")
+        if isinstance(payload, dict):
+            # A) Map payload fields to top-level if missing (Invariant B)
+            for k in [
+                "buy_ex", "sell_ex", "notional_quote", "legs", "quote",
+                "pair_key", "tier", "strategy",
+                # P0: rendre visibles au RM (sinon rejects SIGNAL_MISSING_BOOK_AGE)
+                "book_age_ms", "book_ts_ms", "decision_ts_ms",
+            ]:
+                if k in payload and opp.get(k) is None:
+                    opp[k] = payload[k]
+
+            # P0: le Scanner emballe l'opportunité dans opp{payload=...}.
+            # Le RM attend certains champs au top-level.
+            pk = payload.get("pair_key")
+            if pk and (not opp.get("pair") or str(opp.get("pair") or "").upper() in ("UNKNOWN", "")):
+                opp["pair"] = pk
+            if pk and not opp.get("symbol"):
+                opp["symbol"] = pk
+
+        # B) Alignement échanges (Invariant A)
+        if not opp.get("buy_ex") and opp.get("buy_exchange"):
+            opp["buy_ex"] = opp.get("buy_exchange")
+        if not opp.get("sell_ex") and opp.get("sell_exchange"):
+            opp["sell_ex"] = opp.get("sell_exchange")
+
+        if not opp.get("buy_exchange") and opp.get("buy_ex"):
+            opp["buy_exchange"] = opp.get("buy_ex")
+        if not opp.get("sell_exchange") and opp.get("sell_ex"):
+            opp["sell_exchange"] = opp.get("sell_ex")
+
+        # P0: Dérivation de 'branch' si absent
+        if not opp.get("branch"):
+            candidates = opp.get("branch_candidates") or []
+            strategy = str(opp.get("strategy") or "").upper()
+            if strategy in ("TT", "TM", "MM", "REB"):
+                opp["branch"] = strategy
+            elif candidates:
+                # Priorité TT > TM > MM
+                if "TT" in candidates: opp["branch"] = "TT"
+                elif "TM" in candidates: opp["branch"] = "TM"
+                elif "MM" in candidates: opp["branch"] = "MM"
+                else: opp["branch"] = candidates[0]
+            else:
+                # Fallback par défaut
+                opp["branch"] = "TT"
+
+        # C) Garantie du format notional_quote (Invariant A + P0-2 compat)
+        nq = opp.get("notional_quote")
+        if not isinstance(nq, dict) or "ccy" not in nq or "amount" not in nq:
+            q, amt = self._normalize_notional_tuple(opp)
+            opp["notional_quote"] = {"ccy": q, "amount": float(amt)}
 
     # =============================================================================
 
@@ -8541,13 +8927,20 @@ class RiskManager:
         Entrée stratégie (ex-Scanner) — pré-filtre industry-like puis délégation.
         Ne modifie pas la logique de décision interne : on garde exactement le pipeline existant.
         """
+        # Canonisation des entrées (Ticket P0-1)
+        try:
+            self._canonize_opportunity(opp)
+        except Exception:
+            logging.exception("[RiskManager] Opportunity canonization failed")
+
         # Readiness (comme avant)
         if getattr(self, "trading_ready_event", None) and not self.trading_ready_event.is_set():
             reason = normalize_reason_code("TRADING_NOT_READY") or "TRADING_NOT_READY"
             try:
                 self._emit_decision_record("skipped", reason, opp, {})
-            finally:
-                return
+            except Exception:
+                pass
+            return
         self._ensure_ready()
 
         # Pré-filtre
@@ -8556,8 +8949,9 @@ class RiskManager:
             # audit + métriques puis sortie
             try:
                 self._emit_decision_record("skipped", reason, opp, ctx)
-            finally:
-                return
+            except Exception:
+                pass
+            return
 
         # audit "admitted" minimal (le détail final peut être émis plus loin si tu veux)
         self._emit_decision_record("admitted", "", opp, ctx)
@@ -8740,7 +9134,7 @@ class RiskManager:
                 except Exception:
                     logging.exception("Unhandled exception")
 
-            await self._alert(
+            self._alert(
                 "RiskManager",
                 f"Rebalancing détecté: {imb}" + (f" | plan={plan}" if plan else ""),
                 alert_type="WARNING"
@@ -8838,7 +9232,7 @@ class RiskManager:
 
             # 1) Alerte centralisée (pager/digest)
             try:
-                asyncio.create_task(self._alert(module, event.get("message", ""), pair=pair, alert_type=level))
+                self._alert(module, event.get("message", ""), pair=pair, alert_type=level)
             except Exception:
                 pass
 
@@ -9011,18 +9405,7 @@ class RiskManager:
             try:
                 res = self._get_orderbooks()
                 books = await res if inspect.isawaitable(res) else res
-                min_ts_by_ex = {}
-                for ex, pairs in (self._last_books or {}).items():
-                    ts = []
-                    for d in (pairs or {}).values():
-                        t = int(d.get("exchange_ts_ms") or d.get("recv_ts_ms") or 0)
-                        if t: ts.append(t)
-                    if ts:
-                        skew = (time.time() * 1000.0) - min(ts)
-                        try:
-                            TIME_SKEW_MS.labels(ex).set(max(0.0, skew))
-                        except Exception:
-                            pass
+
                 if not isinstance(books, dict):
                     await asyncio.sleep(self.t_books)
                     continue
@@ -9036,6 +9419,10 @@ class RiskManager:
                         norm_pk = self._norm_pair(pk)
                         bid = float((snap or {}).get("best_bid") or 0.0)
                         ask = float((snap or {}).get("best_ask") or 0.0)
+                        
+                        # Update EWMA Imbalance
+                        self._update_imbalance_ewma(exu, norm_pk, snap)
+
                         ts_ms = (snap or {}).get("exchange_ts_ms") or (snap or {}).get("recv_ts_ms") or 0
                         ts = float(ts_ms) / 1000.0 if ts_ms else now_s
                         ob_cache[(exu, norm_pk)] = {
@@ -9045,6 +9432,29 @@ class RiskManager:
                         }
                 self._orderbooks = ob_cache
                 self._mark_books_observability(self._last_books)
+                
+                # P0: Mise à jour des statuts RM pour Grafana (health/slip/vol/total)
+                try:
+                    from modules.obs_metrics import update_rm_status, RM_QUEUE_DEPTH
+                    # Update queue depth (si on utilise une file d'attente interne)
+                    if hasattr(self, "_event_queue") and RM_QUEUE_DEPTH is not None:
+                        try:
+                            q_size = self._event_queue.qsize() if hasattr(self._event_queue, "qsize") else 0
+                            RM_QUEUE_DEPTH.labels(exchange="ALL").set(float(q_size))
+                        except Exception: pass
+
+                    for ex in self.exchanges:
+                        exu = ex.upper()
+                        # Santé globale (1 si on a des books)
+                        update_rm_status(exu, "health", 1.0)
+                        # Statut Slippage (1 si alimenté)
+                        update_rm_status(exu, "slip", 1.0 if self.slip_collector else 0.0)
+                        # Statut Volatilité (1 si monitor actif)
+                        update_rm_status(exu, "vol", 1.0 if self.volatility else 0.0)
+                        # Statut Total (Toujours 1 si la boucle tourne)
+                        update_rm_status(exu, "total", 1.0)
+                except Exception:
+                    pass
 
                 # Slippage & fees collector (passif)
                 if self.slip_collector and hasattr(self.slip_collector, "collect_from_orderbooks"):
@@ -9161,6 +9571,42 @@ class RiskManager:
             logger.debug("[RiskManager] ladder_tick placeholder failed", exc_info=False)
 
 
+    async def _reconcile_pending_transfers(self) -> None:
+        """
+        P0: Boucle de réconciliation REST pour les transferts bloqués en SUBMITTED.
+        """
+        if not self._transfer_controller:
+            return
+        
+        pending_ids = self._transfer_controller.list_pending_transfer_ids()
+        if not pending_ids:
+            return
+            
+        mbf = getattr(self, "balance_fetcher", None)
+        if not mbf or not hasattr(mbf, "verify_transfer_status_rest"):
+            return
+            
+        for tid in pending_ids:
+            payload = self._transfer_controller.get_transfer_payload(tid)
+            if not payload: continue
+            
+            ex = str(payload.get("exchange") or "").upper()
+            # On prend le premier alias pour l'authentification (souvent SUB_TT ou SUB_TM)
+            alias = str(payload.get("from_alias") or payload.get("to_alias") or "")
+            if not ex or not alias: continue
+            
+            try:
+                # Appel REST pour vérifier le statut réel
+                new_status = await mbf.verify_transfer_status_rest(ex, alias, tid)
+                if new_status == "SETTLED":
+                    logger.info("[RiskManager] P0: REST Reconciled transfer %s -> SETTLED", tid)
+                    self._transfer_controller.mark_settled(tid, payload=payload)
+                elif new_status == "FAILED":
+                    logger.warning("[RiskManager] P0: REST Reconciled transfer %s -> FAILED", tid)
+                    self._transfer_controller.mark_failed(tid, payload=payload, error="reconciled_failed_rest")
+            except Exception as e:
+                logger.debug("[RiskManager] REST reconciliation failed for %s: %s", tid, e)
+
     async def _loop_balances(self):
         while self._running:
             try:
@@ -9168,7 +9614,13 @@ class RiskManager:
                     self._transfer_controller.check_timeouts()
                 except Exception:
                     logger.exception("[RiskManager] transfer timeout check failed")
-                if getattr_bool(self.cfg, "dry_run", False):
+                
+                # AJOUT P0: Réconciliation REST périodique
+                try:
+                    await self._reconcile_pending_transfers()
+                except Exception:
+                    logger.debug("[RiskManager] _reconcile_pending_transfers failed", exc_info=True)
+                if bool(getattr(self.cfg, "dry_run", False)):
                     bals = self._virtual_balances.copy()
                     self._last_balances = bals
                     # pousser l'inventaire par ex/quote vers Prometheus
@@ -9287,7 +9739,7 @@ class RiskManager:
                         except Exception:
                             logging.exception("Unhandled exception")
 
-                    await self._alert(
+                    self._alert(
                         "RiskManager",
                         f"Rebalancing détecté: {imb}" + (f" | plan={plan}" if plan else ""),
                         alert_type="WARNING"
@@ -9326,28 +9778,93 @@ class RiskManager:
             return
 
         balances = self._balances_snapshot()
-        alias_mm = str(getattr(self, "mm_alias", "MM") or "MM").upper()
         now = time.time()
         status_cache = getattr(self, "_alias_balance_status", {}) or {}
 
+        # 1. Groupement des drifts par (alias, asset) pour une vision globale (notamment pour Cross-CEX)
+        all_drifts = {}
+
         for ex, per_alias in (balances or {}).items():
             exu = str(ex).upper()
-            if status_cache.get((exu, alias_mm)) != "OK":
-                continue
+            for alias, assets in (per_alias or {}).items():
+                if not self._is_mm_alias(exu, alias):
+                    continue
+                
+                if status_cache.get((exu, alias)) != "OK":
+                    continue
 
-            assets = (per_alias or {}).get(alias_mm, {}) or {}
-            for asset in assets.keys():
-                asset_u = str(asset).upper()
-                drift_usd, drift_pct = self._mm_compute_inventory_drift(exu, alias_mm, asset_u, balances)
-                state = self._mm_classify_inventory_state(drift_usd, drift_pct)
-                self.mm_reb_state[(exu, alias_mm, asset_u)] = {
-                    "state": state,
-                    "drift_usd": drift_usd,
-                    "drift_pct": drift_pct,
-                    "last_update_ts": now,
-                }
+                for asset in (assets or {}).keys():
+                    asset_u = str(asset).upper()
+                    drift_usd, drift_pct = self._mm_compute_inventory_drift(exu, alias, asset_u, balances)
 
-                await self._mm_dispatch_actions_for_state(exu, alias_mm, asset_u, state, drift_usd)
+                    # Métriques drift
+                    try:
+                        from modules.obs_metrics import MM_INVENTORY_DRIFT_USD
+                        if MM_INVENTORY_DRIFT_USD:
+                            MM_INVENTORY_DRIFT_USD.labels(asset=asset_u).set(drift_usd)
+                    except Exception:
+                        pass
+
+                    key = (alias, asset_u)
+                    if key not in all_drifts:
+                        all_drifts[key] = []
+                    all_drifts[key].append({
+                        "ex": exu,
+                        "drift_usd": drift_usd,
+                        "drift_pct": drift_pct
+                    })
+
+        # 2. Traitement par stratégie et asset
+        for (alias, asset), drifts in all_drifts.items():
+            is_cross = (str(alias).upper() == self.mm_cross_alias_name)
+            
+            if not is_cross:
+                # MM_MONO ou MM par défaut : gestion indépendante par exchange
+                for d in drifts:
+                    ex = d["ex"]
+                    drift_usd = d["drift_usd"]
+                    drift_pct = d["drift_pct"]
+                    state = self._mm_classify_inventory_state(drift_usd, drift_pct, alias_mm=alias)
+                    
+                    self.mm_reb_state[(ex, alias, asset)] = {
+                        "state": state,
+                        "drift_usd": drift_usd,
+                        "drift_pct": drift_pct,
+                        "last_update_ts": now,
+                    }
+                    await self._mm_dispatch_actions_for_state(ex, alias, asset, state, drift_usd)
+            else:
+                # MM_CROSS : gestion intelligente du delta global
+                total_drift_usd = sum(d["drift_usd"] for d in drifts)
+                global_state = self._mm_classify_inventory_state(total_drift_usd, 0.0, alias_mm=alias)
+                
+                # Enregistrement de l'état global pour le monitoring
+                for d in drifts:
+                    self.mm_reb_state[(d["ex"], alias, asset)] = {
+                        "state": global_state,
+                        "drift_usd": d["drift_usd"],
+                        "global_drift_usd": total_drift_usd,
+                        "last_update_ts": now,
+                    }
+
+                if global_state in ["TENSION", "CRITICAL"]:
+                    # Le delta global est déséquilibré -> on réduit la jambe la plus lourde via un trade simple (Self-rebal)
+                    worst = max(drifts, key=lambda x: abs(x["drift_usd"]))
+                    logger.info(f"[RiskManager] MM_CROSS global drift {global_state} for {asset}: {total_drift_usd:.1f}$ -> reducing on {worst['ex']}")
+                    # On force une action simple pour réduire le delta global
+                    self._mm_trigger_self_rebal(worst["ex"], alias, asset, total_drift_usd)
+                else:
+                    # Delta global OK. On vérifie s'il y a des déséquilibres locaux (offsetting)
+                    for d in drifts:
+                        ex = d["ex"]
+                        local_drift = d["drift_usd"]
+                        local_state = self._mm_classify_inventory_state(local_drift, 0.0, alias_mm=alias)
+                        
+                        if local_state in ["TENSION", "CRITICAL"]:
+                            # On a un déséquilibre interne (ex: long sur A, short sur B).
+                            # On utilise le Cross-CEX rebal (trade d'arbitrage ou transfert)
+                            logger.info(f"[RiskManager] MM_CROSS local imbalance on {ex}:{asset}: {local_drift:.1f}$ -> cleaning up")
+                            await self._mm_dispatch_actions_for_state(ex, alias, asset, local_state, local_drift)
 
     async def _mm_dispatch_actions_for_state(self, ex: str, alias_mm: str, asset: str, state: str,
                                              drift_usd: float) -> None:
@@ -9359,12 +9876,19 @@ class RiskManager:
         if status_cache.get((ex, alias_mm)) != "OK":
             return
 
+        is_mono = (str(alias_mm).upper() == self.mm_mono_alias_name)
+
         if st == "ALERT":
             self._mm_trigger_self_rebal(ex, alias_mm, asset, drift_usd)
         elif st == "TENSION":
             await self._mm_plan_intra_cex_transfers(ex, alias_mm, asset, drift_usd)
         elif st == "CRITICAL":
-            await self._mm_trigger_cross_cex_reb(ex, alias_mm, asset, drift_usd)
+            if is_mono:
+                # Pour Mono-CEX, on évite le cross-cex, on fait un intra-cex aggressif ou on renforce le self-rebal
+                logger.info(f"[RiskManager] MM_MONO Critical drift on {ex}:{asset} ({drift_usd:.1f}$) -> using intra-cex rebalancing")
+                await self._mm_plan_intra_cex_transfers(ex, alias_mm, asset, drift_usd)
+            else:
+                await self._mm_trigger_cross_cex_reb(ex, alias_mm, asset, drift_usd)
 
     def _mm_trigger_self_rebal(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> None:
         if not getattr(self, "mm_inventory_enabled", False):
@@ -9375,9 +9899,10 @@ class RiskManager:
             "pair": pair_key,
             "buy_ex": ex,
             "sell_ex": ex,
+            "alias": alias_mm,
             "notional_usdc": abs(float(drift_usd)),
         }
-        self._maybe_fire_mm_inventory_single(opp, reason="mm_reb_alert")
+        self._maybe_fire_mm_inventory_single(opp, reason="mm_reb_alert", branch=alias_mm)
 
     async def _mm_plan_intra_cex_transfers(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> None:
         if self.rebalancing is None:
@@ -9503,10 +10028,18 @@ class RiskManager:
 
         while self._running:
             try:
+                vol_getter = getattr(self, "vol_monitor", None)
+
                 for pair in self.symbols:
-                    # 1) Monitor (inputs “bruts” issus du router)
-                    metrics = self.vol_monitor.get_current_metrics(pair) or {}
-                    thresholds = self.vol_monitor.get_current_thresholds(pair) or {}
+                    # --- SAFE: vol_monitor peut être None ---
+                    if vol_getter is not None:
+                        metrics = vol_getter.get_current_metrics(pair) or {}
+                        thresholds = vol_getter.get_current_thresholds(pair) or {}
+                        sig = metrics.get("prudence_signal") or vol_getter.get_prudence_signal(pair)
+                    else:
+                        metrics = {}
+                        thresholds = {}
+                        sig = "normal"
 
                     # 2) Manager (ajustements non bloquants)
                     if self.vol_manager and hasattr(self.vol_manager, "step"):
@@ -9543,7 +10076,12 @@ class RiskManager:
                         self._last_band[pair] = band
 
                     # 4) Pause pair en prudence élevée/modérée (affecte scanning/decision)
-                    sig = metrics.get("prudence_signal") or self.vol_monitor.get_prudence_signal(pair)
+                    sig = "NORMAL"
+                    if self.vol_monitor and hasattr(self.vol_monitor, "get_prudence_signal"):
+                        sig = metrics.get("prudence_signal") or self.vol_monitor.get_prudence_signal(pair)
+                    elif metrics.get("prudence_signal"):
+                        sig = metrics["prudence_signal"]
+
                     self._paused[pair] = (str(sig).lower() in ("modéré", "modere", "élevé", "eleve"))
 
                 set_rm_paused_count(sum(1 for v in self._paused.values() if v))
@@ -9563,7 +10101,7 @@ class RiskManager:
             try:
                 self._tick_mode()
             except Exception:
-                logger.exception("[RiskManager] _tick_mode failed", exc_info=False)
+                logger.exception("[RiskManager] _tick_mode failed", exc_info=True)
             await asyncio.sleep(interval_s)
     # ===================== Revalidation & Profitability API =====================
     def _apply_mode_overrides(self) -> None:
@@ -9786,31 +10324,71 @@ class RiskManager:
           - books trop vieux (age > seuil),
           - private WS/acks dégradé si exposé.
         """
+        vol_bad = False
+        stale_bad = False
+        pws_bad = False
+
         policy = self._signal_policy
         age_s, age_missing = self._latest_book_age_s_with_missing()
+        
+        # Warmup grace period (e.g. 5s) to avoid TEMPETE at boot
+        import time
+        is_warmup = bool((time.time() - getattr(self, "_boot_ts", 0)) < 5.0)
+        
         stale_bad = bool(age_s > float(self._switch_knobs.opp_vol_exit_slip_age_s_max))
         if age_missing and bool(getattr(policy, "require_book_age_for_opp", True)):
-            self._signal_missing("BOOK_AGE")
-            stale_bad = True
+            if not is_warmup:
+                self._signal_missing("BOOK_AGE")
+                stale_bad = True
+            else:
+                stale_bad = False
+        
+        vol_bad = False
         try:
             vm = self.vol_manager.get_current_metrics(None) if hasattr(self, "vol_manager") else None
             vol_p95 = None if not vm else (vm or {}).get("p95_bps")
         except Exception:
             vol_p95 = None
-            if vol_p95 is None and bool(getattr(policy, "require_vol_signal_for_opp", True)):
-                self._signal_missing("VOL_P95")
-                vol_bad = True
-            else:
-                vol_bad = bool(float(vol_p95 or 0.0) >= float(self._switch_knobs.oppvol_p95_bps_min))
+
+        if vol_p95 is None and bool(getattr(policy, "require_vol_signal_for_opp", True)):
+            self._signal_missing("VOL_P95")
+            vol_bad = True
+        else:
+            vol_bad = bool(float(vol_p95 or 0.0) >= float(self._switch_knobs.oppvol_p95_bps_min))
 
         pws_health = getattr(self, "private_ws_healthy", None)
-        if pws_health is None and bool(getattr(policy, "require_pws_health_for_opp", True)):
+        # En DRY_RUN, on est souvent moins strict sur le PWS s'il n'est pas explicitement requis
+        is_live = self._rm_live_armed()
+        pws_required = bool(getattr(policy, "require_pws_health_for_opp", is_live))
+        
+        if pws_health is None and pws_required:
             self._signal_missing("PWS_HEALTH")
             pws_bad = True
-        else:
+        elif pws_health is not None:
             pws_bad = not bool(pws_health)
+        else:
+            pws_bad = False
 
-        return bool(vol_bad or stale_bad or pws_bad)
+        if vol_bad or stale_bad or pws_bad:
+            # Log détaillé pour diagnostic (Macro 7-Diagnostic)
+            if self.rm_mode == "NORMAL":
+                try:
+                    # Signal details in tags for metrics if possible
+                    self.obs_inc("rm_tempete_trigger_total", 
+                                 stale=str(stale_bad), 
+                                 vol=str(vol_bad), 
+                                 pws=str(pws_bad),
+                                 is_live=str(is_live))
+
+                    logging.getLogger(__name__).info(
+                        "[RM][TEMPETE] Trigger details: stale=%s(age=%.3fs) vol=%s(p95=%s) pws=%s(health=%s) is_live=%s",
+                        stale_bad, age_s, vol_bad, vol_p95, pws_bad, pws_health, is_live
+                    )
+                except Exception:
+                    pass
+            return True
+
+        return False
 
     def set_pacer_mode(self, mode: str, *, source: str = "engine_pacer") -> None:
         """
@@ -9884,11 +10462,63 @@ class RiskManager:
         except Exception:
             pass
 
+    def set_engine_metrics(self, metrics: dict, *, source: str = "engine") -> None:
+        """
+        Snapshot des métriques de l'Engine (latence, RPS, etc.).
+        Utilisé pour les gates de performance MM.
+        """
+        try:
+            if not isinstance(metrics, dict):
+                return
+            self._last_engine_metrics = dict(metrics)
+            import time
+            self._last_engine_metrics_ts = float(time.time())
+
+            # Mise à jour des gauges d'observabilité demandées
+            ack_p95 = float(metrics.get("p95_ack_ms") or 0.0)
+            if hasattr(self, "obs_set"):
+                self.obs_set("mm_ack_p95_ms", ack_p95)
+
+            # Logique de Gate 2 (Latency/Ack) : calcul du niveau de pénalité
+            soft_thresh = float(getattr(self, "mm_ack_p95_ms_soft", 40.0))
+            hard_thresh = float(getattr(self, "mm_ack_p95_ms_hard", 100.0))
+
+            penalty_level = 0  # none
+            if ack_p95 >= hard_thresh:
+                penalty_level = 2  # hard
+                # Hard stop via mm_enabled dans mode_overrides
+                if hasattr(self, "_current_mode_overrides"):
+                    self._current_mode_overrides["mm_enabled"] = False
+                    self.enable_mm = False
+            elif ack_p95 >= soft_thresh:
+                penalty_level = 1  # soft
+
+            if hasattr(self, "obs_set"):
+                self.obs_set("mm_latency_penalty_state", penalty_level)
+
+            self._mm_latency_penalty_level = penalty_level
+
+        except Exception:
+            pass
+
     def set_engine_pacer_policy(self, policy: dict, *, source: str = "engine_pacer") -> None:
         """
         Snapshot best-effort de la policy du PACER (incluant flags hold-time).
         Sert uniquement à down-clamp les mode_overrides (IOC_ONLY / MM freeze).
         """
+        if not hasattr(self, "_clock_offset_ms"):
+            # P0: Forcer une tentative de recalage au premier contact avec le Pacer
+            # Cela aide à synchroniser les horloges si le Pacer est à l'heure réelle.
+            try:
+                import time
+                now = time.time()
+                p_ts = policy.get("ts", now)
+                diff = p_ts - now
+                if abs(diff) > 1.0:
+                    self._clock_offset_ms = diff * 1000.0
+                    logging.getLogger(__name__).info("[RM] Calibration temporelle via Pacer: Offset=%dms", self._clock_offset_ms)
+            except Exception: pass
+
         try:
             if not isinstance(policy, dict):
                 return
@@ -10281,6 +10911,58 @@ class RiskManager:
         )
         cap = float(getattr(rm_cfg, "split_penalty_bps_max", 6.0))
         return float(min(cap, cap * ratio))
+
+    def _compute_tt_revalidation_overlays(self, buy_ex: str, sell_ex: str, pair_key: str) -> Dict[str, float]:
+        """
+        Calcule les overlays RM-owned pour TT (Ticket D2-2).
+        - latency_penalty_bps: dérivé du p95 submit->ack reporté par l'Engine.
+        - staleness_penalty_bps: dérivé de l'âge du book vs TTL.
+        """
+        overlays = {
+            "latency_penalty_bps": 0.0,
+            "staleness_penalty_bps": 0.0
+        }
+
+        # 1. Latency penalty
+        if self._get_rm_knob("latency_penalty_enabled", default=True):
+            engine_metrics = getattr(self, "engine_metrics", {})
+            p95_ack = float(engine_metrics.get("p95_ack_ms", 0.0))
+            
+            # Logique piecewise: ex 40ms -> 0bps, 100ms -> 5bps, 200ms -> 10bps
+            if p95_ack > 40.0:
+                # 0.1 bps par ms au dessus de 40ms, capé à 15bps
+                overlays["latency_penalty_bps"] = min(15.0, (p95_ack - 40.0) * 0.1)
+
+        # 2. Staleness penalty
+        if self._get_rm_knob("staleness_penalty_enabled", default=True):
+            # On récupère l'âge le plus élevé entre les deux jambes
+            book_age_s = 0.0
+            try:
+                books = self._last_books or {}
+                pk = self._norm_pair(pair_key)
+                buy_book = books.get(buy_ex, {}).get(pk, {}) or {}
+                sell_book = books.get(sell_ex, {}).get(pk, {}) or {}
+                
+                age_buy = time.time() - float(buy_book.get("ts_exchange_ms", 0) / 1000.0) if buy_book.get("ts_exchange_ms") else 0
+                age_sell = time.time() - float(sell_book.get("ts_exchange_ms", 0) / 1000.0) if sell_book.get("ts_exchange_ms") else 0
+                book_age_s = max(age_buy, age_sell)
+            except Exception:
+                pass
+
+            if book_age_s > 0.4: # 400ms
+                # 5 bps par seconde au dessus de 400ms, capé à 10bps
+                overlays["staleness_penalty_bps"] = min(10.0, (book_age_s - 0.4) * 10.0)
+
+        # Metrics pour debug
+        if overlays["latency_penalty_bps"] > 0 or overlays["staleness_penalty_bps"] > 0:
+             try:
+                 if hasattr(self, "obs_inc"):
+                     self.obs_inc("rm_latency_penalty_bps", value=overlays["latency_penalty_bps"])
+                     self.obs_inc("rm_staleness_penalty_bps", value=overlays["staleness_penalty_bps"])
+             except Exception:
+                 pass
+
+        return overlays
 
     def _total_cost_bps(self, buy_ex: str, sell_ex: str, pair_key: str) -> float:
         """
@@ -10829,7 +11511,7 @@ class RiskManager:
         except Exception:
             logger.debug(f"[RiskManager] simulator update failed for {pair}", exc_info=False)
 
-    async def _alert(self, module: str, message: str, pair: Optional[str] = None, alert_type: str = "INFO"):
+    def _alert(self, module: str, message: str, pair: Optional[str] = None, alert_type: str = "INFO"):
         if not self.alert_cb:
             return
         try:
@@ -10926,11 +11608,14 @@ class RiskManager:
           L’ExecutionEngine ne doit pas recalculer un second "rebalancing_cost" en bps en parallèle.
         """
         try:
-            buy_ex = str(cross.get("to_exchange")).upper()
-            sell_ex = str(cross.get("from_exchange")).upper()
+            buy_ex = str(cross.get("to_exchange") or cross.get("buy_exchange") or "").upper()
+            sell_ex = str(cross.get("from_exchange") or cross.get("sell_exchange") or "").upper()
             pair = (cross.get("pair_key") or cross.get("pair") or "").replace("-", "").upper()
             if not (buy_ex and sell_ex and pair):
                 return False
+
+            # Extraction de la taille pour l'estimation (size-aware)
+            size_quote = float(cross.get("amount") or cross.get("amount_usdc") or 0.0)
 
             allow_loss = float(self.rebal_allow_loss_bps)
             estimator = getattr(self, "rebal_mgr", None)
@@ -10940,17 +11625,19 @@ class RiskManager:
                         pair_key=pair,
                         from_exchange=sell_ex,
                         to_exchange=buy_ex,
+                        size_quote=size_quote,
                     ))
                 except Exception:
                     est_bps = None
                 else:
-                    if est_bps < -allow_loss:
+                    if est_bps is not None and est_bps < -allow_loss:
                         logger.info(
-                            "[RiskManager] rebal cross %s→%s rejeté (net=%.1f bps < -%.1f)",
+                            "[RiskManager] rebal cross %s→%s rejeté (net=%.1f bps < -%.1f, size=%.0f)",
                             sell_ex,
                             buy_ex,
                             est_bps,
                             allow_loss,
+                            size_quote
                         )
                         try:
                             REBAL_CROSS_TOO_EXPENSIVE_TOTAL.labels("rm_validate").inc()
@@ -11464,14 +12151,25 @@ class RiskManager:
         self._reb_hint_event(REB_HINT_IGNORED_UNIMPLEMENTED, status="ignored", hint=op)
         logger.info("[RiskManager] bridge_pre_hint ignoré (unimplemented): %s", op)
 
-
     def _mark_loop_success(self, loop_name: str) -> None:
         state = self._loop_health.setdefault(loop_name, {"last_success": 0.0, "consecutive_errors": 0})
         state["last_success"] = time.time()
         state["consecutive_errors"] = 0
+
         if loop_name == "orderbooks":
             self._last_books_snapshot_ts = state["last_success"]
+
+            # P0A: fournir un timestamp "dernier book reçu" en ms pour éviter
+            #      SIGNAL_MISSING_BOOK_AGE dans _latest_book_age_s_with_missing().
+            try:
+                ts_ms = int(state["last_success"] * 1000.0)
+                self.books_last_recv_ts_ms = ts_ms
+                self.last_orderbook_recv_ts_ms = ts_ms
+            except Exception:
+                pass
+
             self._maybe_update_trading_ready()
+
         elif loop_name == "balances":
             self._last_balances_ts = state["last_success"]
             self._maybe_update_trading_ready()
@@ -11494,8 +12192,11 @@ class RiskManager:
     def _maybe_update_trading_ready(self) -> None:
         cfg = getattr(self, "cfg", None)
         rm_cfg = getattr(cfg, "rm", cfg)
+        g_cfg = getattr(cfg, "g", None)
+
         now = time.time()
 
+        # -------------------- deps readiness --------------------
         engine_ready = False
         eng = getattr(self, "engine", None)
         if eng and getattr(eng, "ready_event", None):
@@ -11508,8 +12209,10 @@ class RiskManager:
         bal_age = now - self._last_balances_ts if self._last_balances_ts else 1e9
         max_book_age = float(getattr(self, "max_book_age_s", 1.0) or 1.0)
         bal_ttl = float(getattr(self, "_balance_ttl_s_normal", 60.0) or 60.0)
+
         books_ready = book_age <= max_book_age
         balances_ready = bal_age <= bal_ttl
+
         balances_status = None
         balances_reason_code = None
         mbf = getattr(self, "balance_fetcher", None)
@@ -11522,10 +12225,59 @@ class RiskManager:
                     balances_ready = False
             except Exception:
                 balances_ready = False
+
         scanner_required = bool(getattr(rm_cfg, "trading_ready_require_scanner_hook", False))
         scanner_ready = True
         if scanner_required:
             scanner_ready = callable(getattr(self, "_scanner_consumer", None))
+
+        # Slippage readiness (fail-closed)
+        slip_ready = True
+        slip_reason = "slip_unknown_or_stale"
+        try:
+            slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s",
+                                       float(getattr(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0))))
+        except Exception:
+            slip_ttl_s = float(float(getattr(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0)))
+
+        slip = getattr(self, "slippage_handler", None)
+        if slip and hasattr(slip, "get_status"):
+            try:
+                slip_status = slip.get_status() or {}
+                slip_age = slip_status.get("age_s")
+                if slip_age is None or (isinstance(slip_age, float) and not math.isfinite(slip_age)):
+                    slip_ready = False
+                else:
+                    slip_ready = float(slip_age) <= float(slip_ttl_s)
+            except Exception:
+                slip_ready = False
+        else:
+            slip_ready = False
+
+        # Volatility readiness (fail-closed)
+        vol_ready = True
+        vol_reason = "vol_unknown_or_stale"
+        try:
+            vol_ttl_s = float(
+                getattr(getattr(self.bot_cfg, "vol", None), "ttl_s", None)
+                or self._get_rm_knob("vol_snapshot_ttl_s", legacy="VOL_SNAPSHOT_TTL_S", default=5.0)
+            )
+        except Exception:
+            vol_ttl_s = float(self._get_rm_knob("vol_snapshot_ttl_s", legacy="VOL_SNAPSHOT_TTL_S", default=5.0))
+
+        vm = getattr(self, "vol_manager", None)
+        if vm and hasattr(vm, "get_current_metrics"):
+            try:
+                vol_meta = vm.get_current_metrics(None) or {}
+                vol_age = vol_meta.get("age_s", vol_meta.get("last_age_s"))
+                if vol_age is None or (isinstance(vol_age, float) and not math.isfinite(vol_age)):
+                    vol_ready = False
+                else:
+                    vol_ready = float(vol_age) <= float(vol_ttl_s)
+            except Exception:
+                vol_ready = False
+        else:
+            vol_ready = False
 
         readiness_reasons: List[str] = []
         if not engine_ready:
@@ -11541,77 +12293,25 @@ class RiskManager:
                 inc_blocked("rm", reason_code, None)
         if not scanner_ready:
             readiness_reasons.append("scanner_hook_missing")
-        slip_ready = True
-        slip_reason = "slip_unknown_or_stale"
-        try:
-            slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s",
-                                       getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0)))
-        except Exception:
-            slip_ttl_s = float(getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0))
-        slip = getattr(self, "slippage_handler", None)
-        if slip and hasattr(slip, "get_status"):
-            try:
-                slip_status = slip.get_status() or {}
-                slip_age = slip_status.get("age_s")
-                if slip_age is None or (isinstance(slip_age, float) and not math.isfinite(slip_age)):
-                    slip_ready = False
-                else:
-                    slip_ready = float(slip_age) <= float(slip_ttl_s)
-            except Exception:
-                slip_ready = False
-        else:
-            slip_ready = False
         if not slip_ready:
             if slip_reason not in readiness_reasons:
                 readiness_reasons.append(slip_reason)
                 inc_blocked("rm", slip_reason, None)
-
-        vol_ready = True
-        vol_reason = "vol_unknown_or_stale"
-        try:
-            vol_ttl_s = float(
-                getattr(getattr(self.bot_cfg, "vol", None), "ttl_s", None)
-                or self._get_rm_knob(
-                    "vol_snapshot_ttl_s",
-                    legacy="VOL_SNAPSHOT_TTL_S",
-                    default=5.0,
-                )
-            )
-        except Exception:
-            vol_ttl_s = float(
-                self._get_rm_knob(
-                    "vol_snapshot_ttl_s",
-                    legacy="VOL_SNAPSHOT_TTL_S",
-                    default=5.0,
-                )
-            )
-        vm = getattr(self, "vol_manager", None)
-        if vm and hasattr(vm, "get_current_metrics"):
-            try:
-                vol_meta = vm.get_current_metrics(None) or {}
-                vol_age = vol_meta.get("age_s", vol_meta.get("last_age_s"))
-                if vol_age is None or (isinstance(vol_age, float) and not math.isfinite(vol_age)):
-                    vol_ready = False
-                else:
-                    vol_ready = float(vol_age) <= float(vol_ttl_s)
-            except Exception:
-                vol_ready = False
-        else:
-            vol_ready = False
         if not vol_ready:
             if vol_reason not in readiness_reasons:
                 readiness_reasons.append(vol_reason)
                 inc_blocked("rm", vol_reason, None)
+
+        # -------------------- unified trading_state integration --------------------
         unified = bool(getattr(rm_cfg, "ff_trading_state_unified", False))
         blocked_reason = None
         degraded_reason = None
+
         if unified:
+            # BLOCKED si private plane critique ou logging critique
             pws_status = getattr(self, "_private_ws_status", {}) or {}
             pws_health = pws_status.get("pws_health") if isinstance(pws_status, dict) else {}
-            pws_critical = bool(
-                (pws_health or {}).get("critical_drop_seen")
-                or getattr(self, "_pws_critical_drop_seen", False)
-            )
+            pws_critical = bool((pws_health or {}).get("critical_drop_seen") or getattr(self, "_pws_critical_drop_seen", False))
             if pws_critical:
                 blocked_reason = normalize_reason_code(
                     (pws_health or {}).get("last_critical_drop_reason")
@@ -11623,8 +12323,7 @@ class RiskManager:
             lhm_critical = bool(lhm_health.get("critical_drop_seen"))
             if not blocked_reason and lhm_critical:
                 blocked_reason = normalize_reason_code(
-                    lhm_health.get("last_critical_drop_reason")
-                    or "LOGGERH_JSONL_QUEUE_FULL"
+                    lhm_health.get("last_critical_drop_reason") or "LOGGERH_JSONL_QUEUE_FULL"
                 ) or "LOGGERH_JSONL_QUEUE_FULL"
 
             lhm_cfg = getattr(cfg, "lhm", None)
@@ -11634,10 +12333,51 @@ class RiskManager:
 
             if not blocked_reason and readiness_reasons:
                 degraded_reason = readiness_reasons[0]
-        else:
-            if str(getattr(self, "trading_state", "READY")).upper() != "READY":
-                readiness_reasons.append("pws_critical_drop")
 
+            if blocked_reason:
+                self._set_trading_state("BLOCKED", reason=blocked_reason)
+            elif degraded_reason:
+                self._set_trading_state("DEGRADED", reason=degraded_reason)
+            else:
+                self._set_trading_state("READY", reason=None)
+
+        # -------------------- PIPELINE_READY vs TRADING_ALLOWED --------------------
+        pipeline_ready = (not readiness_reasons)
+
+        # Si BLOCKED (private plane / truth), pipeline doit être considéré non prêt.
+        try:
+            tstate = str(getattr(self, "trading_state", "READY") or "READY").upper()
+        except Exception:
+            tstate = "READY"
+        if tstate == "BLOCKED":
+            pipeline_ready = False
+            if "blocked" not in readiness_reasons:
+                readiness_reasons.insert(0, "blocked")
+
+        # Trading allowed (live) = pipeline_ready + flags (NO dry_run, NO kill, armed)
+        dry_run = bool(getattr(rm_cfg, "dry_run", False))
+        kill_switch = bool(getattr(rm_cfg, "global_kill_switch", False)) or bool(getattr(self, "global_kill_switch", False))
+
+        fs = getattr(g_cfg, "feature_switches", {}) if g_cfg else {}
+        live_mode = (str(getattr(g_cfg, "mode", "DRY_RUN")).upper() == "PROD") or bool(fs.get("engine_real", False))
+        armed = bool(getattr(g_cfg, "live_trading_armed", False))
+        armed_effective = bool(live_mode and armed)
+
+        trading_allowed = (not dry_run) and (not kill_switch) and armed_effective
+        trading_ready = bool(pipeline_ready and trading_allowed and tstate == "READY")
+
+        # -------------------- publish events --------------------
+        if pipeline_ready:
+            self.pipeline_ready_event.set()
+        else:
+            self.pipeline_ready_event.clear()
+
+        if trading_ready:
+            self.trading_ready_event.set()
+        else:
+            self.trading_ready_event.clear()
+
+        # -------------------- store & metrics --------------------
         self._readiness.update({
             "engine": engine_ready,
             "books": books_ready,
@@ -11645,30 +12385,22 @@ class RiskManager:
             "scanner": scanner_ready,
             "slippage": slip_ready,
             "volatility": vol_ready,
-            "reasons": readiness_reasons,
+            "pipeline_ready": bool(pipeline_ready),
+            "trading_allowed": bool(trading_allowed),
+            "trading_ready": bool(trading_ready),
+            "reasons": list(readiness_reasons),
         })
 
+        # Dep readiness metrics (extended)
         safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if engine_ready else 0.0, dep="engine")
         safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if books_ready else 0.0, dep="books")
         safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if balances_ready else 0.0, dep="balances")
         safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if scanner_ready else 0.0, dep="scanner")
+        safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if slip_ready else 0.0, dep="slippage")
+        safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 1.0 if vol_ready else 0.0, dep="volatility")
 
-        if unified:
-            if blocked_reason:
-                self._set_trading_state("BLOCKED", reason=blocked_reason)
-            elif degraded_reason:
-                self._set_trading_state("DEGRADED", reason=degraded_reason)
-            else:
-                self._set_trading_state("READY", reason=None)
-            ready = self.get_trading_state() == "READY"
-        else:
-            ready = not readiness_reasons
-            if ready:
-                self.trading_ready_event.set()
-            else:
-                self.trading_ready_event.clear()
-
-        safe_set(RM_TRADING_READY, "rm_trading_ready", "rm", 1.0 if ready else 0.0)
+        safe_set(RM_PIPELINE_READY, "rm_pipeline_ready", "rm", 1.0 if pipeline_ready else 0.0)
+        safe_set(RM_TRADING_READY, "rm_trading_ready", "rm", 1.0 if trading_ready else 0.0)
 
     def _audit_effective_config(self, *, strict: bool = False) -> Dict[str, Any]:
         cfg = getattr(self, "cfg", None)
@@ -11729,33 +12461,6 @@ class RiskManager:
         return payload
 
 
-    def _legacy_convert(self, op: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Conversion des anciens formats d'opérations de rebalancing.
-
-        Objectif : mapper les schémas historiques vers les types normalisés
-        *internal_wallet_transfer* / *internal_subaccount_transfer* / *rebalancing_trade*.
-        """
-        t = str(op.get("type") or "").lower()
-
-        # Ancien format pour transferts internes entre alias (USDC only)
-        if t in ("internal_transfer", "internal_alias_transfer", "transfer"):
-            src = op.get("from") or {}
-            dst = op.get("to") or {}
-            return {
-                "type": "internal_subaccount_transfer",
-                "exchange": op.get("exchange"),
-                "from_alias": op.get("from_alias") or (src.get("alias") if isinstance(src, dict) else None),
-                "to_alias": op.get("to_alias") or (dst.get("alias") if isinstance(dst, dict) else None),
-                "ccy": str(op.get("ccy") or "USDC").upper(),
-                "amount": float(
-                    op.get("amount_usdc")
-                    or op.get("amount")
-                    or 0.0
-                ),
-            }
-
-        # Par défaut : pas de conversion
-        return None
 
 
     async def _forward_rebalancing_trade(self, op: Dict[str, Any]) -> None:
@@ -11942,6 +12647,41 @@ class RiskManager:
         if not aliases_norm:
             return
 
+        # Ticket P0-RM-CAPMOVE-01: Ajout d'une réservation si c'est un débit potentiel pour un alias source
+        if transfer_id:
+            res_key = str(transfer_id)
+            if subtype == "subaccount":
+                # Pour un transfert inter-sous-comptes, on réserve sur l'alias source
+                src_alias = str(payload.get("from_alias") or "").upper()
+                if src_alias:
+                    self._reserved_balances[res_key] = {
+                        "exchange": exchange,
+                        "alias": src_alias,
+                        "ccy": ccy,
+                        "amount": amount,
+                        "deadline": now + max_delay_s,
+                        "start_ts": now,
+                    }
+                    self._sync_reserved_metrics()
+                    logger.info("[RiskManager] Réservation balance (subaccount) active: %s.%s %f %s (tid=%s)",
+                                exchange, src_alias, amount, ccy, transfer_id)
+            elif subtype == "wallet":
+                # Pour un transfert inter-wallets, on réserve si on sort du wallet préféré (généralement SPOT)
+                alias = str(payload.get("alias") or ev.get("alias") or "").upper()
+                from_w = str(payload.get("from_wallet") or "").upper()
+                # On assume que SPOT est le wallet de trading principal
+                if alias and from_w in ("SPOT", "TRADE", "TRADING", "MAIN"):
+                    self._reserved_balances[res_key] = {
+                        "exchange": exchange,
+                        "alias": alias,
+                        "ccy": ccy,
+                        "amount": amount,
+                        "deadline": now + max_delay_s,
+                        "start_ts": now,
+                    }
+                    logger.info("[RiskManager] Réservation balance (wallet) active: %s.%s %f %s (tid=%s)",
+                                exchange, alias, amount, ccy, transfer_id)
+
         # Enregistre l'état local + demande de resync ciblé via MBF.
         for alias_u in aliases_norm:
             key = (exchange, alias_u)
@@ -12080,7 +12820,7 @@ class RiskManager:
                 venue=f"{ex}:wallet_transfer",
             )
             if outcome.get("status") == "SUBMITTED":
-                await self._alert(
+                self._alert(
                     "RiskManager",
                     f"✅ Internal WALLET transfer {ex}[{alias}] {from_wallet}→{to_wallet} {amount} {ccy} "
                     f"(transfer_id={transfer_id})",
@@ -12135,18 +12875,18 @@ class RiskManager:
                 venue=f"{ex}:subaccount_transfer",
             )
             if outcome.get("status") == "SUBMITTED":
-                await self._alert(
+                self._alert(
                     "RiskManager",
                     f"✅ Internal SUBACCOUNT transfer {ex} {from_alias}→{to_alias} {amount} {ccy} "
                     f"(transfer_id={transfer_id})",
                 )
-                if getattr_bool(self.cfg, "dry_run", False):
+                if bool(getattr(self.cfg, "dry_run", False)):
                     self.adjust_virtual_balance(ex, from_alias, ccy, -amount)
                     self.adjust_virtual_balance(ex, to_alias, ccy, +amount)
         except Exception:
             logger.exception("[RiskManager] internal subaccount transfer failed")
 
-    def _make_internal_transfer(self, ex: str, from_alias: str, to_alias: str, amount_usdc: float) -> Dict[str, Any]:
+    def _make_internal_transfer(self, ex: str, from_alias: str, to_alias: str, amount: float, ccy: str = "USDC") -> Dict[str, Any]:
         now_ms = int(time.time() * 1000)
         payload = {
             "type": "internal_transfer",
@@ -12154,7 +12894,9 @@ class RiskManager:
             "exchange": str(ex).upper(),
             "from_alias": from_alias,
             "to_alias": to_alias,
-            "amount_usdc": float(amount_usdc),
+            "ccy": str(ccy).upper(),
+            "amount": float(amount),
+            "amount_usdc": float(amount) if str(ccy).upper() == "USDC" else 0.0, # Compat legacy
             "meta": {"source": "RebalancingManager", "kind": "REB_TRANSFER"},
         }
         payload["transfer_id"] = TransferController.canonical_transfer_id(payload)
@@ -12220,10 +12962,17 @@ class RiskManager:
     def _make_rebalancing_actions(self, plan: Dict[str, Any]) -> List[Dict[str, Any]]:
         actions: List[Dict[str, Any]] = []
         for tr in plan.get("internal_transfers", []) or []:
-            amt = float(tr.get("amount_usdc") or tr.get("amount") or 0.0)
+            amt = float(tr.get("amount") or tr.get("amount_usdc") or 0.0)
+            ccy = str(tr.get("ccy") or "USDC").upper()
             actions.append(
-                self._make_internal_transfer(tr.get("exchange"), str(tr.get("from_alias")), str(tr.get("to_alias")),
-                                             amt))
+                self._make_internal_transfer(
+                    tr.get("exchange"), 
+                    str(tr.get("from_alias")), 
+                    str(tr.get("to_alias")),
+                    amt,
+                    ccy=ccy
+                )
+            )
         x = self._make_cross_cex_opportunity(plan)
         if x:
             actions.append(x)
@@ -12281,22 +13030,25 @@ class RiskManager:
         """
         Vue capitale unifiée RM/Rebal pour les décisions d’inventaire/caps.
 
-        Priorité des sources :
-        1) MBF via _RM_MBFGlue.snapshot() (real/merged selon cfg).
-        2) DRY-RUN pur : overlay _virtual_balances si MBF indisponible.
-        3) Fallback legacy : rebalancing.latest_balances.
-
-        Retourne toujours un dict normalisé {EXCHANGE}{ALIAS}{ASSET->float}.
+        Optimisation P1 (HFT) : 
+        - Utilise un cache read-only rafraîchi toutes les 200ms.
+        - Supprime les normalisations UPPER redondantes (déjà gérées par MBF).
+        - Intègre les débits virtuels (réservations) de manière efficace.
         """
+        now = time.time()
+        # P1: Fast-path cache (200ms)
+        if (now - self._last_balances_ts) < self._balances_cache_interval_s and self._balances_cache:
+            return self._balances_cache
+
         balances: Dict[str, Dict[str, Dict[str, float]]] = {}
 
         # 1) Source principale : MBF (owner data-plane)
         glue = getattr(self, "_mbf_glue", None)
         if glue is not None:
             try:
+                # Utilise la vue optimisée du MBF
                 raw = glue.snapshot(cached_only=True)
             except Exception:
-                # on loggue mais on ne bloque pas la décision : on tombera sur les fallbacks
                 try:
                     logger.exception("RM×MBF: snapshot() failed", exc_info=True)
                 except Exception:
@@ -12304,43 +13056,67 @@ class RiskManager:
                 raw = {}
 
             if isinstance(raw, dict) and raw:
-                # a) format as_rm_snapshot v1 : {EX,…,"meta":{…}} ou futur {"balances":{…},"meta":{…}}
-                if "balances" in raw and isinstance(raw.get("balances"), dict):
-                    balances = raw.get("balances") or {}
-                else:
-                    # on considère toutes les clés dict sauf 'meta' comme exchanges
+                # format as_rm_snapshot : {"balances":{...},"meta":{...}}
+                balances = raw.get("balances") or {}
+                if not balances:
+                    # fallback legacy
                     balances = {
                         ex: per for ex, per in raw.items()
                         if ex != "meta" and isinstance(per, dict)
                     }
 
         # 2) DRY-RUN pur : overlay virtuel RM si MBF ne fournit rien
-        if not balances and getattr_bool(self.cfg, "dry_run", False) and getattr(self, "_virtual_balances", None):
-            balances = {
-                str(ex).upper(): {
-                    al: dict(assets or {}) for al, assets in (per or {}).items()
-                }
-                for ex, per in (getattr(self, "_virtual_balances", {}) or {}).items()
-            }
+        if not balances and bool(getattr(self.cfg, "dry_run", False)) and getattr(self, "_virtual_balances", None):
+            balances = getattr(self, "_virtual_balances", {}) or {}
 
-        # 3) Fallback legacy : cache RebalancingManager (toujours aligné MBF en prod)
+        # 3) Fallback legacy : cache RebalancingManager
         if not balances:
-            bals = getattr(self.rebalancing, "latest_balances", {}) or {}
-            balances = {
-                str(ex).upper(): {
-                    al: dict(assets or {}) for al, assets in (per_alias or {}).items()
-                }
-                for ex, per_alias in (bals or {}).items()
-            }
+            balances = getattr(self.rebalancing, "latest_balances", {}) or {}
 
-        # Normalisation finale : upper sur exchange/asset, float sur montants
+        # Normalisation légère (MBF est déjà en UPPER, on assure juste le type float)
+        # On évite de recréer TOUT le dictionnaire si possible, mais on a besoin d'une copie
+        # pour appliquer les réservations sans polluer la source.
         normalized: Dict[str, Dict[str, Dict[str, float]]] = {}
-        for ex, per_alias in (balances or {}).items():
+        for ex, per_alias in balances.items():
             exu = str(ex).upper()
-            dst = normalized.setdefault(exu, {})
-            for alias, assets in (per_alias or {}).items():
-                al = str(alias)
-                dst[al] = {str(ccy).upper(): float(v or 0.0) for ccy, v in (assets or {}).items()}
+            dst_ex = normalized.setdefault(exu, {})
+            for alias, assets in per_alias.items():
+                alu = str(alias).upper()
+                dst_ex[alu] = {str(ccy).upper(): float(v or 0.0) for ccy, v in assets.items()}
+
+        # Ticket P0-RM-CAPMOVE-01: Déduction des réservations actives (virtual debit)
+        reserved_changed = False
+        for tid, res in list(self._reserved_balances.items()):
+            # 1) Expiration TTL
+            if now > res.get("deadline", 0):
+                del self._reserved_balances[tid]
+                reserved_changed = True
+                continue
+
+            # 2) Libération si balance rafraîchie
+            ex = res["exchange"]
+            alias = res["alias"]
+            age = self._alias_balance_age_s.get((ex, alias))
+            if age is not None:
+                snap_ts = now - age
+                if snap_ts > res.get("start_ts", 0):
+                    del self._reserved_balances[tid]
+                    reserved_changed = True
+                    continue
+            
+            # 3) Application du débit virtuel
+            ccy = res["ccy"]
+            if ex in normalized and alias in normalized[ex]:
+                current = normalized[ex][alias].get(ccy, 0.0)
+                normalized[ex][alias][ccy] = max(0.0, current - float(res["amount"]))
+
+        if reserved_changed:
+            self._sync_reserved_metrics()
+
+        # Mise à jour du cache
+        self._balances_cache = normalized
+        self._last_balances_ts = now
+
         return normalized
 
     def _mm_compute_inventory_drift(
@@ -12373,7 +13149,7 @@ class RiskManager:
         drift_pct = 0.0
         return drift_usd, drift_pct
 
-    def _mm_classify_inventory_state(self, drift_usd: float, drift_pct: float) -> str:
+    def _mm_classify_inventory_state(self, drift_usd: float, drift_pct: float, alias_mm: str = "MM") -> str:
         """Classe l'état MM en fonction des seuils drift_usd/pct.
 
         P0 : si drift_pct est nul (cible = 0), on utilise des paliers USD basés
@@ -12385,9 +13161,19 @@ class RiskManager:
         if abs_usd < float(self.mm_reb_inventory_min_notional_usd):
             return "NORMAL"
 
-        soft = float(self.mm_reb_inventory_soft_pct)
-        hard = float(self.mm_reb_inventory_hard_pct)
-        critical = float(self.mm_reb_inventory_critical_pct)
+        al_u = str(alias_mm).upper()
+        if al_u == self.mm_mono_alias_name:
+            soft = float(self.mm_mono_reb_soft)
+            hard = float(self.mm_mono_reb_hard)
+            critical = float(self.mm_mono_reb_critical)
+        elif al_u == self.mm_cross_alias_name:
+            soft = float(self.mm_cross_reb_soft)
+            hard = float(self.mm_cross_reb_hard)
+            critical = float(self.mm_cross_reb_critical)
+        else:
+            soft = float(self.mm_reb_inventory_soft_pct)
+            hard = float(self.mm_reb_inventory_hard_pct)
+            critical = float(self.mm_reb_inventory_critical_pct)
 
         if abs_pct > 0:
             if abs_pct <= soft:
@@ -12398,11 +13184,11 @@ class RiskManager:
                 return "TENSION"
             return "CRITICAL"
 
-        # Fallback cible neutre : on transpose les seuils pct en multiples de la base
+        # Fallback cible neutre : on transpose les seuils pct en paliers USD au-dessus de la base
         base = max(float(self.mm_reb_inventory_min_notional_usd), 1.0)
-        soft_usd = base * max(soft / 100.0, 1.0)
-        hard_usd = base * max(hard / 100.0, 1.0)
-        critical_usd = base * max(critical / 100.0, 1.0)
+        soft_usd = base * (1.0 + soft / 100.0)
+        hard_usd = base * (1.0 + hard / 100.0)
+        critical_usd = base * (1.0 + critical / 100.0)
 
         if abs_usd <= soft_usd:
             return "NORMAL"
@@ -12411,6 +13197,188 @@ class RiskManager:
         if abs_usd <= critical_usd:
             return "TENSION"
         return "CRITICAL"
+
+    def _update_imbalance_ewma(self, exchange: str, pair_key: str, snap: Dict[str, Any]) -> None:
+        try:
+            asks = snap.get("asks", [])
+            bids = snap.get("bids", [])
+            if not asks or not bids:
+                return
+
+            # On prend le top 3 pour calculer l imbalance
+            sum_ask = sum(float(q) for p, q in asks[:3])
+            sum_bid = sum(float(q) for p, q in bids[:3])
+
+            if (sum_ask + sum_bid) <= 0:
+                return
+
+            imbalance = (sum_bid - sum_ask) / (sum_bid + sum_ask)
+
+            key = (str(exchange).upper(), self._norm_pair(pair_key))
+            prev = self._mm_imbalance_ewma.get(key, imbalance)
+            alpha = getattr(self, "_mm_imbalance_alpha", 0.3)
+            self._mm_imbalance_ewma[key] = (1 - alpha) * prev + alpha * imbalance
+        except Exception:
+            pass
+
+    def _is_imbalance_adverse(self, exchange: str, pair_key: str, leg_to_disable: str) -> bool:
+        """
+        Détermine si l imbalance du carnet est défavorable à la cotation unidirectionnelle.
+        """
+        try:
+            key = (str(exchange).upper(), self._norm_pair(pair_key))
+            ewma = self._mm_imbalance_ewma.get(key, 0.0)
+            thresh = getattr(self, "mm_single_imbalance_threshold", 0.6)
+
+            if leg_to_disable == "BUY":  # On ne cote que SELL
+                # Si forte pression BUY, le prix risque de monter -> adverse pour un maker SELL (adverse selection)
+                return ewma > thresh
+            elif leg_to_disable == "SELL":  # On ne cote que BUY
+                # Si forte pression SELL, le prix risque de baisser -> adverse pour un maker BUY
+                return ewma < -thresh
+        except Exception:
+            pass
+        return False
+
+    def _compute_mm_inventory_skews(self, ex: str, pair: str, drift_usd: float) -> tuple[float, float]:
+        """
+        Calcule les skews de prix et de taille basés sur le drift d'inventaire.
+        drift_usd > 0 : Trop de base (LONG), on veut vendre.
+        drift_usd < 0 : Pas assez de base (SHORT), on veut acheter.
+        """
+        # Paramètres résolus via capital profile
+        target = float(self._get_rm_knob("mm_inv_target_usd", default=0.0))
+        band_lo = float(self._get_rm_knob("mm_inv_band_lo_usd", default=500.0))
+        band_hi = float(self._get_rm_knob("mm_inv_band_hi_usd", default=2000.0))
+        skew_strength_price = float(self._get_rm_knob("mm_skew_strength_price", default=1.0))
+        skew_strength_size = float(self._get_rm_knob("mm_skew_strength_size", default=1.0))
+
+        relative_drift = drift_usd - target
+        abs_drift = abs(relative_drift)
+
+        if abs_drift < band_lo:
+            return 0.0, 1.0  # Neutre
+
+        # Skew linéaire entre band_lo et band_hi
+        factor = min(1.0, (abs_drift - band_lo) / (max(1.0, band_hi - band_lo)))
+
+        # Skew prix : relative_drift > 0 (LONG) => skew > 0 => prix plus bas (vendre plus facile)
+        price_skew = (relative_drift / band_hi) * factor * skew_strength_price
+
+        # Skew taille : relative_drift > 0 (LONG) => size_skew > 1 => vendre plus gros, acheter plus petit
+        size_skew = 1.0 + (relative_drift / band_hi) * factor * skew_strength_size
+
+        return price_skew, size_skew
+
+    def get_mm_leg_restriction(self, ex: str, alias: str, asset: str, pair_key: str = "") -> Optional[str]:
+        """
+        Renvoie 'BUY' si le leg BUY doit être désactivé (trop Long).
+        Renvoie 'SELL' si le leg SELL doit être désactivé (trop Short).
+        Renvoie 'BOTH' si la cotation doit être totalement arrêtée (stuck/adverse).
+        Utilisé par le Scanner pour le MM bidirectionnel (Mono-CEX ou Cross-CEX).
+
+        Implémente :
+        - Hystérésis (inv_band_hi/lo)
+        - Escalade temporelle (anti-stuck)
+        - Gate imbalance adverse
+        """
+        ex_u = str(ex).upper()
+        al_u = str(alias).upper()
+        asset_u = str(asset).upper()
+        key = (ex_u, al_u, asset_u)
+
+        # On consulte l'état d'inventaire calculé par la boucle de rebalancing
+        state_info = self.mm_reb_state.get(key)
+        if not state_info:
+            return None
+
+        drift_usd = float(state_info.get("drift_usd", 0.0))
+        abs_drift = abs(drift_usd)
+        now = time.time()
+
+        # État précédent
+        current = self.mm_inventory_mode_state.get(key)
+        if not current:
+            # Init par défaut
+            current = {"mode": "DUAL", "last_transition": now, "phase": 1}
+            self.mm_inventory_mode_state[key] = current
+
+        # --- Transitions DUAL <-> SINGLE ---
+        if current["mode"] == "DUAL":
+            if abs_drift > getattr(self, "inv_band_hi_usd", 250.0):
+                if (now - current["last_transition"]) >= getattr(self, "inv_state_min_seconds", 10.0):
+                    current["mode"] = "SINGLE"
+                    current["last_transition"] = now
+                    current["start_drift_usd"] = drift_usd
+                    current["max_drift_usd"] = abs_drift
+                    current["phase"] = 1
+                    current["last_phase_transition"] = now
+                    # Metrics transition
+                    if hasattr(self, "obs_inc"):
+                        self.obs_inc("mm_inventory_mode_transitions_total", old="DUAL", new="SINGLE", asset=asset_u)
+
+        elif current["mode"] == "SINGLE":
+            if abs_drift < getattr(self, "inv_band_lo_usd", 100.0):
+                if (now - current["last_transition"]) >= getattr(self, "inv_state_min_seconds", 10.0):
+                    current["mode"] = "DUAL"
+                    current["last_transition"] = now
+                    current.pop("start_drift_usd", None)
+                    current.pop("phase", None)
+                    if hasattr(self, "obs_inc"):
+                        self.obs_inc("mm_inventory_mode_transitions_total", old="SINGLE", new="DUAL", asset=asset_u)
+
+        # --- Logique SINGLE active ---
+        if current["mode"] == "SINGLE":
+            time_in_single = now - current["last_transition"]
+            try:
+                from modules.obs_metrics import MM_SINGLE_TIME_SECONDS
+                if MM_SINGLE_TIME_SECONDS:
+                    MM_SINGLE_TIME_SECONDS.labels(asset=asset_u).set(time_in_single)
+            except Exception: pass
+
+            leg_to_disable = "BUY" if drift_usd > 0 else "SELL"
+            
+            # A) Gate Imbalance adverse
+            if pair_key and self._is_imbalance_adverse(ex_u, pair_key, leg_to_disable):
+                try:
+                    if hasattr(self, "obs_inc"):
+                        self.obs_inc("mm_single_blocked_total", asset=asset_u, reason="MM_SINGLE_IMB_ADVERSE")
+                except Exception: pass
+                return "BOTH"
+
+            # B) Escalade Anti-stuck
+            current["max_drift_usd"] = max(current.get("max_drift_usd", 0.0), abs_drift)
+            
+            # Phase 1 -> 2 : Stuck
+            if current["phase"] == 1 and time_in_single >= getattr(self, "single_stuck_t1_s", 30.0):
+                # Si le drift ne baisse pas significativement (>= 90% du départ)
+                if abs_drift >= 0.9 * abs(current.get("start_drift_usd", 0.0)):
+                    current["phase"] = 2
+                    current["last_phase_transition"] = now
+                    if hasattr(self, "obs_inc"):
+                        self.obs_inc("mm_single_escalations_total", asset=asset_u, phase="2")
+
+            # Phase 2 -> 3 : Worsening or Max Time
+            if current["phase"] == 2 and time_in_single >= getattr(self, "single_stuck_t2_s", 60.0):
+                # Si le drift empire (>= 95% du max vu)
+                if abs_drift >= 0.95 * current.get("max_drift_usd", 0.0):
+                    current["phase"] = 3
+                    current["last_phase_transition"] = now
+                    if hasattr(self, "obs_inc"):
+                        self.obs_inc("mm_single_escalations_total", asset=asset_u, phase="3")
+            
+            # Phase 3 Hard Stop
+            if time_in_single >= getattr(self, "single_max_time_s", 120.0):
+                current["phase"] = 3
+
+            if current["phase"] == 3:
+                # Trigger REB (self-rebalance agressif)
+                self._mm_trigger_self_rebal(ex_u, al_u, asset_u, drift_usd)
+                return "BOTH"
+
+            return leg_to_disable
+
+        return None
 
     @staticmethod
     def _aggregate_by_exchange(snapshot: Dict[str, Dict[str, Dict[str, float]]], asset: str) -> Dict[str, float]:
@@ -12494,6 +13462,10 @@ class RiskManager:
         return share <= max_share + 1e-9
 
     def _fresh_enough(self, book: dict) -> bool:
+        # P0 : Bypass total en DRY_RUN pour ne pas bloquer les calculs de slippage
+        if bool(getattr(self.cfg, "dry_run", False)):
+            return True
+            
         try:
             now_ms = time.time() * 1000.0
             ex_ms = float(book.get("exchange_ts_ms") or 0.0)
@@ -12610,6 +13582,9 @@ class RiskManager:
         """
         view = self._get_capital_view_from_mbf(mode=mode)
         pockets = view.get("pockets_by_quote") or {}
+        # Ticket P0-RM-CAPMOVE-01: Appliquer les réservations
+        pockets = self._apply_reservations_to_pockets(pockets)
+
         if not pockets:
             return 0.0
 
@@ -12677,6 +13652,8 @@ class RiskManager:
 
         view = self._get_capital_view_from_mbf(mode=mode)
         pockets = view.get("pockets_by_quote") or {}
+        # Ticket P0-RM-CAPMOVE-01: Appliquer les réservations
+        pockets = self._apply_reservations_to_pockets(pockets)
 
         statuses = ("OK", "DEGRADED", "BLOCKED", "UNKNOWN")
         by_status: Dict[str, float] = {s: 0.0 for s in statuses}
@@ -12815,8 +13792,11 @@ class RiskManager:
         )
         b_bid, b_ask = self.get_top_of_book(buy_ex, pair_key, max_age_s=tob_max_age_s)
         s_bid, s_ask = self.get_top_of_book(sell_ex, pair_key, max_age_s=tob_max_age_s)
-        if s_bid <= b_ask:
-            raise InconsistentStateError(f"No edge: {sell_ex}->{buy_ex} bid<=ask")
+        
+        # On ne vérifie l edge que si on est en cross-CEX (arbitrage classique)
+        if str(sell_ex).upper() != str(buy_ex).upper():
+            if s_bid <= b_ask:
+                raise InconsistentStateError(f"No edge: {sell_ex}->{buy_ex} bid<=ask")
 
         # Strict verde
         if fee_age <= fee_ttl_strict and vol_age <= vol_ttl_strict:
@@ -13223,6 +14203,7 @@ class RiskManager:
             buy_px_override: Optional[float] = None,
             sell_px_override: Optional[float] = None,
             price_overrides: Optional[dict] = None,
+            meta_to_fill: Optional[dict] = None, # Ticket D5
     ) -> bool:
         """
         Revalidation "last-mile" unifiée et robuste.
@@ -13258,6 +14239,10 @@ class RiskManager:
             # enforce_min_required=False => mode "drift-only" (sonde Engine) :
             # on ne recalcule pas min_required_bps ici pour éviter un 2e GO/NO-GO économique.
             if enforce_min_required:
+                # Overlays de pénalité (Ticket D2-2)
+                tt_overlays = self._compute_tt_revalidation_overlays(buy_ex, sell_ex, pk)
+                tt_penalty = tt_overlays["latency_penalty_bps"] + tt_overlays["staleness_penalty_bps"]
+
                 if min_required_bps is None:
                     if getattr(self, "dynamic_min_required", False) and not is_rebalancing:
                         try:
@@ -13271,6 +14256,10 @@ class RiskManager:
                         min_required_bps = 0.0 if is_rebalancing else float(
                             getattr(self, "base_min_bps", getattr(getattr(self.cfg, "rm", None), "base_min_bps", 20.0))
                         )
+
+                # Ajout des pénalités au seuil
+                if tt_penalty > 0 and not is_rebalancing:
+                    min_required_bps = float(min_required_bps) + tt_penalty
 
                 # VM adjustments (boost threshold)
                 try:
@@ -13448,6 +14437,39 @@ class RiskManager:
                     return False
 
             # OK
+            # Ticket D5: Reality check components
+            if meta_to_fill is not None:
+                try:
+                    mid = (buy_ask + sell_bid) / 2.0
+                    gross_bps = ((sell_bid / buy_ask) - 1.0) * 10000.0 if buy_ask > 0 else 0.0
+                    
+                    # Penalties components
+                    lat_pen = 0.0
+                    stale_pen = 0.0
+                    if enforce_min_required:
+                        try:
+                            ovl = self._compute_tt_revalidation_overlays(buy_ex, sell_ex, pk)
+                            lat_pen = ovl.get("latency_penalty_bps", 0.0)
+                            stale_pen = ovl.get("staleness_penalty_bps", 0.0)
+                        except Exception: pass
+                    
+                    f_buy = locals().get("fee_buy", 0.0)
+                    f_sell = locals().get("fee_sell", 0.0)
+                    s_buy = locals().get("slip_buy", 0.0)
+                    s_sell = locals().get("slip_sell", 0.0)
+
+                    meta_to_fill["edge_components"] = {
+                        "gross_bps": round(gross_bps, 2),
+                        "fees_bps": round((f_buy + f_sell) * 10000.0, 2),
+                        "slip_bps": round((s_buy + s_sell) * 10000.0, 2),
+                        "latency_penalty_bps": round(lat_pen, 2),
+                        "staleness_penalty_bps": round(stale_pen, 2),
+                        "net_bps": round(net_bps, 2),
+                        "split_penalty_bps": round(split_penalty_bps, 2)
+                    }
+                except Exception:
+                    logging.debug("Failed to fill edge_components")
+
             return True
 
         except Exception:
@@ -13472,12 +14494,12 @@ class RiskManager:
                   évalué sur la vue capitale unifiée (_balances_snapshot).
         """
         try:
-            base_min = getattr_float(self.cfg, "min_usdc", 1000.0)
+            base_min = float(getattr(self.cfg, "min_usdc", 1000.0))
             # si règles CEX présentes, on les prend en compte
             rule_min = float(self.compute_cex_min_notional_usdc(exchange, pair_key) or 0.0)
 
             # DRY-RUN : on ne borne pas par le cash, on applique seulement les règles de taille
-            if getattr_bool(self.cfg, "dry_run", False):
+            if bool(getattr(self.cfg, "dry_run", False)):
                 return max(base_min, rule_min)
 
             # PROD : borne par cash disponible (quote) sur la vue unifiée
@@ -13497,7 +14519,7 @@ class RiskManager:
             need = max(base_min, rule_min)
             return float(min(need, cap)) if cap > 0 else need
         except Exception:
-            return getattr_float(self.cfg, "min_usdc", 1000.0)
+            return float(getattr(self.cfg, "min_usdc", 1000.0))
 
 
     # ---------- Fees & slippage dynamiques ----------
@@ -13521,7 +14543,7 @@ class RiskManager:
 
             sfc = getattr(self, "slip_collector", None)
             if sfc is not None and hasattr(sfc, "get_total_cost_pct"):
-                kind = getattr_str(self.cfg, "sfc_slippage_source", "ewma").lower()
+                kind = str(getattr(self.cfg, "sfc_slippage_source", "ewma")).lower()
                 pct = float(sfc.get_total_cost_pct(
                     route_sfc,
                     side="MM",
@@ -13542,10 +14564,18 @@ class RiskManager:
             return 0.0
 
 
-    def get_fee_pct(self, exchange: str, pair_key: str, mode: str = "taker") -> float:
+    def get_prudence_key(self, pair: str) -> str:
+        """
+        API publique renvoyant le régime de prudence actuel (NORMAL/CAREFUL/ALERT/...).
+        """
+        if hasattr(self, "_current_prudence"):
+            return str(self._current_prudence(pair))
+        return "NORMAL"
+
+    def get_fee_pct(self, exchange: str, pair_key: str, mode: str = "taker", prudence_key: Optional[str] = None) -> float:
         if self.slip_collector is None or not hasattr(self.slip_collector, "get_fee_pct"):
             raise RuntimeError("SlippageAndFeesCollector non pronto (get_fee_pct)")
-        return float(self.slip_collector.get_fee_pct(exchange, self._norm_pair(pair_key), mode))
+        return float(self.slip_collector.get_fee_pct(exchange, self._norm_pair(pair_key), mode, prudence_key=prudence_key))
 
     def get_slippage(self, exchange: str, pair_key: str, side: str = "buy") -> float:
         """
@@ -13578,6 +14608,23 @@ class RiskManager:
             pass
 
         return 0.0
+
+    def get_slippage_for_rebal(self, exchange: str, pair_key: str, side: str = "buy") -> float:
+        """
+        Slippage spécifique au rééquilibrage : plus conservateur (P95).
+        """
+        ex = (exchange or "").upper()
+        pk = self._norm_pair(pair_key)
+        sd = (side or "buy").lower()
+
+        if self.slip_collector is not None and hasattr(self.slip_collector, "get_slippage"):
+            try:
+                # On force le P95 pour le rééquilibrage pour être conservateur
+                return float(self.slip_collector.get_slippage(ex, pk, sd, kind="p95"))
+            except Exception:
+                pass
+
+        return self.get_slippage(exchange, pair_key, side)
 
     def _compute_cost_breakdown_for_route(self, buy_ex: str, sell_ex: str, pair_key: str) -> Dict[str, float]:
         """
@@ -13612,7 +14659,7 @@ class RiskManager:
         try:
             sfc = getattr(self, "slip_collector", None)
             if sfc is not None and hasattr(sfc, "get_total_cost_pct"):
-                kind = getattr_str(self.cfg, "sfc_slippage_source", "ewma").lower()
+                kind = str(getattr(self.cfg, "sfc_slippage_source", "ewma")).lower()
                 buy_leg = {"ex": be, "alias": "TT", "role": "taker"}
                 sell_leg = {"ex": se, "alias": "TT", "role": "taker"}
                 total_cost_pct = float(sfc.get_total_cost_pct(
@@ -13706,7 +14753,7 @@ class RiskManager:
         Fallback = 0.0.
         """
         # dans class RiskManager, méthode _get_slippage(...)
-        kind = getattr_str(self.cfg, "sfc_slippage_source", "ewma").lower()
+        kind = str(getattr(self.cfg, "sfc_slippage_source", "ewma")).lower()
         try:
             if self.slip_collector and hasattr(self.slip_collector, "get_slippage"):
                 return float(self.slip_collector.get_slippage(
@@ -13740,17 +14787,17 @@ class RiskManager:
         try:
             dyn_bps = float(self._dynamic_min_required_bps(pk))  # bps (ex: 20.0)
         except Exception:
-            dyn_bps = getattr_float(self, "base_min_bps", 20.0)
+            dyn_bps = float(getattr(self, "base_min_bps", 20.0))
 
         # Convertit la ceiling fraction → bps
-        ceiling_frac = getattr_float(self.cfg, "dyn_min_required_bps_ceiling_pct", 0.003)  # ex: 0.003
-        ceiling_bps = max(getattr_float(self, "base_min_bps", 20.0) + ceiling_frac * 10_000.0,
+        ceiling_frac = float(getattr(self.cfg, "dyn_min_required_bps_ceiling_pct", 0.003))  # ex: 0.003
+        ceiling_bps = max(float(getattr(self, "base_min_bps", 20.0)) + ceiling_frac * 10_000.0,
                           ceiling_frac * 10_000.0)
         if dyn_bps > ceiling_bps:
             return False
 
         # --- slippage buy/sell avec source contrôlée par cfg
-        max_slip = getattr_float(self.cfg, "fastpath_slip_bps_max", 0.003)  # fraction
+        max_slip = float(getattr(self.cfg, "fastpath_slip_bps_max", 0.003))  # fraction
         try:
             s_buy = self._get_slippage(buy_ex, pk, "buy")
             s_sell = self._get_slippage(sell_ex, pk, "sell")
@@ -13861,9 +14908,9 @@ class RiskManager:
         best_edge = float(max(e_sell, e_buy))
 
         # Seuils NN (config)
-        nn_min_edge_bps = getattr_float(self.cfg, "tm_nn_min_edge_bps", 9.0)
-        nn_max_vol_bps = getattr_float(self.cfg, "tm_nn_max_vol_bps", 18.0)
-        nn_max_slip_bps = getattr_float(self.cfg, "tm_nn_max_slip_bps", 7.0)
+        nn_min_edge_bps = float(getattr(self.cfg, "tm_nn_min_edge_bps", 9.0))
+        nn_max_vol_bps = float(getattr(self.cfg, "tm_nn_max_vol_bps", 18.0))
+        nn_max_slip_bps = float(getattr(self.cfg, "tm_nn_max_slip_bps", 7.0))
 
         # TTLs (contrat BotConfig si dispo, sinon fallback cfg)
         try:
@@ -13886,9 +14933,9 @@ class RiskManager:
 
         try:
             slip_ttl_s = float(getattr(getattr(self.bot_cfg, "slip", None), "ttl_s",
-                                       getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0)))
+                                       float(getattr(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0))))
         except Exception:
-            slip_ttl_s = float(getattr_float(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0))
+            slip_ttl_s = float(getattr(self.cfg, "SLIP_SNAPSHOT_TTL_S", 2.0))
 
         # 1) Volatilité : doit être dispo + finite + fraîche (TTL) + avec samples.
         vm = getattr(self, "vol_manager", None)
@@ -14006,25 +15053,25 @@ class RiskManager:
         cfg = self.cfg
 
         # Gardé pour tuning ultérieur (NEUTRAL vs NON_NEUTRAL par défaut)
-        default_mode = getattr_str(cfg, "tm_default_mode", "NEUTRAL").upper()
+        default_mode = str(getattr(cfg, "tm_default_mode", "NEUTRAL")).upper()
 
         # Clés canoniques pour le hedging et l'horizon d'exposition
-        neutral_hr = getattr_float(
+        neutral_hr = float(getattr(
             cfg,
             "tm_exposure_ttl_hedge_ratio",
             getattr(self, "tm_exposure_ttl_hedge_ratio", 0.50),
-        )
-        nn_hr = getattr_float(
+        ))
+        nn_hr = float(getattr(
             cfg,
             "tm_nn_hedge_ratio",
             getattr(self, "tm_nn_hedge_ratio", 0.65),
-        )
+        ))
         # Horizon métier d'exposition NN (secondes) : config ou fallback local.
-        nn_max_exposure_s = getattr_float(
+        nn_max_exposure_s = float(getattr(
             cfg,
             "tm_nn_max_exposure_s",
             getattr(self, "tm_nn_max_exposure_s", 3.0),
-        )
+        ))
         # Pour NEUTRAL, on utilise le TTL canonique comme horizon (ms → s).
         try:
             neutral_max_exposure_s = float(
@@ -14058,7 +15105,7 @@ class RiskManager:
 
         # Config globale / par profil pour le NN
         nn_enabled_global = bool(getattr(cfg, "allow_tm_non_neutral", True))
-        allowed_profiles_raw = getattr_str(cfg, "tm_nn_allowed_profiles", "MICRO,SMALL,MID,LARGE")
+        allowed_profiles_raw = str(getattr(cfg, "tm_nn_allowed_profiles", "MICRO,SMALL,MID,LARGE"))
 
         if allowed_profiles_raw:
             allowed_profiles = {
@@ -14198,7 +15245,7 @@ class RiskManager:
         self.transfer_clients.update({str(k).upper(): v for k, v in (clients_by_exchange or {}).items()})
 
     def set_virtual_balances(self, balances: Dict[str, Dict[str, Dict[str, float]]]) -> None:
-        if not getattr_bool(self.cfg, "dry_run", False):
+        if not bool(getattr(self.cfg, "dry_run", False)):
             return
         self._virtual_balances = {
             str(ex).upper(): {al: dict(assets or {}) for al, assets in (accounts or {}).items()}
@@ -14206,7 +15253,7 @@ class RiskManager:
         }
 
     def adjust_virtual_balance(self, exchange: str, account_alias: str, asset: str, delta: float) -> None:
-        if not getattr_bool(self.cfg, "dry_run", False):
+        if not bool(getattr(self.cfg, "dry_run", False)):
             return
         ex = str(exchange).upper()
         al = str(account_alias)
@@ -14225,7 +15272,7 @@ class RiskManager:
         Format:
           {"BINANCE":{"TT":{"USDC":2000,"EUR":2000},"TM":{...}}, "BYBIT":{...}, "COINBASE":{...}}
         """
-        if not getattr_bool(self.cfg, "dry_run", False):
+        if not bool(getattr(self.cfg, "dry_run", False)):
             return
         if overwrite or not hasattr(self, "_virtual_balances"):
             self._virtual_balances = {}
@@ -14251,7 +15298,7 @@ class RiskManager:
             try:
                 if INVENTORY_USD:
                     for q, v in dst.items():
-                        INVENTORY_USD.labels(exu, q).set(v)
+                        INVENTORY_USD.labels(exchange=exu, quote=q).set(v)
             except Exception:
                 logger.debug("INVENTORY_USD gauge update failed", exc_info=False)
 
@@ -14347,10 +15394,10 @@ class RiskManager:
           jitter_ack_ms_min/max, jitter_fill_ms_min/max
         """
         try:
-            j_ack_min = getattr_int(self.cfg, "jitter_ack_ms_min", 8)
-            j_ack_max = getattr_int(self.cfg, "jitter_ack_ms_max", 25)
-            j_fill_min = getattr_int(self.cfg, "jitter_fill_ms_min", 25)
-            j_fill_max = getattr_int(self.cfg, "jitter_fill_ms_max", 120)
+            j_ack_min = int(getattr(self.cfg, "jitter_ack_ms_min", 8))
+            j_ack_max = int(getattr(self.cfg, "jitter_ack_ms_max", 25))
+            j_fill_min = int(getattr(self.cfg, "jitter_fill_ms_min", 25))
+            j_fill_max = int(getattr(self.cfg, "jitter_fill_ms_max", 120))
         except Exception:
             j_ack_min, j_ack_max, j_fill_min, j_fill_max = 8, 25, 25, 120
         if j_ack_min > j_ack_max: j_ack_min, j_ack_max = j_ack_max, j_ack_min
@@ -14370,7 +15417,7 @@ class RiskManager:
         """
         Impacter les soldes virtuels après un TT (avec frais taker).
         """
-        if not getattr_bool(self.cfg, "dry_run", False):
+        if not bool(getattr(self.cfg, "dry_run", False)):
             return
         tb = float(self.get_fee_pct(buy_ex, f"{base_ccy}{quote_ccy}", "taker"))
         ts = float(self.get_fee_pct(sell_ex, f"{base_ccy}{quote_ccy}", "taker"))
@@ -14401,8 +15448,10 @@ class RiskManager:
         payload = {}  # {EX: {PAIR: {buy, sell, recent}}}
         thr_by_pair = {}  # {PAIR: threshold_bps}
 
-        for ex, pairs in (self._last_books or {}).items():
-            for pk in (pairs or {}).keys():
+        # P0: On boucle sur TOUS les exchanges et TOUTES les paires configurées
+        # pour garantir que le Scanner reçoit du slippage (heartbeats) même pour les paires stables.
+        for ex in self.exchanges:
+            for pk in self.symbols:
                 sb = ss = recent = None
                 # 1) priorité SlippageHandler s'il est branché (TTL déjà appliqué)
                 if self.slippage_handler and hasattr(self.slippage_handler, "get_slippage_bps"):
@@ -14452,16 +15501,57 @@ class RiskManager:
     # ---------------------------------------------------------------------
     # ---------------------------------------------------------------------
     def on_scanner_opportunity(self, opp: Dict[str, Any], decision_ctx: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+        start_rm_ns = time.perf_counter_ns()
+        # Instrumentation latence queue Scanner -> RM (P1)
+        tracing_enabled = should_trace_latency(self.bot_cfg)
+
+        if tracing_enabled:
+            scanner_exit_ns = opp.get("scanner_exit_ns")
+            if scanner_exit_ns:
+                queue_ms = (start_rm_ns - int(scanner_exit_ns)) / 1e6
+                if getattr(self.bot_cfg.obs, "enable_segment_metrics_scanner", True):
+                    record_pipeline_latency("scanner_to_rm_queue", queue_ms, exchange=opp.get("buy_exchange", "none"))
+
         """
         P2: scheduler multi-branches TT/TM/MM simultanés + caps notionnels et préemption MM,
             REB lock par combo, shadow non-bloquant.
         - TTL-strict slip/vol (2s/5s)
         - Caps par (branche,CEX) via _apply_caps_and_preempt (legacy opp-level, préemption MM réservée au hedge)
         - REB: lock combo et exécute TM neutral
+        P1: Validation de schéma à la frontière Scanner -> RM.
         """
+        if not opp:
+            return None
+            
+        required = ("branch", "pair", "legs")
+        for f in required:
+            if opp.get(f) is None:
+                logger.warning("[RiskManager] P1: Schema violation from scanner, missing field: %s", f)
+                return None
+        
+        legs = opp.get("legs", [])
+        if not isinstance(legs, (list, tuple)) or not legs:
+            logger.warning("[RiskManager] P1: Schema violation from scanner, invalid or empty legs")
+            return None
+
         now = time.time()
         decision_ctx = decision_ctx if isinstance(decision_ctx, dict) else {"submitted": False, "attempted": False,
                                                                     "reasons": []}
+        # P0A (fallback): si le Scanner fournit book_ts_ms / book_age_ms, on met à jour
+        # last_orderbook_recv_ts_ms pour garder book_age disponible même si la loop OB stalle.
+        try:
+            book_ts_ms = int(opp.get("book_ts_ms") or opp.get("book_ts") or 0)
+            if not book_ts_ms:
+                decision_ts_ms = int(opp.get("decision_ts_ms") or opp.get("ts") or 0)
+                book_age_ms = opp.get("book_age_ms")
+                if decision_ts_ms and book_age_ms is not None:
+                    book_ts_ms = decision_ts_ms - int(book_age_ms)
+            if book_ts_ms > 0:
+                self.last_orderbook_recv_ts_ms = int(book_ts_ms)
+                self.books_last_recv_ts_ms = int(book_ts_ms)
+        except Exception:
+            pass
+
 
         def _record_reason(reason: str) -> None:
             if not reason:
@@ -14650,6 +15740,8 @@ class RiskManager:
             if getattr(self, "log", None): self.log.debug(f"RM.REB_LOCK active for {combo_key}")
             _record_reason(REB_LOCK)
             try:
+                from modules.obs_metrics import REBAL_LOCK_CONFLICT_TOTAL
+                REBAL_LOCK_CONFLICT_TOTAL.labels(pair=str(pair).upper(), route=f"{buy_ex}->{sell_ex}").inc()
                 inc_rm_reject(reason=REB_LOCK, pair=pair)
             except Exception:
                 pass
@@ -14662,7 +15754,7 @@ class RiskManager:
             needs_reb = False
 
         if needs_reb:
-            lock_ttl = getattr(self, "reb_lock_ttl_sec", 15.0)
+            lock_ttl = float(getattr(self.cfg.rm, "rebal_lock_ttl_s", 15.0))
             self._reb_locks[combo_key] = now + lock_ttl
 
 
@@ -14725,22 +15817,34 @@ class RiskManager:
 
         def _cap(branch: str) -> int:
             """
-            Cap effectif (après pacer).
+            Cap effectif (après pacer et overlays de sécurité).
             factor_for_branch ne doit JAMAIS augmenter le cap au-delà du base.
             """
             base = _base_cap_for_branch(branch)
+            factor = 1.0
             if pacer and hasattr(pacer, "factor_for_branch"):
                 try:
                     factor = float(pacer.factor_for_branch(branch))
-                    # Clamp dur pour éviter tout upscale accidentel
-                    if factor > 1.0:
-                        factor = 1.0
-                    if factor < 0.0:
-                        factor = 0.0
-                    return max(0, int(round(base * factor)))
                 except Exception:
-                    return max(0, int(base))
-            return max(0, int(base))
+                    factor = 1.0
+
+            # 2) Overlay de sécurité (AT_RISK / DEGRADED)
+            if factor > 0.0:
+                try:
+                    # On applique une réduction agressive si le statut global RM est dégradé.
+                    if getattr(self, "trading_state", "READY") in ("DEGRADED", "AT_RISK"):
+                        # On réduit de 75% supplémentaires
+                        factor *= 0.25
+                except Exception:
+                    pass
+
+            # Clamp dur pour éviter tout upscale accidentel
+            if factor > 1.0:
+                factor = 1.0
+            if factor < 0.0:
+                factor = 0.0
+
+            return max(0, int(round(base * factor)))
 
         # Caps TRADING par branche pour CETTE opportunité (TT/TM/MM uniquement)
         caps = {"TT": _cap("TT"), "TM": _cap("TM"), "MM": _cap("MM")}
@@ -14789,28 +15893,26 @@ class RiskManager:
             pass
 
         # --- 4) Éligibilités de base ----------------------------------------------
-        strategies: List[str] = []
-        if opp.get("tt_ok", True):
-            strategies.append("TT")
-        if opp.get("tm_ok", True):
-            strategies.append("TM")
-        if opp.get("mm_ok", True):
-            strategies.append("MM")
+        # On utilise la stratégie choisie par le Scanner (TT, TM, MM_MONO, MM_CROSS, REB)
+        opp_strategy = str(opp.get("strategy") or opp.get("branch") or "TT").upper()
+        strategies: List[str] = [opp_strategy]
 
-        # Kill-switch MM unique + mode OFF/CROSS
-        if "MM" in strategies:
+        # Mapping pour les caps et les gardes MM
+        is_mm = self._is_mm_family(opp_strategy)
+        
+        if is_mm:
             if not getattr(self, "enable_mm", False):
-                strategies.remove("MM")
-            elif str(getattr(self, "mm_mode", "MONO") or "MONO").upper() == "CROSS":
-                # MM cross-venue non supporté pour l’instant
-                strategies.remove("MM")
-                inc_rm_reject(reason="MM_MODE_CROSS_UNSUPPORTED")
+                strategies = []
             else:
+                # Support complet MM_MONO et MM_CROSS
                 ok, why = self._is_mm_admissible_from_hints(opp)
                 if not ok:
-                    # Paire pas admissible pour MM (hints scanner / signaux)
-                    strategies.remove("MM")
-                    inc_rm_reject(reason=why)
+                    strategies = []
+                    _record_reason(why)
+                    try:
+                        inc_rm_reject(reason=why, pair=pair)
+                    except Exception:
+                        pass
 
         # --- 5) Caps notionnels par CEX & préemption MM ---------------------------
         def _desired_notional(opp: Dict[str, Any]) -> float:
@@ -14834,36 +15936,32 @@ class RiskManager:
             _record_reason(RM_ENGINE_NOT_READY)
             return decision_ctx
 
-        # 5.a) TT/TM: utilisation directe des caps TT/TM par profil (priorité TT > TM)
-        for strat in ("TT", "TM"):
-            if strat not in strategies:
-                continue
-            cap_branch = caps.get(strat, 0)
-            if cap_branch <= 0:
-                continue
-            if desired < min_trade_usdc:
-                continue
-            try:
-                bundle = self._build_bundle(opp, strategy=strat, decision_ctx=decision_ctx)
-                if bundle:
-                    res_engine = self._multicast_shadow(bundle, decision_ctx=decision_ctx)
-                    decision_ctx["attempted"] = True
-                    decision_ctx["submitted"] = decision_ctx.get("submitted") or bool(res_engine)
-                    sent_any = True
-            except Exception:
-                if getattr(self, "log", None):
-                    self.log.exception(f"RM.on_scanner_opportunity: erreur sur {strat}")
+        # 5.a) TT/TM: utilisation directe des caps TT/TM par profil
+        if opp_strategy in ("TT", "TM") and opp_strategy in strategies:
+            cap_branch = caps.get(opp_strategy, 0)
+            if cap_branch > 0 and desired >= min_trade_usdc:
+                try:
+                    bundle = self._build_bundle(opp, strategy=opp_strategy, decision_ctx=decision_ctx)
+                    if bundle:
+                        res_engine = self._multicast_shadow(bundle, decision_ctx=decision_ctx)
+                        decision_ctx["attempted"] = True
+                        decision_ctx["submitted"] = decision_ctx.get("submitted") or bool(res_engine)
+                        sent_any = True
+                except Exception:
+                    if getattr(self, "log", None):
+                        self.log.exception(f"RM.on_scanner_opportunity: erreur sur {opp_strategy}")
 
-        # 5.b) MM dual : seulement si la paire est éligible et qu’aucun TT/TM n’a tiré
-        if "MM" in strategies and caps.get("MM", 0) > 0 and not sent_any:
+        # 5.b) MM dual : support MM_MONO / MM_CROSS (utilise caps "MM")
+        if is_mm and "MM" in caps and caps["MM"] > 0 and not sent_any and strategies:
             mm_dual_attempted = True
-
             try:
                 slot_notional = self._mm_slot_notional_for_profile(profile_name, min_trade_usdc=min_trade_usdc)
-                opp = dict(opp)
-                opp.setdefault("notional_usdc", slot_notional)
-                opp.setdefault("notional_quote", {"ccy": "USDC", "amount": slot_notional})
-                bundle = self._build_bundle(opp, strategy="MM", decision_ctx=decision_ctx)
+                opp_copy = dict(opp)
+                opp_copy.setdefault("notional_usdc", slot_notional)
+                opp_copy.setdefault("notional_quote", {"ccy": pair_quote, "amount": slot_notional})
+                
+                # On préserve le label spécifique (MM_MONO/MM_CROSS) pour le routage alias
+                bundle = self._build_bundle(opp_copy, strategy=opp_strategy, decision_ctx=decision_ctx)
                 if bundle:
                     res_engine = self._multicast_shadow(bundle, decision_ctx=decision_ctx)
                     decision_ctx["attempted"] = True
@@ -14872,7 +15970,7 @@ class RiskManager:
                     sent_any = True
             except Exception:
                 if getattr(self, "log", None):
-                    self.log.exception("RM.on_scanner_opportunity: erreur sur MM")
+                    self.log.exception(f"RM.on_scanner_opportunity: erreur sur {opp_strategy}")
 
         # 5.c) Fallback MM inventaire (single-maker) :
         # - on NE le déclenche que si MM dual a été tenté mais n'a pas fourni de bundle
@@ -14894,6 +15992,12 @@ class RiskManager:
                 self._multicast_shadow(reb_bundle)
                 decision_ctx["attempted"] = True
                 decision_ctx["submitted"] = decision_ctx.get("submitted") or True
+        
+        # Instrumentation latence RM (P1)
+        if tracing_enabled and getattr(self.bot_cfg.obs, "enable_segment_metrics_rm", True):
+            rm_ms = (time.perf_counter_ns() - start_rm_ns) / 1e6
+            record_pipeline_latency("rm_proc", rm_ms, exchange=opp.get("buy_exchange", "none"))
+
         return decision_ctx
 
 
@@ -15240,20 +16344,54 @@ class RiskManager:
                 except Exception:
                     pass
 
-            if strategy_u == "MM":
+            is_mm_branch = strategy_u in ("MM", "MM_MONO", "MM_CROSS")
+            if is_mm_branch:
+                # Injection de la variante par défaut "neutral" si absente
+                if "mm_variant" not in meta:
+                    meta.setdefault("mm_variant", "neutral")
+
                 base_asset = self._pair_base(pk)
+                # Calcul du drift d'inventaire pour injection de skews (Inventory Target / Mean-Revert)
+                try:
+                    snap = self._balances_snapshot()
+                    drift_usd = self._mm_compute_inventory_drift(buy_ex, "MM", base_asset, snap)
+                    p_skew, s_skew = self._compute_mm_inventory_skews(buy_ex, pk, drift_usd)
+                    meta["inv_price_skew"] = float(p_skew)
+                    meta["inv_size_skew"] = float(s_skew)
+                    meta["inv_drift_usd"] = float(drift_usd)
+                except Exception:
+                    pass
                 delta_state = self.mm_delta_state.get(base_asset, {}).get("state", "OK")
                 if delta_state == "HARD":
                     inc_rm_reject(reason=RM_MM_DELTA_HARD_LIMIT)
                     return None
-            if delta_state == "SOFT":
-                try:
-                    RM_MM_DELTA_SOFT_HIT.labels(asset=base_asset).inc()
-                except Exception:
-                    pass
+                if delta_state == "SOFT":
+                    try:
+                        RM_MM_DELTA_SOFT_HIT.labels(asset=base_asset).inc()
+                    except Exception:
+                        pass
+
+                # Gate 2 — Latency/ack penalty application (Ticket Gate 2)
+                latency_penalty = getattr(self, "_mm_latency_penalty_level", 0)
+                if latency_penalty == 1:  # SOFT
+                    pad_on_bad_ack = float(getattr(self, "mm_pad_on_bad_ack", 1.0))
+                    size_on_bad_ack = float(getattr(self, "mm_size_on_bad_ack", 0.7))
+                    lifetime_mult_on_bad_ack = float(getattr(self, "mm_lifetime_mult_on_bad_ack", 2.0))
+
+                    meta.setdefault("mm_latency_pad_ticks", pad_on_bad_ack)
+                    meta.setdefault("mm_latency_size_factor", size_on_bad_ack)
+                    meta.setdefault("mm_latency_lifetime_mult", lifetime_mult_on_bad_ack)
+
+                    # Réduction directe du notionnel pour le bundle
+                    if notional and "amount" in notional:
+                        try:
+                            old_amt = float(notional["amount"])
+                            notional["amount"] = old_amt * size_on_bad_ack
+                        except Exception:
+                            pass
 
             ex_for_mm = (buy_ex or sell_ex or "").upper()
-            if buy_ex and sell_ex and str(buy_ex).upper() != str(sell_ex).upper():
+            if is_mm_branch and buy_ex and sell_ex and str(buy_ex).upper() != str(sell_ex).upper() and strategy_u == "MM_MONO":
                 inc_rm_reject(reason="MM_MODE_MONO_REQUIRED")
                 return None
             mm_quote = str(
@@ -15262,7 +16400,7 @@ class RiskManager:
                 mm_notional = float((notional or {}).get("amount") or opp.get("notional_usdc") or 0.0)
             except Exception:
                 mm_notional = float(opp.get("notional_usdc") or 0.0)
-            if mm_notional <= 0.0:
+            if is_mm_branch and mm_notional <= 0.0:
                 try:
                     if RM_MM_BUDGET_EXHAUSTED_TOTAL is not None:
                         RM_MM_BUDGET_EXHAUSTED_TOTAL.labels(profile, ex_for_mm or "UNKNOWN", mm_quote).inc()
@@ -15299,7 +16437,7 @@ class RiskManager:
                 if not (self._fresh_enough(buy_book) and self._fresh_enough(sell_book)):
                     _record_decision_reason(RM_MARKETDATA_STALE)
                     try:
-                        inc_rm_reject(reason=RM_MARKETDATA_STALE, pair=pair, route=f"{buy_ex}->{sell_ex}")
+                        inc_rm_reject(reason=RM_MARKETDATA_STALE)
                     except Exception:
                         pass
                     return None
@@ -15313,7 +16451,7 @@ class RiskManager:
                 if qty <= 0.0:
                     _record_decision_reason(RM_OPP_BAD_INPUTS)
                     try:
-                        inc_rm_reject(reason=RM_OPP_BAD_INPUTS, pair=pair, route=f"{buy_ex}->{sell_ex}")
+                        inc_rm_reject(reason=RM_OPP_BAD_INPUTS)
                     except Exception:
                         pass
                     return None
@@ -15333,7 +16471,7 @@ class RiskManager:
                     {"exchange": buy_ex, "account_alias": None, "side": side_buy, "symbol": pair, "qty": qty,
                      "px_limit": pxb, "tif": "IOC", "meta": {"hedge": True}},
                 ]
-            elif strategy == "MM":
+            elif strategy in ("MM", "MM_MONO", "MM_CROSS"):
                 # Deux makers (pose/annul), Engine gère cancel budget & hystérésis
                 legs = [
                     {"exchange": buy_ex, "account_alias": None, "side": "BUY", "symbol": pair, "qty": qty,
@@ -15467,8 +16605,8 @@ class RiskManager:
                         try:
                             loop = asyncio.get_event_loop()
                             if loop.is_running():
-                                fut = asyncio.run_coroutine_threadsafe(simulator.wait_plan(sim_key, sim_wait_ms), loop)
-                                sim_plan = fut.result(timeout=max(0.001, sim_wait_ms / 1000.0))
+                                # P1-1: No blocking wait if loop is running, rely on peek_plan already done
+                                sim_plan = simulator.peek_plan(sim_key)
                             else:
                                 sim_plan = loop.run_until_complete(simulator.wait_plan(sim_key, sim_wait_ms))
                         except Exception:
@@ -15500,26 +16638,35 @@ class RiskManager:
                     except Exception:
                         pass
                     return decision_ctx
+
+                # Fallback sur FragmentationPolicy si sim absent/bypass
+                frag_plan = FragmentationPolicy.build(
+                    total_quote=total,
+                    quote=quote_ccy,
+                    branch=strategy,
+                    mode=str(getattr(self, "trade_mode", "NORMAL")),
+                    config=self.cfg
+                )
                 if sim_mode == "BYPASS_SAFE":
-                    if self.live and not sim_bypass_live:
-                        _record_decision_reason("SIM_CACHE_MISS")
-                        return decision_ctx
                     decision_ctx["simulator_bypassed"] = True
+
         if frag_plan and (frag_plan.get("amounts") or []):
             amounts = frag_plan.get("amounts", [])
             groups = frag_plan.get("groups", []) or ["G1"]
             total_quote = float(frag_plan.get("total_quote", total) or total)
             first = amounts[0] if amounts else total
-            frag_meta = {
+            
+            # Enrichissement avec les champs Legacy pour compatibilité Engine
+            frag_plan.update({
                 "group": groups[0] if groups else "G1",
                 "cohort": groups[0] if groups else "G1",
                 "idx": 0,
                 "total": len(amounts),
-                "weight": (float(first) / total_quote) if total_quote > 0 and first else None,
+                "weight": (float(first) / total_quote) if total_quote > 0 and first else 1.0,
                 "planned_notional_quote": float(first or total),
-                "plan": frag_plan,
                 "source": frag_plan.get("source", "STATIC"),
-            }
+            })
+            frag_meta = frag_plan
 
 
         # Contrôles TM (queuepos/TTL/hedge) en meta additifs (facultatifs)
@@ -15578,7 +16725,7 @@ class RiskManager:
             pair=pair,
             route=route,
             side=strategy,  # "TT" | "TM" | "MM" (selon ta logique appelante)
-            notional_quote=notional,
+            notional_quote=float(notional.get("amount") or 0.0),
         )
         # Optionnel: exposer _pre_cost dans le contexte/trace si tu le journalises
 
@@ -15646,11 +16793,17 @@ class RiskManager:
         # 2) Sinon, on dérive des grilles BotConfig
         if inflight_cap is None and rm_cfg:
             try:
-                # TRADING pur : TT / TM / MM
-                if strategy_u in ("TT", "TM", "MM"):
+                # TRADING pur : TT / TM / MM variants
+                if strategy_u in ("TT", "TM", "MM", "MM_MONO", "MM_CROSS"):
                     caps_by_profile = getattr(rm_cfg, "caps_trading_by_profile", {}) or {}
                     prof_caps = caps_by_profile.get(profile_name) or caps_by_profile.get("LARGE", {})
-                    inflight_cap = int(prof_caps.get(strategy_u, 0) or 0)
+                    
+                    # Fallback mapping pour les variants MM vers le cap MM générique
+                    cap_key = strategy_u
+                    if strategy_u in ("MM_MONO", "MM_CROSS") and strategy_u not in prof_caps:
+                        cap_key = "MM"
+                        
+                    inflight_cap = int(prof_caps.get(cap_key, 0) or 0)
 
                 # REB : budget séparé, exclusif par design
                 elif strategy_u == "REB":
@@ -15689,7 +16842,7 @@ class RiskManager:
             if not meta_leg.get("kind"):
                 if meta_leg.get("maker") and strategy_u == "TM":
                     meta_leg["kind"] = "MAKER_TM"
-                elif meta_leg.get("maker") and strategy_u == "MM":
+                elif meta_leg.get("maker") and strategy_u in ("MM", "MM_MONO", "MM_CROSS"):
                     meta_leg["kind"] = "MAKER_MM"
                 else:
                     meta_leg["kind"] = leg_kind_default
@@ -15749,6 +16902,25 @@ class RiskManager:
             except Exception:
                 reb_flag = False
             meta_root.setdefault("rebalancing_active", reb_flag)
+            
+            # Injection des paramètres d escalade SINGLE mode (Ticket 2)
+            if strategy_u in ("MM", "MM_MONO", "MM_CROSS"):
+                mm_mode = meta.get("mm_mode") or "DUAL"
+                if mm_mode == "SINGLE":
+                    # On cherche l état d inventaire pour cet exchange/alias/asset
+                    inv_key = (str(ex_for_state).upper(), strategy_u, base_for_meta)
+                    state = self.mm_inventory_mode_state.get(inv_key)
+                    if state and state.get("mode") == "SINGLE":
+                        phase = state.get("phase", 1)
+                        meta_root["mm_single_phase"] = phase
+                        if phase == 2:
+                            meta_root["mm_single_pad_ticks"] = getattr(self, "mm_single_aggressive_pad_ticks", 0.0)
+                            meta_root["mm_single_size_factor"] = getattr(self, "mm_single_aggressive_size_factor", 1.2)
+                        
+                        # Budget cancel & lifetime pour SINGLE
+                        meta_root["mm_single_min_quote_lifetime_ms"] = getattr(self, "mm_single_min_quote_lifetime_ms", 1000)
+                        meta_root["mm_single_cancel_budget"] = getattr(self, "mm_single_cancel_budget", 30)
+
             bundle["meta"] = meta_root
 
         # Injection explicite de la décision TM dans le payload pour l'Engine
@@ -15786,6 +16958,13 @@ class RiskManager:
                 meta_root.setdefault("kind", "REB_OP")
             if fx_rate_used is not None:
                 meta_root.setdefault("fx_rate_used", fx_rate_used)
+
+            # Overlays et versioning TT (Ticket D1 & D2)
+            if strategy_u == "TT":
+                meta_root.setdefault("tt_policy_version", getattr(self, "tt_policy_version", "v1"))
+                overlays = self._compute_tt_revalidation_overlays(buy_ex, sell_ex, pk)
+                meta_root.setdefault("overlays", {}).update(overlays)
+
             bundle["meta"] = meta_root
             if strategy_u == "TT" and isinstance(bundle, dict):
                 missing = fraglib.tt_contract_missing_fields(bundle)
@@ -15955,9 +17134,14 @@ class RiskManager:
                 is_ready = True
         if not is_ready:
             # Skip soft: on ne casse pas le lock mais on n’envoie pas tant que l’Engine n’est pas ready
-            if getattr(self, "log", None): self.log.warning("RM.REJECT_READY: engine not ready")
-            if hasattr(self, "obs_inc"): self.obs_inc("rm_reject_total", reason=RM_ENGINE_NOT_READY)
+            if getattr(self, "log", None):
+                self.log.warning("RM.SKIP_READY: engine not ready")
+            try:
+                inc_rm_skip(RM_ENGINE_NOT_READY)
+            except Exception:
+                pass
             return
+
 
         # --- 2) Envoi sérialisé sous verrou -------------------------------------
         async with self._pairlocks[combo_key]:
@@ -15971,6 +17155,10 @@ class RiskManager:
                 attempt += 1
                 try:
                     r = None
+                    # Instrumentation latence RM exit (P1)
+                    if should_trace_latency(self.bot_cfg):
+                        order_bundle["rm_exit_ns"] = time.perf_counter_ns()
+
                     # Appel Engine *bloquant* (on respecte les verrous ici)
                     if engine and hasattr(engine, "submit"):
                         r = engine.submit(order_bundle)
@@ -16522,9 +17710,7 @@ class RiskManager:
         last_age_s = float((met or {}).get("last_age_s", float("inf")))
 
         if not met or not (last_age_s < float("inf")):
-            inc_rm_reject(reason=RM_STALE_VOL,
-                          pair=pair,
-                          route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
+            inc_rm_reject(reason=RM_STALE_VOL)
             raise RMError(RM_STALE_VOL)
 
         # --- TTL strict volatilité : si last_age_s > vol_ttl_s => reject prebundle ---
@@ -16569,7 +17755,7 @@ class RiskManager:
                 "[RiskManager] reject prebundle (RM_STALE_VOL): vol_age_s=%.3f > vol_ttl_s=%.3f pair=%s route=%s",
                 float(last_age_s), float(vol_ttl_s), pair, route_str
             )
-            inc_rm_reject(reason=RM_STALE_VOL, pair=pair, route=route_str)
+            inc_rm_reject(reason=RM_STALE_VOL)
             raise RMError(RM_STALE_VOL)
 
 
@@ -16581,29 +17767,23 @@ class RiskManager:
         sfc = getattr(self, "slip_collector", None) or getattr(self, "sfc", None)
 
         if not sfc or not hasattr(sfc, "get_total_cost_pct"):
-            inc_rm_reject(reason=RM_SFC_UNAVAILABLE,
-                          pair=pair,
-                          route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
+            inc_rm_reject(reason=RM_SFC_UNAVAILABLE)
             raise RMError(RM_SFC_UNAVAILABLE)
 
         route_sfc = self._norm_route_for_sfc(route, pair_key=pair)
-        slip_kind = getattr_str(self.cfg, "sfc_slippage_source", getattr(self, "slippage_source", "ewma"))
+        slip_kind = str(getattr(self.cfg, "sfc_slippage_source", getattr(self, "slippage_source", "ewma")))
 
         cost_frac = float(sfc.get_total_cost_pct(
-            route=route_sfc,
+            route_sfc,
             side=side,
             size_quote=float(notional_quote or 0.0),
             slippage_kind=("p95" if str(slip_kind).lower() == "p95" else "ewma"),
             prudence_key=prudence,
-            ts_ns=None,
-            explain={"stage": "prebundle"},
         ))
         # cost_frac doit être numérique et >= 0
 
         if not (cost_frac >= 0.0):
-            inc_rm_reject(reason=RM_COST_COMPUTE_ERROR,
-                          pair=pair,
-                          route=f"{route.get('buy_ex', '?')}->{route.get('sell_ex', '?')}")
+            inc_rm_reject(reason=RM_COST_COMPUTE_ERROR)
             raise RMError(RM_COST_COMPUTE_ERROR)
 
     # ------------------------------------------------------------------
@@ -16627,6 +17807,7 @@ class RiskManager:
         return {
             "module": "RiskManager",
             "healthy": self._running,
+            "rm_pipeline_ready": bool(getattr(self, "pipeline_ready_event", asyncio.Event()).is_set()),
             "rm_trading_ready": bool(getattr(self, "trading_ready_event", asyncio.Event()).is_set()),
             "rm_loops_ready": bool(getattr(self, "ready_event", asyncio.Event()).is_set()),
             "trading_state": str(getattr(self, "trading_state", "READY")),
@@ -16831,6 +18012,10 @@ class _RM_MBFGlue:
     # --- lectures ---
     def snapshot(self, mode: str | None = None, *, cached_only: bool = False):
         m = (mode or self.mode).lower()
+        # MBF moderne avec vue optimisée fast-path
+        if cached_only and hasattr(self.mbf, "get_full_balances_view"):
+            return self.mbf.get_full_balances_view(mode=m)
+
         # MBF moderne avec overlay intégré
         if hasattr(self.mbf, "as_rm_snapshot"):
             # mappe les modes

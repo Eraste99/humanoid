@@ -49,8 +49,9 @@ if TYPE_CHECKING:  # pragma: no cover
     from modules.bot_config import BotConfig
 
 logger = logging.getLogger(__name__)
+# --- Global flags for observability ---
 _DEPLOYMENT_MODE_WARNED = False
-
+_METRICS_FALLBACK_LOGGED = False
 
 def _deployment_mode(cfg: Optional["BotConfig"]) -> str:
     """Canonical deployment_mode resolver (never empty)."""
@@ -87,6 +88,7 @@ try:
         PACER_CLAMP_SECONDS,
     )
 except Exception:  # pragma: no cover
+    _METRICS_FALLBACK_LOGGED = True
     try:
         from modules import obs_metrics as _obs
 

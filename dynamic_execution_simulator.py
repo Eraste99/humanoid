@@ -39,7 +39,6 @@ import time
 import math
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable, Set
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.errors import (
     RMError, NotReadyError, DataStaleError, InconsistentStateError, ExternalServiceError,SimulationError
 )
@@ -88,6 +87,87 @@ _DEFAULT_ROUTES = {
 _EPS_QTY = 1e-12
 _EPS_PRICE = 1e-12
 
+
+import contracts.payloads as fraglib
+
+class FragmentationPolicy:
+    @staticmethod
+    def build(
+        total_quote: float,
+        quote: str,
+        branch: str,
+        mode: str,
+        depth_ratio: float = 1.0,
+        slip_bps: float = 0.0,
+        cap_factor: float = 1.0,
+        config: Any = None
+    ) -> Dict[str, Any]:
+        """
+        Policy unifiée pour la fragmentation (TT + TM).
+        FragmentationPolicy.build(total_quote, quote, branch, mode, depth_ratio, slip_bps, cap_factor) -> frag
+        """
+        # 1. min_fragment_quote resolution
+        min_fragment_quote = 200.0 # Default fallback
+        if config:
+            # On cherche dans g.min_fragment_quote ou engine.min_fragment_quote
+            g = getattr(config, "g", None)
+            mf_map = getattr(g, "min_fragment_quote", {}) if g else {}
+            if not mf_map:
+                mf_map = getattr(config, "min_fragment_quote", {})
+            
+            # Si config est une instance d'Engine ou RiskManager, ils ont souvent min_fragment_quote_by_quote
+            if not mf_map:
+                mf_map = getattr(config, "min_fragment_quote_by_quote", {})
+            
+            min_fragment_quote = mf_map.get(quote, mf_map.get("USDC", mf_map.get("DEFAULT", 200.0)))
+
+        # 2. max_fragments resolution
+        max_fragments = 3
+        if config:
+            if branch == "TT":
+                max_fragments = getattr(config, "max_tt_fragments_per_bundle", 3)
+                if hasattr(config, "engine"):
+                    max_fragments = getattr(config.engine, "max_tt_fragments_per_bundle", max_fragments)
+            else: # TM
+                max_fragments = getattr(config, "tm_max_open_makers", 3)
+                if hasattr(config, "engine"):
+                    max_fragments = getattr(config.engine, "tm_max_open_makers", max_fragments)
+
+        # Apply cap_factor (ex: if budget constrained)
+        max_fragments = max(1, int(max_fragments * cap_factor))
+        
+        # Depth adjustment: si le book est peu profond, on fragmente plus pour réduire le slippage d'impact
+        if depth_ratio < 0.5:
+            max_fragments = max(max_fragments, min(max_fragments + 2, 8))
+
+        # 3. Weights & Groups
+        weights = [0.5, 0.35, 0.15]
+        group_size = 3
+        if config:
+            engine_cfg = getattr(config, "engine", config)
+            weights = getattr(engine_cfg, "frontload_weights", weights)
+            group_size = getattr(engine_cfg, "frontload_group_size", group_size)
+
+        # 4. Build fragment plan
+        plan = fraglib.build_fragment_plan(
+            total_quote=total_quote,
+            desired_count=None,
+            weights=weights,
+            min_fragment_quote=min_fragment_quote,
+            max_fragments=max_fragments,
+            group_size=group_size,
+            source="POLICY_V1",
+            branch=branch
+        )
+        
+        # 5. Stop Rules
+        plan["stop_rules"] = {
+            "time_budget_ms": 5000,
+            "min_edge_net_bps": -50 if branch == "TM" else 10,
+            "abort_on_health": True
+        }
+        
+        return plan
 
 class DynamicExecutionSimulator:
     def __init__(self, config, depth_limit: int = 10):
@@ -484,33 +564,66 @@ class DynamicExecutionSimulator:
         # Cap utilisable côté ladder (quote)
         ladder_quote = min(self._cum_usdc(asks_n), self._cum_usdc(bids_n))
 
-        # 2) Paramètres avec fallbacks cfg (cfg fourni par le caller: RM/Engine)
-        cfg = self.config
+        # 2) Paramètres avec fallbacks cfg
+        # Canonique: cfg.sim.* (knobs SIM_*) ; fallback: cfg.rm.* (knobs RM_*) ; dernier recours: legacy root.
+        cfg_root = self.config
+        sim_cfg = getattr(cfg_root, "sim", None)
+        rm_cfg = getattr(cfg_root, "rm", None)
+
+        def _pick_attr(name: str):
+            if sim_cfg is not None and hasattr(sim_cfg, name):
+                return getattr(sim_cfg, name)
+            if rm_cfg is not None and hasattr(rm_cfg, name):
+                return getattr(rm_cfg, name)
+            return getattr(cfg_root, name, None)
+
         if not self._suggest_slices_logged:
             self._suggest_slices_logged = True
             logger.debug(
-                "[DynamicExecutionSimulator] suggest_slices uses caller cfg for fragmentation knobs",
-                extra={"cfg_type": type(cfg).__name__},
+                "[DynamicExecutionSimulator] suggest_slices: cfg_root=%s sim=%s rm=%s strict=%s",
+                type(cfg_root).__name__,
+                type(sim_cfg).__name__ if sim_cfg is not None else None,
+                type(rm_cfg).__name__ if rm_cfg is not None else None,
+                self._strict_config(),
             )
+
+        # Strict: ne requiert une clé que si le param n’est PAS fourni explicitement par l’appelant.
         if self._strict_config():
-            missing_attrs = [
-                name
-                for name in ("target_ladder_participation", "max_fragments", "min_fragment_usdc", "fragment_safety_pad")
-                if not hasattr(cfg, name)
-            ]
-            if missing_attrs:
-                raise RuntimeError(f"suggest_slices missing cfg attributes: {missing_attrs}")
-        tp = float(target_participation if target_participation is not None
-                   else getattr(cfg, "target_ladder_participation", 0.25))
+            required = []
+            if target_participation is None:
+                required.append("target_ladder_participation")
+            if max_frags is None:
+                required.append("max_fragments")
+            if min_frag_usdc is None:
+                required.append("min_fragment_usdc")
+            if safety_pad is None:
+                required.append("fragment_safety_pad")
+
+            missing = [k for k in required if _pick_attr(k) is None]
+            if missing:
+                raise RuntimeError(
+                    f"suggest_slices missing cfg attributes (strict): {missing}. "
+                    f"(cfg_root={type(cfg_root).__name__}, sim={type(sim_cfg).__name__ if sim_cfg is not None else None}, rm={type(rm_cfg).__name__ if rm_cfg is not None else None})"
+                )
+
+        tp = float(
+            target_participation
+            if target_participation is not None
+            else (_pick_attr("target_ladder_participation") or 0.25)
+        )
         tp = max(0.0, min(tp, 1.0))
 
-        mf = int(max_frags if max_frags is not None else getattr_int(cfg, "max_fragments", 5))
+        # max_fragments: SIM_* prioritaire, sinon RM_*, sinon fallback
+        mf = int(max_frags if max_frags is not None else getattr(sim_cfg or rm_cfg or cfg_root, "max_fragments", 5))
         mf = max(1, mf)
 
-        mn = float(min_frag_usdc if min_frag_usdc is not None else getattr_float(cfg, "min_fragment_usdc", 200.0))
+        # min_fragment_usdc: SIM_* prioritaire (canonique SIM_MIN_FRAGMENT_USDC)
+        mn = float(min_frag_usdc if min_frag_usdc is not None else getattr(sim_cfg or cfg_root, "min_fragment_usdc", 200.0))
         mn = max(1.0, mn)
 
-        pad = float(safety_pad if safety_pad is not None else getattr_float(cfg, "fragment_safety_pad", 0.9))
+        # fragment_safety_pad: RM_* possible ; IMPORTANT: défaut 0.10 (10%) — 0.9 (90%) était un bug
+        pad_src = safety_pad if safety_pad is not None else _pick_attr("fragment_safety_pad")
+        pad = float(pad_src if pad_src is not None else 0.10)
         pad = max(0.5, min(pad, 1.0))
 
         # 3) Budget effectif (capé par ladder * participation * pad)
@@ -872,6 +985,18 @@ class DynamicExecutionSimulator:
                 self.last_latency_ms = (time.perf_counter() - _t0) * 1000.0
             except Exception:
                 self.last_latency_ms = 0.0
+            
+            # P0: Log de performance HFT pour le simulateur (en microsecondes)
+            eval_us = self.last_latency_ms * 1000.0
+            logger.info("[Sim] Execution (strategy=%s) | Latency: %.2fus | %s", 
+                        strategy, eval_us, symbol)
+
+            try:
+                from modules.obs_metrics import record_execution_latency
+                record_execution_latency(buy_ex or "SIM", strategy, symbol, self.last_latency_ms)
+            except Exception:
+                pass
+
             try:
                 SIM_DECISION_MS.observe(self.last_latency_ms)
             except Exception:
@@ -2044,6 +2169,10 @@ class DynamicExecutionSimulator:
     def _compute_fragmentation_plan(self, job: Dict[str, Any]) -> Dict[str, Any]:
         asks = (job.get("book_snapshot") or {}).get("asks") or []
         bids = (job.get("book_snapshot") or {}).get("bids") or []
+        branch = job.get("branch", "TT")
+        quote = job.get("quote", "USDC")
+        bucket = float(job.get("bucket") or 0.0)
+
         depth_levels = int(
             self._sim_knob(
                 "sim_prime_depth_levels",
@@ -2055,13 +2184,42 @@ class DynamicExecutionSimulator:
         asks = asks[:depth_levels]
         bids = bids[:depth_levels]
 
+        # 1. Simulation de carnet pour suggérer des slices optimales
         plan = self.suggest_slices(
-            budget_usdc=float(job.get("bucket") or 0.0),
+            budget_usdc=bucket,
             asks=asks,
             bids=bids,
         )
-        plan["bucket"] = float(job.get("bucket") or 0.0)
-        return plan
+
+        # 2. Enrichissement / Standardisation via FragmentationPolicy (Spec Unique)
+        policy_plan = FragmentationPolicy.build(
+            total_quote=bucket,
+            quote=quote,
+            branch=branch,
+            mode=str(getattr(self.config, "mode", "NORMAL")),
+            config=self.config
+        )
+
+        res = dict(policy_plan)
+        res.update({
+            "source": "SIMULATOR",
+            "amounts": [round(a, 6) for a in plan.get("amounts", [])],
+        })
+
+        # Recalcul des groupes pour matcher le simulateur
+        count = len(res["amounts"])
+        if count > 0:
+            groups = res.get("groups", [])
+            if not groups:
+                res["groups"] = ["G1"] * count
+            elif len(groups) < count:
+                last_g = groups[-1]
+                res["groups"] = (groups + [last_g] * (count - len(groups)))[:count]
+            elif len(groups) > count:
+                res["groups"] = groups[:count]
+
+        res["bucket"] = bucket
+        return res
 
     async def _mm_hints_worker(self) -> None:
 

@@ -26,50 +26,31 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger("pairs_discovery")
 
+
+import aiohttp
+
+# Dépendances attendues en prod: aiohttp + asyncio-throttle.
+# On garde un fallback ultra-simple pour les environnements de test.
 try:
     from asyncio_throttle import Throttler  # pip install asyncio-throttle
-except Exception:
-    from modules.utils.rate_limiter import AsyncRateLimiter as _RL
-    import aiohttp
-except Exception:  # pragma: no cover - fallback pour environnements de test sans aiohttp
-    class _DummySession:
-        def __init__(self, *_, **__):
-            pass
+except Exception:  # pragma: no cover
+    class Throttler:  # type: ignore
+        """Fallback minimal: limite via semaphore (pas de lissage temporel fin)."""
+
+        def __init__(self, rate_limit: int = 8, period: float = 1.0):
+            self._sem = asyncio.Semaphore(max(1, int(rate_limit)))
 
         async def __aenter__(self):
-            return None
-
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-    try:
-        from modules.rm_compat import getattr_bool, getattr_dict, getattr_float, getattr_int, getattr_list, getattr_str
-    except Exception:  # pragma: no cover - compat chemin local
-        from rm_compat import getattr_bool, getattr_dict, getattr_float, getattr_int, getattr_list, getattr_str
-    from contracts.payloads import DiscoveryResult
-    from bot_config import DiscoveryCfg
-
-
-    class _DummyAiohttp:  # type: ignore
-        ClientSession = _DummySession
-        ClientTimeout = lambda *_, **__: None
-
-
-    aiohttp = _DummyAiohttp()
-
-    try:
-        from asyncio_throttle import Throttler
-    except Exception:  # pragma: no cover - fallback coopérant
-        class Throttler:  # type: ignore
-            def __init__(self, *_, **__):
-                pass
-        async def __aenter__(self):
+            await self._sem.acquire()
             return None
 
         async def __aexit__(self, exc_type, exc, tb):
+            self._sem.release()
             return False
+
+
+from contracts.payloads import DiscoveryResult
+from modules.bot_config import DiscoveryCfg
 
 try:
     from modules.obs_metrics import (
@@ -128,19 +109,23 @@ def _pk(base: str, quote: str) -> str:
 
 
 def _binance_ok_quote(quote: str) -> bool:
-    return quote and quote.upper() in ("USDC", "EUR")
+    return quote and quote.upper() in ("USDC", "USDT", "EUR")
 
 
 def _cb_ok_quote(quote: str) -> bool:
-    return quote and quote.upper() in ("USDC", "EUR")
+    return quote and quote.upper() in ("USDC", "USDT", "EUR")
 
 
 def _bybit_ok_quote(quote: str) -> bool:
-    return quote and quote.upper() in ("USDC", "EUR")
+    return quote and quote.upper() in ("USDC", "USDT", "EUR")
 
 
-def _norm_quote_min(quote: str, min_usdc: float, min_eur: float) -> float:
-    return float(min_usdc if (quote or "USDC").upper() == "USDC" else min_eur)
+def _norm_quote_min(quote: str, min_usdc: float, min_usdt: float, min_eur: float) -> float:
+    q = str(quote or "USDC").upper()
+    if q == "USDC": return float(min_usdc)
+    if q == "USDT": return float(min_usdt)
+    if q == "EUR":  return float(min_eur)
+    return float(min_usdc)
 
 
 def fnum(x: Any, default: float = 0.0) -> float:
@@ -156,7 +141,10 @@ def _build_backoff_policy(retry_cfg: Optional[dict]) -> Any:
 
     """Adapte les formats legacy ({retries, backoff_s}) et v2 ({base_ms, max_ms, ...})."""
     try:
-        from retry_policy import BackoffPolicy  # lazy import pour éviter dépendance forte
+        try:
+            from modules.retry_policy import BackoffPolicy
+        except ImportError:
+            from retry_policy import BackoffPolicy
     except Exception:  # pragma: no cover - fallback inert
         class _P:  # type: ignore
             def __init__(self, **kwargs):
@@ -195,8 +183,12 @@ async def _fetch_json(
 ):
     """GET JSON best-effort via retry_policy.awith_retry (gestions 429 cohérentes)."""
     try:
-        from retry_policy import awith_retry, ErrKind
+        try:
+            from modules.retry_policy import awith_retry
+        except ImportError:
+            from retry_policy import awith_retry
     except Exception as e:  # pragma: no cover - infra manquante
+        logger.error(f"[discovery] retry_policy missing or import failed: {e!r}")
         raise RuntimeError("retry_policy missing") from e
 
     def _note_error(reason: str) -> None:
@@ -230,10 +222,12 @@ async def _fetch_json(
             except RateLimitBackoff:
                 raise
             except asyncio.TimeoutError:
+                logger.error(f"[discovery] Timeout calling {exchange} {url}")
                 _note_error("api_error")
                 raise
-            except Exception:
+            except Exception as e:
                 if not noted_error:
+                    logger.error(f"[discovery] Error calling {exchange} {url}: {e!r}")
                     _note_error("api_error")
                 raise
 
@@ -247,9 +241,10 @@ async def _fetch_json(
         raise outcome.last_exception
 
     # Harmonise l'erreur finale
-    raise RuntimeError(
-        f"GET {url} failed after {outcome.attempts} attempts ({outcome.kind or 'UNKNOWN'})"
-    )
+    msg = f"GET {url} failed after {outcome.attempts} attempts ({outcome.kind or 'UNKNOWN'})"
+    if outcome.last_exception:
+        msg += f": {outcome.last_exception!r}"
+    raise RuntimeError(msg)
 
 # pairs_discovery.py — helpers importables par boot
 
@@ -315,10 +310,22 @@ async def _load_binance(
             limiter=limiter,
             on_error=on_api_error,
         ),
+        return_exceptions=True
     )
-    symbols = [s for s in exinfo.get("symbols", []) if (s or {}).get("status") == "TRADING"]
+
+    if isinstance(exinfo, Exception):
+        msg = f"Binance exchangeInfo API failed: {exinfo!r}"
+        logger.error(f"[discovery] {msg}")
+        if on_api_error: on_api_error("BINANCE", msg)
+        return {}, {}
+
     meta: Dict[str, dict] = {}
+    symbols = (exinfo or {}).get("symbols", [])
+    logger.info(f"[discovery] BINANCE: Received {len(symbols)} raw instruments")
+    
     for s in symbols:
+        if (s or {}).get("status") != "TRADING":
+            continue
         base = (s or {}).get("baseAsset"); quote = (s or {}).get("quoteAsset")
         sym  = (s or {}).get("symbol")
         if not (base and quote and sym):
@@ -326,11 +333,19 @@ async def _load_binance(
         meta[sym] = {"base": base.upper(), "quote": quote.upper(), "symbol": sym}
 
     volq: Dict[str, float] = {}
-    for t in tickers or []:
+    if isinstance(tickers, Exception):
+        logger.warning(f"[discovery] Binance 24hr tickers API unavailable: {tickers!r}")
+        tks_all = []
+    else:
+        tks_all = tickers or []
+    
+    for t in tks_all:
         sym = (t or {}).get("symbol")
         if sym in meta:
             v = fnum((t or {}).get("quoteVolume"), 0.0)
             volq[sym] = v
+            
+    logger.info(f"[discovery] BINANCE: Found {len(meta)} tradable instruments and {len(volq)} with volume")
     return meta, volq
 
 
@@ -348,6 +363,9 @@ async def _load_coinbase(
       - stats:    /products/stats -> {"ETH-USDC":{"last":"..","open":"..","volume":"..", ...}, ...}
     On calcule le volume **quote** ≈ volume_base_24h * last_price.
     """
+    # stats:    /products/stats -> {"ETH-USDC":{"last":"..","open":"..","volume":"..", ...}, ...}
+    # /!\ Coinbase Exchange n'a pas d'endpoint global /stats.
+    # On tente CB_STATS mais si ça échoue, on continue avec meta seule (volume = 0).
     products, stats = await asyncio.gather(
         _fetch_json(
             session,
@@ -367,11 +385,24 @@ async def _load_coinbase(
             limiter=limiter,
             on_error=on_api_error,
         ),
+        return_exceptions=True
     )
+
+    if isinstance(products, Exception):
+        msg = f"Coinbase products API failed: {products!r}"
+        logger.error(f"[discovery] {msg}")
+        if on_api_error: on_api_error("COINBASE", msg)
+        return {}, {}
+
+    if not isinstance(products, list):
+        msg = f"Coinbase products API returned unexpected type: {type(products)} (likely error message)"
+        logger.error(f"[discovery] {msg}. Response snippet: {str(products)[:200]}")
+        if on_api_error: on_api_error("COINBASE", msg)
+        return {}, {}
 
     # Filtre produits "online"
     meta: Dict[str, dict] = {}
-    for p in products or []:
+    for p in products:
         try:
             status = (p.get("status") or "").lower()
             base = p.get("base_currency")
@@ -386,7 +417,12 @@ async def _load_coinbase(
             continue
 
     volq: Dict[str, float] = {}
-    st_all = stats or {}
+    if isinstance(stats, Exception):
+        logger.warning(f"[discovery] Coinbase stats API unavailable (falling back to 0 volume): {stats!r}")
+        st_all = {}
+    else:
+        st_all = stats or {}
+
     # st_all est un dict keyed par "product_id"
     for pid, st in (st_all or {}).items():
         if pid not in meta:
@@ -431,27 +467,62 @@ async def _load_bybit(
             limiter=limiter,
             on_error=on_api_error,
         ),
+        return_exceptions=True
     )
 
+    if isinstance(ins, Exception):
+        msg = f"Bybit instruments API failed: {ins!r}"
+        logger.error(f"[discovery] {msg}")
+        if on_api_error: on_api_error("BYBIT", msg)
+        return {}, {}
+
+    if not isinstance(ins, dict):
+        msg = f"Bybit instruments API returned unexpected type: {type(ins)}"
+        logger.error(f"[discovery] {msg}. Response snippet: {str(ins)[:200]}")
+        if on_api_error: on_api_error("BYBIT", msg)
+        return {}, {}
+
+    if ins.get("retCode") != 0:
+        msg = f"Bybit instruments API returned retCode={ins.get('retCode')}: {ins.get('retMsg')}"
+        logger.error(f"[discovery] {msg}")
+        if on_api_error: on_api_error("BYBIT", msg)
+        return {}, {}
+
     meta: Dict[str, dict] = {}
-    for it in ((ins or {}).get("result", {}) or {}).get("list", []) or []:
+    ins_list = (ins.get("result") or {}).get("list") if isinstance(ins.get("result"), dict) else []
+    logger.info(f"[discovery] BYBIT: Received {len(ins_list or [])} raw instruments")
+    if not isinstance(ins_list, list):
+        logger.warning(f"[discovery] Bybit instruments list missing or invalid type: {type(ins_list)}")
+        ins_list = []
+
+    for it in ins_list:
         try:
-            if (it.get("category") or "").lower() != "spot":
-                continue
-            symbol = it.get("symbol")  # ex: "ETHUSDC"
+            # P0: Assouplissement maximal pour Bybit V5
+            # On accepte tout instrument qui a un base/quote/symbol
+            symbol = it.get("symbol")
             base = it.get("baseCoin")
             quote = it.get("quoteCoin")
-            status = (it.get("status") or "").lower()  # "Trading" vs ...
-            if status not in ("trading", "online", "tradable"):
-                continue
+            
             if not (base and quote and symbol):
                 continue
+                
+            # Filtrage optionnel par catégorie seulement si présent
+            cat = (it.get("category") or "spot").lower()
+            if cat != "spot":
+                continue
+                
             meta[symbol] = {"base": base.upper(), "quote": quote.upper(), "symbol": symbol}
         except Exception:
             continue
 
     volq: Dict[str, float] = {}
-    for tk in ((tks or {}).get("result", {}) or {}).get("list", []) or []:
+    if isinstance(tks, Exception):
+        logger.warning(f"[discovery] Bybit tickers API unavailable: {tks!r}")
+        tks_all = []
+    else:
+        tks_all = ((tks or {}).get("result", {}) or {}).get("list", []) or []
+
+    for tk in tks_all:
         sym = (tk or {}).get("symbol")
         if sym not in meta:
             continue
@@ -463,6 +534,8 @@ async def _load_bybit(
         last = fnum((tk or {}).get("lastPrice"), 0.0)
         vol_base = fnum((tk or {}).get("volume24h"), 0.0)
         volq[sym] = (last * vol_base) if last > 0 else 0.0
+    
+    logger.info(f"[discovery] BYBIT: Found {len(meta)} spot instruments and {len(volq)} with volume")
     return meta, volq
 
 
@@ -486,7 +559,7 @@ async def discover_pairs_3cex(
     """
     Découverte des paires pilotée par cfg.discovery.* + scoring combos.
     - http_timeout_s, max_inflight_requests, retry_policy (base_ms,max_ms,max_attempts,jitter)
-    - quotes_allowed (doit contenir USDC/EUR), whitelist/blacklist, min_24h_volume_usd (base)
+    - quotes_allowed (USDC/USDT/EUR), whitelist/blacklist, min_24h_volume_usd (base)
     - Retourne:
         pair_mapping: {
           "BTCUSDC": {
@@ -541,50 +614,75 @@ async def discover_pairs_3cex(
         _mark_api_error(exchange)
         if reason:
             _add_filtered(reason, 1)
+
     # --------------------------
     # Helpers locaux autonomes
     # --------------------------
 
     def _quote_from_pk(pk: str) -> str:
-        if pk.endswith("USDC"): return "USDC"
-        if pk.endswith("EUR"):  return "EUR"
+        if pk.endswith("USDC"):
+            return "USDC"
+        if pk.endswith("USDT"):
+            return "USDT"
+        if pk.endswith("EUR"):
+            return "EUR"
         return "USDC"
 
     # --------------------------
     # 1) Paramètres de config
     # --------------------------
-    d = cfg.discovery
-    http_timeout_s = getattr_int(d, "http_timeout_s", 10)
-    max_inflight   = getattr_int(d, "max_inflight_requests", 8)
-    rp_cfg = getattr(d, "retry_policy", {"base_ms": 500, "max_ms": 20_000, "max_attempts": 5, "jitter": 1})
-    backoff_policy = _build_backoff_policy(rp_cfg)
-    quotes_allowed = set(q.upper() for q in getattr(d, "quotes_allowed", ["USDC","EUR"]))
-    # Seuils: si non fournis, dériver de min_24h_volume_usd (EUR = 0.3x par défaut comme ta version)
+    d = getattr(cfg, "discovery", None) or DiscoveryCfg()
 
-    # Seuils: si non fournis en args, on lit la conf; sinon on dérive d’un base_min
-    base_min = getattr_float(d, "min_24h_volume_usd", 100_000.0)
-    min_by_quote = getattr(d, "min_quote_volume_by_quote", None) or {}
-    conf_usdc = min_by_quote.get("USDC")
-    conf_eur = min_by_quote.get("EUR")
-    if conf_usdc is None:
-        conf_usdc = getattr(d, "min_quote_volume_usdc", None)
-    if conf_eur is None:
-        conf_eur = getattr(d, "min_quote_volume_eur", None)
-    eur_factor = getattr_float(d, "eur_quote_volume_factor", 0.30)
-    eur_floor = getattr_float(d, "min_quote_volume_floor", 1.0)
+    # Respecte cfg.discovery.enabled : permet de désactiver la discovery sans surprises.
+    if not bool(getattr(d, "enabled", True)):
+        _add_filtered("discovery_disabled", 1)
+        run_ms = (time.perf_counter() - start) * 1000.0
+        try:
+            discovery_observe_run_ms(run_ms)
+        except Exception:
+            pass
+        ranking_mode = "fx_scaled" if eur_usdc_fx else "quote_isolated"
+        result = DiscoveryResult(
+            stage_counts=stage_counts,
+            filtered_counts=filtered_counts,
+            api_errors=api_errors,
+            run_ms=run_ms,
+            top_pairs=[],
+            fx_applied=bool(eur_usdc_fx),
+            ranking_mode=ranking_mode,
+        )
+        if include_result:
+            return {}, [], result
+        return {}, []
 
-    thr_usdc = conf_usdc if conf_usdc is not None else base_min
-    thr_eur = conf_eur if conf_eur is not None else max(eur_floor, eur_factor * base_min)
+    # Exchanges activés (priorité: args > cfg.discovery.enabled_exchanges (si non vide) > cfg.g.enabled_exchanges)
+    enabled_src = "none"
+    enabled = enabled_exchanges
+    if enabled:
+        enabled_src = "args.enabled_exchanges"
+    else:
+        de = getattr(d, "enabled_exchanges", None)
+        if de:
+            enabled = de
+            enabled_src = "cfg.discovery.enabled_exchanges"
+        else:
+            g = getattr(cfg, "g", None)
+            ge = getattr(g, "enabled_exchanges", None) if g is not None else None
+            if ge:
+                enabled = ge
+                enabled_src = "cfg.g.enabled_exchanges"
 
-    # Listes allow/deny (args > cfg)
-    whitelist = set(x.upper() for x in (allowlist if allowlist is not None else getattr(d, "whitelist", [])))
-    blacklist = set(x.upper() for x in (denylist  if denylist  is not None else getattr(d, "blacklist", [])))
-
-    # Exchanges activés
-    enabled = enabled_exchanges or getattr(d, "enabled_exchanges", None) or getattr(cfg, "g", {}).get(
-        "enabled_exchanges", [])
-    enabled = [str(e).upper() for e in enabled]
+    enabled = [str(e).upper() for e in (enabled or [])]
     enabled = [e for e in enabled if e in ("BINANCE", "COINBASE", "BYBIT")]
+
+    logger.info(
+        "[discovery] Starting 3-CEX discovery. Enabled(requested)=%s | Enabled(resolved)=%s (source=%s). Top N: %s",
+        enabled_exchanges,
+        enabled,
+        enabled_src,
+        top_n,
+    )
+
     if len(enabled) < 2:
         _add_filtered("no_enabled_exchanges", 1)
         run_ms = (time.perf_counter() - start) * 1000.0
@@ -606,7 +704,64 @@ async def discover_pairs_3cex(
             return {}, [], result
         return {}, []
 
-    enable_jp = getattr_bool(getattr(cfg, "g", cfg), "enable_jp", False)
+    http_timeout_s = int(getattr(d, "http_timeout_s", 10))
+    max_inflight   = int(getattr(d, "max_inflight_requests", 8))
+    rp_cfg = getattr(d, "retry_policy", {"base_ms": 500, "max_ms": 20_000, "max_attempts": 5, "jitter": 1})
+    backoff_policy = _build_backoff_policy(rp_cfg)
+
+    # Quotes: on respecte cfg.discovery.quotes_allowed, mais on garde un fallback incluant USDT.
+    quotes_allowed = set(q.upper() for q in getattr(d, "quotes_allowed", ["USDC", "USDT", "EUR"]))
+
+    # --- Min volumes (100% piloté par cfg.discovery ; plus de os.getenv) ---
+    is_actually_dry = bool(getattr(cfg, "dry_run", False))
+    base_min_default = 0.0 if is_actually_dry else 100_000.0
+
+    if is_actually_dry:
+        base_min = 0.0
+        logger.info(f"[discovery] DRY_RUN mode: forcing base_min_volume={base_min}")
+    else:
+        base_min = float(getattr(d, "min_24h_volume_usd", base_min_default))
+
+    min_by_quote = getattr(d, "min_quote_volume_by_quote", None) or {}
+
+    conf_usdc = min_by_quote.get("USDC")
+    conf_usdt = min_by_quote.get("USDT")
+    conf_eur  = min_by_quote.get("EUR")
+
+    if conf_usdc is None:
+        conf_usdc = getattr(d, "min_quote_volume_usdc", None)
+    if conf_eur is None:
+        conf_eur = getattr(d, "min_quote_volume_eur", None)
+    # tolérance: si jamais min_quote_volume_usdt existe dans une version future
+    if conf_usdt is None:
+        conf_usdt = getattr(d, "min_quote_volume_usdt", None)
+
+    # Overrides via args (priorité aux args)
+    if min_quote_volume_usdc is not None:
+        conf_usdc = float(min_quote_volume_usdc)
+    if min_quote_volume_eur is not None:
+        conf_eur = float(min_quote_volume_eur)
+
+    eur_factor = float(getattr(d, "eur_quote_volume_factor", 0.30))
+    eur_floor  = float(getattr(d, "min_quote_volume_floor", 1.0))
+
+    thr_usdc = conf_usdc if conf_usdc is not None else base_min
+    thr_usdt = conf_usdt if conf_usdt is not None else base_min
+    thr_eur  = conf_eur  if conf_eur  is not None else max(eur_floor, eur_factor * base_min)
+
+    def _min_for_quote(q: str) -> float:
+        qu = (q or "").upper()
+        if qu == "EUR":
+            return float(thr_eur)
+        if qu == "USDT":
+            return float(thr_usdt)
+        return float(thr_usdc)
+
+    # Listes allow/deny (args > cfg)
+    whitelist = set(x.upper() for x in (allowlist if allowlist is not None else getattr(d, "whitelist", [])))
+    blacklist = set(x.upper() for x in (denylist  if denylist  is not None else getattr(d, "blacklist", [])))
+
+    enable_jp = bool(getattr(getattr(cfg, "g", cfg), "enable_jp", False))
     region_map = None
     for obj in (cfg, getattr(cfg, "g", None)):
         if obj is None:
@@ -646,22 +801,22 @@ async def discover_pairs_3cex(
     region_hints: Dict[str, str] = {}
     for ex in enabled:
         region = _resolve_region(ex)
-        if region is None or region == "UNKNOWN":
-            _add_filtered("unknown_region_hint", 1)
         region_hints[ex] = region or "UNKNOWN"
-        region_blocked[ex] = (region in (None, "UNKNOWN", "JP")) and not enable_jp
+        # On ne bloque que si explicitement JP et que enable_jp=False.
+        region_blocked[ex] = (region == "JP") and not enable_jp
 
     # --------------------------
     # 2) HTTP client + throttler
     # --------------------------
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=http_timeout_s), headers={"User-Agent": "PairsDiscovery/3"}) as session:
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=http_timeout_s),
+        headers={"User-Agent": "PairsDiscovery/3"},
+    ) as session:
         limiter = Throttler(rate_limit=max_inflight, period=1.0)
-
 
         # --------------------------
         # 4) Collecte parallélisée
         # --------------------------
-        # si un exchange n'est pas activé → renvoyer vide
         (b_meta, b_volq) = ({}, {})
         (c_meta, c_volq) = ({}, {})
         (y_meta, y_volq) = ({}, {})
@@ -676,14 +831,13 @@ async def discover_pairs_3cex(
                 on_api_error=_note_api_error,
             ))
         if "COINBASE" in enabled:
-            fetch_tasks.append(
-                _load_coinbase(
-                    session,
-                    policy=backoff_policy,
-                    timeout_s=http_timeout_s,
-                    limiter=limiter,
-                    on_api_error=_note_api_error,
-                ))
+            fetch_tasks.append(_load_coinbase(
+                session,
+                policy=backoff_policy,
+                timeout_s=http_timeout_s,
+                limiter=limiter,
+                on_api_error=_note_api_error,
+            ))
         if "BYBIT" in enabled:
             fetch_tasks.append(_load_bybit(
                 session,
@@ -692,6 +846,7 @@ async def discover_pairs_3cex(
                 limiter=limiter,
                 on_api_error=_note_api_error,
             ))
+
         res = await asyncio.gather(*fetch_tasks, return_exceptions=True)
         i = 0
         if "BINANCE" in enabled:
@@ -701,6 +856,7 @@ async def discover_pairs_3cex(
                     _mark_api_error("BINANCE")
             else:
                 (b_meta, b_volq) = res[i]
+                logger.info(f"[discovery] BINANCE: Loaded {len(b_meta)} meta and {len(b_volq)} volumes")
             i += 1
         if "COINBASE" in enabled:
             if isinstance(res[i], Exception):
@@ -709,6 +865,7 @@ async def discover_pairs_3cex(
                     _mark_api_error("COINBASE")
             else:
                 (c_meta, c_volq) = res[i]
+                logger.info(f"[discovery] COINBASE: Loaded {len(c_meta)} meta and {len(c_volq)} volumes")
             i += 1
         if "BYBIT" in enabled:
             if isinstance(res[i], Exception):
@@ -717,6 +874,8 @@ async def discover_pairs_3cex(
                     _mark_api_error("BYBIT")
             else:
                 (y_meta, y_volq) = res[i]
+                logger.info(f"[discovery] BYBIT: Loaded {len(y_meta)} meta and {len(y_volq)} volumes")
+            i += 1
 
     # --------------------------
     # 5) Normalisation & filtres
@@ -743,8 +902,7 @@ async def discover_pairs_3cex(
             stats = {"raw": raw, "kept": 0}
             return sym_map, vol_map, quote_map, base_map, stats
         for sym, m in (meta or {}).items():
-
-            base = (m or {}).get("base");
+            base = (m or {}).get("base")
             quote = (m or {}).get("quote")
             if not base or not quote:
                 _add_filtered("missing_base_quote", 1)
@@ -754,20 +912,21 @@ async def discover_pairs_3cex(
                 _add_filtered("quote_not_allowed", 1)
                 continue
             base_u = base.upper()
-            if allow is not None and base_u not in allow:
+            pk = _pk(base_u, quote_u)
+
+            if allow is not None and base_u not in allow and pk not in allow:
                 _add_filtered("whitelist", 1)
                 continue
-            if base_u in deny:
+            if base_u in deny or pk in deny:
                 _add_filtered("denylist", 1)
                 continue
 
-            pk = _pk(base_u, quote_u)
             if pk in pk_meta:
                 _add_filtered("pk_collision", 1)
                 continue
             pk_meta[pk] = (base_u, quote_u)
+
             v = fnum(volq.get(sym, 0.0), 0.0)
-            # Coinbase garde product_id hyphéné pour mapping externe
             sym_map[pk] = sym
             vol_map[pk] = v
             quote_map[pk] = quote_u
@@ -783,7 +942,6 @@ async def discover_pairs_3cex(
     for ex, stats in ("binance", b_stats), ("coinbase", c_stats), ("bybit", y_stats):
         _add_stage(f"{ex}_raw", stats.get("raw", 0))
         _add_stage(f"{ex}_eligible", stats.get("kept", 0))
-
 
     # --------------------------
     # 6) pair_mapping enrichi
@@ -821,11 +979,13 @@ async def discover_pairs_3cex(
             continue
         pair_mapping[pk]["binance"] = sym
         pair_mapping[pk]["volumes"]["BINANCE"] = fnum(b_vols.get(pk, 0.0), 0.0)
+
     for pk, sym in c_syms.items():
         if not _ensure(pk, c_quotes.get(pk, _quote_from_pk(pk)), c_bases.get(pk)):
             continue
         pair_mapping[pk]["coinbase"] = sym
         pair_mapping[pk]["volumes"]["COINBASE"] = fnum(c_vols.get(pk, 0.0), 0.0)
+
     for pk, sym in y_syms.items():
         if not _ensure(pk, y_quotes.get(pk, _quote_from_pk(pk)), y_bases.get(pk)):
             continue
@@ -837,20 +997,30 @@ async def discover_pairs_3cex(
     # --------------------------
     # 7) Scoring des combos
     # --------------------------
-
-    combos = [("BINANCE","COINBASE"), ("BINANCE","BYBIT"), ("BYBIT","COINBASE")]
+    combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
     combos = [c for c in combos if all(x in enabled for x in c)]
 
     best_scores: Dict[str, float] = {}
     min_volume_marked: Set[str] = set()
+
     for pk in list(pair_mapping.keys()):
         for a, b in combos:
-            has_a = pair_mapping[pk].get(a.lower()) is not None if a != "COINBASE" else pair_mapping[pk].get("coinbase") is not None
-            has_b = pair_mapping[pk].get(b.lower()) is not None if b != "COINBASE" else pair_mapping[pk].get("coinbase") is not None
+            has_a = (
+                pair_mapping[pk].get(a.lower()) is not None
+                if a != "COINBASE"
+                else pair_mapping[pk].get("coinbase") is not None
+            )
+            has_b = (
+                pair_mapping[pk].get(b.lower()) is not None
+                if b != "COINBASE"
+                else pair_mapping[pk].get("coinbase") is not None
+            )
             if not (has_a and has_b):
                 continue
+
             quote = (pair_mapping[pk]["quote"] or "USDC").upper()
-            thr = _norm_quote_min(quote, thr_usdc, thr_eur)
+            thr = _min_for_quote(quote)
+
             va = fnum((pair_mapping[pk]["volumes"] or {}).get(a, 0.0), 0.0)
             vb = fnum((pair_mapping[pk]["volumes"] or {}).get(b, 0.0), 0.0)
             if va < thr or vb < thr:
@@ -858,16 +1028,18 @@ async def discover_pairs_3cex(
                     _add_filtered("min_volume", 1)
                     min_volume_marked.add(pk)
                 continue
+
             s = float(min(va, vb))
             key = f"{a}/{b}"
             pair_mapping[pk]["combos"][key] = s
             if s > 0:
                 best_scores[pk] = max(best_scores.get(pk, 0.0), s)
 
-        _add_stage("combos_eligible", len(best_scores))
-        drop_combo = max(0, len(pair_mapping) - len(best_scores))
-        if drop_combo:
-            _add_filtered("combo_not_eligible", drop_combo)
+    # ✅ métriques d'audit: comptées UNE SEULE FOIS (sinon sur-comptage)
+    _add_stage("combos_eligible", len(best_scores))
+    drop_combo = max(0, len(pair_mapping) - len(best_scores))
+    if drop_combo:
+        _add_filtered("combo_not_eligible", drop_combo)
 
     # --------------------------
     # 8) Tri global (EUR → USDC via FX)

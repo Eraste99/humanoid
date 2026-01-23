@@ -22,8 +22,9 @@ Dépendances:
 
 from __future__ import annotations
 import asyncio
-import json
 import contextlib
+
+from modules.utils import json_utils as json
 import logging
 import ssl
 import time
@@ -69,7 +70,6 @@ except Exception as e:  # pragma: no cover
     print("[rpc_gateway] aiohttp unavailable, falling back to dummy stubs")
 
 from modules.bot_config import BotConfig
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.payloads import validate_submit_bundle_lite, validate_cancel_lite
 import modules.obs_metrics as obs  # on accède par getattr avec fallback no-op
 
@@ -257,25 +257,29 @@ class RPCSettings:
         rpc_cfg = _resolve_rpc_cfg(cfg)
         enabled = _resolve_rpc_attr(rpc_cfg, cfg, "enabled", default=True, legacy_root="rpc_enabled")
         host = _resolve_rpc_attr(rpc_cfg, cfg, "host", default=default_host, legacy_root="rpc_host")
-        port = getattr_int(rpc_cfg, "port", default_port)
+        port = int(getattr(rpc_cfg, "port", default_port))
         region = _resolve_rpc_region(cfg, default_region)
-        timeout_ms = getattr_int(rpc_cfg, "timeout_ms", 0) or None
-        timeout_s = getattr_float(rpc_cfg, "timeout_s", 2.0)
+        timeout_ms = getattr(rpc_cfg, "timeout_ms", 0)
+        if timeout_ms is not None:
+            timeout_ms = int(timeout_ms)
+        else:
+            timeout_ms = None
+        timeout_s = float(getattr(rpc_cfg, "timeout_s", 2.0))
         if timeout_ms is not None:
             try:
                 timeout_s = max(timeout_s, float(timeout_ms) / 1000.0)
             except Exception:
                 pass
         max_retries = int(min(getattr(rpc_cfg, "max_retries", 2), 2))
-        idempotency_ttl_s = getattr_int(rpc_cfg, "rpc_idempotency_ttl_s", 600)
-        memoize_response = getattr_bool(rpc_cfg, "rpc_idempotency_memoize_response", True)
-        mtls_enabled = getattr_bool(rpc_cfg, "mtls_enabled", True)
+        idempotency_ttl_s = int(getattr(rpc_cfg, "rpc_idempotency_ttl_s", 600))
+        memoize_response = bool(getattr(rpc_cfg, "rpc_idempotency_memoize_response", True))
+        mtls_enabled = bool(getattr(rpc_cfg, "mtls_enabled", True))
         ca_cert = getattr(rpc_cfg, "ca_cert", None)
         server_cert = getattr(rpc_cfg, "server_cert", None)
         server_key = getattr(rpc_cfg, "server_key", None)
         client_cert = getattr(rpc_cfg, "client_cert", None)
         client_key = getattr(rpc_cfg, "client_key", None)
-        require_client_cert = getattr_bool(rpc_cfg, "require_client_cert", True)
+        require_client_cert = bool(getattr(rpc_cfg, "require_client_cert", True))
         g_cfg = getattr(cfg, "g", None)
         mode = str(getattr(g_cfg, "mode", "DRY_RUN")).upper()
         armed = bool(getattr(g_cfg, "live_trading_armed", False))
@@ -333,9 +337,9 @@ class RPCServer:
         self._site = None
         self._lhm = lhm  # <= LoggerHistoriqueManager (facultatif)
         rpc_cfg = _resolve_rpc_cfg(cfg)
-        self._admin_enabled = getattr_bool(rpc_cfg, "admin_enabled", False)
-        self._admin_token = admin_token or getattr_str(rpc_cfg, "admin_token", None)
-        self._strict_validation = getattr_bool(rpc_cfg, "strict_validation", False)
+        self._admin_enabled = bool(getattr(rpc_cfg, "admin_enabled", False))
+        self._admin_token = admin_token or str(getattr(rpc_cfg, "admin_token", "") or "") or None
+        self._strict_validation = bool(getattr(rpc_cfg, "strict_validation", False))
         g_cfg = getattr(cfg, "g", None)
         mode = str(getattr(g_cfg, "mode", "DRY_RUN") or "DRY_RUN").upper()
         self._prod_armed = bool(mode == "PROD" and bool(getattr(g_cfg, "live_trading_armed", False)))
@@ -609,11 +613,8 @@ class RPCServer:
         if body is None:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="unknown")
             raise web.HTTPBadRequest(text="invalid JSON")
-        idem = (
-                request.headers.get("X-Idempotency-Key")
-                or request.headers.get("Idempotency-Key")
-                or self._derive_idem_key_from_payload(body)
-        )
+        idem = self._extract_idempotency_key(request, body)
+
         if not idem:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="RPC_MISSING_IDEMPOTENCY_KEY")
             raise web.HTTPBadRequest(text="missing idempotency key")
@@ -794,18 +795,27 @@ class RPCServer:
                 parts.append(f"{k}:{v}")
         return "|".join(parts) if parts else None
 
+    def _extract_idempotency_key(
+            self,
+            request: web.Request,
+            body: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """
+        Extraction robuste:
+          1) Headers (X-Idempotency-Key / Idempotency-Key)
+          2) Payload (meta.idempotency_key / idempotency_key / client_order_id / bundle_id / trace_id / ts_ns)
+        """
+        idem = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
+        idem = self._sanitize_idempotency_key(idem)
+        if idem:
+            return idem
 
-    def _extract_idempotency_key(self, request: web.Request) -> Optional[str]:
-        # priorités: en-tête dédié, sinon derive du body si présent
-        key = request.headers.get("X-Idempotency-Key") or request.headers.get("Idempotency-Key")
-        if key:
-            return key
-        try:
-            # derive de quelques champs usuels si dispo
-            # NOTE: lecture non bloquante (on suppose _read_json sera re-parsé ensuite)
-            pass
-        except Exception:
-            pass
+        if isinstance(body, dict):
+            idem = self._derive_idem_key_from_payload(body)
+            idem = self._sanitize_idempotency_key(idem)
+            if idem:
+                return idem
+
         return None
 
 

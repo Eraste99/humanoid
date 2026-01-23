@@ -62,7 +62,7 @@ Rôle PnL multi-vues (M5-C v2-B):
 
 
 import asyncio
-import json
+from modules.utils import json_utils as json
 import logging
 import sqlite3
 from datetime import datetime
@@ -72,7 +72,8 @@ from modules.logger_historique.base_trade_logger import BaseTradeLogger
 from modules.logger_historique.pair_history_tracker import PairHistoryTracker, TrackerConfig
 from modules.obs_metrics import update_storage_metrics, PAIR_ROTATION_AGE_SECONDS, PAIR_ROTATION_LAST_TS
 import os, time
-import hashlib, json, time
+import hashlib, time
+from modules.utils import json_utils as json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -545,6 +546,17 @@ class LoggerHistoriqueManager:
 
         # -------- I/O & trackers ---------------------------------
         db_dir = str(Path(out_dir))
+
+        # IMPORTANT: doit être défini AVANT l'instanciation du LogWriter
+        try:
+            self._ops_retention_days = int(
+                getattr(L, "OPS_RETENTION_DAYS", 
+                    getattr(getattr(cfg, "logger_historique", None), "ops_retention_days", 14)
+                )
+            ) or 14
+        except Exception:
+            self._ops_retention_days = 14
+
         self._writer = LogWriter(db_dir=db_dir, ops_retention_days=self._ops_retention_days)
         self._tracker_cfg = self._build_tracker_config_from_lhm_cfg(L)
         self._tracker = PairHistoryTracker(self._tracker_cfg)
@@ -575,14 +587,12 @@ class LoggerHistoriqueManager:
         self._db_lane_q: asyncio.Queue | None = None
         self._db_lane_task: asyncio.Task | None = None
         self._db_lane_executor: ThreadPoolExecutor | None = None
-        self._ops_retention_days = int(getattr(L, "OPS_RETENTION_DAYS", 30)) or 30
         self._fail_closed_latch_op_id = "LHM/TRUTH_PERSISTENCE_FAILED"
         self._fail_closed_latch_persisted = False
         self._opportunity_queue: asyncio.Queue | None = None
         self._opportunity_task: asyncio.Task | None = None
 
 
-        # -------- Pipelines JSONL.gz ------------------------------
         # -------- Pipelines JSONL.gz ------------------------------
         self._jsonl_dir = str(Path(db_dir) / "streams")
         # Nommage canon M5-B2-2:
@@ -616,6 +626,14 @@ class LoggerHistoriqueManager:
 
         # -------- Index SQLite (ts_ns, type, id, path) ------------
         self._index_ready = False  # créé à la 1re écriture
+        # -------- Index lane config (batch + offload) ----------------
+        # (Optionnels via env; defaults sûrs si absents)
+        self._idx_queue = None
+        self._idx_task = None
+        self._idx_queue_max = int(getattr(L, "LHM_IDX_QUEUE_MAX", 50000))
+        self._idx_batch_max = int(getattr(L, "LHM_IDX_BATCH_MAX", 200))
+        self._idx_flush_interval_s = float(getattr(L, "LHM_IDX_FLUSH_INTERVAL_S", 0.25))
+
 
         # -------- Contexte runtime / lifecycle --------------------
         self._started = False
@@ -746,13 +764,20 @@ class LoggerHistoriqueManager:
         if btl:
             btl.set_event_sink(self._on_event_sink)  # (log_type, entries)
             await btl.start()
+
         # 2) Worker JSONL (best-effort si configuré)
         self._init_jsonl_streams()
 
+        # 2.5) Index SQLite (idx) writer: offload thread + batch (évite loop-lag)
+        try:
+            await self._start_idx_lane()
+        except Exception:
+            logger.exception("start: idx lane spawn failed")
+
         await self._spawn_streams_worker()
+
         # 5) Storage monitor (best-effort) — met à jour les métriques disque / storage
         try:
-            # Met à jour le global pour cohérence (même si on passe path explicitement)
             global LHM_STORAGE_PATH
             LHM_STORAGE_PATH = getattr(self, "_storage_path", None)
             start_storage_monitor(path=LHM_STORAGE_PATH, period_s=60.0)
@@ -851,6 +876,15 @@ class LoggerHistoriqueManager:
         except Exception:
             logger.exception("stop: jsonl drain barrier failed")
 
+        # 3.5) Drain + stop idx writer (SQLite idx) (best-effort)
+        try:
+            await self._idx_barrier(timeout_s=2.0)
+        except Exception:
+            logger.exception("stop: idx barrier failed")
+        try:
+            await self._stop_idx_lane()
+        except Exception:
+            logger.exception("stop: idx lane stop failed")
 
         # 4) Arrêt worker JSONL (maintenant seulement)
         self._running = False
@@ -862,6 +896,7 @@ class LoggerHistoriqueManager:
             except Exception:
                 pass
         self._streams_task = None
+
         # 5) Stop storage monitor (best-effort)
         try:
             await stop_storage_monitor()
@@ -1318,23 +1353,114 @@ class LoggerHistoriqueManager:
         """
         Draine chaque stream JSONL au plus N items par tick (backpressure).
         Retourne True si au moins un élément a été écrit.
+
+        Patch perf:
+        - Les streams "indexés" gardent l'écriture ligne-par-ligne (offset précis).
+        - Les streams non-indexés écrivent en batch (1 to_thread par batch),
+          ce qui évite les saturations et les 'loggerh drop' sous charge.
         """
         streams = getattr(self, "_jsonl_streams", {}) or {}
         if not streams:
             return False
+
         wrote_any = False
         per_tick_budget = int(getattr(self, "_stream_batch", 500)) or 500
+
+        indexed_streams = {"rm_decisions", "engine_submits", "engine_acks", "privatews_events"}
+
         for name in order:
             q_rot = streams.get(name)
             if not q_rot:
                 continue
             q, rot = q_rot
+
             n = 0
+
+            # --- Mode batch (non indexé)
+            if name not in indexed_streams:
+                batch_lines: list[bytes] = []
+                batch_count = 0
+
+                while n < per_tick_budget:
+                    try:
+                        item = q.get_nowait()
+                    except Exception:
+                        break
+
+                    try:
+                        try:
+                            line = (json.dumps(item, ensure_ascii=False, separators=(",", ":"),
+                                               default=str) + "\n").encode("utf-8")
+                        except Exception:
+                            try:
+                                fallback = {"raw_json": json.dumps(item, ensure_ascii=False, default=str)}
+                            except Exception:
+                                fallback = {"raw_json": str(item)}
+                            try:
+                                line = (json.dumps(fallback, ensure_ascii=False, separators=(",", ":"),
+                                                   default=str) + "\n").encode("utf-8")
+                            except Exception:
+                                self._drop_stream_record(name, reason="LOGGERH_JSONL_SERIALIZE_ERROR", payload=item)
+                                try:
+                                    self._critical_drop_seen = True
+                                except Exception:
+                                    pass
+                                continue
+
+                        batch_lines.append(line)
+                        batch_count += 1
+                        n += 1
+
+                    except Exception:
+                        # Si on casse pendant la construction de batch, on drop l'item et on continue
+                        try:
+                            self._drop_stream_record(name, reason="LOGGERH_JSONL_BUILD_BATCH_ERROR", payload=item)
+                        except Exception:
+                            pass
+
+                if batch_count > 0:
+                    try:
+                        blob = b"".join(batch_lines)
+                        await asyncio.to_thread(rot.write_line, blob)
+                        wrote_any = True
+
+                        # OBS
+                        try:
+                            lhm_on_ingested(name, n=batch_count)
+                            lhm_set_queue_size(name, q.qsize())
+                            set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
+                        except Exception:
+                            pass
+                        self._maybe_plateau(name, q)
+
+                    except Exception:
+                        # Écriture batch a échoué → on considère ces batch_count items perdus
+                        try:
+                            self._drop_stream_record(name, reason="LOGGERH_JSONL_WRITE_ERROR_BATCH",
+                                                     payload={"count": batch_count})
+                        except Exception:
+                            pass
+                        try:
+                            self._critical_drop_seen = True
+                        except Exception:
+                            pass
+                        # continue vers le prochain stream
+
+                # Rotation (best-effort)
+                try:
+                    await asyncio.to_thread(rot.rotate_if_needed)
+                except Exception:
+                    logger.exception("rotate_if_needed failed for %s", name)
+
+                continue  # stream suivant
+
+            # --- Mode indexé (ligne-par-ligne, offsets précis)
             while n < per_tick_budget:
                 try:
                     item = q.get_nowait()
                 except Exception:
                     break
+
                 try:
                     try:
                         line = (json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str) + "\n").encode(
@@ -1354,59 +1480,53 @@ class LoggerHistoriqueManager:
                             except Exception:
                                 pass
                             continue
-                    # Écriture via l’API du rotateur (thread-safe)
+
                     offset_bytes = rot.current_bytes
                     path = rot.current_path
                     await asyncio.to_thread(rot.write_line, line)
 
-                    if name in {"rm_decisions", "engine_submits", "engine_acks", "privatews_events"}:
-                        try:
-                            payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else item
-                            ts_ms = item.get("ts_ms") or payload_obj.get("ts_ms") or payload_obj.get("timestamp_ms")
-                            if ts_ms is None:
-                                ts_ms = self._ensure_ts_ms(payload_obj if isinstance(payload_obj, dict) else item)
-                            ts_ns = int(ts_ms) * 1_000_000 if ts_ms is not None else time.time_ns()
-                            event_type = (
-                                    item.get("event_type")
-                                    or payload_obj.get("event_type")
-                                    or payload_obj.get("kind")
-                                    or name
-                            )
-                            ev_id = (
-                                    item.get("event_id")
-                                    or payload_obj.get("event_id")
-                                    or item.get("id")
-                                    or payload_obj.get("id")
-                            )
-                            trace_id = payload_obj.get("trace_id") or item.get("trace_id")
-                            bundle_id = payload_obj.get("bundle_id") or item.get("bundle_id")
-                            decision_id = payload_obj.get("decision_id") or item.get("decision_id")
-                            idempotency_key = (
-                                    payload_obj.get("idempotency_key")
-                                    or payload_obj.get("idempotence_key")
-                                    or item.get("idempotency_key")
-                                    or item.get("idempotence_key")
-                            )
-                            self._insert_index_event(
-                                ts_ns=int(ts_ns),
-                                typ=str(event_type),
-                                ev_id=None if ev_id is None else str(ev_id),
-                                path=path,
-                                offset_bytes=offset_bytes,
-                                trace_id=None if trace_id is None else str(trace_id),
-                                bundle_id=None if bundle_id is None else str(bundle_id),
-                                decision_id=None if decision_id is None else str(decision_id),
-                                idempotency_key=None if idempotency_key is None else str(idempotency_key),
-                            )
-                        except Exception:
-                            logger.exception("index insert failed for %s", name)
+                    # Index insert (inchangé)
+                    try:
+                        payload_obj = item.get("payload") if isinstance(item.get("payload"), dict) else item
+                        ts_ms = item.get("ts_ms") or payload_obj.get("ts_ms") or payload_obj.get("timestamp_ms")
+                        if ts_ms is None:
+                            ts_ms = self._ensure_ts_ms(payload_obj if isinstance(payload_obj, dict) else item)
+                        ts_ns = int(ts_ms) * 1_000_000 if ts_ms is not None else time.time_ns()
+                        event_type = (item.get("event_type") or payload_obj.get("event_type") or payload_obj.get(
+                            "kind") or name)
+                        ev_id = (item.get("event_id") or payload_obj.get("event_id") or item.get(
+                            "id") or payload_obj.get("id"))
+                        trace_id = payload_obj.get("trace_id") or item.get("trace_id")
+                        bundle_id = payload_obj.get("bundle_id") or item.get("bundle_id")
+                        decision_id = payload_obj.get("decision_id") or item.get("decision_id")
+                        idempotency_key = (
+                                payload_obj.get("idempotency_key")
+                                or payload_obj.get("idempotence_key")
+                                or item.get("idempotency_key")
+                                or item.get("idempotence_key")
+                        )
+
+                        await self._idx_enqueue_event(
+                            ts_ns=int(ts_ns),
+                            typ=str(event_type),
+                            ev_id=None if ev_id is None else str(ev_id),
+                            path=path,
+                            offset_bytes=offset_bytes,
+                            trace_id=None if trace_id is None else str(trace_id),
+                            bundle_id=None if bundle_id is None else str(bundle_id),
+                            decision_id=None if decision_id is None else str(decision_id),
+                            idempotency_key=None if idempotency_key is None else str(idempotency_key),
+                        )
+
+                    except Exception:
+                        logger.exception("index insert failed for %s", name)
 
                     wrote_any = True
                     n += 1
 
-                    # === OBS (on conserve tes compteurs) ===
+                    # OBS
                     try:
-                        lhm_on_ingested(name)
+                        lhm_on_ingested(name, n=1)
                         lhm_set_queue_size(name, q.qsize())
                         set_lhm_queue(sum((s[0].qsize() for s in streams.values())), self._jsonl_queue_cap)
                     except Exception:
@@ -1414,42 +1534,20 @@ class LoggerHistoriqueManager:
                     self._maybe_plateau(name, q)
 
                 except Exception:
-
-                    # Drop contrôlé si l’écriture échoue (I/O JSONL)
-
                     try:
                         self._drop_stream_record(name, reason="LOGGERH_JSONL_WRITE_ERROR", payload=item)
-
+                    except Exception:
+                        pass
+                    try:
+                        self._critical_drop_seen = True
                     except Exception:
                         pass
 
-                    # Erreur de stockage → pipeline PnL potentiellement non audit-grade
-
-                    try:
-                        self._mark_storage_error(
-                            reason="TRUTH_PERSISTENCE_FAILED",
-                            payload={"stream": name, "stage": "jsonl_write"},
-                        )
-                    except Exception:
-                        logger.exception("jsonl write: storage error marking failed")
-
-            # Rotation par âge testée à chaque tick (et comptabilisée)
+            # Rotation (best-effort)
             try:
-                rotated = await asyncio.to_thread(rot.rotate_if_needed)
-                if rotated:
-                    try:
-                        lhm_on_rotation(name)
-                    except Exception:
-                        pass
+                await asyncio.to_thread(rot.rotate_if_needed)
             except Exception:
-                logger.exception("jsonl age-rotation failed for %s", name)
-                try:
-                    self._mark_storage_error(
-                        reason="TRUTH_PERSISTENCE_FAILED",
-                        payload={"stream": name, "stage": "jsonl_rotate"},
-                    )
-                except Exception:
-                    logger.exception("jsonl rotate: storage error marking failed")
+                logger.exception("rotate_if_needed failed for %s", name)
 
         return wrote_any
 
@@ -1637,8 +1735,13 @@ class LoggerHistoriqueManager:
                 e["pnl_missing"] = False
                 try:
                     from modules.obs_metrics import DERIVED_NET_PROFIT_SIGN_TOTAL
+                    # [PnL-Live] Enrichissement labels région/branche/mode pour cohérence dashboard
+                    reg = str(e.get("pod_region") or "EU").upper()
+                    br = str(e.get("trade_mode") or e.get("branch") or "TT").upper()
+                    md = str(e.get("deployment_mode") or "EU_ONLY").upper()
                     DERIVED_NET_PROFIT_SIGN_TOTAL.labels(
                         reason="net_bps",
+                        region=reg, branch=br, mode=md
                     ).inc()
                 except Exception:
                     pass
@@ -1654,8 +1757,13 @@ class LoggerHistoriqueManager:
             e["pnl_missing"] = True
             try:
                 from modules.obs_metrics import MISSING_NET_PROFIT_TOTAL
+                # [PnL-Live] Enrichissement labels région/branche/mode pour cohérence dashboard
+                reg = str(e.get("pod_region") or "EU").upper()
+                br = str(e.get("trade_mode") or e.get("branch") or "TT").upper()
+                md = str(e.get("deployment_mode") or "EU_ONLY").upper()
                 MISSING_NET_PROFIT_TOTAL.labels(
                     stage="missing_net_profit",
+                    region=reg, branch=br, mode=md
                 ).inc()
             except Exception:
                 pass
@@ -2116,13 +2224,17 @@ class LoggerHistoriqueManager:
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
         try:
-            loggerh_write_ms.observe(dt_ms)
+            from modules.obs_metrics import LOGGERH_WRITE_MS
+            if LOGGERH_WRITE_MS is not None and not hasattr(LOGGERH_WRITE_MS, "_MetricNoOp"):
+                LOGGERH_WRITE_MS.observe(dt_ms)
         except Exception:
             pass
 
         # Taille de file après flush
         try:
-            lhm_jsonl_queue_size.set(len(self._queue))
+            from modules.obs_metrics import LOGGERH_DB_LANE_QUEUE_DEPTH
+            if LOGGERH_DB_LANE_QUEUE_DEPTH is not None and not hasattr(LOGGERH_DB_LANE_QUEUE_DEPTH, "_MetricNoOp"):
+                LOGGERH_DB_LANE_QUEUE_DEPTH.set(len(self._queue))
         except Exception:
             pass
 
@@ -3653,6 +3765,161 @@ class LoggerHistoriqueManager:
             self._index_ready = True
         except Exception:
             logger.exception("_ensure_index_table failed")
+    # ---------------- index lane (SQLite idx) : offload thread + batch ----------------
+    async def _start_idx_lane(self) -> None:
+        """Démarre le writer d'index SQLite (idx) sans bloquer l'event-loop."""
+        q = getattr(self, "_idx_queue", None)
+        if q is None:
+            # Très large pour éviter les drops; on préfère backpressure (fallback) si saturation.
+            maxsize = int(getattr(self, "_idx_queue_max", 50000))
+            self._idx_queue = asyncio.Queue(maxsize=maxsize)
+        t = getattr(self, "_idx_task", None)
+        if t and not t.done():
+            return
+        self._idx_task = asyncio.create_task(self._idx_writer_loop(), name="LHM-IdxWriter")
+
+    async def _idx_barrier(self, timeout_s: float = 2.0) -> None:
+        """Attend (best-effort) que tous les évènements idx en file soient flushés."""
+        q: asyncio.Queue | None = getattr(self, "_idx_queue", None)
+        if q is None:
+            return
+        try:
+            await asyncio.wait_for(q.join(), timeout=float(timeout_s))
+        except Exception:
+            deadline = time.perf_counter() + float(timeout_s)
+            while time.perf_counter() < deadline and q.qsize() > 0:
+                await asyncio.sleep(0.01)
+
+    async def _stop_idx_lane(self) -> None:
+        """Stop propre du writer idx (timeboxed)."""
+        q: asyncio.Queue | None = getattr(self, "_idx_queue", None)
+        t: asyncio.Task | None = getattr(self, "_idx_task", None)
+        if q is not None:
+            try:
+                q.put_nowait(("__STOP_IDX__",))
+            except Exception:
+                try:
+                    await q.put(("__STOP_IDX__",))
+                except Exception:
+                    pass
+        if t and not t.done():
+            try:
+                await asyncio.wait_for(t, timeout=5.0)
+            except Exception:
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
+        self._idx_task = None
+
+    async def _idx_enqueue_event(
+            self,
+            *,
+            ts_ns: int,
+            typ: str,
+            ev_id: str | None,
+            path: str | None,
+            offset_bytes: int | None = None,
+            trace_id: str | None = None,
+            bundle_id: str | None = None,
+            decision_id: str | None = None,
+            idempotency_key: str | None = None,
+    ) -> None:
+        """Enqueue un évènement d'index. Zéro blocage event-loop (fallback = to_thread)."""
+        ev = (
+            int(ts_ns),
+            str(typ),
+            None if ev_id is None else str(ev_id),
+            path or None,
+            None if offset_bytes is None else int(offset_bytes),
+            None if trace_id is None else str(trace_id),
+            None if bundle_id is None else str(bundle_id),
+            None if decision_id is None else str(decision_id),
+            None if idempotency_key is None else str(idempotency_key),
+        )
+
+        q: asyncio.Queue | None = getattr(self, "_idx_queue", None)
+        t: asyncio.Task | None = getattr(self, "_idx_task", None)
+
+        # Pas de lane idx → fallback direct (en thread)
+        if q is None or t is None or t.done():
+            await asyncio.to_thread(self._insert_index_events_batch, [ev])
+            return
+
+        try:
+            q.put_nowait(ev)
+        except asyncio.QueueFull:
+            # Audit-grade: on évite les drops. On throttle le worker (to_thread) si saturation.
+            logger.warning('{"loggerh":"idx_queue_full","qsize":%d}', int(q.qsize()))
+            await asyncio.to_thread(self._insert_index_events_batch, [ev])
+
+    async def _idx_writer_loop(self) -> None:
+        """Boucle unique: batch-insert dans SQLite via to_thread."""
+        q: asyncio.Queue | None = getattr(self, "_idx_queue", None)
+        if q is None:
+            return
+
+        batch_max = int(getattr(self, "_idx_batch_max", 200))
+        flush_interval = float(getattr(self, "_idx_flush_interval_s", 0.25))
+
+        # Ensure table/indexes hors event-loop
+        try:
+            await asyncio.to_thread(self._ensure_index_table)
+        except Exception:
+            logger.exception("idx_writer: ensure_index_table failed")
+
+        pending: list[tuple] = []
+        pending_count = 0
+
+        try:
+            while True:
+                item = None
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=flush_interval)
+                except asyncio.TimeoutError:
+                    item = None
+
+                # Stop sentinel
+                if isinstance(item, tuple) and len(item) == 1 and item[0] == "__STOP_IDX__":
+                    q.task_done()
+                    if pending:
+                        try:
+                            await asyncio.to_thread(self._insert_index_events_batch, pending)
+                        except Exception:
+                            logger.exception("idx_writer: batch insert failed on stop")
+                        finally:
+                            for _ in range(pending_count):
+                                q.task_done()
+                        pending = []
+                        pending_count = 0
+                    return
+
+                if item is not None:
+                    pending.append(item)
+                    pending_count += 1
+
+                # Flush condition: batch full OR timeout tick
+                if pending and (pending_count >= batch_max or item is None):
+                    try:
+                        await asyncio.to_thread(self._insert_index_events_batch, pending)
+                    except Exception:
+                        logger.exception("idx_writer: batch insert failed")
+                    finally:
+                        for _ in range(pending_count):
+                            q.task_done()
+                        pending = []
+                        pending_count = 0
+
+        except asyncio.CancelledError:
+            if pending:
+                try:
+                    await asyncio.to_thread(self._insert_index_events_batch, pending)
+                except Exception:
+                    pass
+                finally:
+                    for _ in range(pending_count):
+                        with contextlib.suppress(Exception):
+                            q.task_done()
+            return
 
     # --- Proxy “BTL → LHM” (centralisation des métriques) ---
     def on_btl_queue_depth(self, log_type: str, *, depth: int) -> None:
@@ -3870,6 +4137,31 @@ class LoggerHistoriqueManager:
         try:
             from modules.obs_metrics import SCHEMA_VIOLATION_TOTAL
             SCHEMA_VIOLATION_TOTAL.labels(field="filter_exception").inc()
+        except Exception:
+            pass
+
+    def on_btl_emit_error(self, log_type: str, *, error: str) -> None:
+        try:
+            if not hasattr(self, "_consecutive_emit_errors"):
+                self._consecutive_emit_errors = {}
+            self._consecutive_emit_errors[log_type] = self._consecutive_emit_errors.get(log_type, 0) + 1
+
+            from modules.obs_metrics import lhm_on_dropped, LHM_EMIT_ERROR_TOTAL
+            lhm_on_dropped("btl", f"emit_error_{log_type}", n=1)
+            LHM_EMIT_ERROR_TOTAL.labels(log_type=log_type).inc()
+
+            if log_type == "trades" and self._consecutive_emit_errors[log_type] >= 5:
+                self._logging_broken = True
+                self._trigger_fail_closed_logging(f"CONSECUTIVE_EMIT_ERRORS_{log_type}")
+        except Exception:
+            pass
+
+    def on_btl_emit_success(self, log_type: str) -> None:
+        try:
+            if hasattr(self, "_consecutive_emit_errors"):
+                self._consecutive_emit_errors[log_type] = 0
+            if log_type == "trades":
+                self._logging_broken = False
         except Exception:
             pass
 
@@ -4172,6 +4464,24 @@ class LoggerHistoriqueManager:
         except Exception:
             return ["reb_contract_check_failed"]
 
+    def _insert_index_events_batch(self, events: list[tuple]) -> None:
+        """Insert batch dans `idx` (SQLite). À appeler UNIQUEMENT hors event-loop."""
+        if not events:
+            return
+        try:
+            self._ensure_index_table()
+            dbp = self._writer.get_db_path()
+            with sqlite3.connect(dbp, timeout=10) as conn:
+                cur = conn.cursor()
+                cur.executemany(
+                    "INSERT INTO idx (ts_ns,type,id,path,offset_bytes,trace_id,bundle_id,decision_id,idempotency_key) "
+                    "VALUES (?,?,?,?,?,?,?,?,?)",
+                    events,
+                )
+                conn.commit()
+        except Exception:
+            logger.exception("_insert_index_events_batch failed")
+
     def _insert_index_event(
             self,
             ts_ns: int,
@@ -4185,48 +4495,20 @@ class LoggerHistoriqueManager:
             decision_id: str | None = None,
             idempotency_key: str | None = None,
     ) -> None:
-        """
-        Insère une ligne d'index JSONL minimal (M5-B2-3) dans la table `idx`.
-
-        Paramètres:
-        - ts_ns:        timestamp de l'évènement en nanosecondes.
-        - typ:          event_type / kind (ex: "engine.fill", "rm.decision").
-        - ev_id:        identifiant libre (compat historique).
-        - path:         chemin du fichier .jsonl.gz concerné.
-        - offset_bytes: offset approx. dans le fichier (bytes écrits avant la ligne).
-        - trace_id:     identifiant de trace stable si disponible.
-        - bundle_id:    identifiant de bundle stable si disponible.
-        - decision_id:  identifiant de décision RM si disponible.
-        - idempotency_key: idempotency key si disponible.
-
-        Outils externes peuvent ensuite:
-        - rejouer une journée en filtrant par ts_ns/path,
-        - extraire tous les évènements d'un trace_id,
-        - reconstruire un trade complet (via trace_id/bundle_id + path/offset_bytes).
-        """
-        try:
-            self._ensure_index_table()
-            dbp = self._writer.get_db_path()
-            with sqlite3.connect(dbp, timeout=10) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO idx (ts_ns,type,id,path,offset_bytes,trace_id,bundle_id,decision_id,idempotency_key) "
-                    "VALUES (?,?,?,?,?,?,?,?,?)",
-                    (
-                        int(ts_ns),
-                        str(typ),
-                        None if ev_id is None else str(ev_id),
-                        path or None,
-                        None if offset_bytes is None else int(offset_bytes),
-                        None if trace_id is None else str(trace_id),
-                        None if bundle_id is None else str(bundle_id),
-                        None if decision_id is None else str(decision_id),
-                        None if idempotency_key is None else str(idempotency_key),
-                    ),
-                )
-                conn.commit()
-        except Exception:
-            logger.exception("_insert_index_event failed")
+        """Compat: insert un seul évènement (hors event-loop)."""
+        self._insert_index_events_batch([
+            (
+                int(ts_ns),
+                str(typ),
+                None if ev_id is None else str(ev_id),
+                path or None,
+                None if offset_bytes is None else int(offset_bytes),
+                None if trace_id is None else str(trace_id),
+                None if bundle_id is None else str(bundle_id),
+                None if decision_id is None else str(decision_id),
+                None if idempotency_key is None else str(idempotency_key),
+            )
+        ])
 
 
     # ---------------- rotation JSONL & stockage ----------------
@@ -4242,10 +4524,14 @@ class LoggerHistoriqueManager:
     async def _check_storage_usage(self) -> None:
         """
         Sonde l'utilisation du disque hébergeant db_dir/streams et émet des alertes 70/85%.
+
+        IMPORTANT perf:
+        - `shutil.disk_usage()` est bloquant (syscall) → on le met en `asyncio.to_thread`
+          pour ne pas geler l'event-loop.
         """
         try:
             mount = str(Path(self._jsonl_dir).resolve().anchor or "/")
-            total, used, free = shutil.disk_usage(self._jsonl_dir)
+            total, used, free = await asyncio.to_thread(shutil.disk_usage, self._jsonl_dir)
             pct = (used / max(1, total)) * 100.0
             try:
                 STORAGE_USAGE_PCT.labels(mount=mount).set(pct)
@@ -4421,6 +4707,39 @@ class LoggerHistoriqueManager:
             logger.debug("set_rotate_every_s: invalid value %s", seconds)
 
     # ---------------- flush immédiat ----------------
+    async def _rotate_if_needed(self, *, force: bool = False) -> None:
+        """
+        Rotation best-effort :
+        - JSONL rotators (gzip append-only)
+        - SQLite DB via LogWriter
+        """
+
+        # 1) rotate JSONL
+        def _do_jsonl() -> None:
+            try:
+                for rot in (self._jsonl or {}).values():
+                    try:
+                        rot.rotate_if_needed(force=force)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            await asyncio.to_thread(_do_jsonl)
+        except Exception:
+            pass
+
+        # 2) rotate DB
+        try:
+            if force and hasattr(self._writer, "rotate_now"):
+                await asyncio.to_thread(self._writer.rotate_now)
+            else:
+                await self._maybe_rotate_files()
+        except Exception:
+            # best-effort : ne pas casser flush_now
+            pass
+
     async def flush_now(self, rotate: bool = False) -> None:
         """
         Force un flush des buffers BaseTradeLogger + JSONL + DB lane.
@@ -4496,75 +4815,13 @@ class LoggerHistoriqueManager:
         - volatility: doit être scalaire (REAL) => on tente d’extraire un float depuis dict, sinon None
         - slippage_est: compat depuis slippage si présent
         """
-        def _pick_float_from_dict(d: Any, preferred_keys: List[str]) -> Optional[float]:
-            if not isinstance(d, dict) or not d:
-                return None
-            for k in preferred_keys:
-                if k in d and d[k] is not None:
-                    try:
-                        return float(d[k])
-                    except Exception:
-                        pass
-            # fallback: première valeur numérique >0
-            for v in d.values():
-                if isinstance(v, (int, float)) and v > 0:
-                    return float(v)
-            return None
-
-        mapped: List[Dict[str, Any]] = []
-        for r in (rows or []):
-            if not isinstance(r, dict):
-                continue
-            rr = dict(r)
-
-            # trade_result (schema DB)
-            if rr.get("trade_result") is None and rr.get("last_trade_result") is not None:
-                rr["trade_result"] = rr.get("last_trade_result")
-
-            # latency_ms_avg (schema DB)
-            if rr.get("latency_ms_avg") is None:
-                lat = (
-                    _pick_float_from_dict(rr.get("route_latency_ema_ms"), ["e2e", "ack", "fill"])
-                    or _pick_float_from_dict(rr.get("ema_latency_ms"), ["e2e", "ack", "fill"])
-                )
-                if lat is not None:
-                    rr["latency_ms_avg"] = lat
-
-            # slippage_est (schema DB) - best effort
-            if rr.get("slippage_est") is None and isinstance(rr.get("slippage"), (int, float)):
-                rr["slippage_est"] = float(rr.get("slippage"))
-
-            # volatility (schema DB REAL) => jamais un dict
-            vol = rr.get("volatility")
-            if isinstance(vol, dict):
-                rr["volatility"] = _pick_float_from_dict(
-                    vol,
-                    [
-                        "ema_vol_bps", "vol_bps", "volatility_bps",
-                        "sigma_bps", "sigma",
-                        "price_p95", "price_p99", "spread_p95", "spread_p99",
-                        "p95", "p99",
-                    ],
-                )
-            elif not (vol is None or isinstance(vol, (int, float))):
-                rr["volatility"] = None
-
-            mapped.append(rr)
-
-        return mapped
-
-    def _map_pair_history_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Adapter PairHistoryTracker.collect_pair_metrics() -> schéma attendu par LogWriter.write_pair_history().
-        Objectif: éviter les dicts (volatility/ema_latency_ms) qui cassent sqlite bindings.
-        """
         def _pick_numeric(d: Any) -> Optional[float]:
             if isinstance(d, (int, float)):
                 return float(d)
             if not isinstance(d, dict) or not d:
                 return None
             # priorités connues (EMA latencies du tracker)
-            for k in ("e2e", "ack", "fill"):
+            for k in ("e2e", "ack", "fill", "avg"):
                 v = d.get(k)
                 if isinstance(v, (int, float)) and v > 0:
                     return float(v)
@@ -4584,33 +4841,40 @@ class LoggerHistoriqueManager:
             if not pair:
                 continue
 
-            # latency_ms_avg : scalaire dérivé route_latency_ema_ms puis ema_latency_ms
-            lat = None
-            lat_src = r.get("route_latency_ema_ms") or r.get("ema_latency_ms") or r.get("rt_latency_ema_ms")
-            lat = _pick_numeric(lat_src)
+            rr = dict(r)
 
-            # volatility : scalaire (sinon None)
-            vol = _pick_numeric(r.get("volatility"))
+            # trade_result (schema DB)
+            if rr.get("trade_result") is None and rr.get("last_trade_result") is not None:
+                rr["trade_result"] = rr.get("last_trade_result")
 
-            # slippage_est : scalaire depuis tracker "slippage"
-            slip = r.get("slippage")
-            slippage_est = float(slip) if isinstance(slip, (int, float)) else None
+            # latency_ms_avg (schema DB)
+            if rr.get("latency_ms_avg") is None:
+                lat_src = rr.get("route_latency_ema_ms") or rr.get("ema_latency_ms") or rr.get("rt_latency_ema_ms")
+                lat = _pick_numeric(lat_src)
+                if lat is not None:
+                    rr["latency_ms_avg"] = lat
 
-            out.append({
-                "timestamp": r.get("timestamp") or now_iso,
-                "pair": pair,
-                "spread": r.get("spread"),
-                "volume": r.get("volume"),
-                "slippage_est": slippage_est,
-                "slippage_real": r.get("slippage_real"),
-                "volatility": vol,
-                "trade_result": r.get("trade_result") or r.get("last_trade_result"),
-                "net_profitability": r.get("net_profitability"),
-                "opportunity_freq": r.get("opportunity_freq"),
-                "score": r.get("score"),
-                "latency_ms_avg": lat,
-                "tier": r.get("tier"),
-            })
+            # volatility (schema DB REAL) => jamais un dict
+            vol = rr.get("volatility")
+            if isinstance(vol, dict):
+                rr["volatility"] = _pick_numeric(vol)
+            elif not (vol is None or isinstance(vol, (int, float))):
+                rr["volatility"] = None
+
+            # slippage_est (schema DB) - best effort
+            if rr.get("slippage_est") is None:
+                slip = rr.get("slippage")
+                if isinstance(slip, (int, float)):
+                    rr["slippage_est"] = float(slip)
+                elif isinstance(slip, dict):
+                    rr["slippage_est"] = _pick_numeric(slip)
+
+            # Ensure essential fields
+            if "timestamp" not in rr:
+                rr["timestamp"] = rr.get("ts_iso") or rr.get("iso") or now_iso
+            rr["pair"] = pair
+
+            out.append(rr)
 
         return out
 
@@ -4634,7 +4898,9 @@ class LoggerHistoriqueManager:
                     await self._update_db_size_gauge()
 
         except asyncio.CancelledError:
-            logging.exception("Unhandled exception")
+            # Annulation normale lors du stop()
+            return
+
         except Exception:
             logger.exception("rotation_loop error")
 
@@ -5424,32 +5690,7 @@ class LoggerHistoriqueManager:
             return self._tracker.get_scores_for_pair(pair)
         return {"score": float(self.get_score(pair))}
 
-    def rotate_now(self) -> None:
-        """Force une rotation immédiate (le tracker applique ses quotas par branche)."""
-        self._tracker.rotate_pairs()
 
-    def rotate_cohorts(self) -> None:
-        """Best-effort: rotation des cohortes côté tracker (si supporté)."""
-        fn = getattr(self._tracker, "rotate_cohorts", None)
-        if callable(fn):
-            try:
-                fn(now=None)
-            except Exception:
-                logger.exception("rotate_cohorts failed", exc_info=True)
-
-    def get_cohorts(self) -> Dict[str, list]:
-        """
-        API publique: cohortes actuelles (CORE/PRIMARY/AUDITION/SANDBOX).
-        Boot/Scanner ne doivent jamais lire _tracker directement.
-        """
-        fn = getattr(self._tracker, "get_cohorts", None)
-        if callable(fn):
-            try:
-                coh = fn()
-                return coh or {}
-            except Exception:
-                logger.exception("get_cohorts failed", exc_info=True)
-        return {}
 
 
     def set_max_active_by_mode(self, **kw) -> None:
@@ -5567,6 +5808,7 @@ class LoggerHistoriqueManager:
             "tracker": getattr(self._tracker, "get_status_enriched", self._tracker.get_status)(),
             "rotate_every_s": self._rotate_interval,
             "prometheus_enabled": bool(_PROM_READY),
+            "logging_broken": getattr(self, "_logging_broken", False),
             # extras utiles
             "trade_queue_size": getattr(self._trade_logger, "get_queue_size", lambda: None)(),
             "writer": getattr(self._writer, "get_status", lambda: {} )(),

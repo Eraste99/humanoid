@@ -628,20 +628,23 @@ def build_fragment_plan(
     *,
     source: str,
     avg_fragment_quote: Optional[float] = None,
+    branch: str = "TT",
 ) -> Dict[str, Any]:
-    """Construit un plan de fragmentation canonique (amounts + groups).
-
-    La planification reste pure : aucun accès au RiskManager/Engine, uniquement
-    des calculs déterministes basés sur le notional cible et la config.
-    """
+    """Construit un plan de fragmentation canonique (amounts + groups)."""
     total = max(0.0, float(total_quote))
+    min_frag = float(min_fragment_quote or 0.0)
+    
     if total <= 0:
         return {
+            "version": 1,
+            "source": source,
+            "branch": branch,
+            "total_quote": total,
+            "min_fragment_quote": min_frag,
+            "max_fragments": max_fragments or 1,
             "amounts": [],
             "groups": [],
-            "avg_fragment_quote": 0.0,
-            "total_quote": total,
-            "source": source,
+            "group_size": group_size,
             "valid": False,
         }
 
@@ -651,7 +654,7 @@ def build_fragment_plan(
     elif avg_fragment_quote and avg_fragment_quote > 0:
         count = max(1, int(round(total / float(avg_fragment_quote))))
     else:
-        count = max(1, int(round(total / max(min_fragment_quote, 1.0))))
+        count = max(1, int(round(total / max(min_frag, 1.0))))
 
     if max_fragments:
         try:
@@ -686,36 +689,39 @@ def build_fragment_plan(
         if size <= 0 or budget <= 0:
             continue
         per_slice = budget / size
-        if per_slice < min_fragment_quote and size > 1:
-            size = max(1, int(min(size, math.ceil(budget / max(min_fragment_quote, 1.0)))))
+        if per_slice < min_frag and size > 1:
+            size = max(1, int(min(size, math.ceil(budget / max(min_frag, 1.0)))))
             per_slice = budget / size
         for _i in range(size):
-            amt = per_slice
-            amounts.append(amt)
+            amounts.append(per_slice)
             groups.append(label)
 
     diff = total - sum(amounts)
     if amounts and abs(diff) > 1e-6:
         amounts[-1] = max(0.0, amounts[-1] + diff)
 
-    # Fusionner une queue trop petite avec l'avant-dernière tranche
-    if len(amounts) >= 2 and amounts[-1] < (min_fragment_quote * 0.5):
+    if len(amounts) >= 2 and amounts[-1] < (min_frag * 0.5):
         merged = amounts[-1] + amounts[-2]
         amounts[-2] = merged
         amounts.pop()
         if groups:
             groups.pop()
 
-    avg = (sum(amounts) / max(1, len(amounts))) if amounts else 0.0
     return {
-        "amounts": amounts,
-        "groups": groups,
-        "avg_fragment_quote": avg,
-        "total_quote": total,
-        "desired_count": desired_count,
-        "weights": normalize_frontload_weights(weights, max_fragments=count),
-        "group_size": group_size,
+        "version": 1,
         "source": source,
+        "branch": branch,
+        "total_quote": total,
+        "min_fragment_quote": min_frag,
+        "max_fragments": max_fragments or 64,
+        "amounts": [round(a, 6) for a in amounts],
+        "groups": groups,
+        "group_size": group_size,
+        "stop_rules": {
+            "time_budget_ms": 5000,
+            "min_edge_net_bps": -100,
+            "abort_on_health": True
+        },
         "valid": True,
     }
 
@@ -729,64 +735,55 @@ def validate_fragment_plan(
     tol: float = 1e-3,
 ) -> Dict[str, Any]:
     """Valide/normalise un plan de fragments (fallback mono-fragment G1)."""
-    total = max(0.0, float(total_quote))
-    amts = []
-    groups = []
-    try:
-        amts = [float(a) for a in (plan or {}).get("amounts", []) if float(a) > 0]
-    except Exception:
-        amts = []
-    try:
-        groups = list((plan or {}).get("groups", []))
-    except Exception:
-        groups = []
+    if not plan or not isinstance(plan, dict):
+        return build_fragment_plan(total_quote, 1, None, min_fragment_quote, max_fragments, 3, source="VAL_MISSING")
 
-    valid = True
+    amounts = plan.get("amounts") or []
+    groups = plan.get("groups") or []
+    
+    if not amounts or len(amounts) != len(groups):
+        return build_fragment_plan(total_quote, 1, None, min_fragment_quote, max_fragments, 3, source="VAL_INCONSISTENT")
 
-    if max_fragments and max_fragments > 0:
-        amts = amts[: max_fragments]
-        groups = groups[: len(amts)]
+    total_plan = sum(amounts)
+    if abs(total_plan - total_quote) > (total_quote * tol + 1e-3):
+        return build_fragment_plan(total_quote, 1, None, min_fragment_quote, max_fragments, 3, source="VAL_TOTAL_MISMATCH")
 
-    if len(amts) != len(groups) or not amts:
-        valid = False
-    if any(a < min_fragment_quote for a in amts):
-        valid = False
-    if any(g not in FRAGMENT_GROUPS for g in groups):
-        valid = False
-    if total > 0:
-        if abs(sum(amts) - total) > max(tol, tol * max(1.0, total)):
-            valid = False
+    if max_fragments and len(amounts) > max_fragments:
+        return build_fragment_plan(total_quote, max_fragments, None, min_fragment_quote, max_fragments, 3, source="VAL_MAX_FRAG")
 
-    if not valid:
-        amts = [total] if total > 0 else []
-        groups = ["G1"] if total > 0 else []
+    if any(a < (min_fragment_quote * 0.4) for a in amounts):
+        return build_fragment_plan(total_quote, 1, None, min_fragment_quote, max_fragments, 3, source="VAL_MIN_FRAG")
 
-    avg = (sum(amts) / max(1, len(amts))) if amts else 0.0
-    out = {
-        "amounts": amts,
-        "groups": groups,
-        "avg_fragment_quote": avg,
-        "total_quote": total,
-        "valid": valid,
-    }
-    out.update({k: v for k, v in (plan or {}).items() if k not in out})
-    return out
+    return plan
+
 
 # -----------------------------------------------------------------------------
 # Sous-modèles typés (riches)
 # -----------------------------------------------------------------------------
 class Frag(_Cfg, BaseModel):
-    """Fragmentation front-load canonique (G1/G2/G3, plan embarqué)."""
-
-    group: Optional[str] = Field(default=None)
-    idx: Optional[int] = Field(default=None, ge=0)
-    total: Optional[int] = Field(default=None, ge=1)
-    weight: Optional[float] = Field(default=None, ge=0)
-    planned_notional_quote: Optional[float] = Field(default=None, ge=0)
-    plan: Optional[Dict[str, Any]] = None
+    """Slicing/Fragmentation (TT + TM) — spécification unique."""
+    version: int = 1
+    source: str = "UNKNOWN"
+    branch: str = "TT" # TT|TM
+    total_quote: float = 0.0
+    min_fragment_quote: float = 0.0
+    max_fragments: int = 1
+    amounts: List[float] = Field(default_factory=list)
+    groups: List[str] = Field(default_factory=list)
+    group_size: int = 3
+    stop_rules: Dict[str, Any] = Field(default_factory=lambda: {
+        "time_budget_ms": 5000,
+        "min_edge_net_bps": -100,
+        "abort_on_health": True
+    })
+    
     # Legacy / compat
-    cohort: Optional[str] = None
-    weights: Optional[List[float]] = None  # ex: [0.50, 0.35, 0.15]
+    group: Optional[str] = None
+    idx: Optional[int] = None
+    total: Optional[int] = None
+    weight: Optional[float] = None
+    planned_notional_quote: Optional[float] = None
+    plan: Optional[Dict[str, Any]] = None
 
 
 class Caps(_Cfg, BaseModel):
@@ -1582,6 +1579,45 @@ def make_rm_shutdown_event(*,
     }
 
 class ReasonCodes:
+    # Scanner (SC_*)
+    SC_BOOK_STALE = "SC_BOOK_STALE"
+    SC_FEES_UNKNOWN = "SC_FEES_UNKNOWN"
+    SC_FEES_STALE = "SC_FEES_STALE"
+    SC_SLIP_UNKNOWN = "SC_SLIP_UNKNOWN"
+    SC_SLIP_STALE = "SC_SLIP_STALE"
+    SC_VOL_UNKNOWN_OR_STALE = "SC_VOL_UNKNOWN_OR_STALE"
+    SC_BELOW_MIN_BPS = "SC_BELOW_MIN_BPS"
+    SC_SHALLOW_BOOK = "SC_SHALLOW_BOOK"
+
+    # RM (RM_*)
+    RM_MARKETDATA_STALE = "RM_MARKETDATA_STALE"
+    RM_PRUDENCE_BLOCK = "RM_PRUDENCE_BLOCK"
+    RM_BUDGET_EXHAUSTED = "RM_BUDGET_EXHAUSTED"
+    RM_CAP_EXCEEDED_BUNDLE = "RM_CAP_EXCEEDED_BUNDLE"
+    RM_CAP_EXCEEDED_BRANCH = "RM_CAP_EXCEEDED_BRANCH"
+    RM_BELOW_MIN_NET_BPS = "RM_BELOW_MIN_NET_BPS"
+    RM_CLOCK_SKEW = "RM_CLOCK_SKEW"
+    RM_BALANCE_TTL_BLOCK = "RM_BALANCE_TTL_BLOCK"
+    RM_BALANCE_TTL_DEGRADED = "RM_BALANCE_TTL_DEGRADED"
+    RM_MODE_SEVERE_IOC_ONLY = "RM_MODE_SEVERE_IOC_ONLY"
+
+    # Engine (ENGINE_*)
+    # TT
+    ENGINE_TT_REVALIDATE_FAIL = "ENGINE_TT_REVALIDATE_FAIL"
+    ENGINE_TT_STOP_TIME_BUDGET = "ENGINE_TT_STOP_TIME_BUDGET"
+    ENGINE_TT_STOP_EDGE_FLOOR = "ENGINE_TT_STOP_EDGE_FLOOR"
+    ENGINE_TT_STOP_ACK_SLO = "ENGINE_TT_STOP_ACK_SLO"
+    ENGINE_TT_DUALSUBMIT_FAIL = "ENGINE_TT_DUALSUBMIT_FAIL"
+    ENGINE_TT_PANIC_HEDGE = "ENGINE_TT_PANIC_HEDGE"
+    
+    # TM
+    ENGINE_TMGUARD_QPOS_AHEAD_QUOTE = "ENGINE_TMGUARD_QPOS_AHEAD_QUOTE"
+    ENGINE_TMGUARD_QPOS_ETA = "ENGINE_TMGUARD_QPOS_ETA"
+    ENGINE_TM_WATCHDOG_TIMEOUT = "ENGINE_TM_WATCHDOG_TIMEOUT"
+    ENGINE_TM_HEDGE_TTL_BREACH = "ENGINE_TM_HEDGE_TTL_BREACH"
+    ENGINE_TM_REVALIDATE_FAIL = "ENGINE_TM_REVALIDATE_FAIL"
+    ENGINE_TM_PANIC_MODE = "ENGINE_TM_PANIC_MODE"
+
     TEMPETE = "TEMPETE"
     CALM_ENTRY = "CALM_ENTRY"
     ENGINE_ERRORS = "ENGINE_ERRORS"
@@ -1593,12 +1629,23 @@ class ReasonCodes:
         return f"{ReasonCodes.SIGNAL_MISSING_PREFIX}{name}"
 
 KNOWN_REASON_CODES = {
-    "RM_BALANCE_TTL_DEGRADED",
-    "RM_ENGINE_NOT_READY",
-    "RM_BALANCE_TTL_BLOCK",
-    "RM_STALE_VOL",
-    "RM_BELOW_MIN_BPS",
-    "RM_BELOW_MIN_NOTIONAL",
+    # Scanner
+    "SC_BOOK_STALE", "SC_FEES_UNKNOWN", "SC_FEES_STALE", "SC_SLIP_UNKNOWN",
+    "SC_SLIP_STALE", "SC_VOL_UNKNOWN_OR_STALE", "SC_BELOW_MIN_BPS", "SC_SHALLOW_BOOK",
+
+    # RM
+    "RM_MARKETDATA_STALE", "RM_PRUDENCE_BLOCK", "RM_BUDGET_EXHAUSTED",
+    "RM_CAP_EXCEEDED_BUNDLE", "RM_CAP_EXCEEDED_BRANCH", "RM_BELOW_MIN_NET_BPS",
+    "RM_CLOCK_SKEW", "RM_BALANCE_TTL_BLOCK", "RM_BALANCE_TTL_DEGRADED",
+    "RM_MODE_SEVERE_IOC_ONLY", "RM_ENGINE_NOT_READY", "RM_STALE_VOL",
+
+    # Engine TT
+    "ENGINE_TT_REVALIDATE_FAIL", "ENGINE_TT_STOP_TIME_BUDGET", "ENGINE_TT_STOP_EDGE_FLOOR",
+    "ENGINE_TT_STOP_ACK_SLO", "ENGINE_TT_DUALSUBMIT_FAIL", "ENGINE_TT_PANIC_HEDGE",
+
+    # Engine TM
+    "ENGINE_TMGUARD_QPOS_AHEAD_QUOTE", "ENGINE_TMGUARD_QPOS_ETA", "ENGINE_TM_WATCHDOG_TIMEOUT",
+    "ENGINE_TM_HEDGE_TTL_BREACH", "ENGINE_TM_REVALIDATE_FAIL", "ENGINE_TM_PANIC_MODE",
     "RM_CAPS_INVALID",
     "ENGINE_SUBMIT_TIMEOUT",
     "RM_CAPS_BROKEN",
@@ -1692,6 +1739,19 @@ KNOWN_REASON_CODES = {
     "ROUTER_QUEUE_FULL_PAIR_FROZEN",
     "TRANSFER_FSM_IN_PROGRESS_SKIP",
     "TRANSFER_FSM",
+    "ENGINE_TT_POLICY_NO_PLAN",
+    "ENGINE_TT_POLICY_DEGRADED_STAGGERED",
+    "ENGINE_TT_POLICY_IOC_ONLY",
+    "ENGINE_TT_REVALIDATE_FAIL",
+    "ENGINE_TT_FRAGMENT_NOT_PROFITABLE",
+    "RM_MIN_EDGE_WITH_LAT_PENALTY",
+    "ENGINE_TT_STOP_EDGE_FLOOR",
+    "ENGINE_TT_STOP_ACK_SLO",
+    "ENGINE_TT_STOP_TIME_BUDGET",
+    "ENGINE_TT_STOP_PANIC_HEDGE",
+    "ENGINE_TT_PWS_UNHEALTHY",
+    "ENGINE_TT_BOOK_STALE",
+    "ENGINE_TT_ROUTER_STALE",
     "TRANSFER_FAILED",
     "XFER_STUCK_SUBMITTED_FAIL_CLOSED",
     ReasonCodes.TEMPETE,

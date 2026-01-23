@@ -42,6 +42,7 @@ import base64
 import logging
 import json
 import random
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, Tuple, List,Set, Iterable, Callable
 
 from contracts.payloads import (
@@ -59,12 +60,8 @@ logger.setLevel(logging.INFO)
 
 # === Logger (module-level) ====================================================
 import logging
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 log = logging.getLogger("BalanceFetcher")
-# Optionnel: si ton app ne configure pas déjà le logging global
-if not logging.getLogger().handlers:
-    logging.basicConfig(level=logging.INFO)
 
 
 # ===== Metrics (fallback no-op si absents) ==================================
@@ -83,6 +80,9 @@ try:
         BF_BALANCES_TTL_DEGRADED_SECONDS,
         BF_BALANCES_TTL_BLOCK_SECONDS,
         BF_BALANCES_HEALTH_STATE,
+        MBF_WS_DELTA_APPLIED_TOTAL,
+        MBF_WS_DELTA_REJECTED_TOTAL,
+        MBF_WALLET_ASSET_COUNT,
     )
 except Exception:  # pragma: no cover
     class _NoopMetric:
@@ -98,6 +98,7 @@ except Exception:  # pragma: no cover
     BF_API_LATENCY_MS = BF_API_ERRORS_TOTAL = BF_CACHE_AGE_SECONDS = BF_LAST_SUCCESS_TS = FEE_TOKEN_BALANCE = _NoopMetric()
     BF_HTTP_LATENCY_SECONDS = BF_HTTP_ERRORS_TOTAL = BF_FEE_TOKEN_LEVEL = BF_FEE_TOKEN_LOW_TOTAL = _NoopMetric()
     BF_BALANCES_TTL_NORMAL_SECONDS = BF_BALANCES_TTL_DEGRADED_SECONDS = BF_BALANCES_TTL_BLOCK_SECONDS = BF_BALANCES_HEALTH_STATE = _NoopMetric()
+    MBF_WS_DELTA_APPLIED_TOTAL = MBF_WS_DELTA_REJECTED_TOTAL = MBF_WALLET_ASSET_COUNT = _NoopMetric()
 else:
     class _NoopMetric:
         def labels(self, *_, **__): return self
@@ -231,6 +232,15 @@ class MultiBalanceFetcher:
                 getattr(bf_cfg, "BF_WS_RECO_RESYNC_AGE_THR_S", 6 * 3600.0),
             )
         )
+        # Ticket P0-MBF-WS-02: Fraîcheur WS intégrée
+        self._last_ws_update_ts: Dict[Tuple[str, str], float] = {}
+
+        # Optimisation P1: Cache de snapshot pour le hot path (RiskManager/Scanner)
+        self._rm_snapshot_cache: Dict[str, Dict[str, Any]] = {}  # mode -> snapshot
+        self._last_rm_snapshot_ts: Dict[str, float] = {}        # mode -> timestamp
+        # Intervalle de rafraîchissement du snapshot cache
+        self._rm_snapshot_cache_interval_s = 0.200 # 200ms
+
         # Comptes par alias (upper)
         self.binance_accounts = { _upper(k): v for k, v in (binance_accounts or {}).items() }
         self.coinbase_accounts= { _upper(k): v for k, v in (coinbase_at_accounts or {}).items() }
@@ -429,7 +439,7 @@ class MultiBalanceFetcher:
             bf_cfg = self._bf_cfg
             m = getattr(bf_cfg, "fee_token_low_watermarks", None) if bf_cfg is not None else None
             if not m:
-                legacy = getattr_dict(self.cfg, "FEE_TOKEN_LOW_WATERMARKS")
+                legacy = getattr(self.cfg, "FEE_TOKEN_LOW_WATERMARKS", None)
                 if legacy:
                     self._warn_once(
                         "fee_token_low_watermarks_legacy",
@@ -625,7 +635,7 @@ class MultiBalanceFetcher:
         Périodicité par config BF_ALERT_PERIOD_S (def 15s).
         """
         bf_cfg = self._bf_cfg
-        period = getattr_float(bf_cfg, "BF_ALERT_PERIOD_S", 15.0)
+        period = float(getattr(bf_cfg, "BF_ALERT_PERIOD_S", 15.0))
         low_map = self._get_fee_token_low_map()
 
         task = asyncio.current_task()
@@ -670,7 +680,17 @@ class MultiBalanceFetcher:
             self._running = True
             return
 
-        self._connector = aiohttp.TCPConnector(limit=80, ssl=True, enable_cleanup_closed=True)
+        # P0: Configuration athlétique des connecteurs REST (parité CEX)
+        # Forcer IPv4, TCP_NODELAY, et nettoyage agressif des connexions fermées.
+        import socket
+        self._connector = aiohttp.TCPConnector(
+            limit=80, 
+            ssl=True, 
+            family=socket.AF_INET,
+            force_close=True,
+            enable_cleanup_closed=True,
+            ttl_dns_cache=300
+        )
         self._session = aiohttp.ClientSession(timeout=self._timeout, connector=self._connector)
         if self.use_server_time and not self.dry_run and self.binance_accounts:
             try:
@@ -712,8 +732,8 @@ class MultiBalanceFetcher:
                 mult = 1.0
                 try:
                     bf_cfg = self._bf_cfg
-                    state_eu = getattr_str(bf_cfg, "BF_PACER_EU", "NORMAL").upper()
-                    state_us = getattr_str(bf_cfg, "BF_PACER_US", "NORMAL").upper()
+                    state_eu = str(getattr(bf_cfg, "BF_PACER_EU", "NORMAL")).upper()
+                    state_us = str(getattr(bf_cfg, "BF_PACER_US", "NORMAL")).upper()
                     if state_eu == "DEGRADED": mult = max(mult, 1.4)
                     if state_eu == "SEVERE":   mult = max(mult, 2.0)
                     if state_us == "DEGRADED": mult = max(mult, 1.6)
@@ -1116,6 +1136,84 @@ class MultiBalanceFetcher:
             logger.exception("[Bybit:%s] balances error", al)
             return {}
 
+    # =========================== Frais de trading ============================
+    async def get_trading_fees(self, alias: str) -> Dict[str, Any]:
+        """
+        Détecte l'exchange associé à l'alias et récupère les frais.
+        Interface compatible avec SlippageAndFeesCollector.
+        """
+        al = _upper(alias)
+        if al in self.binance_accounts:
+            return await self._fetch_binance_fees(al)
+        if al in self.bybit_accounts:
+            return await self._fetch_bybit_fees(al)
+        if al in self.coinbase_accounts:
+            return await self._fetch_coinbase_fees(al)
+
+        logger.warning(f"[MultiBalanceFetcher] Alias inconnu pour get_trading_fees: {al}")
+        return {"maker": 0.0, "taker": 0.0, "per_pair": {}}
+
+    async def _fetch_binance_fees(self, alias: str) -> Dict[str, Any]:
+        creds = self.binance_accounts[alias]
+        ts_ms = int(time.time() * 1000 + (self._binance_time_offset_ms if self.use_server_time else 0))
+        query = f"timestamp={ts_ms}&recvWindow=5000"
+        sig = hmac.new(creds["secret"].encode(), query.encode(), hashlib.sha256).hexdigest()
+        url = f"{self.BINANCE_API}/api/v3/account?{query}&signature={sig}"
+        headers = {"X-MBX-APIKEY": creds["api_key"]}
+
+        try:
+            js = await self._request_json("GET", url, headers=headers, key=("BINANCE", alias), endpoint="binance/account")
+            # commissions sont en bps dans /account (ex: 10 = 0.1%)
+            maker = float(js.get("makerCommission", 0)) / 10000.0
+            taker = float(js.get("takerCommission", 0)) / 10000.0
+            return {"maker": maker, "taker": taker, "per_pair": {}}
+        except Exception:
+            logger.exception("[Binance:%s] fee error", alias)
+            return {"maker": 0.0, "taker": 0.0, "per_pair": {}}
+
+    async def _fetch_bybit_fees(self, alias: str) -> Dict[str, Any]:
+        creds = self.bybit_accounts[alias]
+        ts = str(int(time.time() * 1000))
+        recv_window = "5000"
+        query = f"category=spot"
+        payload = f"{ts}{creds['api_key']}{recv_window}{query}"
+        sig = hmac.new(creds["secret"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": creds["api_key"],
+            "X-BAPI-SIGN": sig,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv_window,
+        }
+        url = f"{self.BYBIT_API}/v5/account/fee-rate?{query}"
+
+        try:
+            js = await self._request_json("GET", url, headers=headers, key=("BYBIT", alias), endpoint="bybit/fee-rate")
+            res = js.get("result", {}).get("list", [])
+            if res:
+                maker = float(res[0].get("makerFeeRate", 0))
+                taker = float(res[0].get("takerFeeRate", 0))
+                return {"maker": maker, "taker": taker, "per_pair": {}}
+            return {"maker": 0.0, "taker": 0.0, "per_pair": {}}
+        except Exception:
+            logger.exception("[Bybit:%s] fee error", alias)
+            return {"maker": 0.0, "taker": 0.0, "per_pair": {}}
+
+    async def _fetch_coinbase_fees(self, alias: str) -> Dict[str, Any]:
+        creds = self.coinbase_accounts[alias]
+        path = "/api/v3/brokerage/transaction_summary"
+        headers = self._cb_headers(creds["secret"], "GET", path, api_key=creds["api_key"])
+        url = f"{self.COINBASE_API}{path}"
+
+        try:
+            js = await self._request_json("GET", url, headers=headers, key=("COINBASE", alias), endpoint="coinbase/fees")
+            fee_tier = js.get("fee_tier", {})
+            maker = float(fee_tier.get("maker_fee_rate", 0))
+            taker = float(fee_tier.get("taker_fee_rate", 0))
+            return {"maker": maker, "taker": taker, "per_pair": {}}
+        except Exception:
+            logger.exception("[Coinbase:%s] fee error", alias)
+            return {"maker": 0.0, "taker": 0.0, "per_pair": {}}
+
     # =========================== Agrégations (réel) ===========================
     async def get_all_balances(self, *, force_refresh: bool = False) -> Dict[str, Dict[str, Dict[str, float]]]:
         if self._session is None or self._session.closed:
@@ -1176,6 +1274,34 @@ class MultiBalanceFetcher:
 
         return balances
 
+
+    async def verify_transfer_status_rest(self, exchange: str, alias: str, transfer_id: str) -> str:
+        """
+        P0: Polling REST pour confirmer un transfert (SUBMITTED -> SETTLED/FAILED)
+        """
+        ex = exchange.upper()
+        try:
+            if ex == "BINANCE":
+                # https://binance-docs.github.io/apidocs/spot/en/#query-user-universal-transfer-history-user_data
+                res = await self._request_json("GET", "/sapi/v1/sub-account/transfer/sub-to-sub", key=(ex, alias), params={"clientTranId": transfer_id})
+                if isinstance(res, list) and len(res) > 0:
+                    status = str(res[0].get("status") or "").upper()
+                    if status == "SUCCESS": return "SETTLED"
+                elif isinstance(res, dict) and res.get("status") == "SUCCESS":
+                    return "SETTLED"
+            elif ex == "BYBIT":
+                # https://bybit-exchange.github.io/docs/v5/asset/inter-transfer-list
+                res = await self._request_json("GET", "/v5/asset/transfer/query-inter-transfer-list", key=(ex, alias), params={"transferId": transfer_id})
+                if isinstance(res, dict) and res.get("retCode") == 0:
+                    list_data = res.get("result", {}).get("list", [])
+                    if list_data:
+                        status = str(list_data[0].get("status") or "").upper()
+                        if status == "SUCCESS": return "SETTLED"
+                        if status in ("FAILED", "CANCELLED"): return "FAILED"
+        except Exception as e:
+            logger.warning("[BalanceFetcher] verify_transfer_status_rest failed for %s %s: %s", ex, transfer_id, e)
+        
+        return "SUBMITTED"
 
     async def get_balances(self, mode: str = "real", *, force_refresh: bool = False) -> Dict[
         str, Dict[str, Dict[str, float]]]:
@@ -1283,7 +1409,7 @@ class MultiBalanceFetcher:
         self,
         *,
         mode: str = "merged",
-        quotes: Iterable[str] = ("USDC",),
+        quotes: Iterable[str] = ("USDC", "USDT", "EUR"),
         fee_tokens: Iterable[str] = ("BNB", "MNT"),
         cached_only: bool = True,
     ) -> Dict[str, Any]:
@@ -1637,71 +1763,24 @@ class MultiBalanceFetcher:
         """
         Snapshot unifié prêt pour le RiskManager / Rebalancing.
 
-        Retourne toujours un dict de la forme :
-            {
-                "mode": "real" | "virtual" | "merged",
-                "balances": {                      # vue capitale opérationnelle
-                    EXCHANGE: {ALIAS: {ASSET: float, ...}, ...},
-                    ...
-                },
-                 "meta": {                          # métriques de fraîcheur & fees & WS
-                    "age_s": { "EX.ALIAS": float, ... },
-                    "fee_tokens": {
-                        TOKEN: {
-                            "EX.ALIAS": {
-                                "balance": float,
-                                "level": "low" | "ok" | "high",
-                                "low_watermark": float,
-                                "high_watermark": float,
-                            },
-                            ...,
-                        },
-                    "vip": { "EX.ALIAS": {...}, ... },},
-                    "ws_accounts": {               # statut comptes WS agrégé
-                           "EX.ALIAS": {
-                            "hub_status": "WS_OK" | "WS_DEGRADED" | "WS_DOWN" | "WS_UNKNOWN",
-                            "reco_status": "OK" | "AT_RISK" | "BROKEN" | "UNKNOWN",
-                            "capital_at_risk": bool,
-                            "miss_rate_per_min": float | None,
-                            "age_since_last_alias_resync_s": float | None,
-                            "raw_hub": {...},         # optionnel
-                            "raw_reconciler": {...},  # optionnel
-                        },
-                        ...,
-                    },
-                    "balances_health": {
-                        "EX.ALIAS": {
-                            "state": "NORMAL" | "DEGRADED" | "BLOCK",
-                            "age_s": float,
-                            "ttl_normal_s": float,
-                            "ttl_degraded_s": float,
-                            "ttl_block_s": float,
-                        },
-                        ...,
-
-                    },
-                    "view": "real" | "virtual" | "merged",
-                    "cached_only": bool,
-                    "as_of_ts": float,  # horodatage monotonic
-                },
-
-        - `mode` est aligné sur `get_balances_snapshot` (real/virtual/merged).
-        - `cached_only=True` ne déclenche aucune I/O : si rien n’est en cache,
-          on renvoie juste des métadonnées cohérentes.
-        - `meta["age_s"]` est la source UNIQUE des TTL balances par (exchange, alias)
-          pour le RiskManager, y compris la surcouche « capital en mouvement »
-          introduite au Ticket 8.
+        Optimisation P1 (HFT) : 
+        - Utilise un cache read-only rafraîchi toutes les 200ms si cached_only=True.
+        - Évite les doubles copies défensives et les model_dump() coûteux.
         """
-
-
+        now = time.time()
         view = (mode or "real").lower()
         if view not in ("real", "virtual", "merged"):
             view = "real"
 
+        # P1: Fast-path cache (200ms) pour le RiskManager/Scanner
+        if cached_only and view in self._rm_snapshot_cache:
+            last_ts = self._last_rm_snapshot_ts.get(view, 0.0)
+            if (now - last_ts) < self._rm_snapshot_cache_interval_s:
+                return self._rm_snapshot_cache[view]
+
         # Vue brute selon le mode choisi (real/virtual/merged)
         base_balances = self.get_balances_snapshot(view) or {}
 
-        now = time.time()
         meta_age: Dict[str, float] = {}
         meta_vip: Dict[str, Any] = {}
         meta_fee: Dict[str, Dict[str, Any]] = {}
@@ -1717,7 +1796,14 @@ class MultiBalanceFetcher:
         # Parcours du cache interne _snap pour enrichir meta + backfill éventuel
         for (ex, al), rec in list(self._snap.items()):
             ts = float(rec.get("ts", 0.0))
-            age = max(0.0, now - ts) if ts > 0.0 else float("inf")
+            age_rest = max(0.0, now - ts) if ts > 0.0 else float("inf")
+
+            # Ticket P0-MBF-WS-02: Prise en compte de la fraîcheur WS
+            ts_ws = self._last_ws_update_ts.get((ex, al), 0.0)
+            age_ws = max(0.0, now - ts_ws) if ts_ws > 0.0 else float("inf")
+
+            # On retient le plus frais des deux (REST ou WS) comme base de TTL
+            age = min(age_rest, age_ws)
             meta_age[f"{ex}.{al}"] = age
             # Observabilité TTL cache par alias (gauge Prometheus)
             if ts > 0.0:
@@ -1803,9 +1889,22 @@ class MultiBalanceFetcher:
             "meta": meta,
         }
         try:
-            return validate_balance_snapshot_rm_lite(snapshot_payload).model_dump()
+            res = validate_balance_snapshot_rm_lite(snapshot_payload).model_dump()
         except Exception:
-            return snapshot_payload
+            res = snapshot_payload
+
+        # P1: Mise à jour du cache pour les prochains appels fast-path
+        self._rm_snapshot_cache[view] = res
+        self._last_rm_snapshot_ts[view] = now
+
+        return res
+
+    def get_full_balances_view(self, mode: str = "real") -> Dict[str, Any]:
+        """
+        Alias optimisé pour RiskManager/Scanner.
+        Fournit une vue read-only (snapshot) des balances.
+        """
+        return self.as_rm_snapshot(mode=mode, cached_only=True)
 
 
     # =========================== Public helpers ===============================
@@ -1872,11 +1971,12 @@ class MultiBalanceFetcher:
             alias: str,
             delta: Dict[str, float],
             wallet_type: Optional[str] = None,
+            is_authoritative: bool = False,
     ) -> None:
         """
         Compatibilité: même effet que ingest_account_ws_delta (delta par devise).
         """
-        return self.ingest_account_ws_delta(exchange, alias, delta, wallet_type=wallet_type)
+        return self.ingest_account_ws_delta(exchange, alias, delta, wallet_type=wallet_type, is_authoritative=is_authoritative)
 
     def ingest_account_ws_delta(
             self,
@@ -1884,11 +1984,14 @@ class MultiBalanceFetcher:
             alias: str,
             partial_balances: Dict[str, float],
             wallet_type: Optional[str] = None,
+            is_authoritative: bool = False,
     ) -> None:
         """
         Ingestion opportuniste de snapshots venant d'un feed 'account WS'.
-        Conserve l'hypothèse conservatrice: on ne décrémente jamais un solde réel
-        sans confirmation REST (on ne fait que relever des hausses, et on écrase sur ccy absent).
+        
+        Ticket P0-MBF-WS-01:
+        - Merge non-destructif (ne supprime pas les actifs absents du delta).
+        - Accepte les baisses si is_authoritative=True, avec garde-fou anti-glitch.
         """
         exu, alu = exchange.upper(), alias.upper()
         if not partial_balances:
@@ -1897,31 +2000,86 @@ class MultiBalanceFetcher:
         if any(isinstance(v, dict) for v in partial_balances.values()):
             for wallet, balances in partial_balances.items():
                 if isinstance(balances, dict):
-                    self.ingest_account_ws_delta(exchange, alias, balances, wallet_type=wallet)
+                    self.ingest_account_ws_delta(exchange, alias, balances, wallet_type=wallet, is_authoritative=is_authoritative)
             return
 
-        cur = ((self.latest_balances.get(exu) or {}).get(alu) or {})
-        merged = dict(cur)
+        # 1) Préparation du delta filtré
         filtered: Dict[str, float] = {}
+        has_critical = False
+        # Devises critiques pour la fraîcheur (Ticket P0-MBF-WS-02)
+        critical_assets = {"USDC", "USDT", "EUR", "BNB", "MNT", "KCS"}
+
         for ccy, val in (partial_balances or {}).items():
             try:
-                filtered[str(ccy).upper()] = float(val)
+                ccy_u = str(ccy).upper()
+                filtered[ccy_u] = float(val)
+                if ccy_u in critical_assets:
+                    has_critical = True
             except Exception:
                 continue
         filtered = self._apply_ccy_filter(filtered)
-        for ccy, v in filtered.items():
-            if v >= float(cur.get(ccy, 0.0)):
-                merged[ccy] = v
+        if not filtered:
+            return
 
-        default_wallet = self._default_wallet_type or "SPOT"
-        if (wallet_type or default_wallet).upper() == default_wallet:
-            self.latest_balances.setdefault(exu, {})[alu] = merged
+        # Mise à jour de la fraîcheur WS si mise à jour critique ou hautement fiable
+        if has_critical or is_authoritative:
+            self._last_ws_update_ts[(exu, alu)] = time.time()
 
+        # 2) Merge non-destructif pour latest_balances (seulement si wallet par défaut)
+        default_wallet = (self._default_wallet_type or "SPOT").upper()
+        target_w = (wallet_type or default_wallet).upper()
+        
+        if target_w == default_wallet:
+            cur_bal = self.latest_balances.setdefault(exu, {}).setdefault(alu, {})
+            # On ne décrémente que si authoritative + anti-glitch
+            for ccy, v in filtered.items():
+                cur_v = float(cur_bal.get(ccy, 0.0))
+                if v >= cur_v:
+                    cur_bal[ccy] = v
+                elif is_authoritative:
+                    # Garde-fou anti-glitch (Ticket P0-MBF-WS-01)
+                    # On refuse une baisse absurde (>X% en 1 tick) sans confirmation
+                    max_drop = float(getattr(self.cfg, "MBF_WS_MAX_GLITCH_DROP_PCT", 0.50)) # 50% par défaut
+                    if cur_v > 0 and (cur_v - v) / cur_v > max_drop:
+                        logger.warning(
+                            "[MBF:%s:%s] Glitch suspecté sur %s: %f -> %s (baisse > %d%%). Rejeté.",
+                            exu, alu, ccy, cur_v, v, int(max_drop * 100)
+                        )
+                        try:
+                            MBF_WS_DELTA_REJECTED_TOTAL.labels(exu, alu, "glitch").inc()
+                        except Exception:
+                            pass
+                        # On pourrait marquer suspect ou demander resync
+                        continue
+                    cur_bal[ccy] = v
+
+        # 3) Merge non-destructif pour latest_wallets
         per_alias = self.latest_wallets.setdefault(exu, {})
         per_wallet = per_alias.setdefault(alu, {})
-        w = (wallet_type or default_wallet).upper()
-        per_wallet[w] = dict(filtered)
-        self._wallet_missing_log.pop((exu, alu, w), None)
+        w_cache = per_wallet.setdefault(target_w, {})
+        
+        for ccy, v in filtered.items():
+            cur_v = float(w_cache.get(ccy, 0.0))
+            if v >= cur_v:
+                w_cache[ccy] = v
+            elif is_authoritative:
+                # Même garde-fou ici
+                max_drop = float(getattr(self.cfg, "MBF_WS_MAX_GLITCH_DROP_PCT", 0.50))
+                if cur_v > 0 and (cur_v - v) / cur_v > max_drop:
+                    try:
+                        MBF_WS_DELTA_REJECTED_TOTAL.labels(exu, alu, "glitch_wallet").inc()
+                    except Exception:
+                        pass
+                    continue
+                w_cache[ccy] = v
+        
+        try:
+            MBF_WS_DELTA_APPLIED_TOTAL.labels(exu, alu).inc()
+            MBF_WALLET_ASSET_COUNT.labels(exu, alu, target_w).set(len(w_cache))
+        except Exception:
+            pass
+
+        self._wallet_missing_log.pop((exu, alu, target_w), None)
 
 
     def prefer_ws_for_keys(self, exchange: str, alias: str, ccys: Tuple[str, ...]) -> None:
@@ -1949,6 +2107,10 @@ class MultiBalanceFetcher:
         per_alias = self.latest_wallets.setdefault(exu, {})
         per_wallet = per_alias.setdefault(alu, {})
         per_wallet[w] = {str(k).upper(): float(v) for k, v in (balances or {}).items()}
+        try:
+            MBF_WALLET_ASSET_COUNT.labels(exu, alu, w).set(len(per_wallet[w]))
+        except Exception:
+            pass
         self._wallet_missing_log.pop((exu, alu, w), None)
 
 
@@ -1999,20 +2161,22 @@ class PnlRecoCexAdapter:
         cfg:
             BotConfig (ou sous-ensemble) déjà utilisé par le BalanceFetcher.
         balance_fetcher:
-            Instance existante de BalanceFetcher (optionnel). Si None,
-            l'adaptateur peut en instancier une pour réutiliser ses clients.
-            Pour une première version, on peut laisser ce paramètre inutilisé
-            et simplement construire ses propres clients par CEX.
+            Instance existante de BalanceFetcher (optionnel).
         """
         self.cfg = cfg
-        self._bf = balance_fetcher  # facultatif: hook si tu veux réutiliser les clients existants
+        self._bf = balance_fetcher
         self._symbols_provider = symbols_provider
         self._retry_policy = BackoffPolicy.from_cfg(getattr(cfg, "retry", None))
         self._rl = RateLimiter(getattr(cfg, "rl", None))
         self._warned_cfg_keys: Set[str] = set()
 
-        # TODO (quand tu voudras): initialiser ici les clients REST/HTTP
-        # par CEX pour récupérer les trades/fills du jour.
+        self.BINANCE_API = self._resolve_api_base("binance_rest_base", default="https://api.binance.com")
+        self.BYBIT_API = self._resolve_api_base("bybit_api_base", default="https://api.bybit.com")
+        self.COINBASE_API = self._resolve_api_base("coinbase_api_base", default="https://api.coinbase.com")
+
+        self._binance_time_offset_ms = 0
+        if self._bf and hasattr(self._bf, "_binance_time_offset_ms"):
+            self._binance_time_offset_ms = getattr(self._bf, "_binance_time_offset_ms")
 
     @staticmethod
     def _region_to_tz(region: str) -> str:
@@ -2136,13 +2300,9 @@ class PnlRecoCexAdapter:
             degrade_for_symbols = not symbols_to_query or provider is None
 
         async def _fetch_binance(creds: dict, since_ms: int, until_ms: int, symbols: List[str]) -> List[dict]:
-            api_base = self._resolve_api_base(
-                "binance_rest_base",
-                default=getattr(self, "BINANCE_API", "https://api.binance.com"),
-                legacy_root="binance_rest_base",
-            )
-            url = f"{api_base}/api/v3/myTrades"
+            url = f"{self.BINANCE_API}/api/v3/myTrades"
             headers = {"X-MBX-APIKEY": creds.get("api_key", "")}
+            secret = creds.get("secret", "")
             trades: List[dict] = []
             async with aiohttp.ClientSession() as sess:
                 for sym in symbols:
@@ -2152,19 +2312,20 @@ class PnlRecoCexAdapter:
                             "symbol": sym,
                             "startTime": since_ms,
                             "endTime": until_ms,
-                            "timestamp": int(time.time() * 1000 + getattr(self, "_binance_time_offset_ms", 0)),
+                            "timestamp": int(time.time() * 1000 + self._binance_time_offset_ms),
                         }
-                        query = "&".join(f"{k}={v}" for k, v in signed_params.items())
-                        sig = hmac.new(creds.get("secret", "").encode(), query.encode(), hashlib.sha256).hexdigest()
+                        query = "&".join(f"{k}={v}" for k, v in sorted(signed_params.items()))
+                        sig = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
                         params = dict(signed_params)
                         if cursor is not None:
-                            params["fromId"] = cursor
+                            params["fromId"] = cursor + 1
                         params["signature"] = sig
                         await self._rl.acquire(exu, "pnl_reco", timeout=2.0)
                         async with sess.get(url, params=params, headers=headers, timeout=15) as resp:
                             txt = await resp.text()
                             if resp.status >= 400:
-                                raise RuntimeError(f"BINANCE myTrades error {resp.status}: {txt}")
+                                log.error(f"BINANCE myTrades error {resp.status} for {sym}: {txt}")
+                                break
                             page = json.loads(txt)
                             if not page:
                                 break
@@ -2174,72 +2335,92 @@ class PnlRecoCexAdapter:
                                 break
             return trades
 
-        async def _fetch_coinbase(creds: dict, since_ms: int, until_ms: int) -> List[dict]:
-            api_base = self._resolve_api_base(
-                "coinbase_api_base",
-                default=getattr(self, "COINBASE_API", "https://api.coinbase.com"),
-                legacy_root="coinbase_rest_base",
-            )
-            url = f"{api_base}/api/v3/brokerage/orders/historical/fills"
+        async def _fetch_coinbase(creds: dict, since_ms: int, until_ms: int) -> dict:
+            url = f"{self.COINBASE_API}/api/v3/brokerage/orders/historical/fills"
+            api_key = creds.get("api_key", "")
+            secret = creds.get("secret", "")
             product_filter = getattr(getattr(self.cfg, "g", object()), "pnl_reco_product_ids", None)
             cursor: Optional[str] = None
             fills: List[dict] = []
             async with aiohttp.ClientSession() as sess:
                 while True:
+                    # Coinbase use start_sequence_timestamp / end_sequence_timestamp for historical fills
                     params = {
-                        "start": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_ms / 1000.0)),
-                        "end": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until_ms / 1000.0)),
+                        "start_sequence_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_ms / 1000.0)),
+                        "end_sequence_timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(until_ms / 1000.0)),
                     }
                     if product_filter:
                         params["product_ids"] = ",".join(product_filter)
                     if cursor:
                         params["cursor"] = cursor
+
+                    ts = str(int(time.time()))
+                    path = "/api/v3/brokerage/orders/historical/fills"
+                    # Sort params for consistent signature
+                    sorted_params = sorted(params.items())
+                    query = "&".join(f"{k}={v}" for k, v in sorted_params)
+                    message = ts + "GET" + path + query
+                    signature = hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
+
                     headers = {
-                        "CB-ACCESS-KEY": creds.get("api_key", ""),
-                        "CB-ACCESS-SIGN": creds.get("signature", ""),
-                        "CB-ACCESS-TIMESTAMP": str(int(time.time())),
+                        "CB-ACCESS-KEY": api_key,
+                        "CB-ACCESS-SIGN": signature,
+                        "CB-ACCESS-TIMESTAMP": ts,
+                        "Content-Type": "application/json"
                     }
                     await self._rl.acquire(exu, "pnl_reco", timeout=2.0)
                     async with sess.get(url, params=params, headers=headers, timeout=15) as resp:
                         txt = await resp.text()
                         if resp.status >= 400:
-                            raise RuntimeError(f"COINBASE fills error {resp.status}: {txt}")
+                            log.error(f"COINBASE fills error {resp.status}: {txt}")
+                            return {"fills": [], "degraded": True, "reason": "COINBASE_API_ERROR"}
                         data = json.loads(txt) or {}
                         page = data.get("fills") or []
                         fills.extend(page)
                         cursor = data.get("cursor")
                         if not cursor:
                             break
-            return fills
+            return {"fills": fills, "degraded": False}
 
         async def _fetch_bybit(creds: dict, since_ms: int, until_ms: int, symbols: List[str]) -> List[dict]:
-            api_base = self._resolve_api_base(
-                "bybit_api_base",
-                default=getattr(self, "BYBIT_API", "https://api.bybit.com"),
-                legacy_root="bybit_rest_base",
-            )
-            url = f"{api_base}/v5/execution/list"
+            url = f"{self.BYBIT_API}/v5/execution/list"
+            api_key = creds.get("api_key", "")
+            secret = creds.get("secret", "")
             executions: List[dict] = []
             async with aiohttp.ClientSession() as sess:
                 symbols_scope = symbols or [None]
                 for sym in symbols_scope:
                     cursor: Optional[str] = None
                     while True:
+                        ts = str(int(time.time() * 1000))
                         params = {
                             "category": "spot",
                             "startTime": since_ms,
                             "endTime": until_ms,
+                            "limit": 100
                         }
                         if sym:
                             params["symbol"] = sym
                         if cursor:
                             params["cursor"] = cursor
-                        headers = {}
+
+                        query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+                        recv_window = "5000"
+                        msg = ts + api_key + recv_window + query
+                        signature = hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()
+
+                        headers = {
+                            "X-BAPI-API-KEY": api_key,
+                            "X-BAPI-SIGN": signature,
+                            "X-BAPI-TIMESTAMP": ts,
+                            "X-BAPI-RECV-WINDOW": recv_window,
+                        }
                         await self._rl.acquire(exu, "pnl_reco", timeout=2.0)
                         async with sess.get(url, params=params, headers=headers, timeout=15) as resp:
                             txt = await resp.text()
                             if resp.status >= 400:
-                                raise RuntimeError(f"BYBIT execution list error {resp.status}: {txt}")
+                                log.error(f"BYBIT execution list error {resp.status} for {sym}: {txt}")
+                                break
                             data = json.loads(txt) or {}
                             result = (data.get("result") or {})
                             page = result.get("list") or []
@@ -2273,14 +2454,28 @@ class PnlRecoCexAdapter:
                             "ts": int(t.get("time", 0)),
                         }
                     elif venue == "COINBASE":
-                        fee_ccy = t.get("fee", {}).get("currency") if isinstance(t.get("fee"), dict) else t.get(
-                            "fee_currency")
-                        fee_val = t.get("fee", {})
-                        fee_amt = float(fee_val.get("amount") if isinstance(fee_val, dict) else (fee_val or 0.0))
+                        # Payload Coinbase: {'trade_id': '...', 'product_id': 'BTC-USDC', 'price': '...', 'size': '...', 'side': 'BUY', 'time': '...', 'fee': '...', ...}
+                        fee_val = t.get("fee", 0.0)
+                        fee_amt = float(fee_val if not isinstance(fee_val, dict) else fee_val.get("amount", 0.0))
+                        # fee_ccy sur Coinbase est souvent dans le quote du product_id
+                        fee_ccy = t.get("fee_currency") or quote_ccy
                         price = float(t.get("price", 0.0) or 0.0)
                         qty = float(t.get("size", 0.0) or 0.0)
+                        
+                        # Use entry_time or created_at or fallback to now
+                        raw_ts = t.get("entry_time") or t.get("created_at") or t.get("time")
+                        if raw_ts:
+                            try:
+                                # handle ISO 8601 strings
+                                ts_str = str(raw_ts).replace("Z", "+00:00")
+                                ts_ms = int(datetime.fromisoformat(ts_str).timestamp() * 1000)
+                            except Exception:
+                                ts_ms = int(time.time() * 1000)
+                        else:
+                            ts_ms = int(time.time() * 1000)
+
                         norm = {
-                            "id": str(t.get("trade_id") or t.get("order_id")),
+                            "id": str(t.get("trade_id") or t.get("entry_id") or t.get("order_id") or t.get("fill_id")),
                             "symbol": t.get("product_id"),
                             "side": str(t.get("side", "")).upper() or "BUY",
                             "price": price,
@@ -2288,10 +2483,10 @@ class PnlRecoCexAdapter:
                             "quote_value": price * qty,
                             "fee": fee_amt,
                             "fee_ccy": fee_ccy,
-                            "ts": int(float(t.get("created_at", 0)) * 1000) if "created_at" in t else int(
-                                time.time() * 1000),
+                            "ts": ts_ms,
                         }
                     else:
+                        # BYBIT
                         fee_ccy = t.get("feeCurrency")
                         fee = float(t.get("execFee", 0.0) or 0.0)
                         quote_val = float(t.get("execValue", 0.0) or 0.0)
@@ -2344,29 +2539,20 @@ class PnlRecoCexAdapter:
                     "account_alias": alias_u,
                     "exchange": exu,
                 }
-            if exu == "BINANCE":
-                raw_trades = await _fetch_binance(creds, window_since_ms, window_until_ms, symbols_to_query or [])
-            elif exu == "COINBASE":
-                raw_trades = await _fetch_coinbase(creds, window_since_ms, window_until_ms)
-            else:
-                raw_trades = await _fetch_bybit(creds, window_since_ms, window_until_ms, symbols_to_query or [])
-            norm_trades, degrade_flag, unconverted_fees = _normalize_trades(raw_trades, exu)
-            turnover_quote = sum(abs(t.get("quote_value", 0.0) or 0.0) for t in norm_trades)
-            fees_quote = sum(t.get("fee", 0.0) or 0.0 for t in norm_trades if (t.get("fee_ccy") == quote_ccy))
-            base_delta = sum((t.get("qty", 0.0) or 0.0) * (1 if t.get("side") == "BUY" else -1) for t in norm_trades)
-            pnl = sum((t.get("quote_value", 0.0) or 0.0) * (1 if t.get("side") == "SELL" else -1) for t in
-                      norm_trades) - fees_quote
-            degraded = degrade_flag or abs(base_delta) > 1e-9 or bool(unconverted_fees) or degrade_for_symbols
-            payload = {
-                "net_profit_quote": float(pnl),
-                "fees_quote": float(fees_quote),
-                "turnover_quote": float(turnover_quote),
-                "trades": len(norm_trades),
-                "trades_count": len(norm_trades),
-                "fills": norm_trades,
-                "trades_list": norm_trades,
-                "degraded": degraded,
-                "reason_code": "PNL_RECO_EXCEPTION" if degraded else "",
+            payload: dict = {
+                "net_profit_quote": 0.0,
+                "fees_quote": 0.0,
+                "turnover_quote": 0.0,
+                "trades": 0,
+                "fills": [],
+                "fees": [],
+                "transfers": [],
+                "base_ccy": None,
+                "quote_ccy": quote_ccy,
+                "degraded": False,
+                "reason_code": "",
+                "window_since_ms": window_since_ms,
+                "window_until_ms": window_until_ms,
                 "since_ms": window_since_ms,
                 "until_ms": window_until_ms,
                 "local_day": local_day,
@@ -2374,13 +2560,47 @@ class PnlRecoCexAdapter:
                 "account_alias": alias_u,
                 "exchange": exu,
             }
+            if exu == "BINANCE":
+                raw_trades = await _fetch_binance(creds, window_since_ms, window_until_ms, symbols_to_query or [])
+            elif exu == "COINBASE":
+                cb_res = await _fetch_coinbase(creds, window_since_ms, window_until_ms)
+                raw_trades = cb_res.get("fills", [])
+                if cb_res.get("degraded"):
+                    payload["degraded"] = True
+                    payload["reason_code"] = cb_res.get("reason", "COINBASE_API_ERROR")
+            else:
+                raw_trades = await _fetch_bybit(creds, window_since_ms, window_until_ms, symbols_to_query or [])
+            norm_trades, degrade_flag, unconverted_fees = _normalize_trades(raw_trades, exu)
+            turnover_quote = sum(abs(t.get("quote_value", 0.0) or 0.0) for t in norm_trades)
+            fees_quote = sum(t.get("fee", 0.0) or 0.0 for t in norm_trades if (t.get("fee_ccy") == quote_ccy))
+            base_delta = sum((t.get("qty", 0.0) or 0.0) * (1 if t.get("side") == "BUY" else -1) for t in norm_trades)
+            # PnL logic: QuoteIn - QuoteOut - Fees
+            # Buy -> QuoteOut (Negative), Sell -> QuoteIn (Positive)
+            pnl = sum((t.get("quote_value", 0.0) or 0.0) * (1 if t.get("side") == "SELL" else -1) for t in
+                      norm_trades) - fees_quote
+            
+            degraded = degrade_flag or abs(base_delta) > 1e-9 or bool(unconverted_fees) or degrade_for_symbols
+            if degraded:
+                payload["degraded"] = True
+                if not payload["reason_code"]:
+                    payload["reason_code"] = "PNL_RECO_DEGRADED"
+
+            payload.update({
+                "net_profit_quote": float(pnl),
+                "fees_quote": float(fees_quote),
+                "turnover_quote": float(turnover_quote),
+                "trades": len(norm_trades),
+                "trades_count": len(norm_trades),
+                "fills": norm_trades,
+                "trades_list": norm_trades,
+                "trades_detail": norm_trades,
+                "trades_sorted": True,
+                "trades": norm_trades,
+                "base_ccy": None,
+                "quote_ccy": quote_ccy,
+            })
             if unconverted_fees:
                 payload["unconverted_fees"] = unconverted_fees
-            payload["trades_detail"] = norm_trades
-            payload["trades_sorted"] = True
-            payload["trades"] = norm_trades
-            payload["base_ccy"] = None
-            payload["quote_ccy"] = quote_ccy
             return payload
 
         outcome = await awith_retry(
@@ -2388,8 +2608,10 @@ class PnlRecoCexAdapter:
             venue=f"pnl_reco:{exu}:{alias_u}",
             policy=self._retry_policy,
         )
-        if not outcome.ok:
-            reason_code = "PNL_RECO_EXCEPTION"
+        if not outcome or not outcome.ok:
+            reason_code = outcome.reason if outcome else "PNL_RECO_EXCEPTION"
+            err_msg = str(outcome.error) if outcome and outcome.error else "Unknown error"
+            log.error(f"[PnlRecoCexAdapter] {exu}:{alias_u} fetch failed: {reason_code} - {err_msg}")
             return {
                 "net_profit_quote": 0.0,
                 "fees_quote": 0.0,
@@ -2402,6 +2624,7 @@ class PnlRecoCexAdapter:
                 "quote_ccy": quote_ccy,
                 "degraded": True,
                 "reason_code": reason_code,
+                "error": err_msg,
                 "window_since_ms": window_since_ms,
                 "window_until_ms": window_until_ms,
                 "since_ms": window_since_ms,
@@ -2412,5 +2635,5 @@ class PnlRecoCexAdapter:
                 "exchange": exu,
             }
 
-        payload = outcome.result if isinstance(outcome.result, dict) else {}
+        payload = outcome.result if outcome and isinstance(outcome.result, dict) else {}
         return payload

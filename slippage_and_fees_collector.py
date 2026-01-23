@@ -898,17 +898,28 @@ class SlippageAndFeesCollector:
                            prudence_key: Optional[str]=None) -> Tuple[float,float]:
         """
         Version "sécurisée": si snapshot expiré (TTL), retourne la base, sinon les effectifs.
-        Si prudence_key est fournie et qu’une policy token existe mais non appliquée,
-        on peut (optionnel) souhaiter recalculer un rabais — ici on évite pour la prédictibilité.
         """
         snap = self.get_snapshot(ex, alias)
         if not snap: return 0.0, 0.0
+
+        pair_norm = _norm_pair(pair) if pair else None
+
+        # SFC-01: Si prudence_key exige de désactiver le token, on revient aux VIP fees
+        if prudence_key and snap.token_enabled:
+            pol = self._token_policies.get(_norm_ex(ex))
+            if pol and prudence_key in pol.disable_on_prudence:
+                # On retourne les VIP (ou base)
+                mk = snap.maker_vip if snap.maker_vip > 0 else snap.maker_base
+                tk = snap.taker_vip if snap.taker_vip > 0 else snap.taker_base
+                return mk, tk
+
         if not snap.is_fresh():
             # fallback: base (sans surprises)
-            mk = snap.per_pair.get(_norm_pair(pair), {}).get("maker", snap.maker_base) if pair else snap.maker_base
-            tk = snap.per_pair.get(_norm_pair(pair), {}).get("taker", snap.taker_base) if pair else snap.taker_base
+            mk = snap.per_pair.get(pair_norm, {}).get("maker", snap.maker_base) if pair_norm else snap.maker_base
+            tk = snap.per_pair.get(pair_norm, {}).get("taker", snap.taker_base) if pair_norm else snap.taker_base
             return mk, tk
-        return snap.effective_for("maker", pair), snap.effective_for("taker", pair)
+
+        return snap.effective_for("maker", pair_norm), snap.effective_for("taker", pair_norm)
 
 
     def export_effective_fee_map(self) -> Dict[str, Dict[str, float]]:
@@ -932,13 +943,15 @@ class SlippageAndFeesCollector:
     def get_fee_pct(self,
                     exchange: str,
                     pair: Optional[str],
-                    role: str = "taker") -> float:
+                    role: str = "taker",
+                    prudence_key: Optional[str] = None) -> float:
         """
         Retourne un fee EFFECTIF en fraction (0.001 = 10 bps) pour (exchange, pair, role).
 
         - Agrège sur tous les aliases de l'exchange.
         - Si des snapshots "frais" existent, utilise leurs fees effectifs.
         - Sinon, fallback sur les bases.
+        - Prudence-aware: si prudence_key désactive le token, utilise VIP/base.
         """
         exn = _norm_ex(exchange)
         snaps = self._snapshots.get(exn, {})
@@ -950,10 +963,24 @@ class SlippageAndFeesCollector:
         fresh_vals: List[float] = []
         stale_vals: List[float] = []
 
+        pol = self._token_policies.get(exn) if prudence_key else None
+        disable_token = False
+        if pol and prudence_key in pol.disable_on_prudence:
+            disable_token = True
+
         for snap in snaps.values():
             if not snap:
                 continue
-            val = float(snap.effective_for(role, pair_norm))
+
+            if disable_token and snap.token_enabled:
+                # Utilise VIP fees au lieu de effective
+                if role == "maker":
+                    val = float(snap.maker_vip if snap.maker_vip > 0 else snap.maker_base)
+                else:
+                    val = float(snap.taker_vip if snap.taker_vip > 0 else snap.taker_base)
+            else:
+                val = float(snap.effective_for(role, pair_norm))
+
             if snap.is_fresh(now):
                 fresh_vals.append(val)
             else:

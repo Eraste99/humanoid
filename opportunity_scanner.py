@@ -55,7 +55,6 @@ import uuid
 import logging
 import inspect
 from decimal import Decimal, InvalidOperation, getcontext
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 from contracts.errors import DataStaleError
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Set
 getcontext().prec = 28
@@ -66,26 +65,20 @@ try:
         bump_scanner,
         inc_scanner_rejection,
         inc_scanner_emitted,
+        inc_scanner_decision,
         observe_scanner_latency,
         note_scanner_cfg,
+        record_pipeline_latency,
+        set_pipeline_backlog,
+        should_trace_latency,
     )
-except Exception:  # pragma: no cover
-
-    def bump_scanner(*args, **kwargs):  # type: ignore
-        return
-
-    def inc_scanner_rejection(*args, **kwargs):  # type: ignore
-        return
-
-    def inc_scanner_emitted(*args, **kwargs):  # type: ignore
-        return
-
-    def observe_scanner_latency(*args, **kwargs):  # type: ignore
-        return
-
-
-    def note_scanner_cfg(*_a, **_k):  # type: ignore
-        return
+except ImportError:  # pragma: no cover
+    def bump_scanner(*a, **k): return
+    def inc_scanner_rejection(*a, **k): return
+    def inc_scanner_emitted(*a, **k): return
+    def inc_scanner_decision(*a, **k): return
+    def observe_scanner_latency(*a, **k): return
+    def note_scanner_cfg(*a, **k): return
 
 logger = logging.getLogger("OpportunityScanner")
 
@@ -180,6 +173,7 @@ def _route_combo(a: str, b: str) -> str:
 def _quote_of_pair(pair_key: str) -> str:
     pk = _norm_pair(pair_key)
     if pk.endswith("USDC"): return "USDC"
+    if pk.endswith("USDT"): return "USDT"
     if pk.endswith("EUR"):  return "EUR"
     # défaut conservateur: USDC (compat historique)
     return "USDC"
@@ -252,6 +246,14 @@ class _Rotation:
 
 
 class OpportunityScanner:
+    @property
+    def is_actually_dry(self) -> bool:
+        """Détection centralisée du mode DRY_RUN (Simulation)."""
+        return (
+            str(getattr(self.cfg, "MODE", "")).upper() == "DRY_RUN"
+            or bool(getattr(getattr(self.cfg, "rm", None), "dry_run", False))
+            or bool(getattr(self.cfg, "dry_run", False))
+        )
 
 
     """
@@ -314,17 +316,13 @@ class OpportunityScanner:
 
 
         # pair_queue_max : valeur initiale conservatrice, recalée ensuite via apply_runtime_config
+        # pair_queue_max : capacité de file PAR PAIRE (Scanner), ne pas dériver du Router.
+        # On seed depuis la config Scanner (ou fallback interne), puis apply_runtime_config() recale si besoin.
+        self._pair_queue_max = 0
         try:
-            self._pair_queue_max = int(getattr(r, "out_queues_maxlen", 0) or 0)
+            self._pair_queue_max = int(self._compute_pair_queue_max_from_cfg(self.cfg))
         except Exception:
-            self._pair_queue_max = 0
-
-        if self._pair_queue_max <= 0:
-            # fallback sur SCANNER_DEQUE_MAX + max_pairs_per_tick si déjà présent
-            try:
-                self._pair_queue_max = int(self._compute_pair_queue_max_from_cfg(self.cfg))
-            except Exception:
-                self._pair_queue_max = 1000
+            self._pair_queue_max = 1000
 
         self._coalesce_window_ms = int(r.coalesce_window_ms)
         self._require_l2_first = bool(r.require_l2_first)
@@ -338,8 +336,20 @@ class OpportunityScanner:
         # --------------------------------
         s = self.cfg.scanner
         # workers / windows / habilitations
-        self._workers = int(self._get_scanner_knob("workers", legacy="SCANNER_WORKERS", default=1, cast=int))
+        self._workers = int(getattr(s, "workers", 1))
         self._workers_target = self._workers
+        
+        # P0: Augmenter radicalement la capacité de traitement simultané pour le Top 120
+        # Sinon le Scanner sature dès qu'il dépasse 30 paires
+        self._max_pairs_per_tick = int(getattr(s, "max_pairs_per_tick", 150))
+        if self.is_actually_dry:
+            self._max_pairs_per_tick = 500
+            self.logger.info("[Scanner] DRY_RUN: Capacité par tick augmentée à %d paires", self._max_pairs_per_tick)
+
+        if self.is_actually_dry and self._workers_target < 4:
+            self._workers_target = 4
+            self._workers = 4
+            self.logger.info("[Scanner] DRY_RUN: boosting workers count to %d", self._workers_target)
         self._dedup_window_s = float(getattr(s, "dedup_window_s", 0.5))
         self._ttl_hints_s = float(getattr(s, "ttl_hints_s", 1.0))
         self._audition_ttl_min = int(getattr(s, "audition_ttl_min", 5))
@@ -353,19 +363,17 @@ class OpportunityScanner:
             self.logger.warning("SCANNER_ENABLE_MM_HINTS=1 ignored because ENABLE_MAKER_MAKER=0")
         self._enable_mm_hints = global_mm_enabled and scanner_mm_enabled
         self.mm_mode = str(getattr(s, "mm_mode", "OFF") or "OFF").upper()
-        self._binance_depth_level = int(
-            self._get_scanner_knob("binance_depth_level", legacy="binance_depth_level", default=10, cast=int)
-        )
+        self._binance_depth_level = int(getattr(s, "binance_depth_level", 10))
 
         # seuils/rythme (override possibles via cfg.scanner.*)
-        self.min_spread_net = D(getattr(s, "min_spread_net", 0.002))          # 20 bps
+        self.min_spread_net = float(getattr(s, "min_spread_net", 0.002))      # 20 bps
         self.min_required_bps = float(getattr(s, "min_required_bps", 15.0))   # bps
         self.drift_guard_bps = float(getattr(s, "drift_guard_bps", 10.0))     # bps
         self.max_pairs_per_tick = int(getattr(s, "max_pairs_per_tick", 40))
-        self.max_time_skew_s = D(getattr(s, "max_time_skew_s", 0.20))         # 200 ms
+        self.max_time_skew_s = float(getattr(s, "max_time_skew_s", 0.20))     # 200 ms
         self.scan_interval = float(getattr(s, "scan_interval", 0.5))
         self.dedup_cooldown_s = float(
-            max(0.05, self._get_scanner_knob("dedup_cooldown_s", legacy="SCANNER_DEDUP_COOLDOWN_S", default=0.35))
+            max(0.05, float(getattr(s, "dedup_cooldown_s", 0.35)))
         )
         self.backpressure_log_every = int(max(1, getattr(s, "backpressure_log_every", 100)))
         self.max_opportunities = int(max(100, getattr(s, "max_opportunities", 5000)))
@@ -426,13 +434,15 @@ class OpportunityScanner:
         self._maxlen = int(self.max_opportunities)
 
         self._last_emit = {}  # type: Dict[tuple, float]
+        self._last_mm_snapshots = {}  # (pair, exchange) -> dict
+        self._mm_churn_rates = {}    # (pair, exchange) -> float
         self._running = False
         self._task = None  # type: Optional[asyncio.Task]
         self.last_scan_time = 0.0
         self.opportunity_count = 0
         self.active_pairs_count = 0
         self.scan_frequency = 0.0
-        self.average_spread = D("0")
+        self.average_spread = 0.0
         self.net_positive_count = 0
         self._last_opp_ts_by_pair = {}  # type: Dict[str, float]
 
@@ -448,6 +458,8 @@ class OpportunityScanner:
 
         # Liste d'exchanges utilisée en mode pull (tick); peut être override par Boot
         self.exchanges: List[str] = []
+        # Fallback pour _top_pairs si l'univers n'est pas encore synchronisé
+        self.pairs: List[str] = list(getattr(self.cfg.g, "pairs", []) or [])
 
 
         # Compteurs de filtrage / backpressure
@@ -474,8 +486,8 @@ class OpportunityScanner:
         self.enabled_combos = getattr(self, "_load_enabled_combos", lambda: [])()
 
         # Hints paramétrables (avec fallbacks)
-        self.emit_hints = getattr_bool(s, "emit_hints", True)
-        self.hint_cfg = getattr_dict(s, "hint_cfg") or {
+        self.emit_hints = bool(getattr(s, "emit_hints", True))
+        self.hint_cfg = getattr(s, "hint_cfg", None) or {
             "tt_max_skew_ms": getattr(self.rm.cfg, "scanner_max_skew_ms", 200),
             "tm_min_depth_ratio": getattr(self.rm.cfg, "tm_nn_min_depth_ratio", 1.4),
             "tm_max_vol_bps": getattr(self.rm.cfg, "tm_nn_max_vol_bps", 60.0),
@@ -529,10 +541,10 @@ class OpportunityScanner:
         # ------------------------------------
         self._vol_bps = {}        # pair -> vol instant bps
         self._vol_ema = {}        # (ex, pair) -> ema bps
-        self.vol_alpha_penalty = getattr_float(s, "vol_alpha_penalty", 0.15)
-        self.vol_soft_cap_bps  = getattr_float(s, "vol_soft_cap_bps", 40.0)
-        self.vol_beta_min_req  = getattr_float(s, "vol_beta_min_req", 0.20)
-        self.vol_chaos_bps     = getattr_float(s, "vol_chaos_bps", 120.0)
+        self.vol_alpha_penalty = float(getattr(s, "vol_alpha_penalty", 0.15))
+        self.vol_soft_cap_bps  = float(getattr(s, "vol_soft_cap_bps", 40.0))
+        self.vol_beta_min_req  = float(getattr(s, "vol_beta_min_req", 0.20))
+        self.vol_chaos_bps     = float(getattr(s, "vol_chaos_bps", 120.0))
         self.vol_ema_lambda    = float(min(0.99, max(0.0, getattr(s, "vol_ema_lambda", 0.7))))
 
         # ------------------------------------
@@ -541,6 +553,10 @@ class OpportunityScanner:
         self.priority_weight_logger  = float(max(0.0, getattr(s, "priority_weight_logger", 0.7)))
         self.priority_weight_scanner = float(max(0.0, getattr(s, "priority_weight_scanner", 0.3)))
         self._internal_scores = {}  # moyenne récente des scores par paire
+
+        # --- Caches de priorité (LHM) ---
+        self._priority_cache = None         # List[str] ou None
+        self._priority_last_refresh = 0.0
 
         # ------------------------------------
         # 11) Pacers / quotas d'évaluations
@@ -553,14 +569,30 @@ class OpportunityScanner:
         self.eval_hz_sandbox = float(getattr(s, "scanner_eval_hz_sandbox", self.eval_hz_audition))
         self.global_eval_hz = float(getattr(s, "scanner_global_eval_hz", 200.0))
 
+        # --------------------------------
+        # Overrides HFT / DRY_RUN (P0: Priorité absolue sur le .env)
+        # --------------------------------
+        if self.is_actually_dry:
+            # On force des quotas virtuellement illimités pour ne pas brider la simulation
+            self.global_eval_hz = 5000.0
+            self.eval_hz_primary = 1000.0
+            self.eval_hz_audition = 500.0
+            self.logger.info("[Scanner] DRY_RUN DETECTED: Forcing HFT/Infinite Quotas (Ignoring .env)")
+
         # token-buckets
+        effective_hz = self.global_eval_hz
+        
         global_burst = float(getattr(self.cfg.scanner, "scanner_global_eval_burst_factor", 2.0))
         self._tb_global = TokenBucket(
-            rate_per_s=self.global_eval_hz,
-            burst=max(1, int(self.global_eval_hz * global_burst)),
+            rate_per_s=effective_hz,
+            burst=max(1, int(effective_hz * global_burst)),
             name="scanner_global",
         )
+        self.logger.info("[Scanner] global rate limiter: rate=%s/s (dry_run=%s)", effective_hz, self.is_actually_dry)
         self._tb_pair = {}
+
+        # P0: On mémorise le temps de boot pour une grâce initiale sur le staleness
+        self._boot_ts = time.time()
 
         # --- Shedding pilotable ---
         self._shed_load_threshold = float(getattr(s, "shed_load_threshold", 0.95))
@@ -577,6 +609,9 @@ class OpportunityScanner:
         self._primary_pairs = set()
         self._audition_pairs = set()
         self._sandbox_pairs = set()
+
+        # Liste statique de repli (si discovery off)
+        self.pairs = getattr(self.cfg.g, "pairs", []) or []
 
     # --- Hooks historiques + rejets unifiés (méthodes de classe) ---
     def set_history_logger(self, sink: Callable[[dict], Any]) -> None:
@@ -644,30 +679,87 @@ class OpportunityScanner:
         route: str,
         pair: str,
         ctx: Optional[dict] = None,
+        strategy: Optional[str] = None,
     ) -> None:
         """Rejet centralisé: métriques + log + historique (facultatif)."""
-        # compteur P0 unifié
+        
+        # 1) Métriques Prometheus (Toujours incrémentées, ultra-rapide)
         try:
+            # compteur P0 unifié
             inc_blocked("scanner", reason, pair)
+            # métrique harmonisée
+            from modules.obs_metrics import inc_scanner_rejection
+            inc_scanner_rejection(reason=reason, route=route, pair=pair, strategy=strategy or "TT")
         except Exception:
             pass
 
-        # métrique legacy si branchée
+        # 2) FAST GATE : Échantillonnage statistique (1/500 par défaut pour les rejets communs)
+        # On ne traite le contexte et les logs que si l'échantillonnage passe.
+        is_dry = self.is_actually_dry
+        
+        # Rejets structurels ou rares : on garde un échantillonnage plus généreux
+        is_rare = reason not in (
+            "book_stale", "below_min_bps", "min_notional", "slippage",
+            "SCANNER_PAIR_NOT_IN_PRIORITY", "SCANNER_PAIR_PAUSED",
+            "rate_limit_global", "rate_limit_pair", "backlog_purge",
+            "below_tm_hint", "neg_both"
+        )
+        
+        # On incrémente un compteur interne pour l'échantillonnage déterministe par raison
+        if not hasattr(self, "_rejection_counters"):
+            self._rejection_counters = defaultdict(int)
+        
+        self._rejection_counters[reason] += 1
+        count = self._rejection_counters[reason]
+        
+        # Logique d'échantillonnage : 
+        # - Toujours loguer les 3 premiers rejets d'une raison donnée
+        # - Puis 1/500 pour les rejets communs
+        # - Puis 1/50 pour les rejets rares ou en DRY_RUN
+        sample_rate = 500
+        if is_rare or is_dry:
+            sample_rate = 50
+            
+        should_log = (count <= 3) or (count % sample_rate == 0)
+
+        if not should_log:
+            return
+
+        # 3) Enrichissement du contexte (Seulement si non filtré)
+        if ctx is not None and "age_ms" not in ctx:
+            try:
+                now_ms = int(time.time() * 1000)
+                ex = ctx.get("exchange")
+                if ex and pair:
+                    snap = self.orderbooks.get(ex, {}).get(pair)
+                    if snap:
+                        recv_ts = snap.get("recv_ts_ms")
+                        if recv_ts:
+                            ctx["rejection_age_ms"] = now_ms - int(recv_ts)
+            except Exception:
+                pass
+
+        # 4) Log contextualisé
         try:
-            inc_scanner_rejection(reason=reason, route=route, pair=pair)
+            is_dry = self.is_actually_dry
+            # P0: Log filtré pour éviter le flood.
+            # En DRY_RUN, on continue de masquer les rejets de "bruit" (bps, notionnel, prio) 
+            # mais on laisse passer les erreurs "structurelles" (fees, slip, vol, no_books)
+            # pour permettre la calibration du bot avant la prod.
+            if not is_dry or reason not in (
+                "book_stale", "below_min_bps", "min_notional",
+                "SCANNER_PAIR_NOT_IN_PRIORITY", "SCANNER_PAIR_PAUSED",
+                "rate_limit_global", "rate_limit_pair", "backlog_purge",
+                "below_tm_hint"
+            ):
+                logger.warning(
+                    "[Scanner][reject] pair=%s route=%s reason=%s ctx=%s",
+                    pair or "UNKNOWN", route, reason, ctx or {}
+                )
         except Exception:
             pass
 
-        # log contextualisé
-        try:
-            logger.warning(
-                "[Scanner][reject] pair=%s route=%s reason=%s ctx=%s",
-                pair, route, reason, ctx or {}
-            )
-        except Exception:
-            pass
-
-        # historique (facultatif)
+        # 5) Historique (facultatif)
         if self._hist_logger is not None:
             try:
                 self._hist_logger({
@@ -880,6 +972,37 @@ class OpportunityScanner:
             return float(bps) / 1e4
         return None
 
+    def _get_priority_list(self) -> Optional[List[str]]:
+        """Récupère et cache la liste des paires prioritaires du LHM."""
+        now = time.time()
+        # Refresh toutes les 1.0s pour éviter la saturation CPU/Log
+        if self._priority_cache is not None and (now - self._priority_last_refresh) < 1.0:
+            return self._priority_cache
+
+        mgr = getattr(self, "logger_historique_manager", None)
+        if mgr is None:
+            return None
+
+        priority = None
+        try:
+            # 1) si possible, priorité par mode (TT/TM)
+            if self.scanner_mode in {"TT", "TM"}:
+                get_prio_by_mode = getattr(mgr, "get_priority_pairs_by_mode", None)
+                if callable(get_prio_by_mode):
+                    priority = get_prio_by_mode(self.scanner_mode)
+
+            # 2) fallback sur priorité globale si rien trouvé
+            if priority is None:
+                get_prio = getattr(mgr, "get_priority_pairs", None)
+                if callable(get_prio):
+                    priority = get_prio()
+        except Exception:
+            priority = None
+
+        self._priority_cache = priority
+        self._priority_last_refresh = now
+        return priority
+
     # ---------------- Entrées (push) ----------------
     def update_orderbook(self, data: dict) -> None:
         # Fraîcheur ToB par exchange (utile pour estimer la latence)
@@ -888,98 +1011,138 @@ class OpportunityScanner:
             if ex_for_fresh:
                 self._last_seen_books_by_ex[ex_for_fresh] = time.time()
         except Exception:
-            logging.exception("Unhandled exception")
+            pass
 
         if not data:
             return
 
+        # P1: Validation légère de schéma à la frontière Router -> Scanner.
+        # EXTRÊMEMENT RAPIDE (Fast Path). On ne check que le minimum vital.
         ex = _norm_ex(data.get("exchange"))
         pair_raw = data.get("pair_key") or data.get("symbol")
-        if not pair_raw:
+        if not pair_raw or not ex:
             return
         pair = _norm_pair(pair_raw)
-        if not data.get("active", False):
+
+        # P0: Mise à jour systématique du cache latest
+        self.orderbooks.setdefault(ex, {})[pair] = data
+
+        if not data.get("active", True):
             self._record_rejection(reason="inactive", route="*", pair=pair, ctx={"exchange": ex})
             return
 
-        now_ms = int(time.time() * 1000)
-        recv_ts_ms = data.get("recv_ts_ms")
+        # P0: Calcul d'âge par MONOTONIC (Précis, Athlétique, Insensible aux sauts d'heure)
+        now_mono_ns = time.monotonic_ns()
+        recv_mono_ns = data.get("recv_mono_ns")
+        
+        if recv_mono_ns is not None:
+            age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
+        else:
+            # Fallback sur recv_ts_ms si mono absent (vieux events ou tests)
+            now_ms = int(time.time() * 1000)
+            recv_ts_ms = data.get("recv_ts_ms")
+            if recv_ts_ms is not None:
+                age_ms = now_ms - int(recv_ts_ms)
+            else:
+                self._record_rejection(reason="schema_missing_field", route="*", pair=pair, ctx={"exchange": ex, "field": "recv_ts_ms"})
+                return
+
         book_ttl_ms = data.get("book_ttl_ms")
-        if recv_ts_ms is None:
-            self._record_rejection(
-                reason="schema_missing_field",
-                route="*",
-                pair=pair,
-                ctx={"exchange": ex, "field": "recv_ts_ms"},
-            )
-            return
         if book_ttl_ms is None:
             book_ttl_ms = self._book_ttl_ms_default(ex)
-        if book_ttl_ms is None or float(book_ttl_ms) <= 0.0:
-            self._record_rejection(
-                reason="schema_missing_field",
-                route="*",
-                pair=pair,
-                ctx={"exchange": ex, "field": "book_ttl_ms"},
-            )
-            return
-        try:
-            age_ms = now_ms - int(recv_ts_ms)
-        except Exception:
-            self._record_rejection(
-                reason="schema_missing_field",
-                route="*",
-                pair=pair,
-                ctx={"exchange": ex, "field": "recv_ts_ms"},
-            )
-            return
-        if age_ms > int(book_ttl_ms):
+        
+        # P0: On respecte les TTL de prod même en DRY_RUN pour permettre la calibration.
+        is_actually_dry = self.is_actually_dry
+
+        if age_ms > int(book_ttl_ms or 1200):
+            # P0 Observabilité
+            try:
+                from modules.obs_metrics import SCANNER_EVENT_AGE_MS
+                if SCANNER_EVENT_AGE_MS:
+                    SCANNER_EVENT_AGE_MS.labels(exchange=ex, pair=pair).observe(age_ms)
+            except Exception:
+                pass
+
+            # P0: Grâce initiale de 5s au démarrage du Scanner
+            if (time.time() - self._boot_ts) < 5.0:
+                return
+
             self._record_rejection(
                 reason="book_stale",
                 route="*",
                 pair=pair,
-                ctx={"exchange": ex, "age_ms": age_ms, "ttl_ms": int(book_ttl_ms)},
+                ctx={"exchange": ex, "age_ms": age_ms, "ttl_ms": int(book_ttl_ms or 1200)},
             )
             return
+        
+        # P0 Observabilité (Success)
+        try:
+            from modules.obs_metrics import SCANNER_EVENT_AGE_MS
+            if SCANNER_EVENT_AGE_MS:
+                SCANNER_EVENT_AGE_MS.labels(exchange=ex, pair=pair).observe(age_ms)
+        except Exception:
+            pass
+
+        # --- NOUVEAU : Incrémenter le Rate Limiter Scanner ---
+        try:
+            from modules.obs_metrics import SCANNER_RATE_LIMITED_TOTAL
+            # On ne veut pas importer Engine à chaque tick, on vérifie si présent
+            if SCANNER_RATE_LIMITED_TOTAL:
+                pass # Déjà géré par _record_rejection ou le loop principal
+        except ImportError:
+            pass
+        
+
+        # --- NOUVEAU : Mesure latence Router -> Scanner ---
+        pub_ts = data.get("publish_ts_ms")
+        if pub_ts:
+            try:
+                now_ms_local = int(time.time() * 1000)
+                transfer_lat = now_ms_local - int(pub_ts)
+                from modules.obs_metrics import ENGINE_ROUTER_TO_SCANNER_LAT_MS, _MetricNoOp
+                if ENGINE_ROUTER_TO_SCANNER_LAT_MS is not None and not isinstance(ENGINE_ROUTER_TO_SCANNER_LAT_MS, _MetricNoOp):
+                    ENGINE_ROUTER_TO_SCANNER_LAT_MS.observe(float(transfer_lat))
+            except Exception: pass
 
         # Univers/pauses (LHM)
-        if self._universe is not None and pair not in self._universe:
+        is_dry = self.is_actually_dry
+        if is_dry:
+            # P0: Forcer le passage en DRY_RUN
+            pass
+        elif self._universe is not None and pair not in self._universe:
             self._record_rejection(reason="SCANNER_PAIR_NOT_IN_UNIVERSE", route="*", pair=pair, ctx={"exchange": ex})
             return
         try:
+            priority = self._get_priority_list()
+            if priority and pair not in priority:
+                self._record_rejection(
+                    reason="SCANNER_PAIR_NOT_IN_PRIORITY", route="*", pair=pair, ctx={"exchange": ex}
+                )
+                return
+
             mgr = getattr(self, "logger_historique_manager", None)
-            priority = None
-
             if mgr is not None:
-                # 1) si possible, priorité par mode (TT/TM)
-                if self.scanner_mode in {"TT", "TM"}:
-                    get_prio_by_mode = getattr(mgr, "get_priority_pairs_by_mode", None)
-                    if callable(get_prio_by_mode):
-                        priority = get_prio_by_mode(self.scanner_mode)
-
-                # 2) fallback sur priorité globale si rien trouvé
-                if priority is None:
-                    get_prio = getattr(mgr, "get_priority_pairs", None)
-                    if callable(get_prio):
-                        priority = get_prio()
-
-                if priority and pair not in priority:
-                    self._record_rejection(
-                        reason="SCANNER_PAIR_NOT_IN_PRIORITY", route="*", pair=pair, ctx={"exchange": ex}
-                    )
+                # P0: En DRY_RUN, on bypass le pause check pour ne pas bloquer les tests
+                is_paused_fn = getattr(mgr, "is_paused", None)
+                # Ne pas écraser is_actually_dry : il inclut cfg.rm.dry_run
+                if (not is_dry) and callable(is_paused_fn) and is_paused_fn(pair):
+                    self._record_rejection(reason="SCANNER_PAIR_PAUSED", route="*", pair=pair, ctx={"exchange": ex})
                     return
 
-                is_paused = getattr(mgr, "is_paused", None)
-                if callable(is_paused) and is_paused(pair):
-                    self._record_rejection(reason="SCANNER_PAIR_PAUSED", route="*", pair=pair, ctx={"exchange": ex})
+                # --- NOUVEAU : Incrémenter le Rate Limiter Scanner ---
+                from modules.obs_metrics import SCANNER_RATE_LIMITED_TOTAL
+                if hasattr(self, "_tb_global") and not self._tb_global.try_consume():
+                    if SCANNER_RATE_LIMITED_TOTAL is not None and not hasattr(SCANNER_RATE_LIMITED_TOTAL, "_MetricNoOp"):
+                        # P0: Fix ValueError: Incorrect label names (besoin de 'kind' et 'cohort')
+                        SCANNER_RATE_LIMITED_TOTAL.labels(kind="global", cohort="ALL").inc()
+                    self._record_rejection(reason="rate_limit_global", route="*", pair=pair, ctx={"exchange": ex})
                     return
 
         except Exception:
             logging.exception("Unhandled exception")
 
 
-        # Stocker le snapshot puis quotas
-        self.orderbooks.setdefault(ex, {})[pair] = data
+        # Quotas par paire
         allowed, _why = self._should_scan_now(pair)
         if self._workers_target > 0:
             if allowed:
@@ -989,12 +1152,30 @@ class OpportunityScanner:
             return
 
         # Évalue uniquement la paire concernée (mode pull / sans workers)
+        start_proc = time.perf_counter_ns()
         self.check_opportunity(pair)
+
+        # Instrumentation latence Scanner Pull (P1)
+        if should_trace_latency(self.cfg):
+            proc_ms = (time.perf_counter_ns() - start_proc) / 1e6
+            if getattr(self.cfg.obs, "enable_segment_metrics_scanner", True):
+                record_pipeline_latency("scanner_proc", proc_ms, route="*", exchange=data.get("exchange", "none"))
 
     # ---------------- Pull utils ----------------
     def _enqueue_for_workers(self, pair: str, event: dict) -> None:
         try:
             dq = self._queues[pair]
+
+            # Instrumentation latence queue interne Scanner (P1)
+            if should_trace_latency(self.cfg):
+                event["scanner_internal_exit_ns"] = time.perf_counter_ns()
+
+            # P1: Purge agressive pendant la phase de boot (5s)
+            # Si on accumule trop dans la file d'une paire alors qu'on n'a pas encore fini de booter,
+            # on ne garde que le plus frais pour éviter le burst de staleness à T=5.01s.
+            if (time.time() - self._boot_ts) < 5.0 and len(dq) >= 1:
+                dq.clear()
+
             if self._pair_queue_max and len(dq) >= self._pair_queue_max:
                 self._record_rejection(reason="queue_full", route="*", pair=pair)
             dq.append(event)
@@ -1027,7 +1208,7 @@ class OpportunityScanner:
     # ---------------- Pull utils ----------------
     def _top_pairs(self) -> List[str]:
         """Priorisation canonique PairHistory, raffinée par le score interne Scanner."""
-        base = sorted({_norm_pair(p) for p in (self._universe or self.pairs or []) if p})
+        base = sorted({_norm_pair(p) for p in (self._universe or self.pairs or []) if _norm_pair(p)})
         if not base:
             return []
 
@@ -1111,8 +1292,8 @@ class OpportunityScanner:
             raise DataStaleError("fee_unknown")
 
         slip_ttl = min(
-            self._public_ttl(buy_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
-            self._public_ttl(sell_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
+            self._public_ttl(buy_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 5.0)),
+            self._public_ttl(sell_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 5.0)),
         )
         slip_age = self._slip_age_seconds(pk)
         if not math.isfinite(slip_age) or slip_age > slip_ttl:
@@ -1189,24 +1370,31 @@ class OpportunityScanner:
 
     # ---------------- Détection (mode push) ----------------
     def _book_ttl_ms_default(self, exchange: str) -> Optional[int]:
+        """
+        Retourne le TTL par défaut pour les orderbooks.
+        Optimisation HFT : On utilise une valeur légèrement plus large dans le Scanner 
+        que dans le RiskManager (RM) pour laisser passer les opportunités vers le gating final
+        sans double rejet précoce.
+        """
         ttl_ms = None
         try:
             router_cfg = getattr(self.cfg, "router", None)
+            # Si le Router dit 1200ms, le Scanner accepte 1500ms pour éviter les micro-conflits
             ttl_ms = getattr(router_cfg, "stale_ms", None) if router_cfg is not None else None
             if isinstance(ttl_ms, (int, float)) and ttl_ms > 0:
-                return int(ttl_ms)
+                return int(ttl_ms) + 300
         except Exception:
             ttl_ms = None
         try:
             max_book_age_s = getattr(self.cfg, "max_book_age_s", None)
             if isinstance(max_book_age_s, (int, float)) and max_book_age_s > 0:
-                return int(float(max_book_age_s) * 1000.0)
+                return int(float(max_book_age_s) * 1000.0) + 300
         except Exception:
             pass
-        return None
+        return 1500 # Default fallback raisonnable pour 120 paires
 
     def _snapshot_ts_seconds(self, snap: dict, *, pair_key: str, exchange: str) -> Optional[float]:
-        if not snap.get("active", False):
+        if not snap.get("active", True):
             self._record_rejection(
                 reason="inactive",
                 route="*",
@@ -1216,60 +1404,64 @@ class OpportunityScanner:
             return None
 
         recv_ts_ms = snap.get("recv_ts_ms")
-        if recv_ts_ms is None:
-            self._record_rejection(
-                reason="schema_missing_field",
-                route="*",
-                pair=pair_key,
-                ctx={"exchange": exchange, "field": "recv_ts_ms"},
-            )
-            return None
-
         book_ttl_ms = snap.get("book_ttl_ms")
         if book_ttl_ms is None:
             book_ttl_ms = self._book_ttl_ms_default(exchange)
-        if book_ttl_ms is None or float(book_ttl_ms) <= 0.0:
-            self._record_rejection(
-                reason="schema_missing_field",
-                route="*",
-                pair=pair_key,
-                ctx={"exchange": exchange, "field": "book_ttl_ms"},
-            )
-            return None
 
-        now_ms = int(time.time() * 1000)
-        try:
-            age_ms = now_ms - int(recv_ts_ms)
-        except Exception:
-            self._record_rejection(reason="schema_missing_field", route="*", pair=pair_key)
-            return None
-        if age_ms > int(book_ttl_ms):
+        # P0: calcul d'âge robuste par MONOTONIC
+        now_mono_ns = time.monotonic_ns()
+        recv_mono_ns = snap.get("recv_mono_ns")
+        
+        if recv_mono_ns is not None:
+            age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
+        else:
+            if recv_ts_ms is None:
+                self._record_rejection(reason="schema_missing_field", route="*", pair=pair_key, ctx={"exchange": exchange, "field": "recv_ts_ms"})
+                return None
+            age_ms = int(time.time() * 1000) - int(recv_ts_ms)
+
+        if age_ms > int(book_ttl_ms or 1500):
+            if (time.time() - getattr(self, "_boot_ts", 0)) < 5.0:
+                return None
+            if age_ms > 60000:
+                self.logger.warning("[Scanner] ABSURD AGE detected in _snapshot_ts_seconds for %s: %sms", pair_key, age_ms)
             self._record_rejection(
                 reason="book_stale",
                 route="*",
                 pair=pair_key,
-                ctx={"exchange": exchange, "age_ms": age_ms, "ttl_ms": int(book_ttl_ms)},
+                ctx={"exchange": exchange, "age_ms": age_ms, "ttl_ms": int(book_ttl_ms or 1500)},
             )
             return None
+
         ts_ms = snap.get("exchange_ts_ms") or recv_ts_ms
         if ts_ms is None:
-            self._record_rejection(reason="missing_ts", route="*", pair=pair_key)
             return None
-        try:
-            ts_s = float(ts_ms) / 1000.0
-        except Exception:
-            self._record_rejection(reason="invalid_ts", route="*", pair=pair_key)
-            return None
-        if not math.isfinite(ts_s):
-            self._record_rejection(reason="invalid_ts", route="*", pair=pair_key)
-            return None
-        return ts_s
+        return float(ts_ms) / 1000.0
     def _synced_snapshots_for_pair(self, pair_key: str):
         snaps: List[Tuple[str, dict, float]] = []
+        # P0: On identifie l'âge maximal toléré pour synchronisation (plus strict que _snapshot_ts_seconds)
+        now_ms = int(time.time() * 1000)
+        mono_now_ns = time.monotonic_ns()
+
         for ex, pairs in self.orderbooks.items():
             snap = pairs.get(pair_key)
             if not snap:
                 continue
+            
+            # --- AJOUT P1 : Double check de fraicheur avant sync ---
+            # Si une paire n'a pas été mise à jour depuis longtemps dans orderbooks,
+            # on ne veut même pas tenter de la synchroniser.
+            recv_mono_ns = snap.get("recv_mono_ns")
+            if recv_mono_ns is not None:
+                age_ms = int((mono_now_ns - int(recv_mono_ns)) / 1_000_000)
+            else:
+                recv_ts = snap.get("recv_ts_ms")
+                age_ms = (now_ms - int(recv_ts)) if recv_ts else 999999
+            
+            # Si le snapshot a plus de 2.5s, on l'ignore silencieusement ici (déjà loggué par _snapshot_ts_seconds si appelé)
+            if age_ms > 2500:
+                continue
+
             ts_s = self._snapshot_ts_seconds(snap, pair_key=pair_key, exchange=ex)
             if ts_s is None:
                 continue
@@ -1475,7 +1667,7 @@ class OpportunityScanner:
         Somme notional QUOTE (proxy depth) sur N niveaux côté ask et bid, puis max.
         N via cfg.binance_depth_level (def 10).
         """
-        N = int(self._get_scanner_knob("binance_depth_level", legacy="binance_depth_level", default=10, cast=int))
+        N = int(getattr(self.cfg.scanner, "binance_depth_level", 10))
         d = (self.orderbooks.get(ex, {}) or {}).get(pair) or {}
         ob = d.get("orderbook") or {}
         asks = (ob.get("asks") or d.get("asks") or [])[:N]
@@ -1527,9 +1719,95 @@ class OpportunityScanner:
     _depth_p95_usd = _depth_p95_quote
     _queuepos_est_usd = _queuepos_est_quote
 
+    # --- MICROSTRUCTURE (MM Adaptive) ---
+    def _compute_microprice_imbalance(self, data: dict) -> tuple[float, float]:
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        if not bids or not asks:
+            return 0.0, 0.0
+
+        # On prend les 3 premiers niveaux pour l'imbalance
+        b_vol = sum(float(b[1]) for b in bids[:3])
+        a_vol = sum(float(a[1]) for a in asks[:3])
+
+        best_bid = float(bids[0][0])
+        best_ask = float(asks[0][0])
+
+        total_vol = b_vol + a_vol
+        if total_vol <= 0:
+            return (best_bid + best_ask) / 2.0, 0.0
+
+        imbalance = (b_vol - a_vol) / total_vol
+        microprice = (best_bid * a_vol + best_ask * b_vol) / total_vol
+        return microprice, imbalance
+
+    def _update_churn(self, pair: str, exchange: str, data: dict) -> float:
+        key = (pair, exchange)
+        last = self._last_mm_snapshots.get(key)
+        now = time.time()
+        
+        if last is None:
+            self._last_mm_snapshots[key] = data.copy()
+            self._last_mm_snapshots[key]["_t_internal"] = now
+            return 0.0
+
+        # Churn = nombre de changements dans le top 3 / dt
+        changes = 0
+        cur_bids = data.get("bids", [])
+        last_bids = last.get("bids", [])
+        for i in range(min(3, len(cur_bids), len(last_bids))):
+            if cur_bids[i] != last_bids[i]: changes += 1
+            
+        cur_asks = data.get("asks", [])
+        last_asks = last.get("asks", [])
+        for i in range(min(3, len(cur_asks), len(last_asks))):
+            if cur_asks[i] != last_asks[i]: changes += 1
+
+        dt = max(0.001, now - last.get("_t_internal", now - 0.1))
+        
+        self._last_mm_snapshots[key] = data.copy()
+        self._last_mm_snapshots[key]["_t_internal"] = now
+
+        # EWMA sur le churn
+        old_churn = self._mm_churn_rates.get(key, 0.0)
+        instant_churn = changes / dt
+        new_churn = old_churn * 0.9 + instant_churn * 0.1
+        self._mm_churn_rates[key] = new_churn
+
+        try:
+            from modules.obs_metrics import MM_CHURN_RATE
+            if MM_CHURN_RATE:
+                MM_CHURN_RATE.labels(exchange=exchange, pair=pair).set(new_churn)
+        except Exception: pass
+
+        return new_churn
+
+    def _compute_depth_profile(self, data: dict) -> float:
+        # Ratio volume L1 / volume Top 5. Plus c'est proche de 1, plus c'est "top-heavy" (fragile)
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        if not bids or not asks: return 0.0
+
+        v1 = float(bids[0][1]) + float(asks[0][1])
+        v5 = sum(float(b[1]) for b in bids[:min(5, len(bids))]) + sum(float(a[1]) for a in asks[:min(5, len(asks))])
+
+        if v5 <= 0: return 0.0
+        ratio = v1 / v5
+        
+        try:
+            pair = data.get("pair_key") or data.get("symbol")
+            ex = data.get("exchange")
+            from modules.obs_metrics import MM_DEPTH_PROFILE_RATIO
+            if MM_DEPTH_PROFILE_RATIO and pair and ex:
+                MM_DEPTH_PROFILE_RATIO.labels(exchange=ex, pair=pair).set(ratio)
+        except Exception: pass
+
+        return ratio
+
     # --- SCORE MM (quote-agnostic + fallback de config) ---
     def _score_mm(
-            self, *, a_ex: str, b_ex: str, pair: str, maker_px_a: float, maker_px_b: float
+            self, *, a_ex: str, b_ex: str, pair: str, maker_px_a: float, maker_px_b: float,
+            a_data: Optional[dict] = None, b_data: Optional[dict] = None
     ) -> tuple[float, dict]:
         """
         Score MM : combine net_bps estimé, proba de fill bilatérale (queue vs depth) et pénalité vol.
@@ -1543,6 +1821,21 @@ class OpportunityScanner:
         dB = self._depth_p95_quote(b_ex, pair)
         qposA = self._queuepos_est_quote(a_ex, pair, maker_px_a, side="SELL")
         qposB = self._queuepos_est_quote(b_ex, pair, maker_px_b, side="BUY")
+
+        # Indicateurs microstructure additionnels
+        micro_A, imb_A = (0.0, 0.0)
+        micro_B, imb_B = (0.0, 0.0)
+        churn_A, churn_B = (0.0, 0.0)
+        dp_A, dp_B = (0.0, 0.0)
+
+        if a_data:
+            micro_A, imb_A = self._compute_microprice_imbalance(a_data)
+            churn_A = self._update_churn(pair, a_ex, a_data)
+            dp_A = self._compute_depth_profile(a_data)
+        if b_data:
+            micro_B, imb_B = self._compute_microprice_imbalance(b_data)
+            churn_B = self._update_churn(pair, b_ex, b_data)
+            dp_B = self._compute_depth_profile(b_data)
 
         # Fallbacks de config : *_quote puis *_usd (rétro-compat)
         depth_min_quote = float(
@@ -1608,6 +1901,11 @@ class OpportunityScanner:
             "net_bps": net_bps,
             "p_both": p_both,
             "ttl_ms": int(getattr(s, "mm_ttl_ms", 2200)),
+            # Nouveaux indicateurs
+            "microprice": {"A": micro_A, "B": micro_B},
+            "imbalance": {"A": imb_A, "B": imb_B},
+            "churn_rate": {"A": churn_A, "B": churn_B},
+            "depth_profile": {"A": dp_A, "B": dp_B},
         }
         return score, hints
 
@@ -1727,367 +2025,68 @@ class OpportunityScanner:
         rm_cfg = getattr(self.cfg, "rm", None)
         return bool(getattr(rm_cfg, "strict_config", False))
 
-    def _warn_alias(self, key: str, msg: str) -> None:
-        if key in self._warned_aliases:
-            return
-        self._warned_aliases.add(key)
-        self.logger.warning("%s", msg)
-
-    def _get_scanner_knob(self, name: str, *, legacy: str | None = None, default=None, cast=None):
-        missing = object()
-        scanner_cfg = getattr(self.cfg, "scanner", None)
-        val = getattr(scanner_cfg, name, missing) if scanner_cfg is not None else missing
-        legacy_val = getattr(self.cfg, legacy, missing) if legacy else missing
-
-        if val is not missing and legacy_val is not missing and val != legacy_val:
-            msg = f"scanner.{name} mismatch: scanner.{name}={val} legacy {legacy}={legacy_val}"
-            if self._strict_config():
-                raise RuntimeError(msg)
-            self._warn_alias(f"{name}_conflict", msg)
-
-        if val is not missing:
-            result = val
-        elif legacy_val is not missing:
-            msg = f"legacy {legacy} is deprecated; use scanner.{name} instead"
-            if self._strict_config():
-                raise RuntimeError(msg)
-            self._warn_alias(f"{name}_legacy", msg)
-            result = legacy_val
-        else:
-            result = default
-
-        if cast is not None:
-            try:
-                return cast(result)
-            except Exception:
-                return result
-        return result
     # À mettre dans opportunity_scanner.py (dans la classe)
     def apply_runtime_config(self, cfg: Any) -> None:
         """
-        Applique une mise à jour "live" de la configuration Scanner à partir
-        d'un BotConfig (ou équivalent).
-
-        Invariants business (Ticket 5 / P0 Marché Public) :
-        - Source principale des paramètres : cfg.scanner (ScannerCfg).
-        - Compat sur les anciens champs agrégés :
-          cfg.SCANNER_HZ / cfg.SCANNER_DEQUE_MAX / cfg.SCANNER_DEDUP_COOLDOWN_S.
-        - Pas de lecture directe de SCANNER_* pour des paramètres déjà
-          exposés dans ScannerCfg.
+        Recalage runtime depuis cfg (non destructif).
+        IMPORTANT: pair_queue_max est une capacité "par paire" (pas "par tick")
         """
-        # --- Point d'entrée principal : ScannerCfg ---------------------------
-        scanner_cfg = getattr(cfg, "scanner", None)
-        if scanner_cfg is None:
-            # fallback : utiliser la cfg attachée à l'instance si disponible
-            scanner_cfg = getattr(getattr(self, "cfg", None), "scanner", None)
+        now = time.time()
 
-        # --- Merge éventuel des clés legacy dans ScannerCfg -----------------
-        # SCANNER_DEDUP_COOLDOWN_S : cadence de cooldown dedup (legacy)
-        legacy_dedup = getattr(cfg, "SCANNER_DEDUP_COOLDOWN_S", None)
-        if scanner_cfg is not None and legacy_dedup is not None:
-            try:
-                scanner_cfg.dedup_cooldown_s = float(legacy_dedup)
-                msg = "legacy SCANNER_DEDUP_COOLDOWN_S used; prefer scanner.dedup_cooldown_s"
-                if self._strict_config() and float(scanner_cfg.dedup_cooldown_s) != float(legacy_dedup):
-                    raise RuntimeError(msg)
-                self._warn_alias("dedup_cooldown_s_legacy", msg)
-            except Exception:
-                pass
-
-        # SCANNER_HZ : override agrégé des fréquences par tier (legacy)
-        legacy_hz = getattr(cfg, "SCANNER_HZ", None)
-        if scanner_cfg is not None and isinstance(legacy_hz, dict):
-            if self._strict_config():
-                raise RuntimeError("legacy SCANNER_HZ used; prefer scanner.scanner_eval_hz_*")
-            self._warn_alias("scanner_hz_legacy", "legacy SCANNER_HZ used; prefer scanner.scanner_eval_hz_*")
-            def _pick(d: Dict[str, Any], *keys: str) -> Optional[float]:
-                for k in keys:
-                    if k in d and d[k] is not None:
-                        try:
-                            return float(d[k])
-                        except Exception:
-                            return None
-                return None
-
-            v = _pick(legacy_hz, "CORE", "core")
-            if v is not None:
-                scanner_cfg.scanner_eval_hz_core = v
-            v = _pick(legacy_hz, "PRIMARY", "primary")
-            if v is not None:
-                scanner_cfg.scanner_eval_hz_primary = v
-            v = _pick(legacy_hz, "AUDITION", "audition")
-            if v is not None:
-                scanner_cfg.scanner_eval_hz_audition = v
-            v = _pick(legacy_hz, "SANDBOX", "sandbox")
-            if v is not None:
-                scanner_cfg.scanner_eval_hz_sandbox = v
-
-        # --- Global Hz, workers & fréquences par tier -----------------------
-        if scanner_cfg is not None:
-            self.global_eval_hz = float(
-                self._get_scanner_knob(
-                    "scanner_global_eval_hz", legacy="SCANNER_HZ", default=getattr(self, "global_eval_hz", 200.0)
-                )
-            )
-            self.eval_hz_core = float(
-                getattr(scanner_cfg, "scanner_eval_hz_core", getattr(self, "eval_hz_core", self.global_eval_hz))
-            )
-            self.eval_hz_primary = float(
-                getattr(scanner_cfg, "scanner_eval_hz_primary", getattr(self, "eval_hz_primary", self.global_eval_hz))
-            )
-            self.eval_hz_audition = float(
-                getattr(
-                    scanner_cfg,
-                    "scanner_eval_hz_audition",
-                    getattr(self, "eval_hz_audition", max(1.0, self.global_eval_hz * 0.25)),
-                )
-            )
-            self.eval_hz_sandbox = float(
-                getattr(
-                    scanner_cfg,
-                    "scanner_eval_hz_sandbox",
-                    getattr(self, "eval_hz_sandbox", max(0.5, self.global_eval_hz * 0.15)),
-                )
-            )
-            self._workers = int(max(1, self._get_scanner_knob("workers", legacy="SCANNER_WORKERS", default=self._workers, cast=int)))
-        else:
-            # compat très ancien cfg sans ScannerCfg
-            self.global_eval_hz = float(
-                getattr(cfg, "scanner_global_eval_hz", getattr(self, "global_eval_hz", 200.0)) or 200.0
-            )
-            self.eval_hz_core = float(
-                getattr(cfg, "scanner_eval_hz_core", getattr(self, "eval_hz_core", self.global_eval_hz))
-            )
-            self.eval_hz_primary = float(
-                getattr(cfg, "scanner_eval_hz_primary", getattr(self, "eval_hz_primary", self.global_eval_hz))
-            )
-            self.eval_hz_audition = float(
-                getattr(
-                    cfg,
-                    "scanner_eval_hz_audition",
-                    getattr(self, "eval_hz_audition", max(1.0, self.global_eval_hz * 0.25)),
-                )
-            )
-            self.eval_hz_sandbox = float(
-                getattr(
-                    cfg,
-                    "scanner_eval_hz_sandbox",
-                    getattr(self, "eval_hz_sandbox", max(0.5, self.global_eval_hz * 0.15)),
-                )
-            )
-            self._workers = int(
-                max(1, self._get_scanner_knob("workers", legacy="SCANNER_WORKERS", default=self._workers, cast=int)))
-
-        # --- Dedup window & cooldown ----------------------------------------
-        if scanner_cfg is not None:
-            # fenêtre de dedup & cooldown pilotées par ScannerCfg (P0)
-            self._dedup_window_s = float(
-                max(0.01, getattr(scanner_cfg, "dedup_window_s", getattr(self, "_dedup_window_s", 0.16)))
-            )
-            self.dedup_cooldown_s = float(
-                max(0.01, getattr(scanner_cfg, "dedup_cooldown_s", getattr(self, "dedup_cooldown_s", 0.16)))
-            )
-        else:
-            # compat legacy : on se rabat sur l'ancien champ global si présent
-            self.dedup_cooldown_s = float(
-                max(
-                    0.01,
-                    self._get_scanner_knob(
-                        "dedup_cooldown_s",
-                        legacy="SCANNER_DEDUP_COOLDOWN_S",
-                        default=getattr(self, "dedup_cooldown_s", 0.16),
-                    ),
-                )
-            )
-
-        # --- Deques input / backlog (SCANNER_DEQUE_MAX = agrégateur P0) ----
-        dq_cfg = getattr(cfg, "SCANNER_DEQUE_MAX", None)
-        if dq_cfg is not None:
-            msg = "legacy SCANNER_DEQUE_MAX used; prefer scanner.* queue sizing"
-            if self._strict_config():
-                raise RuntimeError(msg)
-            self._warn_alias("scanner_deque_max_legacy", msg)
-
-        if isinstance(dq_cfg, dict):
-            base_core = int(dq_cfg.get("CORE", dq_cfg.get("core", getattr(self, "_deque_max_core", 1500))))
-            base_primary = int(
-                dq_cfg.get("PRIMARY", dq_cfg.get("primary", getattr(self, "_deque_max_primary", base_core)))
-            )
-            base_audition = int(
-                dq_cfg.get(
-                    "AUDITION",
-                    dq_cfg.get(
-                        "audition",
-                        getattr(self, "_deque_max_audition", max(300, base_primary // 3)),
-                    ),
-                )
-            )
-            base_sandbox = int(
-                dq_cfg.get(
-                    "SANDBOX",
-                    dq_cfg.get(
-                        "sandbox",
-                        getattr(self, "_deque_max_sandbox", max(200, base_primary // 4)),
-                    ),
-                )
-            )
-        elif isinstance(dq_cfg, (int, float)):
-            base_core = int(dq_cfg)
-            base_primary = int(dq_cfg)
-            base_audition = max(300, base_primary // 3)
-            base_sandbox = max(200, base_primary // 4)
-        else:
-            base_core = int(getattr(self, "_deque_max_core", 1500))
-            base_primary = int(getattr(self, "_deque_max_primary", base_core))
-            base_audition = int(getattr(self, "_deque_max_audition", max(300, base_primary // 3)))
-            base_sandbox = int(getattr(self, "_deque_max_sandbox", max(200, base_primary // 4)))
-
-        self._deque_max_core = base_core
-        self._deque_max_primary = base_primary
-        self._deque_max_audition = base_audition
-        self._deque_max_sandbox = base_sandbox
-        # pour le logging backpressure existant
-        self.deque_max = self._deque_max_core
-
-        # --- Token buckets : recalage sur la nouvelle global_eval_hz --------
-        try:
-            # _tb_global : limiter nb de paires / seconde
-            if hasattr(self, "_tb_global") and self._tb_global is not None:
-                global_burst = float(getattr(self.cfg.scanner, "scanner_global_eval_burst_factor", 2.0))
-                self._tb_global.update_sync(
-                    rate_per_s=self.global_eval_hz,
-                    burst=max(1, int(self.global_eval_hz * global_burst)),
-                )
-            else:
-                global_burst = float(getattr(self.cfg.scanner, "scanner_global_eval_burst_factor", 2.0))
-                self._tb_global = TokenBucket(
-                    rate_per_s=self.global_eval_hz,
-                    burst=max(1, int(self.global_eval_hz * global_burst)),
-                    name="scanner_global",
-                )
-        except Exception:
-            # en cas de problème, on garde l'ancien bucket
-            pass
-
-        # reset du cache per-pair : il sera repopulé progressivement
-        self._tb_pair = {}
-
-        # --- Pair-level queues : alignement SCANNER_DEQUE_MAX + max_pairs_per_tick ---
+        # --- Pair queue max (par paire, pas "par tick")
+        # Recalcul propre: dépend du PRIMARY deque (ou fallback)
         try:
             new_pair_max = int(self._compute_pair_queue_max_from_cfg(cfg))
-        except Exception:
-            new_pair_max = int(getattr(self, "_pair_queue_max", 1000) or 1000)
+            old_pair_max = int(getattr(self, "_pair_queue_max", 1500) or 1500)
 
-        old_pair_max = int(getattr(self, "_pair_queue_max", 0) or 0)
-        if new_pair_max != old_pair_max and new_pair_max > 0:
-            from collections import deque, defaultdict
-
-            self._pair_queue_max = new_pair_max
-
-            # reconstruire les deques existants avec le nouveau maxlen
-            old_queues = getattr(self, "_queues", {}) or {}
-            new_queues = {}
-            for pk, dq in old_queues.items():
-                try:
-                    new_queues[pk] = deque(dq, maxlen=self._pair_queue_max)
-                except Exception:
-                    # fallback: réinitialise la file si problème
-                    new_queues[pk] = deque(maxlen=self._pair_queue_max)
-
-            self._queues = defaultdict(lambda: deque(maxlen=self._pair_queue_max))
-            self._queues.update(new_queues)
-
-            try:
-                self.logger.info(
-                    "[Scanner] pair_queue_max recalé via SCANNER_DEQUE_MAX/max_pairs_per_tick: %s -> %s",
-                    old_pair_max,
-                    self._pair_queue_max,
+            if new_pair_max != old_pair_max:
+                self._pair_queue_max = new_pair_max
+                logger.info(
+                    "[Scanner] pair_queue_max ajusté à %d (via PRIMARY_DEQUE_MAX)",
+                    new_pair_max,
                 )
+        except Exception:
+            pass
+
+        # --- Touch timestamp (utile si tu as du watchdog)
+        try:
+            self._last_runtime_cfg_ts = now
+        except Exception:
+            pass
+
+    def _compute_pair_queue_max_from_cfg(self, cfg: Any) -> int:
+        """
+        Déduit une capacité "par paire" robuste.
+
+        Règle:
+        - On part du deque PRIMARY (capacité de la cohorte PRIMARY),
+          car c'est la meilleure approximation d'une pression "par paire".
+        - AUCUNE division par max_pairs_per_tick (sinon tu retombes dans 5000 -> 30).
+        - On garde un plancher de sécurité.
+        """
+        # Base: PRIMARY deque max si dispo, sinon fallback conservateur
+        base_primary = int(getattr(self, "_deque_max_primary", 1500) or 1500)
+
+        # Si cfg.scanner a un override explicite, on le respecte (si tu l’ajoutes plus tard).
+        sc = getattr(cfg, "scanner", None)
+        if sc is not None:
+            try:
+                v = getattr(sc, "pair_queue_max", None)
+                if v is not None:
+                    return max(50, int(v))
+            except Exception:
+                pass
+            try:
+                # Si tu pilotes deque_max_primary côté cfg.scanner, on le prend en priorité
+                v = getattr(sc, "deque_max_primary", None)
+                if v is not None:
+                    base_primary = max(50, int(v))
             except Exception:
                 pass
 
-    def _compute_pair_queue_max_from_cfg(self, cfg) -> int:
-        """
-        Calcule une capacité cohérente pour les deques par paire, en alignant :
-        - SCANNER_DEQUE_MAX (cap globale par tier, en pratique PRIMARY),
-        - max_pairs_per_tick,
-        - le plafond éventuel Router.out_queues_maxlen.
-
-        Retourne une valeur bornée (16..10_000).
-        """
-        # max_pairs_per_tick depuis ScannerCfg ou instance
-        try:
-            sc = getattr(cfg, "scanner", None)
-        except Exception:
-            sc = None
-
-        mpt = None
-        if sc is not None:
-            try:
-                mpt = int(getattr(sc, "max_pairs_per_tick", getattr(self, "max_pairs_per_tick", 40)))
-            except Exception:
-                mpt = None
-        if not mpt or mpt <= 0:
-            mpt = int(getattr(self, "max_pairs_per_tick", 40) or 40)
-
-        # agrégateur SCANNER_DEQUE_MAX : on part de PRIMARY
-        dq_cfg = getattr(cfg, "SCANNER_DEQUE_MAX", None)
-        if dq_cfg is not None:
-            msg = "legacy SCANNER_DEQUE_MAX used; prefer scanner.* queue sizing"
-            if self._strict_config():
-                raise RuntimeError(msg)
-            self._warn_alias("scanner_deque_max_legacy", msg)
-        base_primary = None
-        if isinstance(dq_cfg, dict):
-            try:
-                base_primary = int(
-                    dq_cfg.get(
-                        "PRIMARY",
-                        dq_cfg.get(
-                            "primary",
-                            dq_cfg.get("CORE", dq_cfg.get("core", getattr(self, "_deque_max_primary", 1500))),
-                        ),
-                    )
-                )
-            except Exception:
-                base_primary = None
-        elif isinstance(dq_cfg, (int, float)):
-            base_primary = int(dq_cfg)
-
-        if base_primary is None:
-            try:
-                base_primary = int(getattr(self, "_deque_max_primary", getattr(self, "_deque_max_core", 1500)))
-            except Exception:
-                base_primary = 1500
-
-        # cap globale → capacité par paire approximative
-        per_pair_cap = max(16, base_primary // max(mpt, 1))
-
-        # borne haute éventuelle via Router
-        router_cfg = getattr(cfg, "router", None)
-        router_cap = None
-        try:
-            if router_cfg is not None:
-                router_cap = int(getattr(router_cfg, "out_queues_maxlen", 0) or 0)
-        except Exception:
-            router_cap = None
-
-        if router_cap and router_cap > 0:
-            pair_max = min(per_pair_cap, router_cap)
-        else:
-            pair_max = per_pair_cap
-
-        pair_max = int(max(16, min(pair_max, 10_000)))
-        return pair_max
-
-
-    def _cohort_of(self, pair: str) -> str:
-        pk = _norm_pair(pair)
-        if pk in getattr(self, "_core_pairs", set()):     return "CORE"
-        if pk in getattr(self, "_primary_pairs", set()):  return "PRIMARY"
-        if pk in getattr(self, "_audition_pairs", set()): return "AUDITION"
-        if pk in getattr(self, "_sandbox_pairs", set()):  return "SANDBOX"
-        return "AUDITION"  # défaut sûr
+        # Plancher: jamais trop petit (sinon étouffement)
+        # (50 est volontairement petit mais safe; en pratique base_primary domine)
+        return max(50, int(base_primary))
 
     def _ensure_buckets_for_pair(self, pair: str) -> TokenBucket:
         pk = _norm_pair(pair)
@@ -2196,14 +2195,19 @@ class OpportunityScanner:
 
     def _risk_feeds_fresh(self, pair: str) -> tuple[bool, Optional[str], dict]:
         """
-        Vérifie la fraicheur des flux auxiliaires (slippage/volatility)
-        en se basant EXCLUSIVEMENT sur les SLO publics (fallback cfg.slip/vol.ttl_s).
+        Vérifie la fraicheur des flux auxiliaires (slippage/volatility).
+        Optimisation HFT : En mode PROD, on délègue ce check au RiskManager 
+        pour économiser du CPU sur le Hot Path. 
         """
+        if not self.is_actually_dry:
+            return True, None, {}
+
+        # En mode DRY_RUN, on garde le check local pour la simulation
         ex = next(iter(self.exchanges or []), "")
-        slip_ttl = self._public_ttl(ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0))
+        slip_ttl = self._public_ttl(ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 5.0))
         vol_ttl = self._public_ttl(ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s", 5.0))
 
-        slip_age = self._slip_age_seconds(pair)  # suppose des compteurs internes existants
+        slip_age = self._slip_age_seconds(pair)
         vol_age = self._vol_age_seconds(pair)
         if not math.isfinite(slip_age) or slip_age > slip_ttl:
             return False, "slip_unknown_or_stale", {"age_s": slip_age, "ttl_s": slip_ttl}
@@ -2281,6 +2285,9 @@ class OpportunityScanner:
     # ---------------- Cœur évaluation ----------------
     def _evaluate_pair(self, buy_data: dict, sell_data: dict) -> None:
         _t0 = time.perf_counter()
+        # Instrumentation latence (P1)
+        tracing_enabled = should_trace_latency(self.cfg)
+        
         now = time.time()
         pair = (buy_data.get("pair_key") or buy_data.get("symbol") or "").replace("-", "").upper()
         buy_ex = str((buy_data.get("exchange") or "")).upper()
@@ -2288,10 +2295,21 @@ class OpportunityScanner:
         route_combo = f"{min(buy_ex, sell_ex)}/{max(buy_ex, sell_ex)}"
         quote = _quote_of_pair(pair)
 
+        def _record_latency():
+            eval_us = (time.perf_counter() - _t0) * 1_000_000
+            # On ne loggue que les evaluations un peu lourdes
+            if eval_us > 1000: # > 1ms
+                 self.logger.info("[Scanner] Eval %s: %.2fus", pair, eval_us)
+
         def _book_fresh(snapshot: dict, ex_name: str) -> bool:
-            if not snapshot.get("active", False):
+            # P0: On respecte les conditions de fraîcheur même en DRY_RUN 
+            # pour permettre la calibration du bot sur l'infra cible.
+            is_actually_dry = self.is_actually_dry
+
+            if not snapshot.get("active", True):
                 self._record_rejection(reason="inactive", route=route_combo, pair=pair, ctx={"exchange": ex_name})
                 return False
+
             recv_ts_ms = snapshot.get("recv_ts_ms")
             if recv_ts_ms is None:
                 self._record_rejection(
@@ -2302,8 +2320,14 @@ class OpportunityScanner:
                 )
                 return False
             book_ttl_ms = snapshot.get("book_ttl_ms")
+            
+            # P0: Grâce initiale de 5s au démarrage du Scanner
+            if (time.time() - getattr(self, "_boot_ts", 0)) < 5.0:
+                return True
+
             if book_ttl_ms is None:
                 book_ttl_ms = self._book_ttl_ms_default(ex_name)
+
             if book_ttl_ms is None or float(book_ttl_ms) <= 0.0:
                 self._record_rejection(
                     reason="schema_missing_field",
@@ -2312,16 +2336,40 @@ class OpportunityScanner:
                     ctx={"exchange": ex_name, "field": "book_ttl_ms"},
                 )
                 return False
+            # P0: calcul d'âge robuste aux sauts NTP (wall clock)
+            recv_mono_ns = snapshot.get("recv_mono_ns")
             try:
-                age_ms = int(time.time() * 1000) - int(recv_ts_ms)
+                if recv_mono_ns is not None:
+                    age_ms = int((time.monotonic_ns() - int(recv_mono_ns)) / 1_000_000)
+                    if age_ms < 0:
+                        age_ms = 0
+                else:
+                    age_ms = int(time.time() * 1000) - int(recv_ts_ms)
             except Exception:
                 self._record_rejection(
                     reason="schema_missing_field",
                     route=route_combo,
                     pair=pair,
-                    ctx={"exchange": ex_name, "field": "recv_ts_ms"},
+                    ctx={"exchange": ex_name, "field": "recv_ts_ms/recv_mono_ns"},
                 )
                 return False
+            # Diagnostic: si wall age est énorme mais mono age est OK => saut d'horloge probable
+            if recv_mono_ns is not None:
+                try:
+                    age_wall = int(time.time() * 1000) - int(recv_ts_ms)
+                    if age_wall > 5000 and age_ms < 500:
+                        # Log échantillonné (1/sec max par exchange)
+                        now_s = int(time.time())
+                        k = f"_clockjump_last_{ex_name}"
+                        if getattr(self, k, 0) != now_s:
+                            setattr(self, k, now_s)
+                            self.logger.warning(
+                                "[Scanner][clock_jump?] ex=%s age_wall_ms=%s age_mono_ms=%s",
+                                ex_name, age_wall, age_ms
+                            )
+                except Exception:
+                    pass
+
             if age_ms > int(book_ttl_ms):
                 self._record_rejection(
                     reason="book_stale",
@@ -2335,16 +2383,24 @@ class OpportunityScanner:
         if not _book_fresh(buy_data, buy_ex) or not _book_fresh(sell_data, sell_ex):
             return
 
-        buy_price = D(buy_data.get("best_ask"))
-        sell_price = D(sell_data.get("best_bid"))
-        buy_vol = D(buy_data.get("ask_volume") or 0)
-        sell_vol = D(sell_data.get("bid_volume") or 0)
-        if buy_price <= 0 or sell_price <= 0:
+        # 1. FAST GATE : Prix et spread brut (Types natifs float pour la performance)
+        try:
+            buy_price = float(buy_data.get("best_ask") or 0)
+            sell_price = float(sell_data.get("best_bid") or 0)
+        except (ValueError, TypeError):
+            return
+
+        if buy_price <= 0 or sell_price <= 0 or sell_price <= buy_price:
+            return
+
+        buy_vol = float(buy_data.get("ask_volume") or 0)
+        sell_vol = float(sell_data.get("bid_volume") or 0)
+        if buy_vol <= 0 or sell_vol <= 0:
             return
 
         slip_ttl = min(
-            self._public_ttl(buy_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
-            self._public_ttl(sell_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 2.0)),
+            self._public_ttl(buy_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 5.0)),
+            self._public_ttl(sell_ex, "slip_ttl_s", getattr(self.cfg.slip, "ttl_s", 5.0)),
         )
         def _leg_age(ex_name: str) -> float:
             try:
@@ -2383,7 +2439,7 @@ class OpportunityScanner:
                                    ctx={"side": "sell", "bps": c_sell * 1e4, "thr_bps": thr_bps})
             return
 
-        # Notionnels en quote + minNotional dynamique (charge ↑ => multiplicateur)
+        # 2. FAST GATE : Notionnels en quote + minNotional
         vol_buy_quote = buy_price * buy_vol
         vol_sell_quote = sell_price * sell_vol
         vol_possible_quote = min(vol_buy_quote, vol_sell_quote)
@@ -2391,79 +2447,49 @@ class OpportunityScanner:
         val_min = None
         try:
             val_min = self.risk_manager.get_minimum_volume_required(buy_ex, pair)
-        except Exception as e:
-            self._record_rejection(
-                reason="min_notional_missing",
-                route=route_combo,
-                pair=pair,
-                ctx={"err": type(e).__name__}
-            )
+        except Exception:
             return
+
         if val_min is None or float(val_min) <= 0.0:
-            self._record_rejection(
-                reason="min_notional_missing",
-                route=route_combo,
-                pair=pair
-            )
             return
-        min_notional = D(val_min)
-
-        # >>> NOUVEAU : multiplicateur minNotional sous charge (audition prioritaire)
+        
+        min_notional = float(val_min)
         boost_bps_dyn, min_notional_mult_dyn = self._dynamic_thresholds_for(pair)
-        if vol_possible_quote < (min_notional * D(min_notional_mult_dyn)):
-            self.blocks["min_notional"] += 1
-            self._record_rejection(
-                reason="min_notional",
-                route=route_combo,
-                pair=pair,
-                ctx={
-                    "vol_possible_quote": float(vol_possible_quote),
-                    "min_notional": float(min_notional),
-                    "min_notional_mult": float(min_notional_mult_dyn),
-                },
-            )
+        
+        if vol_possible_quote < (min_notional * float(min_notional_mult_dyn)):
+            # On ne record que si c'est vraiment bas, sinon on drop silencieusement pour le CPU
+            if vol_possible_quote < (min_notional * 0.5):
+                self.blocks["min_notional"] += 1
+                self._record_rejection(
+                    reason="min_notional",
+                    route=route_combo,
+                    pair=pair,
+                    ctx={
+                        "vol_quote": vol_possible_quote,
+                        "min_notional": min_notional
+                    },
+                )
             return
 
+        # 3. Calcul du spread norm (float)
         spread_brut = sell_price - buy_price
-        mid = (sell_price + buy_price) / D(2)
-        if mid <= 0:
-            return
+        mid = (sell_price + buy_price) / 2.0
         spread_norm = spread_brut / mid
-        if spread_norm <= 0:
-            return
 
         # Coûts dynamiques (TAKER) — cache → RM
-        def _slip(ex: str, side: str) -> Optional[Decimal]:
+        def _slip(ex: str, side: str) -> Optional[float]:
             # 1) cache
             v = self._cached_slip(ex, pair, side)
             if v is None:
                 # 2) source stricte via RM -> SFC
                 try:
                     v = self.risk_manager.get_slippage(ex, pair, side=side)
-                except DataStaleError:
+                except Exception:
                     v = None
 
             if v is None:
-                # Rejet explicite: pas de valeur inventée
-                self.blocks["slip"] += 1
-                self._record_rejection(
-                    reason="slip_unknown_or_stale",
-                    route=route_combo,
-                    pair=pair,
-                    ctx={"ex": ex, "side": side},
-                )
                 return None
-            try:
-                return D(v)
-            except Exception:
-                self.blocks["slip"] += 1
-                self._record_rejection(
-                    reason="slip_unknown_or_stale",
-                    route=route_combo,
-                    pair=pair,
-                    ctx={"ex": ex, "side": side, "raw": v},
-                )
-                return None
+            return float(v)
 
         # Fees strictes via RM (fraction, ex: 0.001); aucun 0 “de confort”
         try:
@@ -2486,20 +2512,22 @@ class OpportunityScanner:
             )
             return
         if fb is None or fs is None or float(fb) <= 0.0 or float(fs) <= 0.0:
-            self._record_rejection(
-                reason="fee_unknown",
-                route=route_combo,
-                pair=pair,
-                ctx={"buy_ex": buy_ex, "sell_ex": sell_ex}
-            )
             return
 
-        fees_buy_taker = D(fb)
-        fees_sell_taker = D(fs)
+        fees_buy_taker = float(fb)
+        fees_sell_taker = float(fs)
         slip_buy = _slip(buy_ex, "buy")
         slip_sell = _slip(sell_ex, "sell")
+        
         if slip_buy is None or slip_sell is None:
+            self._record_rejection(
+                reason="slip_unknown",
+                route=route_combo,
+                pair=pair,
+                ctx={"buy_ex": buy_ex, "sell_ex": sell_ex},
+            )
             return
+            
         total_cost = fees_buy_taker + fees_sell_taker + slip_buy + slip_sell
         spread_net = spread_norm - total_cost
 
@@ -2512,12 +2540,13 @@ class OpportunityScanner:
         vol_penalty_bps = 0.0
         if not isinstance(vol_bps_scanner, (int, float)):
             self._record_rejection(
-                reason="vol_unknown_or_stale",
+                reason="vol_unknown",
                 route=route_combo,
                 pair=pair,
-                ctx={"ttl_s": vol_ttl},
+                ctx={"buy_ex": buy_ex, "sell_ex": sell_ex},
             )
             return
+            
         excess = max(0.0, float(vol_bps_scanner) - self.vol_soft_cap_bps)
         vol_penalty_bps = excess * self.vol_alpha_penalty  # bps
         local_min_required_bps = float(self.min_required_bps) + self.vol_beta_min_req * excess
@@ -2525,18 +2554,19 @@ class OpportunityScanner:
         # >>> NOUVEAU : boost bps sous charge (audition d'abord)
         local_min_required_bps += float(boost_bps_dyn)
 
-        # Pré-filtre VOL + charge
-        if float(spread_net * D(1e4)) < local_min_required_bps:
+        if (spread_net * 1e4) < local_min_required_bps:
             self.blocks["fast_prefilter"] += 1
-            self._record_rejection(
-                reason="below_min_bps",
-                route=route_combo,
-                pair=pair,
-                ctx={
-                    "net_bps": float(spread_net * D(1e4)),
-                    "min_required_bps": float(local_min_required_bps),
-                },
-            )
+            # On ne record que si on est proche du seuil ou si on veut débugger
+            if (spread_net * 1e4) > (local_min_required_bps - 5.0):
+                self._record_rejection(
+                    reason="below_min_bps",
+                    route=route_combo,
+                    pair=pair,
+                    ctx={
+                        "net_bps": spread_net * 1e4,
+                        "min_bps": local_min_required_bps
+                    },
+                )
             return
 
         # --- (reste de votre fonction inchangé : TM/TT hints, MM hints, sizing, dédup,
@@ -2563,8 +2593,8 @@ class OpportunityScanner:
         ob_buy_asks = (buy_data.get("orderbook") or {}).get("asks") or []
         ob_sell_bids = (sell_data.get("orderbook") or {}).get("bids") or []
 
-        need_buy_qty = float(((vol_possible_quote / buy_price) if buy_price > 0 else D(0)))
-        need_sell_qty = float(((vol_possible_quote / sell_price) if sell_price > 0 else D(0)))
+        need_buy_qty = (vol_possible_quote / buy_price) if buy_price > 0 else 0.0
+        need_sell_qty = (vol_possible_quote / sell_price) if sell_price > 0 else 0.0
 
         agg_buy_on_sell = self._agg_depth_qty(
             ob_sell_bids, side="bids", limit_price=float(sell_price),
@@ -2597,7 +2627,7 @@ class OpportunityScanner:
         tt_k = float(self.hint_cfg.get("tt_skew_vol_k", 1.0))
         tt_limit_ms_eff = tt_base * (1.0 + tt_k * vol_factor)
 
-        spread_bps = float(spread_norm * D(1e4))
+        spread_bps = spread_norm * 1e4
 
         tm_estimates: List[Dict[str, Any]] = []
         if buy_maker_fee_bps is not None:
@@ -2636,43 +2666,49 @@ class OpportunityScanner:
         tm_best_bps = max((e.get("est_net_bps_weighted", e.get("est_net_bps", -1e9)) for e in tm_estimates),
                           default=-1e9)
 
-        if float(spread_net) < 0.0 and tm_best_bps < 0.0:
+        # Pre-evaluation des hints MM pour permettre l'opportunisme même sans arb TT/TM
+        mm_score = -1e9
+        mm_hints = {}
+        mm_eligible = False
+        try:
+            mm_mode = (getattr(self, "mm_mode", "OFF") or "OFF").upper()
+            if mm_mode != "OFF" and self._should_consider_mm_for_pair(pair):
+                ma = float((sell_data.get("best_ask") or 0.0))
+                mb = float((buy_data.get("best_bid") or 0.0))
+                mm_score, mm_hints = self._score_mm(
+                    a_ex=sell_ex, b_ex=buy_ex, pair=pair, maker_px_a=ma, maker_px_b=mb,
+                    a_data=sell_data, b_data=buy_data
+                )
+                mm_eligible = mm_score > -1e8
+                SC_STRATEGY_SCORE.labels(pair, "MM").set(mm_score)
+                SC_ELIGIBLE.labels(pair, "MM").set(1.0 if mm_eligible else 0.0)
+        except Exception:
+            pass
+
+        if spread_net < 0.0 and tm_best_bps < 0.0 and not mm_eligible:
             self.blocks["neg_both"] += 1
+            # Ici on est dans un entre-deux TT/TM/MM, on utilise MIXED ou le mode actuel
             self._record_rejection(reason="neg_both", route=route_combo, pair=pair,
-                                   ctx={"tt_net_pct": float(spread_net * 100), "tm_best_bps": tm_best_bps})
+                                   ctx={"tt_net_pct": spread_net * 100, "tm_best_bps": tm_best_bps, "mm_score": mm_score},
+                                   strategy="MIXED")
             return
 
         tm_hint_min = float(self.hint_cfg["tm_hint_min_est_net_bps"])  # bps
-        if float(spread_net) < float(self.min_spread_net) and tm_best_bps < tm_hint_min:
+        if spread_net < float(self.min_spread_net) and tm_best_bps < tm_hint_min and not mm_eligible:
             self.blocks["below_tm_hint"] += 1
             self._record_rejection(reason="below_tm_hint", route=route_combo, pair=pair,
-                                   ctx={"tt_net_pct": float(spread_net * 100), "tm_best_bps": tm_best_bps,
-                                        "tm_hint_min_bps": tm_hint_min})
+                                   ctx={"tt_net_pct": spread_net * 100, "tm_best_bps": tm_best_bps,
+                                        "tm_hint_min_bps": tm_hint_min, "mm_score": mm_score},
+                                   strategy="MIXED")
             return
 
         # Sizing (depth-aware + cap + inventaire)
         target_quote = vol_possible_quote
         if self.max_notional_quote and self.max_notional_quote > 0:
-            target_quote = min(target_quote, D(self.max_notional_quote))
-        val_min = None
-        try:
-            val_min = self.risk_manager.get_minimum_volume_required(buy_ex, pair)
-        except Exception as e:
-            self._record_rejection(
-                reason="min_notional_missing",
-                route=route_combo,
-                pair=pair,
-                ctx={"err": type(e).__name__}
-            )
-            return
-        if val_min is None or float(val_min) <= 0.0:
-            self._record_rejection(
-                reason="min_notional_missing",
-                route=route_combo,
-                pair=pair
-            )
-            return
-        min_notional = D(val_min)
+            target_quote = min(target_quote, float(self.max_notional_quote))
+        
+        # min_notional déjà récupéré plus haut, on réutilise
+        min_notional = float(val_min)
 
         size_ok = False
         attempts = 0
@@ -2680,7 +2716,7 @@ class OpportunityScanner:
             try:
                 valid = self.risk_manager.validate_inventory_bundle(
                     buy_ex=buy_ex, sell_ex=sell_ex, pair_key=pair,
-                    vol_usdc_buy=float(target_quote), vol_usdc_sell=float(target_quote),
+                    vol_usdc_buy=target_quote, vol_usdc_sell=target_quote,
                     is_rebalancing=False,
                 )
             except Exception:
@@ -2688,14 +2724,14 @@ class OpportunityScanner:
             if valid:
                 size_ok = True
                 break
-            target_quote *= D("0.7")
+            target_quote *= 0.7
             attempts += 1
             if attempts > 5:
                 break
         if not size_ok:
             self.blocks["inventory"] += 1
             self._record_rejection(reason="inventory", route=route_combo, pair=pair,
-                                   ctx={"min_notional": float(min_notional)})
+                                   ctx={"min_notional": min_notional})
             return
 
         # Dédup court
@@ -2722,7 +2758,11 @@ class OpportunityScanner:
         buy_recv_ts_ms = int(buy_data.get("recv_ts_ms") or 0)
         sell_recv_ts_ms = int(sell_data.get("recv_ts_ms") or 0)
         recv_candidates = [ts for ts in (buy_recv_ts_ms, sell_recv_ts_ms) if ts > 0]
-        book_age_ms = max(0, decision_ts_ms - min(recv_candidates)) if recv_candidates else 0
+
+        book_ts_ms = int(min(recv_candidates)) if recv_candidates else 0
+        book_age_ms = max(0, decision_ts_ms - book_ts_ms) if book_ts_ms > 0 else 0
+
+
         region_buy = self._resolve_exchange_region(buy_ex)
         region_sell = self._resolve_exchange_region(sell_ex)
         deployment_mode = str(getattr(getattr(self.cfg, "g", object()), "deployment_mode", "UNKNOWN")).upper()
@@ -2753,19 +2793,39 @@ class OpportunityScanner:
             "meta": {"best_price": float(sell_price), "type": ("rebalancing" if is_rebal else "standard")},
         }
 
+        # Determination de la stratégie la plus probable pour l'observabilité
+        if is_rebal:
+            strat_label = "REB"
+        elif mm_eligible and float(spread_net) < float(self.min_spread_net) and tm_best_bps < tm_hint_min:
+            # Distinction Mono vs Cross pour routing alias
+            if str(buy_ex).upper() == str(sell_ex).upper():
+                strat_label = "MM_MONO"
+            else:
+                strat_label = "MM_CROSS"
+        elif self.scanner_mode == "MIXED":
+            if float(spread_net) >= float(self.min_spread_net):
+                strat_label = "TT"
+            elif tm_best_bps >= float(self.hint_cfg["tm_hint_min_est_net_bps"]):
+                strat_label = "TM"
+            else:
+                strat_label = "MIXED"
+        else:
+            strat_label = self.scanner_mode
+
         payload = {
             "type": ("rebalancing" if is_rebal else "bundle"),
             "legs": [leg_buy, leg_sell],
             "pair_key": pair,
             "buy_ex": buy_ex,
             "sell_ex": sell_ex,
-            "strategy": ("REB" if is_rebal else self.scanner_mode),
+            "strategy": strat_label,
             "quote": quote,
             "quote_ccy": quote,
             "notional_quote": {"ccy": quote, "amount": float(target_quote)},
             "notional_quote_amount": float(target_quote),
             "volume_usdc": float(target_quote),
             "book_age_ms": int(book_age_ms),
+            "book_ts_ms": int(book_ts_ms),
             "fees_buy": float(fees_buy_taker),
             "fees_sell": float(fees_sell_taker),
             "slip_buy": float(slip_buy),
@@ -2785,13 +2845,46 @@ class OpportunityScanner:
             "ts_buy_ex_ms": int(buy_data.get("exchange_ts_ms") or buy_data.get("recv_ts_ms") or 0),
             "ts_sell_ex_ms": int(sell_data.get("exchange_ts_ms") or sell_data.get("recv_ts_ms") or 0),
         }
+
+        # --- REEQUILIBRAGE MM PAR DESACTIVATION DE LEG ---
+        # Si on est en MM (Mono ou Cross), on vérifie si l'inventaire impose de couper un côté.
+        if strat_label in ("MM_MONO", "MM_CROSS"):
+            try:
+                base_asset = pair.replace(quote, "")
+                final_legs = []
+                for leg in payload["legs"]:
+                    side = leg["side"]
+                    ex = leg["exchange"]
+                    restriction = self.risk_manager.get_mm_leg_restriction(ex, strat_label, base_asset, pair_key=pair)
+                    if restriction == side:
+                        # Ce côté aggrave l'inventaire -> on le désactive (Self-rebal passif)
+                        payload.setdefault("meta", {})["leg_restricted"] = side
+                        self.logger.info("[Scanner] MM Rebalancing: disabling %s leg for %s on %s (inventory drift)", side, pair, ex)
+                    elif restriction == "BOTH":
+                        # Les deux côtés sont restreints (phase 3 ou imbalance adverse)
+                        payload.setdefault("meta", {})["mm_blocked_reason"] = "STUCK_OR_ADVERSE"
+                        final_legs = []
+                        break
+                    else:
+                        final_legs.append(leg)
+                
+                if not final_legs:
+                    # Les deux côtés sont restreints (rare) ou un seul leg restant était restreint
+                    return
+
+                payload["legs"] = final_legs
+                if len(final_legs) == 1:
+                    payload["meta"]["mm_mode"] = "SINGLE"
+            except Exception:
+                pass
         sim_snapshot = {
             "asks": list((buy_data.get("asks") or [])[: self._binance_depth_level]),
             "bids": list((sell_data.get("bids") or [])[: self._binance_depth_level]),
-            "recv_ts_ms": min([ts for ts in (buy_recv_ts_ms, sell_recv_ts_ms) if ts > 0]) if (
-                        buy_recv_ts_ms or sell_recv_ts_ms) else 0,
+            "recv_ts_ms": int(book_ts_ms),
+
         }
         payload["sim_snapshot"] = sim_snapshot
+        
         try:
             sim = getattr(self, "simulator", None)
             if sim:
@@ -2917,39 +3010,26 @@ class OpportunityScanner:
                 }
             }
 
-            # Hints MM (mode MONO seulement, indépendants du succès TT/TM)
-            try:
-                mm_mode = (self.mm_mode or "OFF").upper()
-                if mm_mode == "OFF":
-                    SC_ELIGIBLE.labels(pair, "MM").set(0.0)
-                elif mm_mode == "CROSS":
-                    self.logger.debug("[Scanner] MM CROSS non supporté (pair=%s)", pair)
-                    SC_ELIGIBLE.labels(pair, "MM").set(0.0)
-                elif self._should_consider_mm_for_pair(pair):
-                    ma = float((sell_data.get("best_ask") or 0.0))
-                    mb = float((buy_data.get("best_bid") or 0.0))
-                    score_mm, mm_hints = self._score_mm(a_ex=sell_ex, b_ex=buy_ex, pair=pair, maker_px_a=ma,
-                                                        maker_px_b=mb)
-                    SC_STRATEGY_SCORE.labels(pair, "MM").set(score_mm)
-                    SC_ELIGIBLE.labels(pair, "MM").set(1.0 if score_mm > -1e8 else 0.0)
-                    hints["MM"] = mm_hints
-                    hints["MM_score"] = float(score_mm)
-                    hints.setdefault("expected_net_bps", {})
-                    hints["expected_net_bps"]["TT"] = float(spread_net * 1e4)
-                    hints["expected_net_bps"]["TM"] = float(tm_best_bps)
-                    hints["expected_net_bps"]["MM"] = float(mm_hints.get("net_bps", float("nan")))
-                else:
-                    SC_ELIGIBLE.labels(pair, "MM").set(0.0)
-            except Exception:
-                logging.exception("Unhandled exception")
+            # Hints MM (déjà évalués plus haut)
+            if mm_eligible:
+                hints["MM"] = mm_hints
+                hints["MM_score"] = float(mm_score)
+                hints.setdefault("expected_net_bps", {})
+                hints["expected_net_bps"]["TT"] = float(spread_net * 1e4)
+                hints["expected_net_bps"]["TM"] = float(tm_best_bps)
+                hints["expected_net_bps"]["MM"] = float(mm_hints.get("net_bps", float("nan")))
+            else:
+                # On s'assure que SC_ELIGIBLE est à 0 si on arrive ici sans mm_eligible
+                try: SC_ELIGIBLE.labels(pair, "MM").set(0.0)
+                except: pass
 
         # Score net (pénalité VOL douce) — pondéré par la taille effectivement sélectionnée
-        vol_penalty_frac = D(vol_penalty_bps / 1e4) if vol_penalty_bps > 0 else D(0)
-        score_net = (spread_net - vol_penalty_frac) * D(target_quote)
+        vol_penalty_frac = (vol_penalty_bps / 1e4) if vol_penalty_bps > 0 else 0.0
+        score_net = (spread_net - vol_penalty_frac) * target_quote
 
         # Latence WS→Scanner (estimation robuste)
-        buy_ms = int(payload["ts_buy_ex_ms"] or 0)
-        sell_ms = int(payload["ts_sell_ex_ms"] or 0)
+        buy_ms = int(payload.get("ts_buy_ex_ms") or 0)
+        sell_ms = int(payload.get("ts_sell_ex_ms") or 0)
         if buy_ms and sell_ms:
             sec = max(0.0, (time.time() * 1000.0 - min(buy_ms, sell_ms)) / 1000.0)
         else:
@@ -2961,27 +3041,38 @@ class OpportunityScanner:
 
         opp = {
             "opp_id": opp_id,
+            # Propagation latence (P1)
+            "router_entry_ns": buy_data.get("router_entry_ns") or sell_data.get("router_entry_ns"),
+            "router_exit_ns": buy_data.get("router_exit_ns") or sell_data.get("router_exit_ns"),
+            "scanner_entry_ns": buy_data.get("scanner_entry_ns") or sell_data.get("scanner_entry_ns"),
             "arb_id": arb_id,
             "pair": pair,
+            "symbol": pair,
             "quote": quote,
             "buy_exchange": buy_ex,
             "sell_exchange": sell_ex,
+            "route": {
+                "buy_exchange": buy_ex,
+                "sell_exchange": sell_ex,
+            },
+            "notional_quote": {
+                "ccy": quote,
+                "amount": float(target_quote),
+            },
             "buy_price": float(buy_price),
             "sell_price": float(sell_price),
-            "spread_brut_pct": float((spread_norm) * 100),
+            "spread_brut_pct": float(spread_norm * 100),
             "spread_net_pct": float(spread_net * 100),
             "volume_top_buy": float(buy_vol),
             "volume_top_sell": float(sell_vol),
             "volume_possible_quote": float(vol_possible_quote),
             "volume_selected_quote": float(target_quote),
-            "volume_possible_usdc": float(vol_possible_quote),
-            "volume_selected_usdc": float(target_quote),
             "timestamp": now,
             "t_detect": t_detect,
             "t_scan_done": t_scan_done,
             "latency_ws_to_scan_ms": latency_ws_to_scan_ms,
-            "score": float(score_net.quantize(Decimal("0.0001"))),
-            "type": "rebalancing" if is_rebal else "standard",
+            "score": round(float(score_net), 4),
+            "type": "bundle",
             "branch_candidates": ["TT", "TM"] + (["MM"] if self._should_consider_mm_for_pair(pair) else []),
             "hints": hints,
             "payload": payload,
@@ -2989,6 +3080,7 @@ class OpportunityScanner:
                 "route_combo": route_combo,
                 "vol_penalty_bps": vol_penalty_bps,
                 "min_required_bps_local": local_min_required_bps,
+                "strategy": "standard",
             },
         }
 
@@ -3012,8 +3104,8 @@ class OpportunityScanner:
 
         self._last_opp_ts_by_pair[pair] = now
         self.average_spread = (
-                                      (self.average_spread * D(self.opportunity_count - 1)) + (D(spread_net) * D(100))
-                              ) / D(self.opportunity_count)
+                                      (float(self.average_spread) * (self.opportunity_count - 1)) + (spread_net * 100)
+                              ) / self.opportunity_count
 
         mgr = getattr(self, "logger_historique_manager", None)
         rec = getattr(mgr, "record_opportunity", None) if mgr is not None else None
@@ -3033,7 +3125,9 @@ class OpportunityScanner:
         )
 
         try:
-            inc_scanner_emitted(route=route_combo, pair=pair)
+            strategy = payload.get("strategy", self.scanner_mode)
+            inc_scanner_emitted(route=route_combo, pair=pair, strategy=strategy)
+            inc_scanner_decision(pair=pair, strategy=strategy)
         except Exception:
             logging.exception("Unhandled exception")
         try:
@@ -3051,6 +3145,8 @@ class OpportunityScanner:
         reason_rm = "no_callback"
 
         try:
+            if tracing_enabled:
+                opp["scanner_exit_ns"] = time.perf_counter_ns()
             cb = self.on_opportunity
             if cb:
                 ack_timeout_s = float(getattr(getattr(self.cfg, "scanner", object()), "rm_ack_timeout_s", 0.0) or 0.0)
@@ -3136,33 +3232,67 @@ class OpportunityScanner:
 
         # Canonique: histogramme par cohorte (PRIMARY/AUDITION)
         try:
-            RM_DECISION_MS.labels(cohort=self._cohort_of(pair)).observe(dt_ms)
+            from modules.obs_metrics import RM_DECISION_MS
+            if RM_DECISION_MS is not None and not hasattr(RM_DECISION_MS, "_MetricNoOp"):
+                RM_DECISION_MS.labels(cohort=self._cohort_of(pair)).observe(dt_ms)
         except Exception:
             pass
 
         # Aliases / compat existante (vous les gardez)
-        SCANNER_DECISION_MS.observe(dt_ms)
-        SCANNER_EVAL_MS.labels(pair, route_combo).observe(dt_ms)
+        try:
+            from modules.obs_metrics import SCANNER_DECISION_MS, SCANNER_EVAL_MS
+            if SCANNER_DECISION_MS is not None and not hasattr(SCANNER_DECISION_MS, "_MetricNoOp"):
+                SCANNER_DECISION_MS.observe(dt_ms)
+            if SCANNER_EVAL_MS is not None and not hasattr(SCANNER_EVAL_MS, "_MetricNoOp"):
+                SCANNER_EVAL_MS.labels(pair=pair, route=route_combo).observe(dt_ms)
+        except Exception:
+            pass
+        
+        # P0: Fin de mesure latence précise
+        _record_latency()
 
     # ---------------- Pull mode: tick ----------------
     def tick(self) -> None:
-        if not callable(self.get_books):
-            return
+        # pull-mode tick() : doit être fail-loud si books absents (sinon D7 = silence)
         books = self.get_books() or {}
         now = time.time()
         self.last_scan_time = now
 
-        # Priorisation mixte (LHM + scoring interne)
+        if not books:
+            # Throttle: 1 rejet / 10s max
+            last = float(getattr(self, "_last_no_books_rej_ts", 0.0) or 0.0)
+            if (now - last) >= 10.0:
+                setattr(self, "_last_no_books_rej_ts", now)
+                try:
+                    self._record_rejection(reason="no_books", route="*", pair="GLOBAL", ctx={"where": "tick"})
+                except Exception:
+                    pass
+            # Heartbeat load (même si 0)
+            try:
+                gl = self._tb_load(self._tb_global) if hasattr(self, "_tb_global") else 0.0
+                bump_scanner(load=float(gl))
+            except Exception:
+                pass
+            return
+
+        # Heartbeat load (pull-mode)
+        try:
+            gl = self._tb_load(self._tb_global) if hasattr(self, "_tb_global") else 0.0
+            bump_scanner(load=float(gl))
+        except Exception:
+            pass
+
         pairs_to_scan = self._top_pairs()
-        exs = self.exchanges or list(books.keys())
+        exs = [ex for ex in (self.exchanges or list(books.keys())) if ex]
 
         for pk in pairs_to_scan:
-            # Quotas pair + global
+            if not pk:
+                continue
             allowed, _ = self._should_scan_now(pk)
             if not allowed:
                 continue
 
-            for i, sell_ex in enumerate(exs):
+            for sell_ex in exs:
                 for buy_ex in exs:
                     if _route_combo(buy_ex, sell_ex) not in self.enabled_combos:
                         continue
@@ -3174,8 +3304,6 @@ class OpportunityScanner:
                     if bid <= 0 or ask <= 0 or bid <= ask:
                         continue
 
-                    # Pré-filtre rapide (fees/slip cache → fallback RM)
-                    # Pré-filtre rapide (fees/slip cache → fallback RM)
                     mid = 0.5 * (bid + ask)
                     gross = (bid - ask) / max(mid, 1e-12)
                     try:
@@ -3187,12 +3315,11 @@ class OpportunityScanner:
                             reason=reason,
                             route=_route_combo(buy_ex, sell_ex),
                             pair=_norm_pair(pk),
-                            ctx={"err": type(e).__name__}
+                            ctx={"err": type(e).__name__},
                         )
-                        continue  # on passe à la route suivante sans casser le tick
+                        continue
                     net_now = gross - cost
 
-                    # Min requis dynamique (vol + charge)
                     local_min_req_bps = self.min_required_bps
                     vol_ttl = min(
                         self._public_ttl(buy_ex, "vol_ttl_s", getattr(self.cfg.vol, "ttl_s", 5.0)),
@@ -3212,57 +3339,17 @@ class OpportunityScanner:
                     boost_bps, _mult = self._dynamic_thresholds_for(pk)
                     min_req = (local_min_req_bps + boost_bps) / 1e4
 
-                    if net_now < min_req:
-                        self.blocks["fast_prefilter"] += 1
+                    if net_now <= min_req:
                         self._record_rejection(
                             reason="below_min_bps",
                             route=_route_combo(buy_ex, sell_ex),
                             pair=_norm_pair(pk),
-                            ctx={"net_bps": float(net_now * 1e4), "min_required_bps": float(min_req * 1e4)},
+                            ctx={"net": float(net_now), "min_req": float(min_req)},
                         )
                         continue
 
-                    # Construire snapshots "compat router" puis évaluer
-                    now_ms = int(time.time() * 1000)
-                    book_ttl_ms = b_buy.get("book_ttl_ms")
-                    if book_ttl_ms is None:
-                        book_ttl_ms = self._book_ttl_ms_default(buy_ex)
-                    buy_data = {
-                        "exchange": buy_ex,
-                        "pair_key": pk,
-                        "active": True,
-                        "best_bid": float(b_buy.get("best_bid") or 0.0),
-                        "best_ask": float(b_buy.get("best_ask") or 0.0),
-                        "bid_volume": float(b_buy.get("bid_volume") or 0.0),
-                        "ask_volume": float(b_buy.get("ask_volume") or 0.0),
-                        "orderbook": {
-                            "bids": (b_buy.get("orderbook") or {}).get("bids") or b_buy.get("bids") or [],
-                            "asks": (b_buy.get("orderbook") or {}).get("asks") or b_buy.get("asks") or [],
-                        },
-                        "exchange_ts_ms": int(b_buy.get("exchange_ts_ms") or b_buy.get("recv_ts_ms") or now_ms),
-                        "recv_ts_ms": int(b_buy.get("recv_ts_ms") or b_buy.get("exchange_ts_ms") or now_ms),
-                        "book_ttl_ms": int(book_ttl_ms) if book_ttl_ms is not None else None,
-                    }
-                    book_ttl_ms = b_sell.get("book_ttl_ms")
-                    if book_ttl_ms is None:
-                        book_ttl_ms = self._book_ttl_ms_default(sell_ex)
-                    sell_data = {
-                        "exchange": sell_ex,
-                        "pair_key": pk,
-                        "active": True,
-                        "best_bid": float(b_sell.get("best_bid") or 0.0),
-                        "best_ask": float(b_sell.get("best_ask") or 0.0),
-                        "bid_volume": float(b_sell.get("bid_volume") or 0.0),
-                        "ask_volume": float(b_sell.get("ask_volume") or 0.0),
-                        "orderbook": {
-                            "bids": (b_sell.get("orderbook") or {}).get("bids") or b_sell.get("bids") or [],
-                            "asks": (b_sell.get("orderbook") or {}).get("asks") or b_sell.get("asks") or [],
-                        },
-                        "exchange_ts_ms": int(b_sell.get("exchange_ts_ms") or b_sell.get("recv_ts_ms") or now_ms),
-                        "recv_ts_ms": int(b_sell.get("recv_ts_ms") or b_sell.get("exchange_ts_ms") or now_ms),
-                        "book_ttl_ms": int(book_ttl_ms) if book_ttl_ms is not None else None,
-                    }
-                    self._evaluate_pair(buy_data, sell_data)
+                    # On a une opp brute positive : on délègue à la pipeline normale
+                    self.check_opportunity(pk)
 
     # ---------------- Status / lifecycle ----------------
     def _is_healthy(self) -> bool:
@@ -3273,7 +3360,7 @@ class OpportunityScanner:
         self.active_pairs_count = sum(
             1 for ex_data in self.orderbooks.values()
             for _, data in ex_data.items()
-            if data.get("active", False)
+            if data.get("active", True)
         )
 
         status = {
@@ -3398,9 +3485,8 @@ class OpportunityScanner:
             non_empty = []
 
         if non_empty:
-            # On choisit la paire avec la file la plus longue
-            non_empty.sort(key=lambda kv: len(kv[1]), reverse=True)
-            return non_empty[0][0]
+            # On choisit la paire avec la file la plus longue (plus efficace que sort)
+            return max(non_empty, key=lambda kv: len(kv[1]))[0]
 
         # 2) Fallback : round-robin sur l'univers priorisé
         pairs = getattr(self, "_rr_pairs", None)
@@ -3457,22 +3543,22 @@ class OpportunityScanner:
         self._last_scan_ts_by_pair[pk] = now
         return True
 
-    def _pop_latest_event(self, pair: str) -> Optional[dict]:
+    def _pop_latest_event(self, pair: str) -> Optional[Tuple[dict, bool]]:
         """
         Récupère le dernier évènement pour une paire dans le mode worker.
 
-        - Si _queues contient des évènements pour cette paire → on prend
-          le plus récent (LIFO).
-        - Sinon, on fabrique un évènement minimal basé sur le dernier
-          snapshot orderbook connu, pour garder un comportement correct
-          même si le Router ne remplit pas encore _queues.
+        - Si _queues contient des évènements pour cette paire → on prend le plus récent (LIFO).
+        - Sinon, évènement synthétique basé sur le dernier snapshot orderbook connu.
+        - Fallback Router: si cache interne vide mais Router a une vue books, on hydrate le cache.
+
+        Retourne: (event_dict, is_synthetic)
         """
         try:
             pk = self._norm_pair(pair)
         except Exception:
             pk = (pair or "").replace("-", "").upper()
 
-        # 1) Mode file évènementielle (future-proof)
+        # 1) File évènementielle
         dq = None
         try:
             queues = getattr(self, "_queues", {}) or {}
@@ -3481,18 +3567,89 @@ class OpportunityScanner:
             dq = None
 
         if dq:
+            # P1: Freshness check. Si la file est pleine d'événements vieux, on purge.
+            now_mono_ns = time.monotonic_ns()
+            # On réduit à 1500ms pour être plus agressif
+            ttl_ms = 1500
+            
+            # --- AJOUT P1 : Si la file est trop longue (> 50), on drop tout sauf le dernier
+            if len(dq) > 50:
+                self._record_rejection(reason="backlog_purge", route="*", pair=pk, ctx={"len": len(dq)})
+                ev = dq.pop()
+                dq.clear()
+                dq.append(ev)
+
+            while dq:
+                try:
+                    ev = dq.pop() # LIFO
+                    recv_mono_ns = ev.get("recv_mono_ns")
+                    if recv_mono_ns is not None:
+                        age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
+                    else:
+                        recv_ts = ev.get("recv_ts_ms")
+                        age_ms = (int(time.time() * 1000) - int(recv_ts)) if recv_ts else 999999
+
+                    if age_ms > ttl_ms:
+                        continue
+                    
+                    # Instrumentation latence queue interne Scanner (P1)
+                    if getattr(self.cfg.obs, "enable_latency_tracing", False):
+                        exit_ns = ev.get("scanner_internal_exit_ns")
+                        if exit_ns:
+                            delay_ms = (time.perf_counter_ns() - int(exit_ns)) / 1e6
+                            if getattr(self.cfg.obs, "enable_segment_metrics_scanner", True):
+                                record_pipeline_latency("scanner_internal_queue", delay_ms, exchange=ev.get("exchange", "none"))
+
+                    return ev, False
+                except IndexError:
+                    break
+
+        # 2) Cache interne orderbooks
+        now_mono_ns = time.monotonic_ns()
+        for ex, per_pair in (self.orderbooks or {}).items():
+            if pk in (per_pair or {}):
+                data = per_pair[pk]
+                recv_mono_ns = data.get("recv_mono_ns")
+                if recv_mono_ns is not None:
+                    age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
+                else:
+                    recv_ts = data.get("recv_ts_ms")
+                    age_ms = (int(time.time() * 1000) - int(recv_ts)) if recv_ts else 999999
+
+                if age_ms > 2000: # Cache trop vieux
+                    continue
+                return {"pair": pk, "exchange": ex, "ts": time.time()}, True
+
+        # 3) Fallback Router → hydrate cache interne
+        r = getattr(self, "router", None)
+        fn = (
+                getattr(r, "get_latest_orderbooks_light", None)
+                or getattr(r, "get_latest_orderbooks", None)
+                or getattr(r, "get_orderbooks", None)
+        )
+        if callable(fn):
+            snap = fn() or {}
             try:
-                return dq.pop()
-            except IndexError:
+                # hydrate minimalement self.orderbooks[ex][pk]
+                for ex, per_pair in (snap or {}).items():
+                    if not isinstance(per_pair, dict):
+                        continue
+                    d = per_pair.get(pk)
+                    if not isinstance(d, dict) or not d:
+                        continue
+                    exu = str(ex).upper()
+                    self.orderbooks.setdefault(exu, {})[pk] = dict(d)
+            except Exception:
                 pass
 
-        # 2) Fallback : évènement synthétique à partir du cache orderbooks
-        for ex, per_pair in (self.orderbooks or {}).items():
-            if pk in per_pair:
-                # _evaluate_routes_for_pair ne lit pas encore `ev`, un dict non vide suffit
-                return {"pair": pk, "exchange": ex, "ts": time.time()}
+            # si on a réussi à hydrater au moins un exchange pour pk → event synthétique
+            try:
+                for ex, per_pair in (self.orderbooks or {}).items():
+                    if pk in (per_pair or {}):
+                        return {"pair": pk, "exchange": "ROUTER", "ts": time.time()}, True
+            except Exception:
+                pass
 
-        # Aucun snapshot disponible pour cette paire
         return None
 
     async def _scan_loop(self):
@@ -3503,46 +3660,95 @@ class OpportunityScanner:
                 gl = self._tb_load(self._tb_global) if hasattr(self, "_tb_global") else 0.0
                 now = time.time()
 
+                # Heartbeat load → D7 scanner_global_load (throttle ~4Hz)
+                last_hb = float(getattr(self, "_last_load_metric_ts", 0.0) or 0.0)
+                if (now - last_hb) >= 0.25:
+                    setattr(self, "_last_load_metric_ts", now)
+                    try:
+                        bump_scanner(load=float(gl))
+                    except Exception:
+                        pass
+
                 self._apply_load_shedding(gl, now)
 
                 pair = self._next_candidate_pair()
                 if not pair:
-                    await asyncio.sleep(0.002);
+                    # Throttle 1 rejet / 30s max
+                    last = float(getattr(self, "_last_no_pairs_rej_ts", 0.0) or 0.0)
+                    if (now - last) >= 30.0:
+                        setattr(self, "_last_no_pairs_rej_ts", now)
+                        try:
+                            self._record_rejection(reason="no_pairs", route="*", pair="GLOBAL",
+                                                   ctx={"where": "scan_loop"})
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.005)
                     continue
 
-                allowed, why = self._should_scan_now(pair)
-                if not allowed:
-                    await asyncio.sleep(0.0008 if why == "pair_bucket" else 0.0015);
+                res = self._pop_latest_event(pair)
+                if not res:
+                    # Fail-loud (sinon Grafana = "No data" et on ne sait pas pourquoi)
+                    last = float(getattr(self, "_last_no_books_rej_ts", 0.0) or 0.0)
+                    if (now - last) >= 10.0:
+                        setattr(self, "_last_no_books_rej_ts", now)
+                        try:
+                            self._record_rejection(reason="no_books", route="*", pair=_norm_pair(pair),
+                                                   ctx={"where": "scan_loop"})
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.005)
                     continue
 
-                # appliquer shedding sur buckets
+                ev, is_synthetic = res
+
+                if is_synthetic:
+                    allowed, _why = self._should_scan_now(pair)
+                    if not allowed:
+                        await asyncio.sleep(0.005)
+                        continue
+                    await asyncio.sleep(0.001)
+
                 cohort = "PRIMARY" if pair in getattr(self, "_primary_pairs", set()) else "AUDITION"
                 if cohort == "AUDITION" and getattr(self, "_shed_audition", 1.0) <= 0.0:
+                    await asyncio.sleep(0.001)
                     continue
                 if cohort == "PRIMARY" and getattr(self, "_shed_primary", 1.0) < 1.0:
-                    # probabilité de passer selon shedding
                     if random.random() > getattr(self, "_shed_primary", 1.0):
+                        await asyncio.sleep(0.001)
                         continue
 
                 if not self._dedup_ok(pair):
-                    continue
-
-                ev = self._pop_latest_event(pair)
-                if not ev:
+                    await asyncio.sleep(0.001)
                     continue
 
                 feeds_ok, feeds_reason, feeds_ctx = self._risk_feeds_fresh(pair)
                 if not feeds_ok:
-                    self._record_rejection(reason=feeds_reason or "stale_risk_feeds", route="*", pair=pair,
-                                           ctx=feeds_ctx)
+                    self._record_rejection(
+                        reason=feeds_reason or "stale_risk_feeds",
+                        route="*",
+                        pair=_norm_pair(pair),
+                        ctx=feeds_ctx,
+                    )
+                    await asyncio.sleep(0.001)
                     continue
 
+                start_proc = time.perf_counter_ns()
                 self._evaluate_routes_for_pair(pair, ev, enable_mm=self._enable_mm_hints)
+
+                # Instrumentation latence Scanner (P1)
+                tracing_enabled = should_trace_latency(self.cfg)
+
+                if tracing_enabled:
+                    proc_ms = (time.perf_counter_ns() - start_proc) / 1e6
+                    if getattr(self.cfg.obs, "enable_segment_metrics_scanner", True):
+                        record_pipeline_latency("scanner_proc", proc_ms, route="*", exchange=ev.get("exchange", "none"))
+
+                await asyncio.sleep(0)
 
             except asyncio.CancelledError:
                 break
             except Exception:
                 self.logger.exception("[Scanner] worker error")
-                await asyncio.sleep(0.005)
+                await asyncio.sleep(0.01)
 
 

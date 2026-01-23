@@ -58,20 +58,61 @@ class _AlertCounter:
         self.count += 1
         return None
 
+# --- PROMETHEUS FALLBACK ---
 try:
-    from prometheus_client import Counter, Gauge, Histogram, REGISTRY
+    from prometheus_client import Counter, Gauge, Histogram, REGISTRY, start_http_server, CollectorRegistry, CONTENT_TYPE_LATEST, generate_latest
+    _PROM_READY = True
 except Exception:
+    _PROM_READY = False
+    REGISTRY = None
+    CollectorRegistry = None
+    CONTENT_TYPE_LATEST = 'text/plain; version=0.0.4; charset=utf-8'
+
     class _NoopMetric:
-        def __init__(self, *_, **__):
+        def __init__(self, *_a, **_k): pass
+        def labels(self, **_k): return self
+        def inc(self, *_a, **_k): pass
+        def set(self, *_a, **_k): pass
+        def observe(self, *_a, **_k): pass
+
+    Counter = Gauge = Histogram = _NoopMetric
+
+    def start_http_server(*_a, **_k):
+        log.warning('prometheus_client absent: /metrics non démarré (no-op)')
+
+    def generate_latest(_=None):
+        return b'# prometheus_client indisponible (Cas 1: import fail)\n'
+
+def _metric(klass, name: str, doc: str, *args, **kwargs):
+    """
+    Optimisation HFT : Centralisation de la création de métriques.
+    Si prometheus_client est absent, retourne un _NoopMetric silencieux.
+    """
+    if not _PROM_READY:
+        return _NoopMetric()
+
+    reg = REGISTRY
+    if reg is not None:
+        try:
+            existing = getattr(reg, '_names_to_collectors', {}).get(name)
+            if existing is not None:
+                return existing
+        except Exception:
             pass
+    return klass(name, doc, *args, **kwargs)
 
-        def labels(self, **kwargs): return self
-        def inc(self, *a, **k): pass
-        def set(self, *a, **k): pass
-        def observe(self, *a, **k): pass
+# --- FONDATIONS OBSERVABILITÉ ---
+OBS_NOOP_TOTAL = _metric(Counter, "obs_noop_total", "Total des appels metrics no-op", ["metric", "where"])
+OBS_INIT_ERROR_TOTAL = _metric(Counter, "obs_init_error_total", "Echecs d'initialisation de métriques", ["metric", "kind"])
+OBS_LABEL_MISMATCH_TOTAL = _metric(Counter, "obs_label_mismatch_total", "Labels fournis non conformes", ["metric"])
 
-    Counter = Gauge = Histogram = _NoopMetric  # type: ignore
-    REGISTRY = None  # type: ignore
+# --- MANDATORY OBSERVABILITY (P0) ---
+ROUTER_EVENT_AGE_MS = _metric(Histogram, "router_event_age_ms", "Age des events à l'entrée du Router (ms)", ["exchange"], buckets=[10, 50, 100, 250, 500, 1000, 2000, 5000])
+SCANNER_EVENT_AGE_MS = _metric(Histogram, "scanner_event_age_ms", "Age des events à l'évaluation Scanner (ms)", ["exchange", "pair"], buckets=[50, 100, 250, 500, 1000, 1500, 2000, 5000])
+ROUTER_DROPPED_TOTAL = _metric(Counter, "router_dropped_total", "Total des events drop par le Router", ["exchange", "reason"])
+PWS_HUB_DROPPED_TOTAL = _metric(Counter, "pws_hub_dropped_total", "Total des events drop par le PrivateWSHub", ["exchange", "reason"])
+PWS_LATENCY_DRAIN_MS = _metric(Histogram, "pws_latency_drain_ms", "Latence de vidage des queues privées (ms)", ["exchange"], buckets=[5, 10, 25, 50, 100, 250, 500])
+LHM_EMIT_ERROR_TOTAL = _metric(Counter, "lhm_emit_error_total", "Total des erreurs d'émission LHM (rupture de logging)", ["log_type"])
 
 # --- BEGIN OM-0: STRICT + PROM READY + Noop ---
 try:
@@ -107,38 +148,6 @@ def _load_obs_defaults() -> dict[str, object]:
     }
 
 _OBS_DEFAULTS = _load_obs_defaults()
-try:
-    from prometheus_client import Counter, Gauge, Histogram  # déjà présent en général
-    _PROM_READY = True
-except Exception:
-    # fallback: on exporte des classes no-op
-    _PROM_READY = False
-    class _NoopMetric:
-        def __init__(self, *_, **__):
-            pass
-        def labels(self, **kwargs): return self
-        def inc(self, *a, **k): pass
-        def set(self, *a, **k): pass
-        def observe(self, *a, **k): pass
-    Counter = Gauge = Histogram = _NoopMetric  # type: ignore
-# --- END OM-0 ---
-# --- BEGIN OM-1: fondations observabilité ---
-# 1) No-op/erreurs d'init metrics
-OBS_NOOP_TOTAL = Counter(  # increments quand un call obs échoue / est no-op
-    "obs_noop_total",
-    "Total des appels metrics no-op (init manquante, label mismatch, etc.)",
-    ["metric", "where"]
-)
-OBS_INIT_ERROR_TOTAL = Counter(  # increments quand une metric ne peut pas être créée
-    "obs_init_error_total",
-    "Echecs d'initialisation de métriques",
-    ["metric", "kind"]
-)
-OBS_LABEL_MISMATCH_TOTAL = Counter(  # increments quand labels() ne matchent pas la définition
-    "obs_label_mismatch_total",
-    "Labels fournis non conformes à la métrique déclarée",
-    ["metric"]
-)
 
 def prom_ready() -> bool:
     """Expose readiness des métriques Prometheus pour les modules clients (ex: LHM.get_status)."""
@@ -154,24 +163,24 @@ def set_strict_obs(strict: bool | int | None) -> None:
 # --- END OM-1 ---
 # --- BEGIN OM-2: métriques utilisées par Engine/Scanner/LHM ---
 # Scanner – hint top_qty manquant (utilisé dans Patch S4)
-SCANNER_HINT_TOPQTY_MISSING_TOTAL = Counter(
+SCANNER_HINT_TOPQTY_MISSING_TOTAL = _metric(Counter,
     "scanner_hint_topqty_missing_total",
     "Hints L1 (top_qty) manquants (non bloquant)",
     ["pair", "ex", "side"]
 )
 # Simulator priming
-SIM_PRIME_TOTAL = Counter(
+SIM_PRIME_TOTAL = _metric(Counter,
     "sim_prime_total",
     "Prime requests enqueued",
     ["branch"],
 )
-SIM_PRIME_ERROR_TOTAL = Counter(
+SIM_PRIME_ERROR_TOTAL = _metric(Counter,
     "sim_prime_error_total",
     "Prime errors",
     ["branch"],
 )
 # LHM – rotations fichiers (demandée précédemment)
-LOGGERH_FILE_ROTATIONS_TOTAL = Counter(
+LOGGERH_FILE_ROTATIONS_TOTAL = _metric(Counter,
     "loggerh_file_rotations_total",
     "Compteur de rotations de fichiers du LoggerHistorique",
     ["reason"]  # ex: size, time, manual
@@ -179,65 +188,65 @@ LOGGERH_FILE_ROTATIONS_TOTAL = Counter(
 
 # Engine – erreurs/visibilité supplémentaires (si déjà définies, garde celles existantes)
 
-AC_KV_ERRORS_TOTAL = Counter(
+AC_KV_ERRORS_TOTAL = _metric(Counter,
         "ac_kv_errors_total",
         "Erreurs KV (anti-crossing multi-pod)",
         ["kind"]  # set/get/eval_del
     )
 
 
-AC_RESERVE_CONFLICT_TOTAL = Counter(
+AC_RESERVE_CONFLICT_TOTAL = _metric(Counter,
         "ac_reserve_conflict_total",
         "Conflits de réservation (anti-crossing)",
         ["branch", "ex"]  # TM/MM, EX
     )
 
 
-AC_RELEASE_ERRORS_TOTAL = Counter(
+AC_RELEASE_ERRORS_TOTAL = _metric(Counter,
         "ac_release_errors_total",
         "Erreurs de release (anti-crossing)",
         ["kind"]  # kv_delete/memory
     )
 
 
-ENGINE_WORKER_ERRORS_TOTAL = Counter(
+ENGINE_WORKER_ERRORS_TOTAL = _metric(Counter,
         "engine_worker_errors_total",
         "Erreurs dans les workers de l'Engine",
         ["phase"]  # W1/W2...
     )
 
 
-ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL = Counter(
+ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL = _metric(Counter,
         "engine_inflight_gauge_set_errors_total",
         "Echecs de set() du gauge in-flight",
         ["exchange"]
     )
 
 
-ENGINE_BEST_PRICE_MISSING_TOTAL = Counter(
+ENGINE_BEST_PRICE_MISSING_TOTAL = _metric(Counter,
         "engine_best_price_missing_total",
         "Prix de référence manquant côté Engine",
         ["exchange", "pair", "side"]
     )
 # LHM – EOD orchestration (EOD-01)
-LHM_EOD_RUNS_TOTAL = Counter(
+LHM_EOD_RUNS_TOTAL = _metric(Counter,
     "lhm_eod_runs_total",
     "Total des exécutions EOD (logger historique)",
     labelnames=["status"],
 )
 
-LHM_EOD_ERRORS_TOTAL = Counter(
+LHM_EOD_ERRORS_TOTAL = _metric(Counter,
     "lhm_eod_errors_total",
     "Erreurs rencontrées pendant l'EOD (par étape)",
     labelnames=["stage"],
 )
 
-LHM_EOD_DURATION_MS = Histogram(
+LHM_EOD_DURATION_MS = _metric(Histogram,
     "lhm_eod_duration_ms",
     "Durée des runs EOD en millisecondes",
 )
 
-LHM_EOD_LAST_SUCCESS_TS_MS = Gauge(
+LHM_EOD_LAST_SUCCESS_TS_MS = _metric(Gauge,
     "lhm_eod_last_success_ts_ms",
     "Horodatage (ms epoch) du dernier EOD réussi",
 )
@@ -272,67 +281,109 @@ def safe_observe(metric, name: str, where: str, value: float, **labels):
 # --- END OM-3 ---
 
 
+# --- BEGIN CARDINALITY GATING ---
+# Liste des métriques autorisées à conserver le label 'pair' (Haute Cardinalité)
+# Les autres métriques verront leur label 'pair' agrégé en 'ALL' ou supprimé.
+CRITICAL_METRICS_WITH_PAIR = {
+    "inventory_usd",
+    "rm_decision_ms",
+    "rm_fragment_profit_ms",
+    "pair_health_penalty_total",
+    "pnl_quote_total",
+    "active_bundles_count",
+    "inflight_orders_count",
+    "spread_bps",
+    "vol_bps",
+    "vol_ewma_bps",
+    "vol_p95_bps",
+    "dynamic_min_bps",
+    "mm_fills_both_total",
+    "mm_single_fill_hedged_total",
+    "mm_panic_hedge_total",
+    "engine_inflight",
+    "pnl_live_day_usd",
+    "mm_throttled_total",
+    "mm_makers_expired_ttl_total",
+    "mm_makers_canceled_total",
+    "engine_cancellations_total",
+    "engine_retries_total",
+    "engine_queuepos_blocked_total",
+    "router_pair_queue_depth",
+    "scanner_evaluate_ms",
+}
+
+def _filter_labels(name: str, labelnames: tuple | list) -> list:
+    """Filtre les labels pour limiter la cardinalité si nécessaire."""
+    if "pair" not in labelnames:
+        return list(labelnames)
+    
+    # Si la métrique est critique, on garde le label 'pair'
+    if name in CRITICAL_METRICS_WITH_PAIR:
+        return list(labelnames)
+    
+    # Sinon, on retire 'pair' de la définition de la métrique pour agréger
+    return [l for l in labelnames if l != "pair"]
+
 def get_counter(name, documentation, labelnames=(), **kwargs):
-    try:
-        return Counter(name, documentation, labelnames=labelnames, **kwargs)
-    except ValueError:
-        return REGISTRY._names_to_collectors[name]
+    filtered_labels = _filter_labels(name, labelnames)
+    return _metric(Counter, name, documentation, labelnames=filtered_labels, **kwargs)
 
 def get_gauge(name, documentation, labelnames=(), **kwargs):
-    try:
-        return Gauge(name, documentation, labelnames=labelnames, **kwargs)
-    except ValueError:
-        return REGISTRY._names_to_collectors[name]
+    filtered_labels = _filter_labels(name, labelnames)
+    return _metric(Gauge, name, documentation, labelnames=filtered_labels, **kwargs)
 
 def get_histogram(name, documentation, labelnames=(), **kwargs):
-    try:
-        return Histogram(name, documentation, labelnames=labelnames, **kwargs)
-    except ValueError:
-        return REGISTRY._names_to_collectors[name]
-try:
-    from prometheus_client import Counter, Gauge, Histogram, REGISTRY, start_http_server, CollectorRegistry, CONTENT_TYPE_LATEST, generate_latest
-except Exception:
-    REGISTRY = None
-    CollectorRegistry = None
-    CONTENT_TYPE_LATEST = 'text/plain; version=0.0.4; charset=utf-8'
-
-    class _NoopMetric:
-
-        def __init__(self, *_a, **_k):
-            ...
-
-        def labels(self, *_a, **_k):
-            return self
-
-        def inc(self, *_a, **_k):
-            ...
-
-        def set(self, *_a, **_k):
-            ...
-
-        def observe(self, *_a, **_k):
-            ...
-    Counter = Gauge = Histogram = _NoopMetric
-
-    def start_http_server(*_a, **_k):
-        logging.getLogger('obs_metrics').warning('prometheus_client absent: /metrics non démarré (no-op)')
-
-    def generate_latest(_=None):
-        return b'# prometheus_client indisponible\n'
-
-def _metric(klass, name: str, doc: str, *args, **kwargs):
-    """Retourne un collector existant s'il est déjà enregistré dans REGISTRY,
-    sinon en crée un nouveau. Évite les ValueError en cas de double import."""
-    reg = REGISTRY if 'REGISTRY' in globals() else None
-    if reg is not None:
-        try:
-            existing = getattr(reg, '_names_to_collectors', {}).get(name)
-            if existing is not None:
-                return existing
-        except Exception:
-            pass
-    return klass(name, doc, *args, **kwargs)
+    filtered_labels = _filter_labels(name, labelnames)
+    return _metric(Histogram, name, documentation, labelnames=filtered_labels, **kwargs)
+# --- END CARDINALITY GATING ---
 BUCKETS_MS = (1, 2, 5, 10, 20, 50, 75, 100, 150, 250, 400, 600, 1000, 1500, 2000, 3000, 5000, 8000, 12000)
+BUCKETS_LATENCY_HFT = (0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0)
+
+# --- LATENCY PIPELINE (END-TO-END) ---
+LATENCY_PIPELINE_MS = _metric(
+    Histogram,
+    'latency_pipeline_ms',
+    'End-to-end pipeline latency by segment (ms)',
+    ['segment', 'route', 'exchange'],
+    buckets=BUCKETS_LATENCY_HFT
+)
+
+PIPELINE_BACKLOG = _metric(
+    Gauge,
+    'pipeline_backlog',
+    'Number of pending events in pipeline stages',
+    ['stage']
+)
+
+def record_pipeline_latency(segment: str, dt_ms: float, route: str = 'none', exchange: str = 'none') -> None:
+    try:
+        LATENCY_PIPELINE_MS.labels(segment=_norm(segment), route=_norm(route), exchange=_norm(exchange)).observe(max(0.0, float(dt_ms)))
+    except Exception:
+        pass
+
+def set_pipeline_backlog(stage: str, count: int) -> None:
+    try:
+        PIPELINE_BACKLOG.labels(stage=_norm(stage)).set(float(count))
+    except Exception:
+        pass
+
+# --- END LATENCY PIPELINE ---
+
+def should_trace_latency(cfg: Any) -> bool:
+    """Check if latency tracing is enabled and should be sampled."""
+    try:
+        if not cfg or not hasattr(cfg, "obs"):
+            return False
+        obs = cfg.obs
+        if not getattr(obs, "enable_latency_tracing", False):
+            return False
+        rate = getattr(obs, "latency_sampling_rate", 1.0)
+        if rate >= 1.0:
+            return True
+        import random
+        return random.random() <= rate
+    except Exception:
+        return False
 
 def _norm(v: Any) -> str:
     if v is None:
@@ -376,51 +427,157 @@ EVENT_LOOP_LAG_MS = _metric(Gauge, 'event_loop_lag_ms', 'Event loop / scheduler 
 _loop_lag_thread: Optional[threading.Thread] = None
 _time_skew_thread: Optional[threading.Thread] = None
 
-def start_time_skew_probe(period_s: float=10.0) -> None:
-    """Probe minimaliste: publie 0 ms (OK) périodiquement.
-    Si tu as une source d'offset, appelle update_time_skew(ms) ailleurs.
+_CURRENT_TIME_SKEW_MS = 0.0
+
+def start_time_skew_probe(period_s: float = 10.0) -> None:
+    """
+    Publie TIME_SKEW_MS/TIME_SKEW_STATUS.
+    Best-effort: lit chrony via `chronyc tracking`.
+      - status=1 : mesure OK
+      - status=0 : indisponible (chrony absent/erreur)
     """
     global _time_skew_thread
     if _time_skew_thread and _time_skew_thread.is_alive():
         return
 
     def _runner():
+        import re
+        import subprocess
+
         while True:
+            skew_ms = 0.0
+            status = 0
             try:
-                TIME_SKEW_MS.set(0.0)
-                TIME_SKEW_STATUS.set(1.0)
+                p = subprocess.run(
+                    ["chronyc", "tracking"],
+                    capture_output=True,
+                    text=True,
+                    timeout=0.8,
+                )
+                if p.returncode == 0 and p.stdout:
+                    lines = p.stdout.splitlines()
+
+                    # 1) "System time     : 0.000123 seconds slow/fast of NTP time"
+                    for ln in lines:
+                        if "System time" in ln:
+                            m = re.search(r":\s*([+-]?[0-9]*\.?[0-9]+)\s*seconds", ln)
+                            if m:
+                                sec = float(m.group(1))
+                                ll = ln.lower()
+                                if "slow" in ll:
+                                    sec = -abs(sec)
+                                elif "fast" in ll:
+                                    sec = abs(sec)
+                                skew_ms = sec * 1000.0
+                                status = 1
+                                break
+
+                    # 2) fallback "Last offset   : +0.000001 seconds"
+                    if status == 0:
+                        for ln in lines:
+                            if "Last offset" in ln:
+                                m = re.search(r":\s*([+-]?[0-9]*\.?[0-9]+)\s*seconds", ln)
+                                if m:
+                                    skew_ms = float(m.group(1)) * 1000.0
+                                    status = 1
+                                    break
             except Exception:
                 pass
+
+            try:
+                update_time_skew(skew_ms, status)
+            except Exception:
+                pass
+
             time.sleep(max(1.0, float(period_s)))
-    _time_skew_thread = threading.Thread(target=_runner, name='time_skew_probe', daemon=True)
+
+    _time_skew_thread = threading.Thread(target=_runner, name="time_skew_probe", daemon=True)
     _time_skew_thread.start()
 
 def update_time_skew(ms: float, status: int=1) -> None:
+    global _CURRENT_TIME_SKEW_MS
     try:
+        _CURRENT_TIME_SKEW_MS = float(ms)
         TIME_SKEW_MS.set(float(ms))
         TIME_SKEW_STATUS.set(float(status))
     except Exception:
         log.exception('update_time_skew failed')
 
-def start_loop_lag_probe(period_s: float=0.5) -> None:
-    """Mesure simple du lag: drift d'un sleep périodique."""
-    global _loop_lag_thread
-    if _loop_lag_thread and _loop_lag_thread.is_alive():
-        return
+def get_time_skew_ms() -> float:
+    return _CURRENT_TIME_SKEW_MS
 
-    def _runner():
-        next_t = time.perf_counter() + period_s
-        while True:
-            time.sleep(period_s)
-            now = time.perf_counter()
-            drift = (now - next_t) * 1000.0
-            next_t = now + period_s
+async def start_loop_lag_probe(period_s: float = 0.5) -> None:
+    """
+    Mesure *réelle* du lag de scheduling de l'event-loop (ms).
+
+    Définition:
+      lag_ms = (time_of_callback_execution - scheduled_time) * 1000
+
+    Pourquoi pas asyncio.sleep?
+      - sleep mesure "retard de réveil", mais peut être quasi-nul (arrondi / jitter),
+        et se prête mal à une interprétation HFT.
+      - call_at mesure directement le retard d'exécution d'un callback planifié,
+        ce qu'on veut pour détecter un event-loop bloqué.
+
+    Valeur publiée:
+      EVENT_LOOP_LAG_MS (Gauge) en millisecondes (>= 0).
+    """
+    loop = asyncio.get_running_loop()
+
+    # Garde-fous: éviter des périodes trop petites qui amplifient le bruit flottant.
+    try:
+        period_s = float(period_s)
+    except Exception:
+        period_s = 0.5
+    if period_s < 0.05:
+        period_s = 0.05
+
+    while True:
+        try:
+            scheduled_at = loop.time() + period_s
+            fut: asyncio.Future = loop.create_future()
+
+            def _cb() -> None:
+                try:
+                    now = loop.time()
+                    lag_ms = (now - scheduled_at) * 1000.0
+                    if lag_ms < 0.0:
+                        lag_ms = 0.0
+                    try:
+                        EVENT_LOOP_LAG_MS.set(float(lag_ms))
+                    except Exception:
+                        pass
+                finally:
+                    if not fut.done():
+                        try:
+                            fut.set_result(True)
+                        except Exception:
+                            pass
+
+            loop.call_at(scheduled_at, _cb)
+            await fut
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Best-effort: ne jamais casser le bot à cause de l'observabilité.
             try:
-                EVENT_LOOP_LAG_MS.set(max(0.0, float(drift)))
+                await asyncio.sleep(1.0)
             except Exception:
                 pass
-    _loop_lag_thread = threading.Thread(target=_runner, name='loop_lag_probe', daemon=True)
-    _loop_lag_thread.start()
+
+
+# --- Optimisation GC ---
+def optimize_gc():
+    """Ajuste le Garbage Collector pour réduire les pauses en HFT."""
+    try:
+        import gc
+        # Augmente les seuils de déclenchement du GC (réduit la fréquence des pauses)
+        # Par défaut: (700, 10, 10) -> On passe à (50000, 10, 10)
+        gc.set_threshold(50000, 10, 10)
+        log.info("[Obs] GC Optimized: thresholds set to (50000, 10, 10)")
+    except Exception:
+        pass
 NONFATAL_ERRORS_TOTAL = _metric(Counter, 'nonfatal_errors_total', 'Non-fatal errors reported', ['module', 'kind'])
 BLOCKED_TOTAL = _metric(Counter, 'blocked_total', 'Blocked events by guard/gate', ['module', 'reason', 'pair'])
 
@@ -443,6 +600,9 @@ BF_API_ERRORS_TOTAL = _metric(
     'BalanceFetcher API errors',
     ['exchange', 'alias', 'endpoint', 'reason'],
 )
+MBF_WS_DELTA_APPLIED_TOTAL = _metric(Counter, 'mbf_ws_delta_applied_total', 'Total WS deltas applied to MBF', ['exchange', 'alias'])
+MBF_WS_DELTA_REJECTED_TOTAL = _metric(Counter, 'mbf_ws_delta_rejected_total', 'Total WS deltas rejected by MBF', ['exchange', 'alias', 'reason'])
+MBF_WALLET_ASSET_COUNT = _metric(Gauge, 'mbf_wallet_asset_count', 'Number of assets per wallet in MBF', ['exchange', 'alias', 'wallet'])
 BF_API_LATENCY_MS = _metric(
     Histogram,
     'bf_api_latency_ms',
@@ -864,7 +1024,7 @@ SC_BANNED = _metric(Gauge, 'sc_banned', 'Pair banned flag', ['pair'])
 SC_PROMOTED_PRIMARY = _metric(Counter, 'sc_promoted_primary_total', 'Promotions to PRIMARY', ['pair'])
 SC_ROTATION_PRIMARY_SIZE = _metric(Gauge, 'sc_rotation_primary_size', 'Rotation PRIMARY size')
 SC_ROTATION_AUDITION_SIZE = _metric(Gauge, 'sc_rotation_audition_size', 'Rotation AUDITION size')
-RM_DECISION_MS = _metric(Histogram, 'rm_decision_ms', 'RiskManager decision latency (ms)', buckets=BUCKETS_MS)
+RM_DECISION_MS = _metric(Histogram, 'rm_decision_ms', 'RiskManager decision latency (ms)', ['cohort'], buckets=BUCKETS_MS)
 RM_REVALIDATE_MS = _metric(Histogram, 'rm_revalidate_ms', 'revalidate_arbitrage duration (ms)')
 RM_FRAGMENT_PROFIT_MS = _metric(Histogram, 'rm_fragment_profit_ms', 'is_fragment_profitable duration (ms)')
 RM_PREFLIGHT_MS = _metric(Histogram, 'rm_preflight_ms', 'Pre-flight gate duration (ms)')
@@ -880,6 +1040,7 @@ RM_DROPPED_TOTAL = _metric(
     'Opportunities dropped by the RM',
     labelnames=('reason',),
 )
+RM_RESERVED_FUNDS_ACTIVE = _metric(Gauge, 'rm_reserved_funds_active', 'Active reserved funds in RM', ['exchange', 'alias', 'ccy'])
 RM_INVALID_PRIVATE_EVENT_TOTAL = _metric(
     Counter,
     'rm_invalid_private_event_total',
@@ -907,6 +1068,12 @@ RM_TRADING_READY = _metric(
     'rm_trading_ready',
     'RiskManager trading readiness (1=ready)',
 )
+RM_PIPELINE_READY = _metric(
+    Gauge,
+    'rm_pipeline_ready',
+    'RiskManager pipeline readiness (deps OK; safe to run in DRY_RUN or PROD with kill-switch)',
+)
+
 RM_DEP_READY = _metric(
     Gauge,
     'rm_dep_ready',
@@ -1096,7 +1263,7 @@ def mark_scanner_to_rm_ts(
         # Best-effort
         pass
 
-INVENTORY_USD = _metric(Gauge, 'inventory_usd', 'Inventory in USD', ['exchange', 'alias'])
+INVENTORY_USD = _metric(Gauge, 'inventory_usd', 'Inventory (quote units) by exchange/quote', ['exchange', 'quote'])
 RM_REJECT_TOTAL = _metric(Counter, 'rm_reject_total', 'RM rejections', ['reason'])
 PAIR_HEALTH_PENALTY_TOTAL = _metric(Counter, 'pair_health_penalty_total', 'Pair health penalties', ['pair', 'reason'])
 VOL_EWMA_BPS = _metric(Gauge, 'vol_ewma_bps', 'EWMA volatility (bps)', ['pair'])
@@ -1150,6 +1317,14 @@ def set_dynamic_min(pair: str, side: str, bps: float) -> None:
 def inc_rm_reject(reason: str) -> None:
     try:
         RM_REJECT_TOTAL.labels(_norm(reason)).inc()
+        # Ticket D4: Unified Robustness
+        if 'REJECT_TOTAL_COUNTER' in globals():
+            REJECT_TOTAL_COUNTER.labels(layer="RM", reason=_norm(reason)).inc()
+    except Exception:
+        pass
+def inc_rm_skip(reason: str) -> None:
+    try:
+        RM_SKIPS_TOTAL.labels(_norm(reason)).inc()
     except Exception:
         pass
 
@@ -1160,26 +1335,138 @@ def mark_rm_to_engine(ok: bool, dt_ms: float, **labels: Any) -> None:
             inc_blocked('rm_to_engine', labels.get('reason', 'unknown'), labels.get('pair'))
     except Exception:
         pass
-MM_FILLS_BOTH = _metric(Counter, 'mm_fills_both_total', 'Both maker orders filled (MM) before TTL; no hedge needed', ['pair'])
-MM_SINGLE_FILL_HEDGED = _metric(Counter, 'mm_single_fill_hedged_total', 'Single maker order filled (MM) then hedged with a taker', ['pair'])
-MM_PANIC_HEDGE_TOTAL = _metric(Counter, 'mm_panic_hedge_total', 'Panic hedge triggered due to exception/timeout during MM', ['pair'])
+MM_FILLS_BOTH = _metric(Counter, 'mm_fills_both_total', 'Both maker orders filled (MM) before TTL; no hedge needed', ['pair', 'variant'])
+MM_SINGLE_FILL_HEDGED = _metric(Counter, 'mm_single_fill_hedged_total', 'Single maker order filled (MM) then hedged with a taker', ['pair', 'variant'])
+MM_PANIC_HEDGE_TOTAL = _metric(Counter, 'mm_panic_hedge_total', 'Panic hedge triggered due to exception/timeout during MM', ['pair', 'variant'])
 MM_THROTTLED_TOTAL = _metric(
     Counter,
     'mm_throttled_total',
     'MM throttle hits by action',
-    ['reason', 'exchange', 'pair'],
+    ['reason', 'exchange', 'pair', 'variant'],
 )
 MM_MAKERS_EXPIRED_TTL_TOTAL = _metric(
     Counter,
     'mm_makers_expired_ttl_total',
     'MM makers expired on TTL enforcement',
-    ['exchange', 'pair'],
+    ['exchange', 'pair', 'variant'],
 )
 MM_MAKERS_CANCELED_TOTAL = _metric(
     Counter,
     'mm_makers_canceled_total',
     'MM makers canceled proactively',
-    ['reason', 'exchange', 'pair'],
+    ['reason', 'exchange', 'pair', 'variant'],
+)
+MM_EXPECTED_CAPTURE_BPS = _metric(
+    Histogram,
+    'mm_expected_capture_bps',
+    'Capture attendue en bps (hints)',
+    ['pair', 'variant'],
+    buckets=(-10, -5, 0, 2, 5, 10, 20, 50, 100)
+)
+MM_REALIZED_BPS = _metric(
+    Histogram,
+    'mm_realized_bps',
+    'Capture réalisée en bps (post-trade)',
+    ['pair', 'variant'],
+    buckets=(-100, -50, -20, -10, -5, 0, 2, 5, 10, 20, 50, 100)
+)
+MM_CANCEL_BUDGET_EXHAUSTED_TOTAL = _metric(
+    Counter,
+    'mm_cancel_budget_exhausted_total',
+    'Nombre de fois où le budget de cancel MM est épuisé',
+    ['exchange', 'pair']
+)
+MM_INVENTORY_DRIFT_USD = _metric(
+    Gauge,
+    'mm_inventory_drift_usd',
+    'Drift inventaire courant en USD',
+    ['asset']
+)
+MM_INVENTORY_MODE_TRANSITIONS_TOTAL = _metric(
+    Counter,
+    'mm_inventory_mode_transitions_total',
+    'Nombre de transitions DUAL <-> SINGLE',
+    ['old', 'new', 'asset']
+)
+MM_SINGLE_TIME_SECONDS = _metric(
+    Gauge,
+    'mm_single_time_seconds',
+    'Temps passe en mode SINGLE par asset',
+    ['asset']
+)
+MM_SINGLE_ESCALATIONS_TOTAL = _metric(
+    Counter,
+    'mm_single_escalations_total',
+    'Nombre d escalades en mode SINGLE',
+    ['asset', 'phase']
+)
+MM_SINGLE_BLOCKED_TOTAL = _metric(
+    Counter,
+    'mm_single_blocked_total',
+    'Nombre de blocages en mode SINGLE par raison',
+    ['asset', 'reason']
+)
+MM_SINGLE_PLACES_TOTAL = _metric(
+    Counter,
+    'mm_single_places_total',
+    'Nombre de placements en mode SINGLE',
+    ['exchange', 'pair', 'variant']
+)
+MM_SINGLE_CANCELS_TOTAL = _metric(
+    Counter,
+    'mm_single_cancels_total',
+    'Nombre d annulations en mode SINGLE',
+    ['exchange', 'pair', 'variant']
+)
+MM_CROSS_BLOCKED_TOTAL = _metric(
+    Counter,
+    'mm_cross_blocked_total',
+    'Number of cross-cex MM opportunities blocked',
+    ['reason', 'pair']
+)
+MM_POST_FILL_MOVE_BPS = _metric(
+    Histogram,
+    'mm_post_fill_move_bps',
+    'Mouvement de prix post-fill en bps (adverse selection proxy)',
+    ['pair', 'variant'],
+    buckets=(-50, -20, -10, -5, -2, 0, 2, 5, 10, 20, 50)
+)
+MM_CHURN_RATE = _metric(
+    Gauge,
+    'mm_churn_rate',
+    'Taux de changement du carnet (updates/s)',
+    ['exchange', 'pair']
+)
+MM_DEPTH_PROFILE_RATIO = _metric(
+    Gauge,
+    'mm_depth_profile_ratio',
+    'Ratio volume L1 / top 5 (fragilité)',
+    ['exchange', 'pair']
+)
+MM_CROSS_SINGLE_FILL_TOTAL = _metric(
+    Counter,
+    'mm_cross_single_fill_total',
+    'MM Cross single leg filled',
+    ['pair']
+)
+MM_CROSS_BOTH_FILL_TOTAL = _metric(
+    Counter,
+    'mm_cross_both_fill_total',
+    'MM Cross both legs filled',
+    ['pair']
+)
+MM_CROSS_DEFENSIVE_MODE = _metric(
+    Gauge,
+    'mm_cross_defensive_mode',
+    'MM Cross defensive mode state',
+    ['pair']
+)
+MM_CROSS_HEDGE_SLIPPAGE_BPS = _metric(
+    Histogram,
+    'mm_cross_hedge_slippage_bps',
+    'MM Cross hedge slippage in bps',
+    ['pair'],
+    buckets=(-100, -50, -20, -10, -5, 0, 5, 10, 20, 50, 100)
 )
 ENGINE_SUBMIT_TO_ACK_MS = _metric(Histogram, 'engine_submit_to_ack_ms', 'Engine submit→ack latency (ms)', buckets=BUCKETS_MS)
 ENGINE_ACK_TO_FILL_MS = _metric(Histogram, 'engine_ack_to_fill_ms', 'Engine ack→fill latency (ms)', buckets=BUCKETS_MS)
@@ -1204,14 +1491,14 @@ PNL_LIVE_DAY_USD = _metric(Gauge, 'pnl_live_day_usd', 'Live PnL for the current 
 #   - Compteur de trades du jour classés par résultat "win" / "loss" / "flat",
 #     selon le signe de net_profit ou, à défaut, de net_profit_sign.
 
-TRADES_LIVE_DAY_TOTAL = _metric(Counter, 'trades_live_day_total', 'Trades live day total', ['result'])
+TRADES_LIVE_DAY_TOTAL = _metric(Counter, 'trades_live_day_total', 'Trades live day total', ['result', 'region', 'branch', 'mode'])
 # DERIVED_NET_PROFIT_SIGN_TOTAL :
 #   - Compteur de trades pour lesquels seul le signe net_profit_sign a été utilisé
 #     (net_profit manquant ou jugé peu exploitable) pour classer win / loss / flat.
 
-DERIVED_NET_PROFIT_SIGN_TOTAL = _metric(Counter, 'derived_net_profit_sign_total', 'Derived net profit sign (fallback)', ['reason'])
+DERIVED_NET_PROFIT_SIGN_TOTAL = _metric(Counter, 'derived_net_profit_sign_total', 'Derived net profit sign (fallback)', ['reason', 'region', 'branch', 'mode'])
 
-MISSING_NET_PROFIT_TOTAL = _metric(Counter, 'missing_net_profit_total', 'Missing net profit values', ['stage'])
+MISSING_NET_PROFIT_TOTAL = _metric(Counter, 'missing_net_profit_total', 'Missing net profit values', ['stage', 'region', 'branch', 'mode'])
 # MISSING_NET_PROFIT_TOTAL :
 #   - Compteur de trades pour lesquels aucun PnL exploitable n'était disponible
 #     au moment de l'agrégation live (ni net_profit ni net_profit_sign utilisable).
@@ -1287,6 +1574,19 @@ ENGINE_PACER_DELAY_MS = _metric(
     'Engine pacer delay (ms)',
     ['region', 'profile', 'mode'],
 )
+ENGINE_RL_WAIT_MS = _metric(
+    Histogram,
+    'engine_rl_wait_ms',
+    'Engine internal rate-limit wait time (ms)',
+    ['exchange', 'lane'],
+    buckets=BUCKETS_MS if 'BUCKETS_MS' in globals() else (1, 2, 5, 10, 25, 50, 100, 250, 500, 1000),
+)
+ENGINE_ORDER_REJECTED_TOTAL = _metric(
+    Counter,
+    'engine_order_rejected_total',
+    'Engine orders rejected by exchange',
+    ['exchange', 'reason'],
+)
 ENGINE_PACER_INFLIGHT_MAX = _metric(
     Gauge,
     'engine_pacer_inflight_max',
@@ -1343,6 +1643,76 @@ ENGINE_DRAIN_LATENCY_MS = _metric(
 
 ENGINE_PACING_BACKPRESSURE_TOTAL = _metric(Counter, 'engine_pacing_backpressure_total', 'Engine pacing backpressure', ['reason'])
 ENGINE_ACK_TIMEOUT_TOTAL = _metric(Counter, 'engine_ack_timeout_total', 'Engine ack timeouts')
+
+# --- TT (Ticket D1, D2, D3, D4) ---
+TT_PLAN_LATENCY_MS = _metric(Histogram, "tt_plan_latency_ms", "Latency of TT plan decision (ms)", buckets=[0.5, 1, 2, 5, 10, 20])
+TT_PLAN_FRAGMENTS = _metric(Gauge, "tt_plan_fragments", "Number of fragments in last TT plan")
+TT_PLAN_SUBMIT_MODE_TOTAL = _metric(Counter, "tt_plan_submit_mode_total", "Counter of TT plan submit modes", ["mode"])
+TT_REVALIDATE_FAIL_TOTAL = _metric(Counter, "tt_revalidate_fail_total", "Counter of TT revalidation failures", ["reason"])
+TT_EDGE_NET_AT_DECISION_BPS = _metric(Histogram, "tt_edge_net_at_decision_bps", "Edge net at decision time (bps)", buckets=[-50, -20, -10, 0, 5, 10, 20, 50, 100])
+TT_EDGE_NET_AT_SUBMIT_BPS = _metric(Histogram, "tt_edge_net_at_submit_bps", "Edge net at submit time (bps)", buckets=[-50, -20, -10, 0, 5, 10, 20, 50, 100])
+RM_LATENCY_PENALTY_BPS = _metric(Gauge, "rm_latency_penalty_bps", "Latency penalty applied by RM (bps)")
+RM_STALENESS_PENALTY_BPS = _metric(Gauge, "rm_staleness_penalty_bps", "Staleness penalty applied by RM (bps)")
+TT_ABORT_TOTAL = _metric(Counter, "tt_abort_total", "Total TT pipeline aborts", ["reason"])
+TT_TIME_BUDGET_EXCEEDED_TOTAL = _metric(Counter, "tt_time_budget_exceeded_total", "Total TT time budget exceeded")
+TT_HEALTH_BLOCK_TOTAL = _metric(Counter, "tt_health_block_total", "Total TT health blocks", ["reason", "exchange"])
+
+# --- TM (Ticket D1, D2, D3, D4) ---
+TM_PLAN_LATENCY_MS = _metric(Histogram, "tm_plan_latency_ms", "Latency of TM plan decision (ms)", buckets=[0.5, 1, 2, 5, 10, 20])
+TM_PLAN_FRAGMENTS = _metric(Gauge, "tm_plan_fragments", "Number of fragments in last TM plan")
+TM_PLAN_LEVELS = _metric(Gauge, "tm_plan_levels", "Number of ladder levels in TM plan")
+TM_REVALIDATE_FAIL_TOTAL = _metric(Counter, "tm_revalidate_fail_total", "Counter of TM revalidation failures", ["reason"])
+TM_ABORT_TOTAL = _metric(Counter, "tm_abort_total", "Total TM pipeline aborts", ["reason"])
+TM_EDGE_NET_BPS_AT_PLACE = _metric(Histogram, "tm_edge_net_bps_at_place", "Edge net BPS at maker placement", buckets=[-20, -10, -5, 0, 5, 10, 20, 50, 100])
+TM_QPOS_BLOCK_TOTAL = _metric(Counter, "tm_qpos_block_total", "TM Queue Position blocks", ["reason", "exchange", "symbol"])
+TM_QPOS_AHEAD_QUOTE = _metric(Gauge, "tm_qpos_ahead_quote", "Ahead quote amount", ["exchange", "symbol"])
+TM_ETA_S = _metric(Gauge, "tm_eta_s", "Estimated time to fill in seconds", ["exchange", "symbol"])
+
+MM_QPOS_BLOCK_TOTAL = _metric(Counter, "mm_qpos_block_total", "MM Queue Position blocks", ["reason", "exchange", "symbol"])
+MM_QPOS_AHEAD_QUOTE = _metric(Gauge, "mm_qpos_ahead_quote", "Ahead quote amount", ["exchange", "symbol"])
+MM_ETA_S = _metric(Gauge, "mm_eta_s", "Estimated time to fill in seconds", ["exchange", "symbol"])
+MM_QUOTES_TOTAL = _metric(Counter, "mm_quotes_total", "Total MM quotes submitted", ["exchange", "pair", "variant"])
+MM_REQUOTES_TOTAL = _metric(Counter, "mm_requotes_total", "Total MM quotes updated/replaced", ["exchange", "pair"])
+MM_CANCELS_TOTAL = _metric(Counter, "mm_cancels_total", "Total MM quotes cancelled", ["exchange", "pair", "reason"])
+MM_FILLS_TOTAL = _metric(Counter, "mm_fills_total", "Total MM fills", ["exchange", "pair", "variant"])
+MM_REJECT_TOTAL = _metric(Counter, "mm_reject_total", "Total MM order rejects", ["reason"])
+MM_ABORT_TOTAL = _metric(Counter, "mm_abort_total", "Total MM pipeline aborts", ["reason"])
+MM_PAUSE_TOTAL = _metric(Counter, "mm_pause_total", "Total MM pauses (circuit breakers)", ["reason"])
+MM_POSTFILL_MOVE_BPS = _metric(Histogram, "mm_postfill_move_bps", "Price move after MM fill (bps)", ["exchange", "pair"], buckets=[-50, -20, -10, -5, 0, 5, 10, 20, 50])
+MM_EXPECTED_CAPTURE_BPS = _metric(Histogram, "mm_expected_capture_bps", "Expected capture at MM placement", ["pair"], buckets=[0, 2, 5, 10, 20, 50, 100])
+MM_INVENTORY_DRIFT_BPS = _metric(Gauge, "mm_inventory_drift_bps", "MM inventory drift from target", ["pair"])
+TM_QUOTES_ALIVE = _metric(Gauge, "tm_quotes_alive", "Number of active TM quotes", ["pair"])
+TM_EXPOSURE_QUOTE = _metric(Gauge, "tm_exposure_quote", "TM exposure in quote currency", ["pair"])
+TM_EXPOSURE_USD = _metric(Gauge, "tm_exposure_usd", "TM exposure in USD", ["pair"])
+TM_HEDGE_SUBMIT_TO_ACK_MS = _metric(Histogram, "tm_hedge_submit_to_ack_ms", "TM hedge submit to ack latency", buckets=[5, 10, 20, 50, 100, 200, 500])
+TM_HEDGE_FAIL_TOTAL = _metric(Counter, "tm_hedge_fail_total", "TM hedge submission failures", ["reason"])
+TM_FALLBACK_TOTAL = _metric(Counter, "tm_fallback_total", "TM fallback mode activations", ["mode"])
+
+
+# --- UNIFIED FRAGMENTATION & EXECUTION (Ticket Slicing/Fragmentation) ---
+FRAG_PLAN_LATENCY_MS = _metric(Histogram, 'frag_plan_latency_ms', 'Fragmentation plan latency (ms)', ['branch'], buckets=BUCKETS_MS)
+FRAG_FRAGMENTS_COUNT = _metric(Histogram, 'frag_fragments_count', 'Number of fragments in plan', ['branch'], buckets=(1, 2, 3, 5, 8, 12, 16, 32))
+FRAG_FRAGMENT_QUOTE_HIST = _metric(Histogram, 'frag_fragment_quote_hist', 'Fragment size (quote ccy)', ['branch'], buckets=(10, 50, 100, 200, 500, 1000, 2500, 5000, 10000))
+FRAG_ABORT_REASON_TOTAL = _metric(Counter, 'frag_abort_reason_total', 'Total plan aborts', ['branch', 'reason'])
+
+# Latences
+RM_DECISION_MS_HIST = _metric(Histogram, 'rm_decision_ms', 'RM decision latency (ms)', buckets=BUCKETS_MS)
+ENGINE_QUEUE_DELAY_MS = _metric(Histogram, 'engine_queue_delay_ms', 'Engine queue delay (ms)', buckets=BUCKETS_MS)
+ENGINE_SUBMIT_TO_ACK_MS_HIST = _metric(Histogram, 'engine_submit_to_ack_ms', 'Submit to ack latency (ms)', ['exchange'], buckets=BUCKETS_MS)
+PRIVATE_WS_LAG_MS = _metric(Histogram, 'private_ws_lag_ms', 'Private WS lag (ms)', ['exchange'], buckets=BUCKETS_MS)
+RPC_LATENCY_MS_HIST = _metric(Histogram, 'rpc_latency_ms', 'RPC gateway latency (ms)', buckets=BUCKETS_MS)
+
+# Qualité
+EDGE_NET_BPS_HIST = _metric(Histogram, 'edge_net_bps_hist', 'Realized edge net bps', ['branch'], buckets=(-100, -50, -20, -10, 0, 5, 10, 20, 50, 100))
+FILL_RATIO_HIST = _metric(Histogram, 'fill_ratio', 'Fill ratio (filled/planned)', ['branch'], buckets=(0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0, 1.1))
+PANIC_HEDGE_TOTAL_COUNTER = _metric(Counter, 'panic_hedge_total', 'Total panic hedges', ['branch', 'reason'])
+QPOS_BLOCK_TOTAL_COUNTER = _metric(Counter, 'qpos_block_total', 'Total queue position blocks', ['exchange', 'reason'])
+
+# Robustesse
+REJECT_TOTAL_COUNTER = _metric(Counter, 'reject_total', 'Total rejects', ['layer', 'reason'])
+ABORT_TOTAL_COUNTER = _metric(Counter, 'abort_total', 'Total execution aborts', ['branch', 'reason'])
+RETRY_TOTAL_COUNTER = _metric(Counter, 'retry_total', 'Total execution retries', ['exchange', 'code'])
+ENGINE_429_TOTAL_COUNTER = _metric(Counter, 'engine_429_total', 'Total 429 received', ['exchange'])
 
 
 # === OBS READINESS (Lot B) — strict + stubs + métriques Lot B ===
@@ -1459,6 +1829,7 @@ PWS_RECONNECTS_TOTAL = _metric(Counter, 'pws_reconnects_total', 'PrivateWS recon
 PWS_EVENT_LAG_MS = _metric(Histogram, 'pws_event_lag_ms', 'PrivateWS event lag (ms)', ['exchange', 'alias'], buckets=BUCKETS_MS)
 PWS_TRANSFERS_TOTAL = _metric(Counter, 'pws_transfers_total', 'PrivateWS internal transfers', ['exchange'])
 PWS_EVENTS_TOTAL = _metric(Counter, 'pws_events_total', 'PrivateWS events received', ['exchange', 'alias', 'status', 'source'])
+PWS_BALANCE_EVENTS_TOTAL = _metric(Counter, 'pws_balance_events_total', 'PrivateWS balance events received', ['exchange', 'alias', 'type'])
 PWS_BACKOFF_SECONDS = _metric(Gauge, 'pws_backoff_seconds', 'PrivateWS backoff seconds', ['exchange', 'alias'])
 PWS_HEARTBEAT_GAP_SECONDS = _metric(
     Gauge,
@@ -1582,13 +1953,13 @@ RECONCILE_RESYNC_LATENCY_MS = _metric(
     buckets=BUCKETS_MS,
 )
 
-RM_SC_RL_REJECT_TOTAL = Counter(
+RM_SC_RL_REJECT_TOTAL = _metric(Counter,
     "rm_sc_rl_reject_total",
     "Rejets RM pour dépassement du soft rate-limit SC (sub-account)",
     labelnames=("exchange", "alias", "branch"),
 )
 
-RM_SC_RL_TOKENS = Gauge(
+RM_SC_RL_TOKENS = _metric(Gauge,
     "rm_sc_rl_tokens",
     "Tokens restants dans le bucket soft RL par SC",
     labelnames=("exchange", "alias", "branch"),
@@ -2252,7 +2623,7 @@ class StatusHTTPServer:
     Par défaut, include_metrics=False pour éviter la double écoute avec ObsServer.
     """
 
-    def __init__(self, host: str='0.0.0.0', port: int=9110, registry=None, include_metrics: bool=False):
+    def __init__(self, host: str='0.0.0.0', port: int=9110, registry=None, include_metrics: bool=True):
         self.host = host
         self.port = int(port)
         self.registry = registry or REGISTRY
@@ -2260,6 +2631,8 @@ class StatusHTTPServer:
         self._boot: Any = None
         self._runner: Optional['web.AppRunner'] = None
         self._site: Optional['web.TCPSite'] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
 
     def set_boot(self, boot: Any) -> None:
         self._boot = boot
@@ -2389,6 +2762,8 @@ class StatusHTTPServer:
             return web.Response(text='# metrics disabled on this endpoint\n', status=200)
         try:
             output = generate_latest(self.registry)
+            if not output or output.strip() == b"":
+                log.warning("/metrics called but REGISTRY seems empty or generate_latest returned nothing")
             return web.Response(body=output, headers={'Content-Type': CONTENT_TYPE_LATEST})
         except Exception:
             log.exception('generate_latest() a échoué')
@@ -2405,17 +2780,47 @@ class StatusHTTPServer:
             web.get('/ready', self._handle_ready),
             web.get('/status', self._handle_status),
             web.get('/healthz', self._handle_healthz),
+            web.get('/metrics', self._handle_metrics)
         ])
-
-        if self.include_metrics:
-            app.add_routes([web.get('/metrics', self._handle_metrics)])
         self._runner = web.AppRunner(app, access_log=None)
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, host=self.host, port=self.port)
         await self._site.start()
-        log.info('StatusHTTPServer started on http://%s:%d (ready/status%s)', self.host, self.port, '/metrics' if self.include_metrics else '')
+        log.info('StatusHTTPServer started on http://%s:%d', self.host, self.port)
+
+    def start_in_thread(self) -> None:
+        """Démarre le serveur dans un thread dédié pour ne pas dépendre de la loop principale."""
+        if self._thread is not None:
+            return
+
+        def _run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            try:
+                self._loop.run_until_complete(self.start())
+                log.info("status_http_loop_running=1")
+                self._loop.run_forever()
+            except Exception:
+                log.exception("StatusHTTPServer thread died")
+            finally:
+                self._loop.close()
+
+        self._thread = threading.Thread(target=_run_loop, name="StatusHTTPThread", daemon=True)
+        self._thread.start()
 
     async def stop(self) -> None:
+        if self._loop and self._loop.is_running():
+            # Arrêt propre si on est en mode thread
+            fut = asyncio.run_coroutine_threadsafe(self._stop_internal(), self._loop)
+            try:
+                fut.result(timeout=5)
+            except Exception:
+                log.warning("StatusHTTPServer stop timed out")
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        else:
+            await self._stop_internal()
+
+    async def _stop_internal(self) -> None:
         try:
             if self._site:
                 await self._site.stop()
@@ -2460,11 +2865,63 @@ class MainMetrics:
         except Exception:
             pass
 
+def _init_default_labels() -> None:
+    """Force l'initialisation des métriques critiques avec des labels par défaut pour exposition immédiate."""
+    if not _PROM_READY:
+        return
+    try:
+        # 1) Modes RiskManager (Gauges 0/1)
+        # On synchronise avec les labels réels utilisés dans rm_update_mode_gauges
+        for m in ("NORMAL", "OPP_VOLUME", "OPP_VOL", "CAREFUL", "ALERTE", "SHUTDOWN"):
+            safe_set(RM_MODE_CURRENT, "rm_mode_current", "boot.init", 0.0, mode=m)
+        safe_set(RM_MODE_CURRENT, "rm_mode_current", "boot.init", 1.0, mode="NORMAL")
+
+        for m in ("NORMAL", "CONSTRAINED", "SEVERE", "QUICK", "HEDGE_ONLY", "SANDBOX", "OPPORTUNISTE"):
+            safe_set(RM_TRADE_MODE_CURRENT, "rm_trade_mode_current", "boot.init", 0.0, mode=m)
+        safe_set(RM_TRADE_MODE_CURRENT, "rm_trade_mode_current", "boot.init", 1.0, mode="NORMAL")
+
+        # 2) Compteurs de transitions (Entries/Exits)
+        for m in ("NORMAL", "OPP_VOLUME", "OPP_VOL", "CAREFUL", "ALERTE", "SHUTDOWN"):
+            for r in ("startup", "volatility", "slippage", "manual", "auto_recovery"):
+                safe_inc(RM_MODE_ENTRIES_TOTAL, "rm_mode_entries_total", "boot.init", mode=m, reason=r, value=0)
+                safe_inc(RM_MODE_EXITS_TOTAL, "rm_mode_exits_total", "boot.init", mode=m, reason=r, value=0)
+
+        # 2b) État de trading RM
+        safe_set(RM_TRADING_READY, "rm_trading_ready", "rm", 0.0)
+        for dep in ("engine", "books", "balances", "scanner"):
+            safe_set(RM_DEP_READY, "rm_dep_ready", "rm", 0.0, dep=dep)
+
+        # 2c) Métriques de démarrage
+        safe_inc(BOT_STARTUPS_TOTAL, "bot_startups_total", "boot.init", value=0)
+        safe_set(BOT_STATE, "bot_state", "boot.init", 1.0) # STARTING
+
+        # 3) Volatilité & Staleness (Paires seed)
+        for p in ("BTCUSDC", "ETHUSDC"):
+            safe_set(VOL_P95_BPS, "vol_p95_bps", "boot.init", 0.0, pair=p)
+            for ex in ("BINANCE", "BYBIT", "COINBASE"):
+                for side in ("buy", "sell"):
+                    safe_set(SLIP_AGE_SECONDS, "slip_age_seconds", "boot.init", 0.0, pair=p, exchange=ex, side=side)
+
+        for ex in ("BINANCE", "BYBIT", "COINBASE"):
+            safe_set(WS_PUBLIC_STALENESS_SECONDS, "ws_public_staleness_seconds", "boot.init", 0.0, deployment_mode="EU_ONLY", exchange=ex, region="EU")
+            safe_set(WS_PUBLIC_STALENESS_SECONDS, "ws_public_staleness_seconds", "boot.init", 0.0, deployment_mode="SPLIT", exchange=ex, region="EU")
+
+        # 4) Latences (Histogrammes -> initialisent les _count/_sum à 0)
+        safe_observe(ROUTER_TO_SCANNER_MS, "router_to_scanner_ms", "boot.init", 0.0, route="tri_cex")
+        safe_observe(SIM_DECISION_MS, "sim_decision_ms", "boot.init", 0.0)
+        safe_observe(RM_DECISION_MS, "rm_decision_ms", "boot.init", 0.0, cohort="PRIMARY")
+
+        log.info("Métriques critiques initialisées avec labels par défaut (enrichi)")
+    except Exception as e:
+        log.warning("Échec initialisation metrics par défaut: %s", e)
+
+
 def start_servers(boot=None, cfg=None) -> dict[str, object]:
     """
     Démarre StatusHTTPServer avec /metrics activable par configuration,
     et ObsServer optionnel. Retourne {"status_server": .., "obs_server": ..}.
     """
+    _init_default_labels()
     servers: dict[str, object] = {}
     obs_cfg = getattr(cfg, "obs", None)
     defaults = dict(_OBS_DEFAULTS)
@@ -2765,16 +3222,6 @@ def ws_public_staleness(
 # --- Wrappers legacy (compat v1) ---
 
 
-def ws_public_on_frame(exchange: str) -> None:
-    """Compatibilité v1: utilisé par d'anciens modules.
-
-    Par défaut, taggue l'évènement avec region/deployment_mode = "UNKNOWN".
-    Les nouveaux appels devraient passer par ws_public_event().
-    """
-    try:
-        ws_public_event(exchange, region="UNKNOWN", deployment_mode="UNKNOWN", stream="legacy")
-    except Exception:  # pragma: no cover
-        _obs_shim_log.debug("ws_public_on_frame(%s) [legacy]", exchange)
 
 
 # --- Wrappers “note_*” consommés par websockets_clients.py -----------------
@@ -2927,19 +3374,6 @@ def ws_public_note_event_dropped(
         return
 
 
-def ws_public_set_staleness(exchange: str, seconds: float) -> None:
-    """Compatibilité v1 pour la staleness WS publics."""
-    try:
-        ws_public_staleness(
-            exchange,
-            region="UNKNOWN",
-            deployment_mode="UNKNOWN",
-            seconds=seconds,
-        )
-    except Exception:  # pragma: no cover
-        _obs_shim_log.debug(
-            "ws_public_set_staleness(%s, %.3f) [legacy]", exchange, seconds
-        )
 
 
 def mark_books_fresh_by_exchange(exchange: str) -> None:
@@ -2964,72 +3398,46 @@ def router_on_combo_event(
         _obs_shim_log.exception('router_on_combo_event failed')
 
 
-def feesync_on_refresh(ok: bool) -> None:
-    _obs_shim_log.debug('feesync_on_refresh(%s) [legacy no-op]', ok)
+
+def bump_scanner(
+    spread_pct: float | None = None,
+    active_pairs: int | None = None,
+    *,
+    load: float | None = None,
+    queue_drop: int | None = None,
+) -> None:
+    """
+    Scanner heartbeat (D7):
+
+    - load (0..1) -> SCANNER_GLOBAL_LOAD gauge
+    - queue_drop est accepté pour compat avec les call-sites (ne doit JAMAIS lever TypeError)
+    - spread_pct/active_pairs : gardés pour compat (pas exportés ici pour l’instant)
+
+    Objectif: éviter le "silence" Grafana (load=0 permanent car bump_scanner no-op)
+    + supprimer les exceptions TypeError silencieuses dues à bump_scanner(queue_drop=1).
+    """
+    try:
+        if load is not None:
+            v = float(load)
+            # clamp + NaN guard
+            if v != v:  # NaN
+                v = 0.0
+            if v < 0.0:
+                v = 0.0
+            elif v > 1.0:
+                v = 1.0
+            safe_set(SCANNER_GLOBAL_LOAD, "scanner_global_load", "bump_scanner", v)
+    except Exception:
+        try:
+            OBS_NOOP_TOTAL.labels(metric="scanner_global_load", where="bump_scanner").inc()
+        except Exception:
+            pass
+
+    # queue_drop/spread_pct/active_pairs: best-effort (compat), volontairement no-op côté métriques
+    # (on préfère ne pas inventer des métriques sans dashboard associé).
+    return None
 
 
-def feesync_on_apply(exchange: str, alias: str) -> None:
-    _obs_shim_log.debug('feesync_on_apply(%s,%s) [legacy no-op]', exchange, alias)
-
-
-def feesync_on_error() -> None:
-    _obs_shim_log.debug('feesync_on_error() [legacy no-op]')
-
-
-def discovery_on_run(enabled_exchanges: list[str], pairs_per_exchange: dict[str, int]) -> None:
-    _obs_shim_log.debug('discovery_on_run(%d exchanges) [legacy no-op]', len(enabled_exchanges or []))
-
-
-def private_on_poller_tick(exchange: str) -> None:
-    _obs_shim_log.debug('private_on_poller_tick(%s) [legacy no-op]', exchange)
-
-
-def private_on_event(exchange: str, typ: str) -> None:
-    _obs_shim_log.debug('private_on_event(%s,%s) [legacy no-op]', exchange, typ)
-
-
-def snapshot_inventory(balances: dict[str, dict[str, float]], mids: dict[str, float]) -> None:
-    _obs_shim_log.debug('snapshot_inventory(...) [legacy no-op]')
-
-
-def bump_scanner(spread_pct: float | None, active_pairs: int | None) -> None:
-    _obs_shim_log.debug('bump_scanner(spread=%s, active=%s) [legacy no-op]', spread_pct, active_pairs)
-
-
-def set_tm_open_makers(n: int) -> None:
-    _obs_shim_log.debug('set_tm_open_makers(%d) [legacy no-op]', n)
-
-
-def tm_on_maker_placed(exchange: str, symbol: str, side: str) -> None:
-    _obs_shim_log.debug('tm_on_maker_placed(%s,%s,%s) [legacy no-op]', exchange, symbol, side)
-
-
-def tm_on_maker_canceled(exchange: str, symbol: str) -> None:
-    _obs_shim_log.debug('tm_on_maker_canceled(%s,%s) [legacy no-op]', exchange, symbol)
-
-
-def tm_on_hedge_sent(exchange: str, symbol: str, side: str, lag_seconds: float | None = None) -> None:
-    _obs_shim_log.debug('tm_on_hedge_sent(%s,%s,%s,lag=%s) [legacy no-op]', exchange, symbol, side, lag_seconds)
-
-
-def tm_on_maker_fill_ratio(ratio: float) -> None:
-    _obs_shim_log.debug('tm_on_maker_fill_ratio(%.3f) [legacy no-op]', ratio)
-
-
-def mm_on_opp(pair: str) -> None:
-    _obs_shim_log.debug('mm_on_opp(%s) [legacy no-op]', pair)
-
-
-def mm_on_both_filled(pair: str) -> None:
-    _obs_shim_log.debug('mm_on_both_filled(%s) [legacy no-op]', pair)
-
-
-def mm_on_single_fill_hedged(pair: str) -> None:
-    _obs_shim_log.debug('mm_on_single_fill_hedged(%s) [legacy no-op]', pair)
-
-
-def mm_on_panic_hedge(pair: str) -> None:
-    _obs_shim_log.debug('mm_on_panic_hedge(%s) [legacy no-op]', pair)
 
 
 def set_engine_queue(n: int) -> None:
@@ -3092,18 +3500,42 @@ def record_pipeline_timings(trace: Dict[str, Any]) -> None:
         _obs_shim_log.exception('record_pipeline_timings failed')
 
 
-def inc_scanner_rejection(reason: str, route: str = 'n/a', pair: str = 'n/a') -> None:
+def inc_scanner_rejection(reason: str, route: str = 'n/a', pair: str = 'n/a', strategy: str = 'TT') -> None:
     try:
-        SCANNER_REJECTIONS_TOTAL.labels(str(reason)).inc()
+        if SCANNER_REJECTED_TOTAL is not None and not isinstance(SCANNER_REJECTED_TOTAL, _MetricNoOp):
+            SCANNER_REJECTED_TOTAL.labels(
+                reason=str(reason),
+                route=str(route),
+                pair=str(pair).upper(),
+                strategy=str(strategy).upper()
+            ).inc()
+        # Ticket D4: Unified Robustness
+        if 'REJECT_TOTAL_COUNTER' in globals():
+            REJECT_TOTAL_COUNTER.labels(layer="SCANNER", reason=str(reason)).inc()
     except Exception:
         _obs_shim_log.exception('inc_scanner_rejection failed')
 
 
-def inc_scanner_emitted(route: str = 'n/a', pair: str = 'n/a') -> None:
+def inc_scanner_emitted(route: str = 'n/a', pair: str = 'n/a', strategy: str = 'TT') -> None:
     try:
-        SCANNER_EMITTED_TOTAL.inc()
+        if OPPORTUNITIES_EMITTED_TOTAL is not None and not isinstance(OPPORTUNITIES_EMITTED_TOTAL, _MetricNoOp):
+            OPPORTUNITIES_EMITTED_TOTAL.labels(
+                strategy=str(strategy).upper(),
+                pair=str(pair).upper()
+            ).inc()
     except Exception:
         _obs_shim_log.exception('inc_scanner_emitted failed')
+
+
+def inc_scanner_decision(pair: str = 'n/a', strategy: str = 'TT') -> None:
+    try:
+        if FINAL_DECISIONS_TOTAL is not None and not isinstance(FINAL_DECISIONS_TOTAL, _MetricNoOp):
+            FINAL_DECISIONS_TOTAL.labels(
+                strategy=str(strategy).upper(),
+                pair=str(pair).upper()
+            ).inc()
+    except Exception:
+        _obs_shim_log.exception('inc_scanner_decision failed')
 
 
 def observe_scanner_latency(route: str, seconds: float) -> None:
@@ -3113,14 +3545,12 @@ def observe_scanner_latency(route: str, seconds: float) -> None:
         _obs_shim_log.exception('observe_scanner_latency failed')
 
 
-def set_engine_running(flag: bool) -> None:
-    _obs_shim_log.debug('set_engine_running(%s) [legacy no-op]', flag)
 
 
 
 __all__ = ['BUCKETS_MS',"LAT_ACK_MS", "LAT_FILL_FIRST_MS", "LAT_FILL_ALL_MS", "LAT_E2E_MS","LOGGERH_FILE_ROTATIONS_TOTAL",
     "LAT_EVENTS_TOTAL", "LAT_PIPELINE_EVENTS_TOTAL","OBS_READY", "obs_is_ready",
-    "PAIR_HISTORY_ROWS_TOTAL", "PAIR_HISTORY_COMPUTE_MS", 'set_region', 'set_deployment_mode', 'lbl_exchange', 'lbl_region', 'lbl_mode', 'start_time_skew_probe', 'start_loop_lag_probe', 'update_time_skew', 'TIME_SKEW_MS', 'TIME_SKEW_STATUS', 'EVENT_LOOP_LAG_MS', 'report_nonfatal', 'inc_blocked', 'NONFATAL_ERRORS_TOTAL', 'BLOCKED_TOTAL', 'BF_API_ERRORS_TOTAL', 'BF_API_LATENCY_MS', 'BF_CACHE_AGE_SECONDS', 'BF_LAST_SUCCESS_TS', 'FEE_TOKEN_BALANCE', 'BF_BALANCES_TTL_NORMAL_SECONDS', 'BF_BALANCES_TTL_DEGRADED_SECONDS', 'BF_BALANCES_TTL_BLOCK_SECONDS', 'BF_BALANCES_HEALTH_STATE', 'mark_bf_latency', 'RPC_LATENCY_MS', 'RPC_ERR_TOTAL', 'RPC_RETRIES_TOTAL', 'RPC_PAYLOAD_REJECTED_TOTAL', 'ROUTER_QUEUE_DEPTH', 'ROUTER_PAIR_QUEUE_DEPTH', 'ROUTER_QUEUE_HIGH_WATERMARK_TOTAL', 'ROUTER_QUEUE_DEPTH_BY_EX', 'ROUTER_DROPPED_TOTAL', 'ROUTER_COMBO_SKEW_MS', 'ROUTER_TO_SCANNER_MS', 'ROUTER_TO_SCANNER_ERRORS_TOTAL', 'mark_router_to_scanner', 'SCANNER_DECISION_MS', 'SCANNER_GLOBAL_LOAD', 'SCANNER_RATE_LIMITED_TOTAL', 'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SC_STRATEGY_SCORE', 'SC_ELIGIBLE', 'SC_BANNED', 'SC_PROMOTED_PRIMARY', 'SC_ROTATION_PRIMARY_SIZE', 'SC_ROTATION_AUDITION_SIZE', 'RM_DECISION_MS', 'mark_scanner_to_rm', 'INVENTORY_USD', 'RM_REJECT_TOTAL', 'PAIR_HEALTH_PENALTY_TOTAL', 'VOL_EWMA_BPS', 'VOL_P95_BPS', 'FEE_MISMATCH_TOTAL', 'FEES_EXPECTED_BPS', 'FEES_REALIZED_BPS', 'FEESYNC_LAST_TS', 'FEESYNC_ERRORS', 'REBAL_DETECTED_TOTAL', 'REBAL_PLAN_QUANTUM_QUOTE', 'RM_PAUSED_COUNT', 'LAST_BOOKS_FRESH_TS', 'LAST_BALANCES_FRESH_TS', 'DYNAMIC_MIN_BPS', 'mark_books_fresh', 'mark_balances_fresh', 'set_rm_paused_count', 'set_dynamic_min', 'inc_rm_reject', 'mark_rm_to_engine', 'MM_FILLS_BOTH', 'MM_SINGLE_FILL_HEDGED', 'MM_PANIC_HEDGE_TOTAL', 'ENGINE_SUBMIT_TO_ACK_MS', 'ENGINE_ACK_TO_FILL_MS', 'ENGINE_CANCELLATIONS_TOTAL', 'ENGINE_RETRIES_TOTAL', 'ENGINE_QUEUEPOS_BLOCKED_TOTAL', 'ENGINE_SUBMIT_QUEUE_DEPTH', 'INFLIGHT_GAUGE', 'ENGINE_DEDUP_HITS_TOTAL', 'PNL_LIVE_DAY_USD', 'TRADES_LIVE_DAY_TOTAL', 'DERIVED_NET_PROFIT_SIGN_TOTAL', 'MISSING_NET_PROFIT_TOTAL', 'ENGINE_PACER_DELAY_MS', 'ENGINE_PACER_INFLIGHT_MAX', 'ENGINE_PACER_MODE', 'PACER_ACK_TARGET_MS', 'PACER_ACK_HI_MS', 'PACER_ACK_SEV_MS', 'ENGINE_DRAIN_LATENCY_MS', 'ENGINE_PACING_BACKPRESSURE_TOTAL', 'inc_engine_pacing_backpressure', 'WS_RECONNECTS_TOTAL', 'WS_BACKOFF_SECONDS', 'WS_CONNECTIONS_OPEN', 'PACER_STATE', 'PACER_CLAMP_SECONDS', 'ENGINE_MUTE_TOTAL', 'FEE_TOKEN_LEVEL', 'FEE_TOKEN_TARGET_PERCENT', 'PWS_DEDUP_HITS_TOTAL', 'PWS_RECONNECTS_TOTAL', 'PWS_EVENT_LAG_MS', 'PWS_TRANSFERS_TOTAL', 'PWS_EVENTS_TOTAL', 'PWS_BACKOFF_SECONDS', 'PWS_HEARTBEAT_GAP_SECONDS', 'PWS_DROPPED_TOTAL', 'PWS_ACK_LATENCY_MS', 'PWS_FILL_LATENCY_MS', 'WS_FAILOVER_TOTAL', 'PWS_POOL_SIZE', 'PWS_QUEUE_DEPTH', 'PWS_QUEUE_CAP', 'WS_RECO_RUN_MS', 'WS_RECO_ERRORS_TOTAL', 'RECONCILE_MISS_TOTAL', 'RECONCILE_RESYNC_TOTAL', 'RECONCILE_RESYNC_LATENCY_MS', 'COLD_RESYNC_TOTAL', 'COLD_RESYNC_RUN_MS', 'recon_run_ms', 'recon_error', 'recon_on_resync', 'recon_observe_latency', 'pws_on_failover', 'pws_set_pool_size', 'LOGGERH_WRITE_MS', 'LOGGERH_QUEUE_PLATEAU_TOTAL', 'LHM_JSONL_INGESTED_TOTAL', 'LHM_JSONL_DROPPED_TOTAL', 'LHM_JSONL_QUEUE_SIZE', 'LOGGERH_TRADE_QUEUE_SIZE', 'LOGGERH_JSONL_ROTATIONS_TOTAL', 'LOGGERH_LAST_FLUSH_TS_SECONDS', 'LOGGERH_LAST_ROTATION_TS_SECONDS', 'loggerh_observe_write_ms', 'lhm_on_ingested', 'lhm_on_dropped', 'lhm_set_queue_size', 'lhm_on_rotation', 'loggerh_set_last_flush_now', 'loggerh_set_last_rotation_now', 'STORAGE_USAGE_PCT', 'STORAGE_BYTES_FREE', 'STORAGE_ALERTS_TOTAL', 'LOGGERH_JSONL_BYTES', 'LOGGERH_DB_STALLS_TOTAL', 'LOGGERH_DB_FILE_BYTES', 'update_storage_metrics',  'SIM_DECISION_MS', 'SIMULATED_VWAP_DEVIATION_BPS', 'sim_on_run', 'PAYLOAD_REJECTED_TOTAL', 'ObsServer', 'StatusHTTPServer', 'MainMetrics', 'BOT_STARTUPS_TOTAL', 'BOT_STATE', 'start_servers_from_env', 'WS_RECONNECTS_TOTAL', 'RM_DECISION_MS', 'RM_PREFLIGHT_MS', 'RM_DECISIONS_TOTAL', 'RM_SKIPS_TOTAL', 'RM_QUEUE_DEPTH', 'RM_REVALIDATE_MS', 'RM_FRAGMENT_PROFIT_MS', 'PAIR_HEALTH_PENALTY_TOTAL', 'POOL_GATE_THROTTLES_TOTAL', 'RM_FINAL_DECISIONS_TOTAL', 'RM_ADMITTED_TOTAL', 'RM_DROPPED_TOTAL',                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "VOL_PRICE_VOL_MICRO",
+    "PAIR_HISTORY_ROWS_TOTAL", "PAIR_HISTORY_COMPUTE_MS", 'set_region', 'set_deployment_mode', 'lbl_exchange', 'lbl_region', 'lbl_mode', 'start_time_skew_probe', 'start_loop_lag_probe', 'update_time_skew', 'TIME_SKEW_MS', 'TIME_SKEW_STATUS', 'EVENT_LOOP_LAG_MS', 'report_nonfatal', 'inc_blocked', 'NONFATAL_ERRORS_TOTAL', 'BLOCKED_TOTAL', 'BF_API_ERRORS_TOTAL', 'BF_API_LATENCY_MS', 'BF_CACHE_AGE_SECONDS', 'BF_LAST_SUCCESS_TS', 'FEE_TOKEN_BALANCE', 'BF_BALANCES_TTL_NORMAL_SECONDS', 'BF_BALANCES_TTL_DEGRADED_SECONDS', 'BF_BALANCES_TTL_BLOCK_SECONDS', 'BF_BALANCES_HEALTH_STATE', 'mark_bf_latency', 'RPC_LATENCY_MS', 'RPC_ERR_TOTAL', 'RPC_RETRIES_TOTAL', 'RPC_PAYLOAD_REJECTED_TOTAL', 'ROUTER_QUEUE_DEPTH', 'ROUTER_PAIR_QUEUE_DEPTH', 'ROUTER_QUEUE_HIGH_WATERMARK_TOTAL', 'ROUTER_QUEUE_DEPTH_BY_EX', 'ROUTER_DROPPED_TOTAL', 'ROUTER_COMBO_SKEW_MS', 'ROUTER_TO_SCANNER_MS', 'ROUTER_TO_SCANNER_ERRORS_TOTAL', 'mark_router_to_scanner', 'SCANNER_DECISION_MS', 'SCANNER_GLOBAL_LOAD', 'SCANNER_RATE_LIMITED_TOTAL', 'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SC_STRATEGY_SCORE', 'SC_ELIGIBLE', 'SC_BANNED', 'SC_PROMOTED_PRIMARY', 'SC_ROTATION_PRIMARY_SIZE', 'SC_ROTATION_AUDITION_SIZE', 'RM_DECISION_MS', 'mark_scanner_to_rm', 'INVENTORY_USD', 'RM_REJECT_TOTAL', 'PAIR_HEALTH_PENALTY_TOTAL', 'VOL_EWMA_BPS', 'VOL_P95_BPS', 'FEE_MISMATCH_TOTAL', 'FEES_EXPECTED_BPS', 'FEES_REALIZED_BPS', 'FEESYNC_LAST_TS', 'FEESYNC_ERRORS', 'REBAL_DETECTED_TOTAL', 'REBAL_PLAN_QUANTUM_QUOTE', 'RM_PAUSED_COUNT', 'LAST_BOOKS_FRESH_TS', 'LAST_BALANCES_FRESH_TS', 'DYNAMIC_MIN_BPS', 'mark_books_fresh', 'mark_balances_fresh', 'set_rm_paused_count', 'set_dynamic_min', 'inc_rm_reject', 'inc_rm_skip', 'mark_rm_to_engine', 'MM_FILLS_BOTH', 'MM_SINGLE_FILL_HEDGED', 'MM_PANIC_HEDGE_TOTAL', 'ENGINE_SUBMIT_TO_ACK_MS', 'ENGINE_ACK_TO_FILL_MS', 'ENGINE_CANCELLATIONS_TOTAL', 'ENGINE_RETRIES_TOTAL', 'ENGINE_QUEUEPOS_BLOCKED_TOTAL', 'ENGINE_SUBMIT_QUEUE_DEPTH', 'INFLIGHT_GAUGE', 'ENGINE_DEDUP_HITS_TOTAL', 'PNL_LIVE_DAY_USD', 'TRADES_LIVE_DAY_TOTAL', 'DERIVED_NET_PROFIT_SIGN_TOTAL', 'MISSING_NET_PROFIT_TOTAL', 'ENGINE_PACER_DELAY_MS', 'ENGINE_PACER_INFLIGHT_MAX', 'ENGINE_PACER_MODE', 'PACER_ACK_TARGET_MS', 'PACER_ACK_HI_MS', 'PACER_ACK_SEV_MS', 'ENGINE_DRAIN_LATENCY_MS', 'ENGINE_PACING_BACKPRESSURE_TOTAL', 'inc_engine_pacing_backpressure', 'WS_RECONNECTS_TOTAL', 'WS_BACKOFF_SECONDS', 'WS_CONNECTIONS_OPEN', 'PACER_STATE', 'PACER_CLAMP_SECONDS', 'ENGINE_MUTE_TOTAL', 'FEE_TOKEN_LEVEL', 'FEE_TOKEN_TARGET_PERCENT', 'PWS_DEDUP_HITS_TOTAL', 'PWS_RECONNECTS_TOTAL', 'PWS_EVENT_LAG_MS', 'PWS_TRANSFERS_TOTAL', 'PWS_EVENTS_TOTAL', 'PWS_BACKOFF_SECONDS', 'PWS_HEARTBEAT_GAP_SECONDS', 'PWS_DROPPED_TOTAL', 'PWS_ACK_LATENCY_MS', 'PWS_FILL_LATENCY_MS', 'WS_FAILOVER_TOTAL', 'PWS_POOL_SIZE', 'PWS_QUEUE_DEPTH', 'PWS_QUEUE_CAP', 'WS_RECO_RUN_MS', 'WS_RECO_ERRORS_TOTAL', 'RECONCILE_MISS_TOTAL', 'RECONCILE_RESYNC_TOTAL', 'RECONCILE_RESYNC_LATENCY_MS', 'COLD_RESYNC_TOTAL', 'COLD_RESYNC_RUN_MS', 'recon_run_ms', 'recon_error', 'recon_on_resync', 'recon_observe_latency', 'pws_on_failover', 'pws_set_pool_size', 'LOGGERH_WRITE_MS', 'LOGGERH_QUEUE_PLATEAU_TOTAL', 'LHM_JSONL_INGESTED_TOTAL', 'LHM_JSONL_DROPPED_TOTAL', 'LHM_JSONL_QUEUE_SIZE', 'LOGGERH_TRADE_QUEUE_SIZE', 'LOGGERH_JSONL_ROTATIONS_TOTAL', 'LOGGERH_LAST_FLUSH_TS_SECONDS', 'LOGGERH_LAST_ROTATION_TS_SECONDS', 'loggerh_observe_write_ms', 'lhm_on_ingested', 'lhm_on_dropped', 'lhm_set_queue_size', 'lhm_on_rotation', 'loggerh_set_last_flush_now', 'loggerh_set_last_rotation_now', 'STORAGE_USAGE_PCT', 'STORAGE_BYTES_FREE', 'STORAGE_ALERTS_TOTAL', 'LOGGERH_JSONL_BYTES', 'LOGGERH_DB_STALLS_TOTAL', 'LOGGERH_DB_FILE_BYTES', 'update_storage_metrics',  'SIM_DECISION_MS', 'SIMULATED_VWAP_DEVIATION_BPS', 'sim_on_run', 'PAYLOAD_REJECTED_TOTAL', 'ObsServer', 'StatusHTTPServer', 'MainMetrics', 'BOT_STARTUPS_TOTAL', 'BOT_STATE', 'start_servers_from_env', 'WS_RECONNECTS_TOTAL', 'RM_DECISION_MS', 'RM_PREFLIGHT_MS', 'RM_DECISIONS_TOTAL', 'RM_SKIPS_TOTAL', 'RM_QUEUE_DEPTH', 'RM_REVALIDATE_MS', 'RM_FRAGMENT_PROFIT_MS', 'PAIR_HEALTH_PENALTY_TOTAL', 'POOL_GATE_THROTTLES_TOTAL', 'RM_FINAL_DECISIONS_TOTAL', 'RM_ADMITTED_TOTAL', 'RM_DROPPED_TOTAL',                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               "VOL_PRICE_VOL_MICRO",
            "VOL_SPREAD_VOL_MICRO",
            "VOL_PRICE_PCTL",
            "VOL_SPREAD_PCTL",
@@ -3213,4 +3643,356 @@ __all__ += [
     'BF_BALANCES_TTL_DEGRADED_SECONDS',
     'BF_BALANCES_TTL_BLOCK_SECONDS',
     'BF_BALANCES_HEALTH_STATE',
+    "ENGINE_ROUTER_PROC_US",
+    "ENGINE_ROUTER_TO_SCANNER_LAT_MS",
+    "SCANNER_DECISION_MS",
+    "SCANNER_EVAL_MS",
+    "RM_DECISION_MS",
+    "LOGGERH_WRITE_MS",
+    "LOGGERH_DB_LANE_DROPS_TOTAL",
+    "LOGGERH_DB_LANE_QUEUE_DEPTH",
+    "SCANNER_REJECTED_TOTAL",
+    "SCANNER_RATE_LIMITED_TOTAL",
+    "ROUTER_QUEUE_DEPTH",
+    "ROUTER_PAIR_QUEUE_DEPTH",
+    "ROUTER_DROPPED_TOTAL",
+    "OPPORTUNITIES_EMITTED_TOTAL",
+    "RM_STATUS_INFO",
+    "RM_QUEUE_DEPTH",
+    "FINAL_DECISIONS_TOTAL",
+    "PACER_DELAY_MS",
+    "PACING_BACKPRESSURE_TOTAL",
+    "MM_PANIC_HEDGE_TOTAL",
+    "QUEUEPOS_BLOCKED_TOTAL",
+    "WS_PUBLIC_FRAME_RECEIVED_TOTAL",
+    "WS_PUBLIC_DROPPED_TOTAL",
+    "WS_PUBLIC_BACKOFF_SECONDS",
+    "WS_PUBLIC_CONN_OPEN_TOTAL",
+    "WS_PUBLIC_STALENESS_SECONDS",
+    "TIME_SKEW_MS",
+    "OBS_INIT_ERRORS_TOTAL",
 ]
+
+# --- Classes et Fonctions de support ---
+class _MetricNoOp:
+    def labels(self, *args, **kwargs): return self
+    def inc(self, *args, **kwargs): pass
+    def set(self, *args, **kwargs): pass
+    def observe(self, *args, **kwargs): pass
+
+def lbl_exchange(ex: str) -> str:
+    return str(ex or "UNKNOWN").upper()
+
+# --- PUBLIC WS: Métriques V2 (Pipeline Standardisé) ---
+WS_PUBLIC_FRAME_RECEIVED_TOTAL = _metric(
+    Counter,
+    "ws_public_frame_received_total",
+    "Nombre total de frames reçues via WS public (V2)",
+    ["exchange", "region", "deployment_mode"]
+)
+
+WS_PUBLIC_DROPPED_TOTAL = _metric(
+    Counter,
+    "ws_public_dropped_total",
+    "Nombre total d'événements jetés (V2)",
+    ["exchange", "region", "deployment_mode", "reason", "kind"]
+)
+
+WS_PUBLIC_BACKOFF_SECONDS = _metric(
+    Counter,
+    "ws_public_backoff_seconds_total",
+    "Temps total passé en backoff (V2)",
+    ["exchange", "region", "deployment_mode", "reason"]
+)
+
+WS_PUBLIC_CONN_OPEN_TOTAL = _metric(
+    Counter,
+    "ws_public_reconnects_total",
+    "Nombre total de reconnexions WS (V2)",
+    ["exchange", "region", "deployment_mode"]
+)
+
+WS_PUBLIC_STALENESS_SECONDS = _metric(
+    Gauge,
+    "ws_public_staleness_seconds",
+    "Temps écoulé depuis le dernier message reçu (s)",
+    ["exchange", "region", "deployment_mode"]
+)
+
+TIME_SKEW_MS = _metric(
+    Gauge,
+    "time_skew_ms",
+    "Décalage d'horloge détecté entre le bot et l'exchange (ms)",
+    ["exchange"]
+)
+
+def ws_public_note_frame_received(exchange: str, region: str, deployment_mode: str):
+    """V2: Note la réception d'une frame brute."""
+    try:
+        if WS_PUBLIC_FRAME_RECEIVED_TOTAL is not None and not isinstance(WS_PUBLIC_FRAME_RECEIVED_TOTAL, _MetricNoOp):
+            WS_PUBLIC_FRAME_RECEIVED_TOTAL.labels(
+                exchange=exchange.upper(), 
+                region=region.upper(), 
+                deployment_mode=deployment_mode.upper()
+            ).inc()
+    except Exception: pass
+
+def ws_public_note_backoff(exchange: str, region: str, deployment_mode: str, reason: str, duration_s: float):
+    """V2: Enregistre une pénalité de backoff."""
+    try:
+        if WS_PUBLIC_BACKOFF_SECONDS is not None and not isinstance(WS_PUBLIC_BACKOFF_SECONDS, _MetricNoOp):
+            WS_PUBLIC_BACKOFF_SECONDS.labels(
+                exchange=exchange.upper(), 
+                region=region.upper(), 
+                deployment_mode=deployment_mode.upper(),
+                reason=str(reason)
+            ).inc(float(duration_s))
+    except Exception: pass
+
+# --- RiskManager: Status et Santé ---
+RM_STATUS_INFO = _metric(
+    Gauge,
+    "rm_status_info",
+    "Statut de santé des composants du RiskManager (1=OK, 0=KO)",
+    ["exchange", "component", "shard"]
+)
+
+RM_QUEUE_DEPTH = _metric(
+    Gauge,
+    "rm_queue_depth",
+    "Nombre d'événements en attente dans le RiskManager",
+    ["exchange"]
+)
+
+FINAL_DECISIONS_TOTAL = _metric(
+    Counter,
+    "final_decisions_total",
+    "Nombre total de décisions finales prises (Autorisées)",
+    ["strategy", "pair"]
+)
+
+def update_rm_status(exchange: str, component: str, status: float, shard: str = "S0"):
+    """Met à jour le statut d'un composant RM pour Prometheus."""
+    try:
+        if RM_STATUS_INFO is not None and not isinstance(RM_STATUS_INFO, _MetricNoOp):
+            RM_STATUS_INFO.labels(
+                exchange=exchange.upper(), 
+                component=component.lower(), 
+                shard=shard.upper()
+            ).set(status)
+    except Exception:
+        pass
+
+# --- Logger: Performance écriture ---
+LOGGERH_WRITE_MS = _metric(
+    Histogram,
+    "loggerh_write_ms",
+    "Temps d'écriture des logs sur disque (ms)",
+    buckets=(0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0)
+)
+
+LOGGERH_DB_LANE_DROPS_TOTAL = _metric(
+    Counter,
+    "loggerh_db_lane_drops_total",
+    "Nombre de logs jetés car la DB lane est saturée",
+    ["stream"]
+)
+
+LOGGERH_DB_LANE_QUEUE_DEPTH = _metric(
+    Gauge,
+    "loggerh_db_lane_queue_depth",
+    "Profondeur de la file d'attente DB Lane",
+    ["stream"]
+)
+
+# --- Scanner: Décisions et évaluations ---
+SCANNER_DECISION_MS = _metric(
+    Histogram,
+    "scanner_decision_ms",
+    "Temps de décision globale du scanner (ms)",
+    buckets=(0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0)
+)
+
+SCANNER_REJECTED_TOTAL = _metric(
+    Counter,
+    "scanner_rejected_total",
+    "Nombre total d'opportunités rejetées par le scanner",
+    ["reason", "route", "pair", "strategy"]
+)
+
+SCANNER_EVAL_MS = _metric(
+    Histogram,
+    "scanner_eval_ms",
+    "Temps d'évaluation par paire/route (ms)",
+    ["pair", "route"],
+    buckets=(0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0)
+)
+
+REBAL_PLAN_BUILD_MS = _metric(
+    Histogram,
+    "rebal_plan_build_ms",
+    "Temps de construction du plan de rebalancing (ms)",
+    buckets=(1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0)
+)
+
+REBAL_OPERATIONS_TOTAL = _metric(
+    Counter,
+    "rebal_operations_total",
+    "Nombre total d'opérations de rebalancing générées",
+    ["type", "exchange", "status"]
+)
+
+REBAL_TRANSFER_LATENCY_MS = _metric(
+    Histogram,
+    "rebal_transfer_latency_ms",
+    "Latence des transferts internes (ms)",
+    ["exchange", "type"],
+    buckets=(10, 50, 100, 250, 500, 1000, 2500, 5000, 10000),
+)
+
+REBAL_TRANSFER_RL_WAIT_MS = _metric(
+    Histogram,
+    "rebal_transfer_rl_wait_ms",
+    "Temps d'attente rate-limit transferts (ms)",
+    ["exchange"],
+    buckets=(1, 5, 10, 50, 100, 500, 1000, 5000),
+)
+
+REBAL_SNAPSHOTS_AGE_S = _metric(
+    Gauge,
+    "rebal_snapshots_age_s",
+    "Âge des snapshots utilisés par le rebalancing",
+    ["kind"]
+)
+
+REBAL_IMBALANCE_GAUGE = _metric(
+    Gauge,
+    "rebal_imbalance_gauge",
+    "Déséquilibre détecté par actif et exchange (valeur quote)",
+    ["exchange", "asset"]
+)
+
+REBAL_LOCK_CONFLICT_TOTAL = _metric(
+    Counter,
+    'rebal_lock_conflict_total',
+    'Nombre de fois où une opération REB est bloquée par un verrou actif',
+    ['pair', 'route']
+)
+
+REBAL_SUCCESS_TOTAL = _metric(
+    Counter,
+    'rebal_success_total',
+    'Nombre total de rebalancements réussis',
+    ['branch', 'pair']
+)
+
+REBAL_ABORT_TOTAL = _metric(
+    Counter,
+    'rebal_abort_total',
+    'Nombre total de rebalancements interrompus',
+    ['branch', 'pair', 'reason']
+)
+
+SCANNER_RATE_LIMITED_TOTAL = _metric(
+    Counter,
+    "scanner_rate_limited_total",
+    "Nombre d'événements rejetés par le rate limiter",
+    ["kind"]
+)
+
+# --- Observabilité: Erreurs d'initialisation ---
+OBS_INIT_ERRORS_TOTAL = _metric(
+    Counter,
+    "obs_init_errors_total",
+    "Nombre d'erreurs lors de l'initialisation de l'observabilité",
+    ["module"]
+)
+
+OPPORTUNITIES_EMITTED_TOTAL = _metric(
+    Counter,
+    "opportunities_emitted_total",
+    "Nombre total d'opportunités envoyées à l'Engine",
+    ["strategy", "pair"]
+)
+
+RM_DECISION_MS = _metric(
+    Histogram,
+    "rm_decision_ms",
+    "Temps de décision du RiskManager par cohorte (ms)",
+    ["cohort"],
+    buckets=(0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0)
+)
+
+# --- Engine: Latence d'exécution (Tick-to-Trade) ---
+ENGINE_EXECUTION_LATENCY_MS = _metric(
+    Histogram,
+    "engine_execution_latency_ms",
+    "Latence entre réception opportunité et envoi de l'ordre (ms)",
+    ["exchange", "strategy", "pair"],
+    buckets=(0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0)
+)
+
+PACER_DELAY_MS = _metric(
+    Gauge,
+    "pacer_delay_ms",
+    "Délai imposé par l'EnginePacer (ms)",
+    ["exchange"]
+)
+
+PACING_BACKPRESSURE_TOTAL = _metric(
+    Counter,
+    "pacing_backpressure_total",
+    "Nombre d'opportunités bloquées par le pacing",
+    ["exchange", "strategy"]
+)
+
+MM_PANIC_HEDGE_TOTAL = _metric(
+    Counter,
+    "mm_panic_hedge_total",
+    "Nombre de panic hedges déclenchés (MM)",
+    ["exchange", "reason"]
+)
+
+QUEUEPOS_BLOCKED_TOTAL = _metric(
+    Counter,
+    "queuepos_blocked_total",
+    "Nombre d'ordres bloqués par QueuePosition",
+    ["exchange", "pair"]
+)
+
+ENGINE_ROUTER_PROC_US = _metric(
+    Histogram,
+    "engine_router_proc_us",
+    "Temps de traitement interne du Router (μs)",
+    ["exchange"],
+    buckets=(1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 250.0, 500.0, 1000.0)
+)
+
+ENGINE_ROUTER_TO_SCANNER_LAT_MS = _metric(
+    Histogram,
+    "engine_router_to_scanner_lat_ms",
+    "Temps de transfert Router -> Scanner (ms)",
+    buckets=(0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 50.0)
+)
+
+def record_execution_latency(exchange: str, strategy: str, pair: str, latency_ms: float):
+    """Enregistre la latence d'exécution (simulée ou réelle) dans Prometheus."""
+    try:
+        m = ENGINE_EXECUTION_LATENCY_MS
+        if m is not None and not isinstance(m, _MetricNoOp):
+            m.labels(
+                exchange=lbl_exchange(exchange), 
+                strategy=strategy.upper(), 
+                pair=pair.upper()
+            ).observe(max(0.0, float(latency_ms)))
+    except Exception:
+        pass
+
+def record_router_proc_time(exchange: str, proc_time_us: float):
+    """Enregistre le temps de traitement du Router."""
+    try:
+        m = ENGINE_ROUTER_PROC_US
+        if m is not None and not isinstance(m, _MetricNoOp):
+            m.labels(exchange=lbl_exchange(exchange)).observe(max(0.0, float(proc_time_us)))
+    except Exception:
+        pass

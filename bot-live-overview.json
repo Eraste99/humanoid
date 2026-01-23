@@ -6,7 +6,7 @@
   "editable": true,
   "style": "dark",
   "tags": ["bot", "live", "slo"],
-  "refresh": "10s",
+  "refresh": "15s",
   "time": { "from": "now-6h", "to": "now" },
   "fiscalYearStartMonth": 1,
   "graphTooltip": 1,
@@ -104,7 +104,7 @@
       "collapsed": false,
       "panels": []
     },
-    {
+        {
       "type": "timeseries",
       "title": "RM Decisions / sec",
       "id": 7,
@@ -116,21 +116,35 @@
           "refId": "A"
         }
       ],
-      "gridPos": { "x": 0, "y": 6, "w": 8, "h": 4 }
+      "gridPos": { "x": 0, "y": 6, "w": 6, "h": 4 }
     },
     {
       "type": "timeseries",
-      "title": "RM Rejects / sec",
+      "title": "RM Rejects / sec (top reasons)",
       "id": 8,
       "datasource": "$datasource",
       "targets": [
         {
-          "expr": "sum by (reason) (rate(rm_reject_total{job=\"$job\"}[$__rate_interval]))",
+          "expr": "topk(8, sum by (reason) (rate(rm_reject_total{job=\"$job\"}[$__rate_interval])))",
           "legendFormat": "{{reason}}",
           "refId": "A"
         }
       ],
-      "gridPos": { "x": 8, "y": 6, "w": 8, "h": 4 }
+      "gridPos": { "x": 6, "y": 6, "w": 6, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "RM Skips / sec (top reasons)",
+      "id": 81,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "topk(8, sum by (reason) (rate(rm_skips_total{job=\"$job\"}[$__rate_interval])))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 6, "w": 6, "h": 4 }
     },
     {
       "type": "timeseries",
@@ -149,8 +163,9 @@
           "refId": "B"
         }
       ],
-      "gridPos": { "x": 16, "y": 6, "w": 8, "h": 4 }
+      "gridPos": { "x": 18, "y": 6, "w": 6, "h": 4 }
     },
+
     {
       "type": "timeseries",
       "title": "Router→Scanner p95 (ms)",

@@ -24,7 +24,6 @@ import math
 import time
 import asyncio
 import numpy as np
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
 
 logger = logging.getLogger("VolatilityMonitor")
 # Observabilité (fallback no-op si obs_metrics absent)
@@ -116,14 +115,57 @@ class VolatilityMonitor:
         self._missing_slo_warned: set[tuple[str, str]] = set()
         self._slo_resolution_warned = False
 
-        self._ttl_s = getattr_int(v, "ttl_s", 5)
-        self._ema_alpha = getattr_float(v, "ema_alpha", 0.20)
-        self._soft_cap_bps = getattr_float(v, "soft_cap_bps", 80.0)
-        self._chaos_cap_bps = getattr_float(v, "chaos_cap_bps", 150.0)
-        self._hysteresis = getattr_float(v, "hysteresis", 0.25)
-        self._vol_min_delta_bps = getattr_float(v, "vol_min_delta_bps", 0.5)
-        self._max_silence_s = getattr_float(v, "max_silence_s", 2.0)
+        self._ttl_s = int(getattr(v, "ttl_s", 5))
+        self._ema_alpha = float(getattr(v, "ema_alpha", 0.20))
+        self._soft_cap_bps = float(getattr(v, "soft_cap_bps", 80.0))
+        self._chaos_cap_bps = float(getattr(v, "chaos_cap_bps", 150.0))
+        self._hysteresis = float(getattr(v, "hysteresis", 0.25))
+        self._vol_min_delta_bps = float(getattr(v, "vol_min_delta_bps", 0.5))
+        self._max_silence_s = float(getattr(v, "max_silence_s", 2.0))
         self._last_forward: Dict[Tuple[str, str], Dict[str, float]] = {}
+        # --- Cross-exchange divergence (corr + dislocation) --------------------
+        # Par défaut: OFF (zéro impact perf/comportement).
+        self._xex_dislocation_enabled = bool(getattr(v, "xex_dislocation_enabled", False))
+        self._xex_corr_enabled = bool(getattr(v, "xex_corr_enabled", False))
+        self._xex_prudence_enabled = bool(getattr(v, "xex_prudence_enabled", False))
+
+        # Routes autorisées (source "mécanique" déjà dans cfg.g.allowed_routes)
+        g = getattr(self.cfg, "g", None)
+        routes = list(getattr(g, "allowed_routes", [])) if g else []
+        neighbors: Dict[str, set[str]] = {}
+        undirected: set[tuple[str, str]] = set()
+        for r in routes:
+            try:
+                a, b = r
+                a = _norm_ex(a); b = _norm_ex(b)
+                if a and b and a != b:
+                    undirected.add(tuple(sorted((a, b))))
+                    neighbors.setdefault(a, set()).add(b)
+                    neighbors.setdefault(b, set()).add(a)
+            except Exception:
+                continue
+        self._xex_routes = undirected
+        self._xex_neighbors = neighbors
+
+        # TTL/cadence/paramètres corr
+        self._xex_ttl_s = float(getattr(v, "xex_ttl_s", float(self._ttl_s)))
+        self._xex_step_ms = int(getattr(v, "xex_step_ms", 200))  # resample grid (ms)
+        self._xex_min_points = int(getattr(v, "xex_min_points", 60))  # min nb returns
+        self._xex_compute_min_interval_s = float(getattr(v, "xex_compute_min_interval_s", 0.35))
+        self._xex_corr_gate_vol_bps = float(getattr(v, "xex_corr_gate_vol_bps", float(self._soft_cap_bps)))
+
+        # Par défaut: corr calculée seulement si liste explicitement fournie (sinon 0 CPU).
+        self._xex_corr_pairs = set(_norm_pair(p) for p in list(getattr(v, "xex_corr_pairs", [])))
+
+        # Seuils divergence (defaults overridables)
+        self._xex_corr_warn = float(getattr(v, "xex_corr_warn", 0.97))
+        self._xex_corr_crit = float(getattr(v, "xex_corr_crit", 0.92))
+        self._xex_disloc_warn_bps = float(getattr(v, "xex_disloc_warn_bps", 6.0))
+        self._xex_disloc_crit_bps = float(getattr(v, "xex_disloc_crit_bps", 12.0))
+
+        # Cache: (pair, ex1, ex2) -> dict(disloc_bps, corr, ts_disloc_s, ts_corr_s, ...)
+        self._xex_cache: Dict[tuple[str, str, str], Dict[str, float]] = {}
+
 
         try:
             note_vol_ttl_seconds(self._ttl_s)
@@ -133,8 +175,8 @@ class VolatilityMonitor:
         # --- Fenêtres: si l'appelant garde les defaults (60 / 2), on prend cfg.vol.window_*_m s'ils existent
         _DEF_LONG = 60
         _DEF_MICR = 2
-        w_long_m  = getattr_int(v, "window_long_m", window_long_minutes if window_long_minutes != _DEF_LONG else _DEF_LONG)
-        w_micro_m = getattr_int(v, "window_micro_m", window_micro_minutes if window_micro_minutes != _DEF_MICR else _DEF_MICR)
+        w_long_m  = int(getattr(v, "window_long_m", window_long_minutes if window_long_minutes != _DEF_LONG else _DEF_LONG))
+        w_micro_m = int(getattr(v, "window_micro_m", window_micro_minutes if window_micro_minutes != _DEF_MICR else _DEF_MICR))
         # si l'appelant a laissé les defaults et que cfg fournit une valeur, on l'utilise
         if window_long_minutes == _DEF_LONG and hasattr(v, "window_long_m"):
             w_long_m = int(v.window_long_m)
@@ -169,6 +211,9 @@ class VolatilityMonitor:
         self.spread_history: Dict[Tuple[str, str], deque] = defaultdict(_hist_deque)
         self.historical_price_vols: Dict[Tuple[str, str], deque] = defaultdict(_hist_deque)
         self.historical_spread_vols: Dict[Tuple[str, str], deque] = defaultdict(_hist_deque)
+
+        # Optimisation P0: Index pour éviter le scan global O(N_pairs)
+        self._pair_to_keys: Dict[str, set[Tuple[str, str]]] = defaultdict(set)
 
         # --- Seuils init & statut signal
         self.signal_status: Dict[str, str] = defaultdict(lambda: "normal")
@@ -266,11 +311,15 @@ class VolatilityMonitor:
             ts = None
         timestamp = datetime.utcfromtimestamp(ts) if ts else datetime.utcnow()
         self.last_update = timestamp
+        self._last_calc_ms = getattr(self, "_last_calc_ms", {})
 
         mid = (bid + ask) / 2.0
         spread = ask - bid
 
         key = (exchange, pair)
+        if key not in self.price_history:
+            self._pair_to_keys[pair].add(key)
+        
         self.price_history[key].append((timestamp, mid))
         self.spread_history[key].append((timestamp, spread))
 
@@ -278,12 +327,22 @@ class VolatilityMonitor:
         self._evaluate_prudence(pair, exchange=exchange, now=timestamp)
 
         self.update_count += 1
+        
+        # P1: Throttle des calculs de volatilité micro (HFT Optimization)
+        # On ne recalcule la vol micro que toutes les 200ms par paire pour économiser du CPU.
+        now_ms = int(time.time() * 1000)
+        calc_key = (exchange, pair, "micro")
+        if now_ms - self._last_calc_ms.get(calc_key, 0) < 200:
+            return
+
+        self._last_calc_ms[calc_key] = now_ms
+
         try:
             # Observe les valeurs micro courantes (post _evaluate_prudence qui remplit l'historique)
             now_dt = timestamp
             pair_norm = pair
-            pv = self.get_price_volatility(pair_norm, window="micro", now=now_dt)
-            sv = self.get_spread_volatility(pair_norm, window="micro", now=now_dt)
+            pv = self.get_price_volatility(pair_norm, window="micro", now=now_dt, exchange=exchange)
+            sv = self.get_spread_volatility(pair_norm, window="micro", now=now_dt, exchange=exchange)
             VOL_PRICE_VOL_MICRO.labels(pair=pair_norm).observe(float(pv))
             VOL_SPREAD_VOL_MICRO.labels(pair=pair_norm).observe(float(sv))
         except Exception:
@@ -291,23 +350,39 @@ class VolatilityMonitor:
 
     # ---- Maintenance fenêtres ----
     def _cleanup_old_data(self, exchange: str, pair: str, now: datetime) -> None:
-        key = (_norm_ex(exchange), _norm_pair(pair))
+        ex_norm = _norm_ex(exchange)
+        pk_norm = _norm_pair(pair)
+        key = (ex_norm, pk_norm)
+        
         dq = self.price_history.get(key)
         if dq is not None:
             while dq and now - dq[0][0] > self.window_long:
                 dq.popleft()
+            if not dq:
+                self.price_history.pop(key, None)
+                if pk_norm in self._pair_to_keys:
+                    self._pair_to_keys[pk_norm].discard(key)
+        
         dq = self.spread_history.get(key)
         if dq is not None:
             while dq and now - dq[0][0] > self.window_long:
                 dq.popleft()
+            if not dq:
+                self.spread_history.pop(key, None)
+
         dq = self.historical_price_vols.get(key)
         if dq is not None:
             while dq and now - dq[0][0] > self.historical_window:
                 dq.popleft()
+            if not dq:
+                self.historical_price_vols.pop(key, None)
+
         dq = self.historical_spread_vols.get(key)
         if dq is not None:
             while dq and now - dq[0][0] > self.historical_window:
                 dq.popleft()
+            if not dq:
+                self.historical_spread_vols.pop(key, None)
 
     # ---- Utils vol ----
     def _clean_values(self, values: List[float]) -> np.ndarray:
@@ -343,7 +418,10 @@ class VolatilityMonitor:
             key = (_norm_ex(exchange), pk)
             dq = store.get(key)
             return [dq] if dq else []
-        return [dq for (ex_key, pk_key), dq in store.items() if pk_key == pk]
+        
+        # Optimisation P0: Utilise l'index au lieu de store.items()
+        keys = self._pair_to_keys.get(pk, set())
+        return [store[k] for k in keys if k in store]
 
     def _window_values(self, series_collection, duration: timedelta, now: Optional[datetime] = None) -> List[float]:
         now = now or datetime.utcnow()
@@ -351,9 +429,16 @@ class VolatilityMonitor:
             collections = [series_collection]
         else:
             collections = [dq for dq in (series_collection or []) if dq]
+        
         values: List[float] = []
         for series in collections:
-            values.extend(val for (t, val) in series if now - t <= duration)
+            # Optimisation P0: Parcours inverse car les deques sont chronologiques.
+            # On s'arrête dès qu'on sort de la fenêtre.
+            for t, val in reversed(series):
+                if now - t <= duration:
+                    values.append(val)
+                else:
+                    break
         return values
 
     def _strict_config(self) -> bool:
@@ -521,6 +606,13 @@ class VolatilityMonitor:
         price_vol_micro = self.get_price_volatility(pair, window="micro", now=now, exchange=exchange)
         spread_vol_micro = self.get_spread_volatility(pair, window="micro", now=now, exchange=exchange)
         vol_bps = self._to_bps(max(price_vol_micro, spread_vol_micro))
+        # ---- Cross-exchange divergence (optional) ----
+        if exchange and self._xex_any_enabled():
+            try:
+                self._xex_update_for_exchange(exchange=str(exchange), pair=pair, now=now, vol_bps=float(vol_bps))
+            except Exception:
+                logger.debug("[VolatilityMonitor] xex_update failed", exc_info=False)
+
         age_s = self.last_age_seconds(exchange or "", pair) if exchange else None
 
 
@@ -577,6 +669,17 @@ class VolatilityMonitor:
         else:
             new_state = "normal"
         self.signal_status[pair] = new_state
+
+        # ---- Cross-exchange prudence overlay (optional, only up-clamp) ----
+        if exchange and getattr(self, "_xex_prudence_enabled", False):
+            try:
+                ov = self._xex_prudence_overlay(exchange=str(exchange), pair=pair)
+                if ov == "élevé":
+                    new_state = "élevé"
+                elif ov == "modéré" and new_state == "normal":
+                    new_state = "modéré"
+            except Exception:
+                logger.debug("[VolatilityMonitor] xex_overlay failed", exc_info=False)
 
         try:
             VOL_SIGNAL_STATE.labels(pair=pair).set({"normal": 0, "modéré": 1, "élevé": 2}[new_state])
@@ -675,6 +778,243 @@ class VolatilityMonitor:
 
     async def stop_monitoring(self) -> None:
         await self.stop()
+    def _xex_any_enabled(self) -> bool:
+        return bool(
+            getattr(self, "_xex_dislocation_enabled", False)
+            or getattr(self, "_xex_corr_enabled", False)
+            or getattr(self, "_xex_prudence_enabled", False)
+        )
+
+    def _xex_key(self, pair: str, ex_a: str, ex_b: str) -> tuple[str, str, str]:
+        pk = _norm_pair(pair)
+        a = _norm_ex(ex_a); b = _norm_ex(ex_b)
+        x, y = (a, b) if a <= b else (b, a)
+        return (pk, x, y)
+
+    def _xex_latest_mid(self, exchange: str, pair: str) -> tuple[Optional[float], Optional[datetime]]:
+        key = (_norm_ex(exchange), _norm_pair(pair))
+        dq = self.price_history.get(key)
+        if not dq:
+            return None, None
+        try:
+            t, mid = dq[-1]
+            return float(mid), t
+        except Exception:
+            return None, None
+
+    def _xex_series_window(self, exchange: str, pair: str, now: datetime, duration: timedelta) -> List[tuple[datetime, float]]:
+        key = (_norm_ex(exchange), _norm_pair(pair))
+        dq = self.price_history.get(key)
+        if not dq:
+            return []
+        cutoff = now - duration
+        out: List[tuple[datetime, float]] = []
+        # iterate from newest backwards, stop once outside window
+        for t, v in reversed(dq):
+            if t < cutoff:
+                break
+            try:
+                out.append((t, float(v)))
+            except Exception:
+                continue
+        out.reverse()
+        return out
+
+    def _xex_dislocation_bps(self, mid_a: float, mid_b: float) -> float:
+        denom = (mid_a + mid_b) / 2.0
+        if denom <= 0:
+            return 0.0
+        return abs(mid_a - mid_b) / denom * 1e4
+
+    def _xex_resample_ffill(self, series: List[tuple[datetime, float]], start: datetime, end: datetime, step_s: float) -> np.ndarray:
+        if not series or step_s <= 0:
+            return np.array([], dtype=float)
+        # series is sorted by time
+        i = 0
+        last = None
+        n = int(max(0.0, (end - start).total_seconds()) / step_s) + 1
+        out = np.empty(n, dtype=float)
+        out.fill(np.nan)
+
+        # advance pointer up to start
+        while i < len(series) and series[i][0] <= start:
+            last = series[i][1]
+            i += 1
+
+        t = start
+        for k in range(n):
+            while i < len(series) and series[i][0] <= t:
+                last = series[i][1]
+                i += 1
+            if last is not None:
+                out[k] = float(last)
+            t = t + timedelta(seconds=step_s)
+        return out
+
+    def _xex_corr_log_returns(self, ex_a: str, ex_b: str, pair: str, now: datetime) -> Optional[float]:
+        # garde-fou: corr activée seulement si whitelist explicitement fournie
+        if not getattr(self, "_xex_corr_pairs", set()):
+            return None
+        if _norm_pair(pair) not in self._xex_corr_pairs:
+            return None
+
+        step_s = max(0.05, float(getattr(self, "_xex_step_ms", 200)) / 1000.0)
+        a = self._xex_series_window(ex_a, pair, now, self.window_micro)
+        b = self._xex_series_window(ex_b, pair, now, self.window_micro)
+        if len(a) < 5 or len(b) < 5:
+            return None
+
+        start = now - self.window_micro
+        start = max(start, a[0][0], b[0][0])
+        end = now
+        pa = self._xex_resample_ffill(a, start, end, step_s)
+        pb = self._xex_resample_ffill(b, start, end, step_s)
+        if pa.size < 10 or pb.size < 10:
+            return None
+
+        mask = np.isfinite(pa) & np.isfinite(pb) & (pa > 0) & (pb > 0)
+        pa = pa[mask]
+        pb = pb[mask]
+        if pa.size < 10 or pb.size < 10:
+            return None
+
+        ra = np.diff(np.log(pa))
+        rb = np.diff(np.log(pb))
+        min_pts = int(getattr(self, "_xex_min_points", 60))
+        if ra.size < min_pts or rb.size < min_pts:
+            return None
+
+        sa = float(np.std(ra))
+        sb = float(np.std(rb))
+        if sa < 1e-12 or sb < 1e-12:
+            # marché plat / quasi-plat : corr "neutre"
+            return 1.0
+
+        c = float(np.corrcoef(ra, rb)[0, 1])
+        if not math.isfinite(c):
+            return None
+        return max(-1.0, min(1.0, c))
+
+    def _xex_update_for_exchange(self, *, exchange: str, pair: str, now: datetime, vol_bps: float) -> None:
+        if not self._xex_any_enabled():
+            return
+        ex = _norm_ex(exchange)
+        pk = _norm_pair(pair)
+        others = list(getattr(self, "_xex_neighbors", {}).get(ex, set()))
+        if not others:
+            return
+
+        now_s = time.time()
+        ttl = float(getattr(self, "_xex_ttl_s", float(self._ttl_s)))
+        compute_iv = float(getattr(self, "_xex_compute_min_interval_s", 0.35))
+
+        for other in others:
+            if not other or other == ex:
+                continue
+            k = self._xex_key(pk, ex, other)
+            rec = self._xex_cache.get(k, {})
+
+            # --- DISLOCATION (cheap) ---
+            if getattr(self, "_xex_dislocation_enabled", False) or getattr(self, "_xex_prudence_enabled", False):
+                mid_a, ta = self._xex_latest_mid(ex, pk)
+                mid_b, tb = self._xex_latest_mid(other, pk)
+                if mid_a is not None and mid_b is not None and ta is not None and tb is not None:
+                    # refuse stale points
+                    if (now - ta).total_seconds() <= ttl and (now - tb).total_seconds() <= ttl:
+                        rec["disloc_bps"] = float(self._xex_dislocation_bps(mid_a, mid_b))
+                        rec["ts_disloc_s"] = float(now_s)
+                        rec["mid_a"] = float(mid_a)
+                        rec["mid_b"] = float(mid_b)
+                        self._xex_cache[k] = rec
+
+            # --- CORRELATION (heavier) ---
+            if not getattr(self, "_xex_corr_enabled", False):
+                continue
+            # gate: ne calcule la corr que si vol_bps >= gate (typiquement soft_cap)
+            gate = float(getattr(self, "_xex_corr_gate_vol_bps", float(self._soft_cap_bps)))
+            if float(vol_bps) < gate:
+                continue
+            last_corr_s = float(rec.get("ts_corr_s", 0.0) or 0.0)
+            if (now_s - last_corr_s) < compute_iv:
+                continue
+
+            corr = self._xex_corr_log_returns(ex, other, pk, now)
+            if corr is not None:
+                rec["corr"] = float(corr)
+                rec["ts_corr_s"] = float(now_s)
+                self._xex_cache[k] = rec
+
+    def _xex_prudence_overlay(self, *, exchange: str, pair: str) -> Optional[str]:
+        if not getattr(self, "_xex_prudence_enabled", False):
+            return None
+        ex = _norm_ex(exchange)
+        pk = _norm_pair(pair)
+        others = list(getattr(self, "_xex_neighbors", {}).get(ex, set()))
+        if not others:
+            return None
+
+        now_s = time.time()
+        ttl = float(getattr(self, "_xex_ttl_s", float(self._ttl_s)))
+
+        worst_disloc = None
+        worst_corr = None  # min corr
+
+        for other in others:
+            k = self._xex_key(pk, ex, other)
+            rec = self._xex_cache.get(k)
+            if not rec:
+                continue
+
+            # disloc
+            td = float(rec.get("ts_disloc_s", 0.0) or 0.0)
+            if td > 0.0 and (now_s - td) <= ttl:
+                d = float(rec.get("disloc_bps", 0.0) or 0.0)
+                worst_disloc = d if worst_disloc is None else max(worst_disloc, d)
+
+            # corr
+            tc = float(rec.get("ts_corr_s", 0.0) or 0.0)
+            if tc > 0.0 and (now_s - tc) <= ttl:
+                c = rec.get("corr", None)
+                if c is not None:
+                    c = float(c)
+                    worst_corr = c if worst_corr is None else min(worst_corr, c)
+
+        if worst_disloc is None and worst_corr is None:
+            return None
+
+        dis_w = float(getattr(self, "_xex_disloc_warn_bps", 6.0))
+        dis_c = float(getattr(self, "_xex_disloc_crit_bps", 12.0))
+        cor_w = float(getattr(self, "_xex_corr_warn", 0.97))
+        cor_c = float(getattr(self, "_xex_corr_crit", 0.92))
+
+        if (worst_disloc is not None and worst_disloc >= dis_c) or (worst_corr is not None and worst_corr <= cor_c):
+            return "élevé"
+        if (worst_disloc is not None and worst_disloc >= dis_w) or (worst_corr is not None and worst_corr <= cor_w):
+            return "modéré"
+        return None
+
+    def get_xex_metrics(self, ex_a: str, ex_b: str, pair: str, ttl_s: Optional[float] = None) -> Optional[Dict[str, float]]:
+        """Getter optionnel (non requis par RM) — utile si tu veux consommer ailleurs."""
+        pk, x, y = self._xex_key(pair, ex_a, ex_b)
+        rec = self._xex_cache.get((pk, x, y))
+        if not rec:
+            return None
+        now_s = time.time()
+        ttl = float(ttl_s) if ttl_s is not None else float(getattr(self, "_xex_ttl_s", float(self._ttl_s)))
+
+        out: Dict[str, float] = {}
+        td = float(rec.get("ts_disloc_s", 0.0) or 0.0)
+        if td > 0 and (now_s - td) <= ttl and "disloc_bps" in rec:
+            out["disloc_bps"] = float(rec["disloc_bps"])
+            out["disloc_age_s"] = float(now_s - td)
+
+        tc = float(rec.get("ts_corr_s", 0.0) or 0.0)
+        if tc > 0 and (now_s - tc) <= ttl and "corr" in rec:
+            out["corr"] = float(rec["corr"])
+            out["corr_age_s"] = float(now_s - tc)
+
+        return out or None
+
     # ----------------------- BUS (per‑CEX vol) -----------------------
     # volatility_monitor.py
     def set_bps_mapping(self, *, midprice_to_bps: float = 1e4, floor_bps: float = 0.0, cap_bps: float = 250.0) -> None:
@@ -827,12 +1167,47 @@ class VolatilityMonitor:
         """Démarre un consumer par CEX pour le bus 'vol'."""
 
         async def _consume(ex: str, q: asyncio.Queue):
+            """Consumer 'vol' par CEX.
+
+            P0: si le consumer ralentit (ou si `on_vol()` devient coûteux), la queue peut
+            monter au HIGH_WM_RATIO côté Router et provoquer des drops.
+
+            Stratégie : en présence de backlog, on draine rapidement la queue et on ne garde
+            que le dernier message par paire (coalescing), puis on traite le batch.
+            """
+            MAX_DRAIN = 256  # borné pour préserver la latence event-loop
+
+            def _pk(m: dict) -> str:
+                try:
+                    return str(m.get("pair_key") or m.get("pair") or "UNKNOWN").upper()
+                except Exception:
+                    return "UNKNOWN"
+
             while True:
                 msg = await q.get()
                 try:
-                    self.on_vol(msg)
-                except Exception:
-                    logging.exception("Unhandled exception in vol consumer")
+                    batch: dict[str, dict] = {_pk(msg): msg}
+
+                    drained = 0
+                    while drained < MAX_DRAIN and not q.empty():
+                        try:
+                            m2 = q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        drained += 1
+                        try:
+                            batch[_pk(m2)] = m2
+                        finally:
+                            try:
+                                q.task_done()
+                            except Exception:
+                                pass
+
+                    for m in batch.values():
+                        try:
+                            self.on_vol(m)
+                        except Exception:
+                            logging.exception("Unhandled exception in vol consumer")
                 finally:
                     try:
                         q.task_done()

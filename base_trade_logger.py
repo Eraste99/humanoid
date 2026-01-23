@@ -64,6 +64,8 @@ class _NoopMetricsProxy:
     def on_btl_flush_latency(self, *a, **k): pass
     def on_btl_emitted(self, *a, **k): pass
     def on_btl_filter_exception(self, *a, **k): pass
+    def on_btl_emit_error(self, *a, **k): pass
+    def on_btl_emit_success(self, *a, **k): pass
 
 logger = logging.getLogger("BaseTradeLogger")
 
@@ -290,9 +292,11 @@ class BaseTradeLogger:
             # Hook métrique (centralisé côté LHM)
             self._emit_metric("on_btl_flush_latency", self.log_type, ms=dur_ms)
             self._emit_metric("on_btl_emitted", self.log_type, n=len(batch))
+            self._emit_metric("on_btl_emit_success", self.log_type)
             return True
-        except Exception:
+        except Exception as e:
             logging.getLogger("BaseTradeLogger").exception("emit failed")
+            self._emit_metric("on_btl_emit_error", self.log_type, error=str(e))
             return False
 
     def _emit_remaining(self) -> bool:

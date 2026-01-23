@@ -18,6 +18,7 @@ Séquence :
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
 from collections import deque
 import time
@@ -27,7 +28,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 
-from logger import logger
+# from logger import logger  # Supprimé (module introuvable)
+import logging
+logger = logging.getLogger("Boot")
 
 from modules.dynamic_execution_simulator import DynamicExecutionSimulator
 from modules.risk_manager.risk_manager import RiskManager
@@ -40,6 +43,7 @@ from modules.volatility_monitor import VolatilityMonitor
 from modules.opportunity_scanner import OpportunityScanner
 from modules.private_ws_hub import PrivateWSHub
 from modules.private_ws_reconciler import PrivateWSReconciler
+from modules.engine_pacer import EnginePacer
 from modules.execution_engine import ExecutionEngine
 from modules.rpc_gateway import RPCServer, make_submitter_for_exchange
 from modules.balance_fetcher import MultiBalanceFetcher
@@ -62,6 +66,35 @@ except Exception:  # pragma: no cover
     BotConfig = Any  # fallback typing only
 
 LOGGER = logging.getLogger("Boot")
+
+def configure_logging(cfg: Any = None) -> None:
+    """
+    Configuration centralisée du logging pour tout le bot.
+    P0: Évite les appels basicConfig multiples qui polluent le hot path.
+    """
+    # Évite de reconfigurer si des handlers sont déjà présents (sauf si forcé)
+    if logging.getLogger().handlers:
+        return
+
+    level = "INFO"
+    log_format = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+    if cfg is not None:
+        try:
+            # Recherche du niveau dans obs.log_level ou g.log_level
+            obs = getattr(cfg, "obs", None)
+            level = getattr(obs, "log_level", level) if obs else level
+            if not level:
+                g = getattr(cfg, "g", None)
+                level = getattr(g, "log_level", "INFO") if g else "INFO"
+        except Exception:
+            level = "INFO"
+
+    logging.basicConfig(
+        level=str(level or "INFO").upper(),
+        format=log_format,
+    )
+    logging.getLogger("Boot").info("[Boot] Logging configuré (level=%s)", level)
 
 class _ObsNoopMetric:
     def labels(self, **_kwargs: Any) -> "_ObsNoopMetric":
@@ -145,6 +178,13 @@ class _LazyScannerProxy:
         self._log = log
         boot_cfg = getattr(cfg, "boot", None)
         mode = str(getattr(boot_cfg, "scanner_proxy_mode", "REJECT") or "REJECT").upper()
+        
+        # P0: Forcer REJECT en PROD si pas explicitement configuré autrement avec précaution.
+        is_prod = str(getattr(cfg, "MODE", "")).upper() == "PROD"
+        if is_prod and mode == "BUFFER":
+            log.info("[Boot] P0: Overriding scanner_proxy_mode to REJECT for PROD safety (avoiding stale backlog)")
+            mode = "REJECT"
+
         if mode not in {"STRICT_ORDER", "BUFFER", "REJECT"}:
             mode = "REJECT"
         self._mode = mode
@@ -213,6 +253,7 @@ class _LazyScannerProxy:
 # --------------------------------- Boot ------------------------------------
 class Boot:
     def __init__(self, cfg: BotConfig, *, logger: Optional[logging.Logger] = None) -> None:
+        configure_logging(cfg)
         self.cfg = cfg
         self.log = logger or LOGGER
         self.ctx = BootContext(cfg=cfg)
@@ -295,8 +336,30 @@ class Boot:
             self._mark_degraded("BOOT_DEP_MISSING", where="rate_limiter")
         if getattr(self.ctx, "retry_policy", None) is None:
             self._mark_degraded("BOOT_DEP_MISSING", where="retry_policy")
-        pacer = self._resolve_pacer_cfg()
-        if pacer is None:
+        pacer_cfg = self._resolve_pacer_cfg()
+        if pacer_cfg is not None and getattr(self.ctx, "pacer", None) is None:
+            try:
+                # On extrait la region_map AVANT l'instanciation pour la passer au constructeur
+                region_map = None
+                if hasattr(self.cfg, "exchange_region_map") and self.cfg.exchange_region_map:
+                    region_map = self.cfg.exchange_region_map
+                elif hasattr(self.cfg, "g") and hasattr(self.cfg.g, "exchange_region_map") and self.cfg.g.exchange_region_map:
+                    region_map = self.cfg.g.exchange_region_map
+
+                # Instanciation explicite du pacer si présent en config mais pas encore en contexte
+                # (résout BOOT_DEP_MISSING:pacer)
+                self.ctx.pacer = EnginePacer(
+                    region=self._canonical_deployment_mode(),
+                    capital_profile=self.cfg.g.capital_profile or "NANO",
+                    bot_cfg=self.cfg,
+                    region_map=region_map
+                )
+
+            except Exception:
+                self.log.exception("[Boot] EnginePacer instantiation failed")
+                self.ctx.pacer = None
+
+        if pacer_cfg is None and getattr(self.ctx, "pacer", None) is None:
             self._mark_degraded("BOOT_DEP_MISSING", where="pacer")
 
     def _get_obs_inc_callback(self) -> Optional[Any]:
@@ -388,16 +451,25 @@ class Boot:
     def _resolve_pacer_cfg(self) -> Any:
         pacer_cfg = getattr(self.cfg, "pacer", None)
         compat_cfg = getattr(self.cfg, "engine_pacer", None)
+        engine_cfg = getattr(self.cfg, "engine", None)
+
+        # On cherche d'abord dans cfg.pacer (nouveau format), puis engine.pacer (BotConfig), puis compat
+        res = pacer_cfg
+        if res is None and engine_cfg:
+            res = engine_cfg # On renvoie l'objet engine entier si c'est lui qui porte les knobs pacer_*
+
+        if res is None:
+            res = compat_cfg
+
         if pacer_cfg and compat_cfg and pacer_cfg is not compat_cfg:
             msg = "pacer config provided in both cfg.pacer and cfg.engine_pacer"
             if self._strict_config():
                 raise RuntimeError(msg)
             self.log.warning("[Boot] %s; using cfg.pacer", msg)
-        if pacer_cfg:
-            return pacer_cfg
-        if compat_cfg:
-            self.log.warning("[Boot] cfg.pacer missing; falling back to cfg.engine_pacer")
-        return compat_cfg
+
+        if res:
+            return res
+        return None
 
     def _resolve_enable_jp(self) -> bool:
         g_cfg = getattr(self.cfg, "g", None)
@@ -532,75 +604,86 @@ class Boot:
 
     # ------------------------------- Public API ----------------------------
     async def start(self) -> BootContext:
+        # --- GC Tuning (Athletic Stack) ---
+        gc.set_threshold(50000, 10, 10)
+        logger.info("[Boot] GC Optimized: thresholds set to (50000, 10, 10)")
+
         self._check_obs_preflight()
-        # boot.py — dans async def start(self): juste au début
+        
         mode = self._canonical_deployment_mode()
         if not mode:
             self.log.error("[Boot] deployment_mode manquant; arrêt")
             raise RuntimeError("missing deployment_mode")
+        
         snapshot_hash = getattr(self.cfg, "snapshot_hash", None)
         snapshot_dict = getattr(self.cfg, "snapshot_dict", None)
         if not callable(snapshot_hash) or not callable(snapshot_dict):
             self.log.error("[Boot] cfg.snapshot_hash/snapshot_dict manquants ou non callables; arrêt")
             raise RuntimeError("invalid config snapshot helpers")
-        cfg_hash = snapshot_hash()
-        self.log.info("[Boot] config snapshot hash=%s", cfg_hash)
-        self.log.debug("[Boot] config snapshot=%s", snapshot_dict())
-
-
-        region = str(getattr(getattr(self.cfg, "g", object()), "pod_region", "EU")).upper()
-        enable_jp = self._resolve_enable_jp()
-
+        
+        self.log.info("[Boot] config snapshot hash=%s", snapshot_hash())
+        
         if self._running:
             return self.ctx
-        # reset des events pour un restart propre
-        for ev in (
-                self.ready_ws,
-                self.ready_router,
-                self.ready_scanner,
-                self.ready_rm,
-                self.ready_engine,
-                self.ready_private,
-                self.ready_balances,
-                self.ready_rpc,
-                self.ready_all,
-        ):
+            
+        for ev in (self.ready_ws, self.ready_router, self.ready_scanner, self.ready_rm,
+                   self.ready_engine, self.ready_private, self.ready_balances, self.ready_rpc, self.ready_all):
             ev.clear()
+            
         self._running = True
         self._mark_stage("starting")
-        try:
-            obs_metrics.safe_inc(obs_metrics.BOT_STARTUPS_TOTAL, "bot_startups_total", "boot.start")
-            obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.start", 1.0)
-        except Exception:
-            pass
         self._emit_lifecycle("boot.starting")
-        self.log.info("[Boot] 🚀 start… deployment_mode=%s", str(mode).upper())
+        self.log.info("[Boot] 🚀 démarrage… deployment_mode=%s", str(mode).upper())
 
-        if region == "JP" and not enable_jp:
-            self._mark_degraded("REGION_JP_DISABLED_BY_DEFAULT", where="region_guard")
-            return self.ctx
-
-        # 1) LHM
         try:
             # 1) LHM
             await self._start_lhm()
-            # 2) Discovery (optionnelle) -> active pairs
+            # 2) Discovery
             await self._discover_pairs_and_compute_active()
+            
+            # --- VERIFICATION PAIRES ACTIVES ---
+            if not self.ctx.active_pairs:
+                # En DRY_RUN, si la découverte échoue, on ne veut pas un bot vide
+                # mais on veut quand même tester si Bybit/Binance répondent.
+                self.log.warning("[Boot] Aucune paire active trouvée. Forçage des paires de test pour DRY_RUN.")
+                self.ctx.active_pairs = ["BTCUSDC", "ETHUSDC"]
+                self.ctx.pairs_map = {
+                    "BTCUSDC": {"binance": "btcusdc", "bybit": "BTCUSDC", "coinbase": "BTC-USDC"},
+                    "ETHUSDC": {"binance": "ethusdc", "bybit": "ETHUSDC", "coinbase": "ETH-USDC"}
+                }
+            # ---------------------------
+
             # 3) Public WS + Router
             strict_order = self._scanner_proxy_mode() == "STRICT_ORDER"
+            self.log.info("[Boot] Initialisation pipeline public (tasks=%s)...", not strict_order)
             await self._start_public_pipeline(start_tasks=not strict_order)
 
-            # 4) Balances plane (MBF) avant RM
+            # 4) Others
             await self._start_balances_plane()
-            # 5) RM (kwargs signature)
+            self.log.info("[Boot] Starting RiskManager...")
             await self._start_rm()
-            # 6) Scanner (bind Router push)
+            self.log.info("[Boot] RiskManager started.")
             await self._start_scanner()
+            
+            # P0: On recâble après le démarrage du scanner pour être sûr que les deux existent
+            if self.ctx.rm and self.ctx.scanner:
+                try:
+                    if hasattr(self.ctx.rm, "set_scanner"):
+                        self.log.info("[Boot] Re-wiring RiskManager -> Scanner slippage bridge (post-scanner)")
+                        self.ctx.rm.set_scanner(self.ctx.scanner)
+                except Exception:
+                    pass
+        
+            # P0: En DRY_RUN, on force ready_rm pour éviter le blocage par manque de flux
+            if self._canonical_mode().upper() == "DRY_RUN":
+                self.ready_rm.set()
+                self.log.info("[Boot] DRY_RUN: forcing ready_rm=True")
+            
             if strict_order:
+                self.log.info("[Boot] Lancement différé des tâches WS publics...")
                 await self._start_public_pipeline_tasks()
-            # 7) Private plane (Hub, Reco, Balances)
+
             await self._start_private_plane()
-            # 7bis) Dépendances Engine (RL + retry)
             self._ensure_engine_dependencies()
 
             if any(
@@ -614,6 +697,7 @@ class Boot:
             await self._start_engine_and_rpc()
             # 9) READY
             await self._evaluate_ready()
+
         except Exception:
             reason = f"boot_start_exception:{self.state.get('stage', 'starting')}"
             self._mark_degraded("BOOT_DEP_START_FAIL", where=reason)
@@ -625,9 +709,14 @@ class Boot:
             self._running = False
             return self.ctx
 
+        status_report = self.get_status()
         self.log.info(
-            "[Boot] ✅ ready=%s degraded=%s reasons=%s",
-            self.ready_all.is_set(), self.state["degraded"], ",".join(self.state["reasons"]) or "none",
+            "[Boot] ✅ ready=%s (Pipeline: %s, Trading: %s) degraded=%s reasons=%s",
+            self.ready_all.is_set(), 
+            status_report.get("pipeline_ready"), 
+            status_report.get("trading_ready"),
+            self.state["degraded"], 
+            ",".join(self.state["reasons"]) or "none",
         )
         if self.ready_all.is_set():
             self._emit_lifecycle("boot.ready")
@@ -659,70 +748,44 @@ class Boot:
             obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.stopping", 3.0)
         except Exception:
             pass
+
         self._running = False
-        # Annule la tâche de sync cohortes si active
-        t = getattr(self, "_cohort_sync_task", None)
-        if t:
-            t.cancel()
-            try:
-                await asyncio.wait_for(t, timeout=timeout_s)
-            except asyncio.TimeoutError:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="cohort_sync_task")
-            except Exception:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="cohort_sync_task")
 
-        # Moniteur santé private WS
-        t = getattr(self, "_private_health_task", None)
-        if t:
-            t.cancel()
+        async def _cancel_and_join(task, where: str) -> None:
+            if not task:
+                return
             try:
-                await asyncio.wait_for(t, timeout=timeout_s)
+                task.cancel()
+                await asyncio.wait_for(task, timeout=timeout_s)
+            except asyncio.CancelledError:
+                # En Python 3.11, CancelledError = BaseException.
+                # Ici c'est attendu: on vient de faire task.cancel().
+                if getattr(task, "cancelled", lambda: False)() or getattr(task, "done", lambda: False)():
+                    return
+                raise
             except asyncio.TimeoutError:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="private_health_task")
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where=where)
             except Exception:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="private_health_task")
+                self._mark_degraded("BOOT_STOP_TIMEOUT", where=where)
+
+        # Annule les tâches internes "boot loops"
+        await _cancel_and_join(getattr(self, "_cohort_sync_task", None), "cohort_sync_task")
+        await _cancel_and_join(getattr(self, "_private_health_task", None), "private_health_task")
         self._private_health_task = None
-        t = getattr(self, "_router_watchdog_task", None)
-        if t:
-            t.cancel()
-            try:
-                await asyncio.wait_for(t, timeout=timeout_s)
-            except asyncio.TimeoutError:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="router_watchdog_task")
-            except Exception:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="router_watchdog_task")
+        await _cancel_and_join(getattr(self, "_router_watchdog_task", None), "router_watchdog_task")
         self._router_watchdog_task = None
-
-        # Moniteur santé pipeline PnL (LHM/JSONL/DB)
-        t = getattr(self, "_pnl_pipeline_task", None)
-        if t:
-            t.cancel()
-            try:
-                await asyncio.wait_for(t, timeout=timeout_s)
-            except asyncio.TimeoutError:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="pnl_pipeline_task")
-            except Exception:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="pnl_pipeline_task")
+        await _cancel_and_join(getattr(self, "_pnl_pipeline_task", None), "pnl_pipeline_task")
         self._pnl_pipeline_task = None
-        t = getattr(self, "_rm_ready_sync_task", None)
-        if t:
-            t.cancel()
-            try:
-                await asyncio.wait_for(t, timeout=timeout_s)
-            except asyncio.TimeoutError:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="rm_ready_sync_task")
-            except Exception:
-                self._mark_degraded("BOOT_STOP_TIMEOUT", where="rm_ready_sync_task")
-            self._rm_ready_sync_task = None
+        await _cancel_and_join(getattr(self, "_rm_ready_sync_task", None), "rm_ready_sync_task")
+        self._rm_ready_sync_task = None
 
+        # Stop composants (ordre inverse)
         await self._stop_component("rpc_server", getattr(self.ctx, "rpc_server", None), "stop", timeout_s)
         await self._stop_component("rpc_client", getattr(self.ctx, "rpc_client", None), "close", timeout_s)
         await self._stop_component("rpc", getattr(self.ctx, "rpc", None), "stop", timeout_s)
 
-        # 2) Scanner
         await self._stop_component("scanner", getattr(self.ctx, "scanner", None), "stop", timeout_s)
 
-        # 3) RM
         rm_timeout = timeout_s
         with contextlib.suppress(Exception):
             cfg_rm = getattr(getattr(self, "cfg", None), "rm", getattr(self, "cfg", None))
@@ -731,23 +794,18 @@ class Boot:
                 self.log.debug("[Boot] using RM-specific stop timeout %.2fs", rm_timeout)
         await self._stop_component("rm", getattr(self.ctx, "rm", None), "stop", rm_timeout)
 
-        # 4) Engine
         await self._stop_component("engine", getattr(self.ctx, "engine", None), "stop", timeout_s)
 
-        # 5) Private plane (Reconciler → Hub → Balances)
         await self._stop_component("reconciler", getattr(self.ctx, "reconciler", None), "stop", timeout_s)
         await self._stop_component("private", getattr(self.ctx, "pws_hub", None), "stop", timeout_s)
         await self._stop_component("balances", getattr(self.ctx, "balances", None), "stop", timeout_s)
 
-
-        # 6) Router/WS publics
         await self._stop_component("router", getattr(self.ctx, "router", None), "stop", timeout_s)
         await self._stop_component("ws", getattr(self.ctx, "ws_public", None), "stop", timeout_s)
 
-        # 7) LoggerHistoriqueManager (LHM)
         await self._stop_component("lhm", getattr(self.ctx, "lhm", None), "stop", timeout_s)
 
-        # Nettoyage des flags/events pour autoriser un restart sain
+        # Nettoyage flags/events
         for ev in (
                 self.ready_ws,
                 self.ready_router,
@@ -764,13 +822,13 @@ class Boot:
                 ev.clear()
             except Exception:
                 pass
-            self._mark_stage("stopped")
-            try:
-                obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.stop", 0.0)
-            except Exception:
-                pass
-            self._emit_lifecycle("boot.stopped")
 
+        self._mark_stage("stopped")
+        try:
+            obs_metrics.safe_set(obs_metrics.BOT_STATE, "bot_state", "boot.stop", 0.0)
+        except Exception:
+            pass
+        self._emit_lifecycle("boot.stopped")
 
     async def wait_ready(self, timeout_s: Optional[float] = None) -> bool:
         try:
@@ -858,19 +916,25 @@ class Boot:
         }
 
         # --- Trading readiness canonique (utilisé par /ready strict) ---
-        # On expose ce que le RM sait (si dispo), et on calcule un "trading_ready" strict minimal.
+        # Nuance : 
+        # - PIPELINE_READY = L'infrastructure technique est en place (flux connectés, modules démarrés).
+        # - TRADING_READY  = Le bot est autorisé à envoyer des ordres (Fonds OK, Pas de kill-switch, Pipeline OK).
+        
         try:
+            s["rm_pipeline_ready"] = bool(rm_status.get("rm_pipeline_ready")) if isinstance(rm_status, dict) else None
             s["rm_trading_ready"] = bool(rm_status.get("rm_trading_ready")) if isinstance(rm_status, dict) else None
-        except Exception:
-            s["rm_trading_ready"] = None
-
-        try:
-            s["trading_state"] = str(rm_status.get("trading_state", "READY")) if isinstance(rm_status,
-                                                                                            dict) else "READY"
+            s["trading_state"] = str(rm_status.get("trading_state", "READY")) if isinstance(rm_status, dict) else "READY"
             s["trading_state_reason"] = rm_status.get("trading_state_reason") if isinstance(rm_status, dict) else None
         except Exception:
-            s["trading_state"] = "READY"
-            s["trading_state_reason"] = None
+            pass
+
+        # Pipeline-ready: infra OK (engine + RM pipeline). Indépendant de DRY_RUN / kill-switch.
+        try:
+            eng_ok = bool(s.get("engine_ready"))
+            rm_pipe_ok = bool(s.get("rm_pipeline_ready"))
+            s["pipeline_ready"] = bool(eng_ok and rm_pipe_ok)
+        except Exception:
+            s["pipeline_ready"] = False
 
         # Trading-ready strict minimal: Engine ready + RM trading ready + trading_state == READY
         # (Fail-safe: si on ne sait pas, on considère NOT READY)
@@ -881,6 +945,15 @@ class Boot:
             s["trading_ready"] = bool(eng_ok and rm_ok and tstate == "READY")
         except Exception:
             s["trading_ready"] = False
+
+        # Résumé pour l'utilisateur
+        s["readiness_summary"] = {
+            "status": "OPERATIONAL" if s["trading_ready"] else ("DEGRADED" if s["pipeline_ready"] else "BOOTING"),
+            "pipeline_ok": s["pipeline_ready"],
+            "trading_ok": s["trading_ready"],
+            "mode": "DRY_RUN" if bool(getattr(self.cfg, "dry_run", False)) else "PROD"
+        }
+
         s["trading_enabled"] = bool(s.get("trading_ready"))
         s["state"] = "READY" if bool(s.get("ready_all")) and not bool(s.get("degraded")) else "DEGRADED"
         return s
@@ -953,6 +1026,10 @@ class Boot:
         try:
             await asyncio.wait_for(getattr(obj, method)(), timeout=timeout_s)
             self._send_status(name, "stopped")
+        except asyncio.CancelledError:
+            # En stop(), on préfère ne pas laisser CancelledError tuer le process.
+            self._send_status(name, "stopped")
+            return
         except asyncio.TimeoutError:
             self._mark_degraded("BOOT_STOP_TIMEOUT", where=name)
         except Exception:
@@ -989,7 +1066,17 @@ class Boot:
                 "ts": time.time(),
             }
             self._module_state[str(component)] = {"status": status, "payload": payload or {}, "ts": msg["ts"]}
-            sink(msg)
+            
+            # P0: On rend l'appel au sink non-bloquant pour le Boot
+            # Certains sinks (ex: CWD) peuvent faire des traitements lourds ou bloquer si leur file est pleine
+            def _fire_and_forget():
+                try:
+                    sink(msg)
+                except Exception:
+                    pass
+            
+            asyncio.get_running_loop().call_soon(_fire_and_forget)
+            
         except Exception:
             # On loggue mais on ne casse jamais le Boot à cause du sink.
             self.log.exception(
@@ -1091,32 +1178,62 @@ class Boot:
         discovered: List[str] = []
         pairs_map: Dict[str, Any] = {}
         disc_result = None
+        
         if use_discovery:
+            self.log.info("[Boot] Lancement de la découverte automatique des paires (top_n=%d)...", top_n)
             try:
-
                 pairs_map, discovered, disc_result = await discover_pairs_3cex(
                     self.cfg,
                     top_n=top_n,
                     include_result=True,
                 )
+                # P0: Respect strict du TOP_N demandé par l'utilisateur
                 if top_n > 0 and len(discovered) > top_n:
                     discovered = discovered[:top_n]
-                self.log.info("[Boot] discovery: %d pairs (top_n=%d)", len(discovered), top_n)
-                if disc_result:
-                    self.log.info(
-                        "[Boot] discovery audit stages=%s filtered=%s api_errors=%s run_ms=%.1f",
-                        disc_result.stage_counts,
-                        disc_result.filtered_counts,
-                        disc_result.api_errors,
-                        float(disc_result.run_ms or 0.0),
-                    )
+                
+                if discovered:
+                    self.log.info("[Boot] Discovery SUCCESS: %d pairs found (Target Top N: %d). Top 5: %s", 
+                                  len(discovered), top_n, discovered[:5])
+                else:
+                    self.log.warning("[Boot] Discovery returned 0 pairs. Falling back to manual list.")
             except Exception as e:
-                self.log.warning("[Boot] discovery failed: %s → fallback config", e)
+                self.log.warning("[Boot] discovery failed: %s → falling back to manual list", e)
                 discovered = []
                 pairs_map = {}
+
         if not discovered:
-            # Fallback config 100% piloté par BotConfig
-            discovered = list(getattr(getattr(self.cfg, "g", object()), "pairs", []) or [])
+            # Mode Manuel (ou Fallback si Discovery HS)
+            manual_pairs = list(getattr(getattr(self.cfg, "g", object()), "pairs", []) or [])
+            if manual_pairs:
+                self.log.info("[Boot] Utilisation de la liste MANUELLE (%d paires): %s", len(manual_pairs), manual_pairs)
+                discovered = manual_pairs
+            else:
+                # P0: Ultime secours en DRY_RUN uniquement
+                if bool(getattr(self.cfg, "dry_run", False)):
+                    self.log.warning("[Boot] Aucune paire (Discovery/Manuel). Forçage par défaut (DRY_RUN).")
+                    discovered = ["BTCUSDC", "ETHUSDC"]
+                else:
+                    self.log.error("[Boot] AUCUNE PAIRE CONFIGURÉE. Le bot va démarrer à vide.")
+                    discovered = []
+            if discovered and not pairs_map:
+                # Heuristique de mapping pour DRY_RUN / Fallback
+                self.log.info("[Boot] building heuristic pairs_map for %d pairs", len(discovered))
+                for p in discovered:
+                    p_up = p.upper()
+                    # Heuristique multi-quote: BTCUSDC, BTCEUR, BTCUSDT
+                    base = p_up
+                    quote = "USDC"
+                    for q in ["USDC", "USDT", "EUR"]:
+                        if p_up.endswith(q):
+                            base = p_up.replace(q, "")
+                            quote = q
+                            break
+                    
+                    pairs_map[p] = {
+                        "binance": p.lower(),
+                        "bybit": p_up,
+                        "coinbase": f"{base}-{quote}" if quote != "EUR" else f"{base}-EUR"
+                    }
         self.ctx.discovered_pairs = discovered
         self.ctx.pairs_map = pairs_map
 
@@ -1144,7 +1261,8 @@ class Boot:
         Pose/alimente self._ws_task, self._router_task, ready_ws, ready_router.
         """
         # --- Queue WS → Router
-        inq_len = int(getattr(getattr(self.cfg, "router", object()), "in_queue_maxlen", 5000))
+        inq_len = max(5000, int(getattr(getattr(self.cfg, "router", object()), "out_queues_maxlen", 20000)))
+
         self.ctx.in_queue = asyncio.Queue(maxsize=inq_len)
 
         # --- 3.1) WS Publics : instanciation identique à ta version
@@ -1246,7 +1364,13 @@ class Boot:
 
         combos = getattr(getattr(self.cfg, "router", object()), "combos", None)
         if not combos:
-            combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
+            from itertools import combinations
+            enabled_exchanges = list(
+                getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"])
+            )
+            combos = list(combinations(enabled_exchanges, 2))
+            if not combos:
+                combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
 
         self.ctx.router = MarketDataRouter(
             in_queue=self.ctx.in_queue,
@@ -1261,6 +1385,7 @@ class Boot:
             combos=combos,
             bot_cfg=self.cfg,
             router_cfg=getattr(self.cfg, "router", None),
+            pair_mapping=self.ctx.pairs_map, # P0: Passer le mapping pour Bybit
         )
 
         try:
@@ -1293,7 +1418,13 @@ class Boot:
         if not combos:
             combos = getattr(getattr(self.cfg, "router", object()), "combos", None)
             if not combos:
-                combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
+                from itertools import combinations
+                enabled_exchanges = list(
+                    getattr(getattr(self.cfg, "g", object()), "enabled_exchanges", ["BINANCE", "COINBASE", "BYBIT"])
+                )
+                combos = list(combinations(enabled_exchanges, 2))
+                if not combos:
+                    combos = [("BINANCE", "COINBASE"), ("BINANCE", "BYBIT"), ("BYBIT", "COINBASE")]
         _raw = getattr(self.cfg, "WS_READY_TIMEOUT_S", None)
         ws_ready_to = float(
             5.0
@@ -1367,22 +1498,14 @@ class Boot:
         self._public_pipeline_started = True
 
     def _wire_volatility_monitor(self) -> None:
-        """Attache les files bus vol et forward scanner/config pour la Volatility."""
+        """Branche le Scanner + files bus vol pour le VolatilityMonitor."""
         vol = getattr(self.ctx, "volatility", None)
         router = getattr(self.ctx, "router", None)
+        scanner = getattr(self.ctx, "scanner", None)
         if not vol or not router:
             return
 
-        vol_cfg = getattr(self.cfg, "vol", None)
-        if vol_cfg and hasattr(vol, "set_bps_mapping"):
-            vol.set_bps_mapping(
-                midprice_to_bps=getattr(vol_cfg, "midprice_to_bps", 1e4),
-                floor_bps=getattr(vol_cfg, "to_bps_floor", 0.0),
-                cap_bps=getattr(vol_cfg, "to_bps_cap", 250.0),
-            )
-
-        if hasattr(vol, "set_scanner"):
-            scanner = getattr(self.ctx, "scanner", None) or self._scanner_proxy
+        if scanner and hasattr(vol, "set_scanner"):
             try:
                 vol.set_scanner(scanner)
             except Exception:
@@ -1394,8 +1517,20 @@ class Boot:
             q = qmap.get("vol") if isinstance(qmap, dict) else None
             if q:
                 queues[str(ex).upper()] = q
+
+        bus_attached = False
         if queues and hasattr(vol, "attach_bus_vol_queues"):
-            vol.attach_bus_vol_queues(queues)
+            try:
+                vol.attach_bus_vol_queues(queues)
+                bus_attached = True
+            except Exception:
+                self.log.debug("[Boot] attach_bus_vol_queues failed", exc_info=True)
+
+        # P0: si les consumers BUS sont actifs, on désactive le legacy feed côté Router
+        # pour éviter un double traitement (CPU) qui mène à la saturation des queues vol.
+        # (Legacy feed supprimé dans le Router, on ne fait rien ici si ce n'est confirmer le branchement BUS)
+        if bus_attached:
+            pass
 
     def _wire_slippage_handler(self) -> None:
         """Attache les files bus slip pour le SlippageHandler (mode bus only)."""
@@ -1411,8 +1546,18 @@ class Boot:
             if q:
                 queues[str(ex).upper()] = q
 
+        bus_attached = False
         if queues and hasattr(slip, "attach_bus_slip_queues"):
-            slip.attach_bus_slip_queues(queues)
+            try:
+                slip.attach_bus_slip_queues(queues)
+                bus_attached = True
+            except Exception:
+                self.log.debug("[Boot] attach_bus_slip_queues failed", exc_info=True)
+
+        # P0: idem slippage — BUS only, on coupe le legacy feed dans le Router.
+        # (Legacy feed supprimé dans le Router, on ne fait rien ici)
+        if bus_attached:
+            pass
 
     async def _start_balances_plane(self) -> None:
         """
@@ -1520,6 +1665,7 @@ class Boot:
             "execution_engine": getattr(self.ctx, "engine", None),
             "history_logger": getattr(self.ctx, "lhm", None),
             "transfer_clients": self._resolve_transfer_clients(),
+            "rate_limiter": getattr(self.ctx, "rate_limiter", None),
         }
         lhm = getattr(self.ctx, "lhm", None)
         if lhm is not None and hasattr(lhm, "record_alert"):
@@ -1554,6 +1700,33 @@ class Boot:
             self.log.exception("[Boot] set_fail_closed_callback failed")
         if hasattr(self.ctx.rm, "start"):
             await self.ctx.rm.start()
+
+        # P0: Câblage des clients API pour la synchronisation des frais réels
+        if self.ctx.rm and self.ctx.balances:
+            try:
+                self.log.info("[Boot] Wiring Fee API clients (using MultiBalanceFetcher)")
+                # On crée un mapping où MBF sert de client pour tous les comptes connus
+                fee_mapping = {}
+                for ex in ["BINANCE", "BYBIT", "COINBASE"]:
+                    accounts = getattr(self.ctx.balances, f"{ex.lower()}_accounts", {})
+                    if accounts:
+                        fee_mapping[ex] = {alias: self.ctx.balances for alias in accounts.keys()}
+
+                if fee_mapping:
+                    self.ctx.rm.connect_fee_sync_clients(fee_mapping)
+            except Exception:
+                self.log.exception("[Boot] Failed to wire Fee API clients")
+
+        # P0: Câblage du pont Slippage RM -> Scanner
+        # C'est ce pont qui permet au Scanner de recevoir le slippage mesuré par le RM
+        # S'il manque, le scanner reste à age_s=inf.
+        if self.ctx.rm and self.ctx.scanner:
+            try:
+                if hasattr(self.ctx.rm, "set_scanner"):
+                    self.log.info("[Boot] Wiring RiskManager -> Scanner slippage bridge")
+                    self.ctx.rm.set_scanner(self.ctx.scanner)
+            except Exception:
+                self.log.exception("[Boot] Failed to wire RM -> Scanner bridge")
         try:
             lhm = getattr(self.ctx, "lhm", None)
             if lhm is not None and hasattr(lhm, "get_active_latches"):
@@ -1684,8 +1857,35 @@ class Boot:
                     audition=[],
                 )
         self.ctx.scanner.apply_runtime_config(self.cfg)
+        # --- D7 wiring safety: pull-mode books source = Router snapshot (LIGHT en priorité) ---
+        try:
+            g_cfg = getattr(self.cfg, "g", object())
+            if not getattr(self.ctx.scanner, "exchanges", None):
+                self.ctx.scanner.exchanges = list(getattr(g_cfg, "enabled_exchanges", []) or [])
+        except Exception:
+            pass
+
+        try:
+            r = self.ctx.router
+            if hasattr(r, "get_latest_orderbooks_light"):
+                self.ctx.scanner.get_books = r.get_latest_orderbooks_light  # type: ignore
+            elif hasattr(r, "get_latest_orderbooks"):
+                self.ctx.scanner.get_books = r.get_latest_orderbooks  # type: ignore
+            else:
+                self.ctx.scanner.get_books = r.get_orderbooks  # type: ignore
+        except Exception:
+            self.log.exception("[Boot] scanner.get_books wiring failed")
+
         self._scanner_proxy.bind(self.ctx.scanner)
-        await self.ctx.scanner.start()
+        
+        self.log.info("[Boot] Starting scanner...")
+        try:
+            await asyncio.wait_for(self.ctx.scanner.start(), timeout=10.0)
+            self.log.info("[Boot] Scanner.start() finished.")
+        except asyncio.TimeoutError:
+            self.log.warning("[Boot] Scanner.start() took too long (>10s), continuing anyway")
+        except Exception:
+            self.log.exception("[Boot] Scanner.start() failed")
 
 
         # P0: bind du proxy pour que le Router n’ait plus 100% de drops
@@ -1823,6 +2023,12 @@ class Boot:
         except Exception:
             self.log.exception("[Boot] wiring MBF event_sink depuis _start_private_plane a échoué")
 
+        # 3quater) Brancher les deltas de balance WS (Ticket P0-PWS-01)
+        try:
+            self._wire_pws_balance_deltas()
+        except Exception:
+            self.log.exception("[Boot] wiring PWS balance deltas a échoué")
+
         reco_task = getattr(self.ctx.reconciler, "_task", None)
         hub_started = bool(getattr(self.ctx.pws_hub, "__class__", None))
         reco_status: Dict[str, Any] = {}
@@ -1878,13 +2084,23 @@ class Boot:
 
                 if coh:
                     dep_mode = self._canonical_deployment_mode()
-                    scn.set_universe(
-                        mode=dep_mode,
-                        core=coh.get("CORE", []),
-                        primary=coh.get("PRIMARY", []),
-                        audition=coh.get("AUDITION", []),
-                        sandbox=coh.get("SANDBOX", []),
-                    )
+                    # Union de toutes les cohortes pour l'univers global
+                    all_p = list(set(coh.get("CORE", []) + coh.get("PRIMARY", []) + coh.get("AUDITION", []) + coh.get("SANDBOX", [])))
+                    
+                    if scn and hasattr(scn, "set_universe"):
+                        scn.set_universe(
+                            mode=dep_mode,
+                            core=coh.get("CORE", []),
+                            primary=coh.get("PRIMARY", []),
+                            audition=coh.get("AUDITION", []),
+                            sandbox=coh.get("SANDBOX", []),
+                        )
+                    
+                    # P0: On synchronise aussi l'univers du RiskManager pour que le push de slippage 
+                    # (via _emit_slippage_to_scanner) couvre toutes les paires actives.
+                    rm = getattr(self.ctx, "rm", None)
+                    if rm and hasattr(rm, "update_pairs"):
+                        rm.update_pairs(all_p)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -1924,9 +2140,20 @@ class Boot:
                 pass
 
         engine = self.ctx.engine
+        mode_upper = self._canonical_mode().upper()
 
         if hasattr(engine, "start"):
+            # P0: inject pacer if missing in engine but present in boot ctx
+            if getattr(engine, "_pacer", None) is None and getattr(self.ctx, "pacer", None) is not None:
+                setattr(engine, "_pacer", self.ctx.pacer)
+            self.log.info("[Boot] Starting ExecutionEngine...")
             await engine.start()
+            self.log.info("[Boot] ExecutionEngine started.")
+            
+            # P0: En DRY_RUN avec simulateur, on force ready_engine
+            if mode_upper == "DRY_RUN" and getattr(engine, "is_simulator", False):
+                self.ready_engine.set()
+                self.log.info("[Boot] DRY_RUN: Simulator detected, forcing ready_engine=True")
 
 
         # Wiring initial Engine ↔ Hub (callback "engine" + set_private_ws_hub)
@@ -2403,21 +2630,34 @@ class Boot:
         return None
 
     async def _sync_rm_trading_ready(self) -> None:
+        """
+        IMPORTANT:
+        - ready_rm = PIPELINE_READY (infra opérationnelle) pour ne pas "rougir" en DRY_RUN / PROD kill-switch.
+        - Le trading live est exposé séparément via status['trading_ready'] (strict).
+        """
         try:
             while self._running:
                 rm = getattr(self.ctx, "rm", None)
                 if not rm:
                     break
-                ev = getattr(rm, "trading_ready_event", None) or getattr(rm, "ready_event", None)
+
+                # Priorité: pipeline_ready_event (nouveau). Fallback: trading_ready_event / ready_event.
+                ev = (
+                    getattr(rm, "pipeline_ready_event", None)
+                    or getattr(rm, "trading_ready_event", None)
+                    or getattr(rm, "ready_event", None)
+                )
+
                 if ev and ev.is_set():
                     self.ready_rm.set()
                 else:
                     self.ready_rm.clear()
+
                 await asyncio.sleep(0.5)
         except asyncio.CancelledError:
             return
         except Exception:
-            self.log.exception("[Boot] rm trading ready sync crashed")
+            self.log.exception("[Boot] rm readiness sync crashed")
 
     async def _evaluate_ready(self) -> None:
         self._mark_stage("evaluating_ready")
@@ -2463,14 +2703,41 @@ class Boot:
         if rpc_enabled and self.ready_rpc not in req:
             req.append(self.ready_rpc)
 
-        # Attente des flags READY avec timeout optionnel
+        # Attente des flags READY avec timeout robuste
+        self.log.info("[Boot] _evaluate_ready: waiting for components: %s", required)
+        
+        mode_upper_can = self._canonical_mode().upper()
+        # En DRY_RUN, on impose un timeout si absent pour éviter le blocage infini du conteneur
+        if mode_upper_can == "DRY_RUN" and warmup_timeout <= 0:
+            warmup_timeout = 20.0
+            self.log.info("[Boot] DRY_RUN mode: forcing safety warmup_timeout=%ss", warmup_timeout)
+
+        for k, ev in req_map.items():
+            if k in required:
+                self.log.info("[Boot] Component %s ready status: %s", k, ev.is_set())
+
         try:
             if warmup_timeout > 0:
-                await asyncio.wait_for(asyncio.gather(*(ev.wait() for ev in req)), timeout=warmup_timeout)
+                self.log.info("[Boot] _evaluate_ready: waiting with timeout %s", warmup_timeout)
+                # On utilise wait_for sur l'ensemble
+                tasks = [ev.wait() for ev in req]
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=warmup_timeout)
             else:
-                await asyncio.gather(*(ev.wait() for ev in req))
+                self.log.info("[Boot] _evaluate_ready: waiting WITHOUT timeout (infinite)")
+                for i, ev in enumerate(req):
+                    comp_name = required[i] if i < len(required) else f"unknown_{i}"
+                    self.log.info("[Boot] Waiting for component: %s", comp_name)
+                    await ev.wait()
+                    self.log.info("[Boot] Component %s is now READY", comp_name)
         except asyncio.TimeoutError:
             reasons.append("warmup_timeout")
+            self.log.warning("[Boot] _evaluate_ready: timeout reached! Proceeding in DEGRADED mode.")
+            # En DRY_RUN, on ne bloque pas le démarrage même si timeout
+            if mode_upper_can == "DRY_RUN":
+                self.log.info("[Boot] DRY_RUN: bypass timeout block to allow dashboard/metrics access")
+        except Exception:
+            self.log.exception("[Boot] Error during readiness wait")
+            reasons.append("readiness_exception")
 
         # Vérif warmup L2
         if warmup_n > 0:
@@ -2749,6 +3016,25 @@ class Boot:
             )
         except Exception:
             self.log.exception("[Boot] MBF.set_event_sink a échoué")
+
+    def _wire_pws_balance_deltas(self) -> None:
+        """
+        Branche les deltas de balance du PrivateWSHub vers le MultiBalanceFetcher (Ticket P0-PWS-01).
+        """
+        hub = getattr(self.ctx, "pws_hub", None)
+        mbf = getattr(self.ctx, "balances", None)
+        
+        if not hub or not mbf:
+            return
+            
+        if not hasattr(hub, "register_callback") or not hasattr(mbf, "ingest_account_update"):
+            return
+            
+        try:
+            hub.register_callback(mbf.ingest_account_update, role="balance")
+            self.log.info("[Boot] PWS balance deltas wired to MBF")
+        except Exception:
+            self.log.exception("[Boot] hub.register_callback(balance) a échoué")
 
     def _wire_router_event_sink(self) -> None:
         router = getattr(self.ctx, "router", None)

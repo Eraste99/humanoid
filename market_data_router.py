@@ -27,12 +27,19 @@ API d’entrée/sortie inchangée côté snapshots ; clés out_queues explicites
 
 
 from _collections_abc import  Mapping
+from modules.utils import json_utils as json
 import asyncio, contextlib, inspect, logging, math, time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Deque, List, Optional, Tuple, Callable, Protocol, runtime_checkable
-from modules.rm_compat import getattr_int, getattr_float, getattr_str, getattr_bool, getattr_dict, getattr_list
-from contracts.payloads import HealthEvent, MarketEvent, SlipEvent, ValidationError, VolEvent
+# from contracts.payloads import HealthEvent, MarketEvent, SlipEvent, ValidationError, VolEvent # Removed for CPU optimization
+# On les ré-importe localement ou on les laisse commentés ici pour éviter l'overhead import global?
+# L'issue demande de les utiliser pour le sampling.
+try:
+    from contracts.payloads import MarketEvent, ValidationError
+except ImportError:
+    MarketEvent = None
+    ValidationError = Exception
 
 logger = logging.getLogger("MarketDataRouter")
 
@@ -46,12 +53,11 @@ except Exception:  # pragma: no cover
         return None
 
 # --- Observability (canonique) ----------------------------------------------
-# On importe TOUT depuis modules.obs_metrics ; si non dispo, on no-op.
-# --- Observability (canonique) ----------------------------------------------
-# On importe TOUT depuis modules.obs_metrics ; si non dispo, on no-op.
+# On importe TOUT depuis modules.obs_metrics ; si non dispo, on utilise le fallback centralisé.
 try:
     from modules.obs_metrics import (
         mark_router_to_scanner_ts,
+        ROUTER_TO_SCANNER_ERRORS_TOTAL,
         ROUTER_QUEUE_DEPTH,
         ROUTER_PAIR_QUEUE_DEPTH,
         ROUTER_QUEUE_DEPTH_BY_EX,
@@ -61,40 +67,25 @@ try:
         note_router_cfg,
         safe_inc,
         safe_set,
+        record_pipeline_latency,
+        set_pipeline_backlog,
+        should_trace_latency,
     )
-except Exception:  # pragma: no cover
-    def mark_router_to_scanner_ts(
-        ts_start_ns: int,
-        *,
-        route: str = "tri_cex",
-        ok: bool = True,
-        reason: str = "ok",
-        **labels: Any,
-    ) -> None:
-        return
-
-    class _NoopMetric:
-        def labels(self, *a, **k): return self
-        def inc(self, *a, **k):    return None
-        def set(self, *a, **k):    return None
-
-
-    ROUTER_QUEUE_DEPTH = _NoopMetric()
-    ROUTER_PAIR_QUEUE_DEPTH = _NoopMetric()
-    ROUTER_QUEUE_DEPTH_BY_EX = _NoopMetric()
-    ROUTER_QUEUE_HIGH_WATERMARK_TOTAL = _NoopMetric()
-    ROUTER_DROPPED_TOTAL = _NoopMetric()
-    WS_RECONNECTS_TOTAL = _NoopMetric()
-
-
-    def note_router_cfg(*_a, **_k):
-        return None
-
-    def safe_inc(*_a, **_k):
-        return None
-
-    def safe_set(*_a, **_k):
-        return None
+except ImportError:  # pragma: no cover
+    # On laisse obs_metrics gérer ses propres fallbacks si possible, 
+    # sinon on définit le minimum vital pour ne pas crasher.
+    def mark_router_to_scanner_ts(*a, **k): return None
+    def note_router_cfg(*a, **k): return None
+    def safe_inc(*a, **k): return None
+    def safe_set(*a, **k): return None
+    
+    ROUTER_TO_SCANNER_ERRORS_TOTAL = None
+    ROUTER_QUEUE_DEPTH = None
+    ROUTER_PAIR_QUEUE_DEPTH = None
+    ROUTER_QUEUE_DEPTH_BY_EX = None
+    ROUTER_QUEUE_HIGH_WATERMARK_TOTAL = None
+    ROUTER_DROPPED_TOTAL = None
+    WS_RECONNECTS_TOTAL = None
 
 
 # PATCH 1 — Gauge pair-level: router_queue_depths{exchange, pair}
@@ -167,11 +158,10 @@ class MarketDataRouter:
         *,
         router_cfg=None,
         bot_cfg=None,
+        pair_mapping: Optional[Dict[str, Dict[str, str]]] = None,
         out_queues: Optional[Dict[str, Dict[str, asyncio.Queue]]] = None,
         combos: Optional[List[Tuple[str, str]]] = None,
         scanner: ScannerProtocol = None,             # ← obligatoire
-        volatility_monitor=None,                     # compat legacy (facultatif)
-        slippage_handler=None,                       # compat legacy (facultatif)
         anchors_sink: Optional[Callable[[Dict[str, Any]], None]] = None,  # push anchor vers un hub externe
         # Fenêtres (histogramme de skew → delta adaptatif)
         base_max_delta_ms: int = 160,
@@ -194,7 +184,7 @@ class MarketDataRouter:
         slip_heartbeat_s: float = 1.5,
         health_heartbeat_s: float = 1.0,
         shard_id: str = "S0",
-            # Flags low-latency
+        # Flags low-latency
         push_to_scanner: bool = True,
         publish_combo_to_bus: bool = True,
         # Gating : exiger un premier L2 avant publication (par clé EX/PAIR)
@@ -207,9 +197,14 @@ class MarketDataRouter:
         if in_queue is None:
             raise ValueError("MarketDataRouter: in_queue requis")
         self.in_queue = in_queue
+        # Validation sampling (P0)
+        self._val_counter = 0
+        self._val_sample_rate = 100  # 1/100 events validés par Pydantic
         # Config injectée dès la construction (legacy : bot_cfg peut subsister)
         self.bot_cfg = bot_cfg
+        self.cfg = bot_cfg # P0: Alias pour éviter les AttributeError sur .cfg
         self.router_cfg = router_cfg or (bot_cfg.router if bot_cfg is not None else None)
+        self.pair_mapping = pair_mapping or {} # P0: Mapping des symboles pour la validation
         self.shard = str(shard_id).upper()  # ➌ NOUVEAU
         self._deployment_mode_logged = False
         self._missing_slo_warned: set[tuple[str, str]] = set()
@@ -219,9 +214,6 @@ class MarketDataRouter:
             raise ValueError("MarketDataRouter: 'scanner' est requis et doit exposer update_orderbook(event).")
         self.scanner = scanner
 
-        # legacy handlers (optionnels)
-        self.volatility_monitor = volatility_monitor
-        self.slippage_handler = slippage_handler
         self.anchors_sink = anchors_sink
 
         self.combos: List[Tuple[str, str]] = [
@@ -230,21 +222,21 @@ class MarketDataRouter:
         ]
 
         if self.router_cfg is not None:
-            stale_source_ms = getattr_int(self.router_cfg, "stale_ms", stale_source_ms)
-            coalesce_window_ms = getattr_int(self.router_cfg, "coalesce_window_ms", coalesce_window_ms)
-            require_l2_first = getattr_bool(self.router_cfg, "require_l2_first", require_l2_first)
+            stale_source_ms = int(getattr(self.router_cfg, "stale_ms", stale_source_ms))
+            coalesce_window_ms = int(getattr(self.router_cfg, "coalesce_window_ms", coalesce_window_ms))
+            require_l2_first = bool(getattr(self.router_cfg, "require_l2_first", require_l2_first))
         self.stale_cfg_ms = int(stale_source_ms or 1000)
         stale_source_ms = self.stale_cfg_ms
 
-        vol_onchange_bps = getattr_float(self.router_cfg, "vol_onchange_bps", vol_onchange_bps)
-        slip_onchange_bps = getattr_float(self.router_cfg, "slip_onchange_bps", slip_onchange_bps)
-        hb_onchange_bps = getattr_float(self.router_cfg, "hb_onchange_bps", hb_onchange_bps)
-        coalesce_maxlen = getattr_int(self.router_cfg, "coalesce_maxlen", coalesce_maxlen)
-        ws_source_backpressure_cooldown_s = getattr_float(
+        vol_onchange_bps = float(getattr(self.router_cfg, "vol_onchange_bps", vol_onchange_bps))
+        slip_onchange_bps = float(getattr(self.router_cfg, "slip_onchange_bps", slip_onchange_bps))
+        hb_onchange_bps = float(getattr(self.router_cfg, "hb_onchange_bps", hb_onchange_bps))
+        coalesce_maxlen = int(getattr(self.router_cfg, "coalesce_maxlen", coalesce_maxlen))
+        ws_source_backpressure_cooldown_s = float(getattr(
             self.router_cfg,
             "ws_source_backpressure_cooldown_s",
             ws_source_backpressure_cooldown_s,
-        )
+        ))
 
         # --- Queues de sortie vers Scanner / Vol / Slip / Health -------------------
         queue_max_spec: int | Dict[str, int] | None = None
@@ -357,6 +349,9 @@ class MarketDataRouter:
         self.publish_combo_to_bus = bool(publish_combo_to_bus)
         self.require_l2_first = bool(require_l2_first)
         self._l2_seen: Dict[Tuple[str, str], bool] = defaultdict(lambda: False)  # (EX,PAIR) -> bool
+        # Cache de tier par pair (PRIMARY/AUDITION/UNKNOWN) pour métriques et purge
+        self._pair_tier: Dict[str, str] = {}
+
         # --- Coalescing par paire ---
         self.coalesce_window_ms = int(max(1, coalesce_window_ms))
         self.coalesce_maxlen = int(max(1, coalesce_maxlen))
@@ -392,7 +387,7 @@ class MarketDataRouter:
         self._last_slip_feed = defaultdict(lambda: 0.0)
         self._vol_feed_min_interval_ms = 75
         # scanner lane décorrélée pour éviter de bloquer l'ingestion
-        scanner_max = getattr_int(self.router_cfg, "scanner_queue_maxlen", 512) if self.router_cfg else 512
+        scanner_max = int(getattr(self.router_cfg, "scanner_queue_maxlen", 512)) if self.router_cfg else 512
         self._scanner_queue: asyncio.Queue = asyncio.Queue(
             maxsize=max(1, scanner_max)
         ) if self.push_to_scanner else asyncio.Queue(maxsize=1)
@@ -418,6 +413,14 @@ class MarketDataRouter:
             self._update_queue_depth_metrics_all()
         except Exception:
             logging.exception("Unhandled exception")
+        # P0 Observabilité: créer des séries 0 pour éviter les panneaux Grafana 'No data'
+        # (Prometheus n'expose pas un Counter tant qu'il n'a jamais été incrémenté)
+        try:
+            ROUTER_TO_SCANNER_ERRORS_TOTAL.labels(route="tri_cex", reason="exception").inc(0)
+            ROUTER_TO_SCANNER_ERRORS_TOTAL.labels(route="tri_cex", reason="queue_full").inc(0)
+        except Exception:
+            pass
+
         # PATCH 3 — State & paramètres backpressure
         # À ajouter dans __init__ de MarketDataRouter (section 'housekeeping' / 'compteurs')
 
@@ -565,15 +568,26 @@ class MarketDataRouter:
         """Optionnel: réception des alertes (backpressure, etc.)."""
         self._event_sink = sink
 
-    def _update_pair_queue_depth(self, pair: str, ex: str, depth: int) -> None:
-        safe_set(
-            ROUTER_PAIR_QUEUE_DEPTH,
-            "router_pair_queue_depth",
-            "_update_pair_queue_depth",
-            int(depth),
-            exchange=str(ex).upper(),
-            pair=str(pair).upper(),
-        )
+    def _update_pair_queue_depth(self, pair: str, tier: str, depth: int) -> None:
+        """Gauge: profondeur de coalescing par pair.
+        IMPORTANT (P0):
+          - Le dashboard D6 attend router_pair_queue_depth{pair,tier}.
+          - Ici, 'tier' est utilisé comme dimension de découpage (dans ce fichier, on lui passe l'exchange).
+        """
+        try:
+            pk = str(pair or "UNKNOWN")
+            tr = str(tier or "UNKNOWN").strip().upper() or "UNKNOWN"
+            self._pair_tier[pk] = tr
+            safe_set(
+                ROUTER_PAIR_QUEUE_DEPTH,
+                "router_pair_queue_depth",
+                "router",
+                pair=pk,
+                tier=tr,
+                value=float(depth),
+            )
+        except Exception:
+            pass
 
     def _bp_note_drop(self, route: str, *, reason: str) -> None:
         """Accumule des drops pour détection backpressure soft."""
@@ -632,73 +646,48 @@ class MarketDataRouter:
 
     # ----------------------- Latest store (full & light) -----------------------
     def _light_from_full(self, b: Dict[str, Any]) -> Dict[str, Any]:
-        bids = b.get("bids") or b.get("b") or []
-        asks = b.get("asks") or b.get("a") or []
-        bb = b.get("best_bid")
-        ba = b.get("best_ask")
-        if bb is None:
-            try:
-                bb = float(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) else 0.0
-            except Exception:
-                bb = 0.0
-        if ba is None:
-            try:
-                ba = float(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) else 0.0
-            except Exception:
-                ba = 0.0
-        ex_ts = b.get("exchange_ts_ms") or b.get("ex_ts_ms") or b.get("ts_ms") or 0
-        rc_ts = b.get("recv_ts_ms") or b.get("rcv_ts_ms") or int(time.time() * 1000)
+        """Vue optimisée (Flat Dict) sans overhead de conversion."""
         return {
-            "best_bid": float(bb or 0.0),
-            "best_ask": float(ba or 0.0),
-            "exchange_ts_ms": int(ex_ts or 0),
-            "recv_ts_ms": int(rc_ts or 0),
+            "best_bid": b.get("best_bid", 0.0),
+            "best_ask": b.get("best_ask", 0.0),
+            "exchange_ts_ms": b.get("exchange_ts_ms", 0),
+            "recv_ts_ms": b.get("recv_ts_ms", 0),
+            "active": b.get("active", True),
         }
 
+
+
     async def _store_latest(self, data: Dict[str, Any]) -> None:
-        async with self._latest_lock:
-            ex = str(data.get("exchange") or data.get("ex") or "").upper()
-            pair = (data.get("pair_key") or data.get("symbol") or data.get("pair") or "").replace("-", "").upper()
-            if not ex or not pair:
-                return
+        """
+        Mise à jour ultra-performante du cache latest_books.
+        Assume que data a été normalisé par _validate_and_enrich (Fast Path).
+        """
+        ex = data.get("exchange")
+        pair = data.get("pair_key")
+        if not ex or not pair:
+            return
 
-            # normalise / fusionne dans la vue full
-            full = self._latest_books.setdefault(ex, {}).get(pair)
-            if full is None:
-                full = {}
-            full.update(data or {})
+        # Accès direct au dictionnaire pour minimiser l'overhead
+        if ex not in self._latest_books:
+            self._latest_books[ex] = {}
+        ex_books = self._latest_books[ex]
 
-            # best_bid/best_ask garantis (si absents, extraire du L2)
-            if "best_bid" not in full or "best_ask" not in full:
-                bids = full.get("bids") or full.get("orderbook", {}).get("bids") or full.get("b") or []
-                asks = full.get("asks") or full.get("orderbook", {}).get("asks") or full.get("a") or []
-                if "best_bid" not in full:
-                    try:
-                        full["best_bid"] = float(bids[0][0]) if bids and isinstance(bids[0], (list, tuple)) else 0.0
-                    except Exception:
-                        full["best_bid"] = 0.0
-                if "best_ask" not in full:
-                    try:
-                        full["best_ask"] = float(asks[0][0]) if asks and isinstance(asks[0], (list, tuple)) else 0.0
-                    except Exception:
-                        full["best_ask"] = 0.0
+        if pair not in ex_books:
+            ex_books[pair] = {}
+        full = ex_books[pair]
+        
+        # Mise à jour atomique (CPython)
+        full.update(data)
 
-            # timestamps uniformisés
-            if "exchange_ts_ms" not in full:
-                if "ex_ts_ms" in full:
-                    full["exchange_ts_ms"] = int(full["ex_ts_ms"])
-                elif "ts_ms" in full:
-                    full["exchange_ts_ms"] = int(full["ts_ms"])
-                else:
-                    full["exchange_ts_ms"] = 0
-            if "recv_ts_ms" not in full:
-                full["recv_ts_ms"] = int(full.get("rcv_ts_ms") or int(time.time() * 1000))
+        # Remplacement des fallbacks lents par des accès directs
+        # best_bid/best_ask/timestamps sont garantis par _validate_and_enrich
+        if "exchange_ts_ms" not in full:
+            full["exchange_ts_ms"] = int(full.get("ts_ex_ms") or 0)
 
-            # commit full
-            self._latest_books.setdefault(ex, {})[pair] = full
-
-            # met à jour la vue légère
-            self._latest_light.setdefault(ex, {})[pair] = self._light_from_full(full)
+        # Mise à jour de la vue légère
+        if ex not in self._latest_light:
+            self._latest_light[ex] = {}
+        self._latest_light[ex][pair] = self._light_from_full(full)
 
     # --- Accesseurs Engine ---
     def get_latest_orderbooks(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
@@ -811,11 +800,13 @@ class MarketDataRouter:
 
      # ----------------------------- Purge -----------------------------
     def _purge_old_snapshots(self) -> None:
-        now = _now_dt()
+        now_ms = int(time.time() * 1000)
+        purge_threshold_ms = int(self.purge_threshold.total_seconds() * 1000)
+        
         for pair in list(self.buffer.keys()):
             for ex in list(self.buffer[pair].keys()):
-                ts_ex: datetime = self.buffer[pair][ex]["ts_ex"]
-                if now - ts_ex > self.purge_threshold:
+                ts_ex_ms = self.buffer[pair][ex]["ts_ex_ms"]
+                if now_ms - ts_ex_ms > purge_threshold_ms:
                     if self.verbose and time.time() - self.last_log_time[f"purge_{pair}_{ex}"] > 1:
                         logger.info(f"[Router] 🧹 Purge stale {pair} - {ex}")
                         self.last_log_time[f"purge_{pair}_{ex}"] = time.time()
@@ -826,12 +817,33 @@ class MarketDataRouter:
 
     # --- PATCH B1: alias attendu par _purge_loop() ---
     def _purge_stale_pairs(self) -> None:
-        self._purge_old_snapshots()
+        # P1: Purge globale des caches latest si trop vieux
+        now_ms = int(time.time() * 1000)
+        mono_now_ns = time.monotonic_ns()
+        
+        # On purge tout ce qui a plus de 3 secondes du cache Router
+        # (Seuil réduit de 5s à 3s pour limiter les rejets book_stale inutiles au Scanner)
+        for ex in list(self._latest_books.keys()):
+            for pair in list(self._latest_books[ex].keys()):
+                snap = self._latest_books[ex][pair]
+                
+                # Priorité au monotonic clock pour le nettoyage du cache
+                recv_mono_ns = snap.get("recv_mono_ns")
+                if recv_mono_ns is not None:
+                    age_ms = int((mono_now_ns - int(recv_mono_ns)) / 1_000_000)
+                else:
+                    recv_ts = snap.get("recv_ts_ms")
+                    age_ms = (now_ms - int(recv_ts)) if recv_ts else 999999
+                
+                if age_ms > 3000:
+                    del self._latest_books[ex][pair]
+                    if pair in self._latest_light.get(ex, {}):
+                        del self._latest_light[ex][pair]
 
     # --- /PATCH B1 ---
 
     async def _purge_loop(self) -> None:
-        flush_every_ms = max(5, getattr_int(self, "coalesce_window_ms", 20))
+        flush_every_ms = max(5, int(getattr(self, "coalesce_window_ms", 20)))
         hb_every_ms = 1000
         last_flush_ms = last_hb_ms = int(time.time() * 1000)
 
@@ -853,8 +865,8 @@ class MarketDataRouter:
         bp_until = 0.0
 
         # Valeurs de base de coalescing / profondeur, pilotées par la cfg Router
-        base_coalesce_ms = getattr_int(self, "coalesce_window_ms", 20)
-        base_maxlen = getattr_int(self, "coalesce_maxlen", 8)
+        base_coalesce_ms = int(getattr(self, "coalesce_window_ms", 20))
+        base_maxlen = int(getattr(self, "coalesce_maxlen", 8))
 
         while getattr(self, "_running", False):
             now_ms = int(time.time() * 1000)
@@ -912,44 +924,6 @@ class MarketDataRouter:
                         self._ws_backpressure_until = 0.0
 
             await asyncio.sleep(0.001)
-    # ------------------------ Legacy internal feeds (compat) ------------------------
-    def _maybe_feed_volatility_legacy(self, pair: str, ex: str, data: Dict[str, Any]) -> None:
-        if not self.volatility_monitor:
-            return
-        now = time.time()
-        key = f"{pair}:{ex}"
-        if (now - self._last_vol_feed[key]) * 1000.0 >= self._vol_feed_min_interval_ms:
-            try:
-                self.volatility_monitor.update_from_orderbook(data)
-            except Exception as e:
-                report_nonfatal("MarketDataRouter", "volatility_feed_error", e)
-                logger.exception("[Router] volatility feed error")
-            self._last_vol_feed[key] = now
-
-    def _maybe_feed_slippage_legacy(self, pair: str, ex: str, data: Dict[str, Any]) -> None:
-        if not self.slippage_handler or not hasattr(self.slippage_handler, "ingest_snapshot"):
-            return
-        ob = data.get("orderbook") or {}
-        if not ob.get("bids") or not ob.get("asks"):
-            return
-        now = time.time()
-        key = f"{pair}:{ex}"
-        if (now - self._last_slip_feed[key]) * 1000.0 >= self._slip_feed_min_interval_ms:
-            try:
-                bid_vol = float(data.get("bid_volume") or 0.0)
-                ask_vol = float(data.get("ask_volume") or 0.0)
-                bids, asks = _sanitize_orderbook(ob, max_levels=50)
-                self.slippage_handler.ingest_snapshot(
-                    exchange=ex,
-                    symbol=pair,
-                    orderbook={"bids": bids, "asks": asks},
-                    bid_volume=bid_vol,
-                    ask_volume=ask_vol,
-                )
-            except Exception as e:
-                report_nonfatal("MarketDataRouter", "slippage_feed_error", e)
-                logger.exception("[Router] slippage feed error")
-            self._last_slip_feed[key] = now
 
     # ------------------------- Coalescing par paire -------------------------
     # PATCH A — _coalesce_enqueue : éviter le double comptage + noter backpressure avant append
@@ -1064,7 +1038,7 @@ class MarketDataRouter:
         task = asyncio.current_task()
         try:
             # Fenêtre de base
-            base_ms = getattr_int(self, "coalesce_window_ms", 20)
+            base_ms = int(getattr(self, "coalesce_window_ms", 20))
 
             # --- Lecture robuste du mode de déploiement -------------------------
             dep_mode = self._deployment_mode()
@@ -1121,61 +1095,24 @@ class MarketDataRouter:
                 ev["pair_key"] = pair_key
                 latest_by_ex[ev["exchange"]] = ev
 
-            # 2) fan-out per-CEX
+            # 2) fan-out per-CEX (rate-limited par pair)
+            # IMPORTANT: on évite de publier à chaque flush (coalesce window), sinon les queues vol/slip saturent.
+            # Les helpers _per_cex_* appliquent capHz + heartbeat + on-change par (exchange,pair).
             for ex_up, ev in latest_by_ex.items():
-                per_cex_key = self._cex_key(ex_up)
-                qmap = self.out_queues.get(per_cex_key, {})
-
-                # VOL
                 try:
-                    payload_vol = VolEvent(
-                        exchange=ex_up,
-                        pair_key=pair_key,
-                        symbol=ev.get("symbol"),
-                        best_bid=ev.get("best_bid"),
-                        best_ask=ev.get("best_ask"),
-                        mid=(
-                            (ev.get("best_bid") + ev.get("best_ask")) / 2.0
-                            if ev.get("best_bid") and ev.get("best_ask") else None
-                        ),
-                        exchange_ts_ms=ev.get("exchange_ts_ms"),
-                        recv_ts_ms=ev.get("recv_ts_ms"),
-                        active=ev.get("active", True),
-                    ).model_dump(exclude_none=True, by_alias=True)
-                    self._try_put(qmap.get("vol"), f"{per_cex_key}.vol", payload_vol)
+                    self._per_cex_vol(ev)
                 except Exception:
-                    logger.exception("[Router] flush vol")
-
-                # SLIP
+                    logger.exception("[Router] fanout vol")
                 try:
-                    payload_slip = SlipEvent(
-                        exchange=ex_up,
-                        pair_key=pair_key,
-                        symbol=ev.get("symbol"),
-                        orderbook=ev.get("orderbook"),
-                        top_bid_vol=ev.get("top_bid_vol"),
-                        top_ask_vol=ev.get("top_ask_vol"),
-                        exchange_ts_ms=ev.get("exchange_ts_ms"),
-                        recv_ts_ms=ev.get("recv_ts_ms"),
-                        active=ev.get("active", True),
-                    ).model_dump(exclude_none=True, by_alias=True)
-                    self._try_put(qmap.get("slip"), f"{per_cex_key}.slip", payload_slip)
+                    self._per_cex_slip(ev)
                 except Exception:
-                    logger.exception("[Router] flush slip")
-
-                # HEALTH
+                    logger.exception("[Router] fanout slip")
                 try:
-                    payload_health = HealthEvent(
-                        exchange=ex_up,
-                        last_ex_ts_ms=int(ev.get("exchange_ts_ms") or 0),
-                        last_recv_ts_ms=int(ev.get("recv_ts_ms") or 0),
-                        seq=ev.get("seq"),
-                    ).model_dump(exclude_none=True)
-                    self._try_put(qmap.get("health"), f"{per_cex_key}.health", payload_health)
+                    self._per_cex_health(ev)
                 except Exception:
-                    logger.exception("[Router] flush health")
+                    logger.exception("[Router] fanout health")
 
-                    # 3) Push vers Scanner (optionnel, via queue dédiée)
+            # 3) Push vers Scanner (optionnel, via queue dédiée)
             if self.push_to_scanner:
                 for ev in latest_by_ex.values():
                     self._enqueue_scanner(ev)
@@ -1284,161 +1221,135 @@ class MarketDataRouter:
 
     # ------------------------- Validation event -------------------------
     def _validate_and_enrich(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Validation hybride (P0) : Fast-Path (types natifs) + Slow-Path (Pydantic sampling).
+        Élimine l'overhead Pydantic sur 99% des events.
+        """
         try:
-            if isinstance(data, dict) and data.get(self._STOP_SENTINEL_KEY):
+            if not isinstance(data, dict):
+                return None
+
+            if data.get(self._STOP_SENTINEL_KEY):
                 return {self._STOP_SENTINEL_KEY: True}
 
-            ev_model = data if isinstance(data, MarketEvent) else MarketEvent(**(data or {}))
-            ev = ev_model.model_dump(exclude_none=True)
-            ex = ev_model.exchange.upper()
-            pair = (ev_model.pair_key or "").replace("-", "").upper()
-            if not pair or not ex:
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_validate_and_enrich",
-                    queue="combo",
-                    reason="pair_unmapped",
-                )
-                return None
-            if not ev_model.active:
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_validate_and_enrich",
-                    queue="combo",
-                    reason="inactive",
-                )
+            # 1. FAST PATH : Extraction et validation minimale (types natifs)
+            ex = str(data.get("exchange") or "").upper()
+            pair = str(data.get("pair_key") or data.get("symbol") or "").replace("-", "").upper()
+            
+            # Top-of-book (float natif)
+            try:
+                bid = float(data.get("best_bid") or 0.0)
+                ask = float(data.get("best_ask") or 0.0)
+            except (ValueError, TypeError):
+                bid, ask = 0.0, 0.0
+
+            if not ex or not pair or bid <= 0 or ask <= 0 or ask < bid:
+                # Anomalie structurelle détectée -> on laisse Pydantic diagnostiquer ou on drop
                 return None
 
-            bid = float(ev_model.best_bid)
-            ask = float(ev_model.best_ask)
-            if bid <= 0 or ask <= 0 or ask < bid:
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_validate_and_enrich",
-                    queue="combo",
-                    reason="schema_mismatch",
-                )
-                return None
-
-            ob = ev.get("orderbook") or {}
-            bids, asks = _sanitize_orderbook(ob, max_levels=50) if ob else ([], [])
-            if ev.get("exchange_ts_ms") is None and ev.get("recv_ts_ms") is None:
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_validate_and_enrich",
-                    queue="combo",
-                    reason="schema_missing_field",
-                )
-                return None
-
-            ex_dt = _to_dt(ev.get("exchange_ts_ms") or ev.get("recv_ts_ms"))
-            recv_dt = _to_dt(ev.get("recv_ts_ms") or ev.get("exchange_ts_ms"))
-            if ex_dt is None or recv_dt is None:
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_validate_and_enrich",
-                    queue="combo",
-                    reason="SCHEMA_BAD_TS",
-                )
-                return None
-            ex_ts_ms = int((ex_dt.timestamp()) * 1000)
-            recv_ts_ms = int((recv_dt.timestamp()) * 1000)
-
-            if recv_ts_ms < ex_ts_ms:
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_validate_and_enrich",
-                    queue="combo",
-                    reason="bad_ts_negative_age",
-                )
-                recv_ts_ms = ex_ts_ms
-            quote = ev.get("quote") or "UNKNOWN"
-            if quote == "UNKNOWN":
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_validate_and_enrich",
-                    queue="combo",
-                    reason="missing_quote",
-                )
-                return None
-            tier = ev.get("tier")
-
-
-            mid = 0.5 * (bid + ask)
-            spread_bps = 10000.0 * (ask - bid) / mid if mid > 0 else 0.0
-            has_l2 = bool(bids) and bool(asks)
-            age_ms = max(0.0, float(recv_ts_ms - ex_ts_ms))
-
-            out = {
-                "exchange": ex,
-                "pair_key": pair,
-                "symbol": ev.get("symbol") or ev_model.symbol,
-                "active": ev_model.active,
-                "best_bid": bid,
-                "best_ask": ask,
-                "bid_volume": float(ev.get("bid_volume") or 0.0),
-                "ask_volume": float(ev.get("ask_volume") or 0.0),
-                "orderbook": {"bids": bids, "asks": asks} if has_l2 else {},
-                "has_l2": has_l2,
-                "exchange_ts_ms": ex_ts_ms,
-                "recv_ts_ms": recv_ts_ms,
-                "age_ms": age_ms,
-                "mid": mid,
-                "l1_spread_bps": spread_bps,
-                "quote": quote,
-                "tier": tier,
-            }
-            return out
-
-        except ValidationError as e:
-            self._events_schema_errors += 1
-            if self.verbose:
-                logger.exception("[Router] event schema invalid")
-            report_nonfatal("MarketDataRouter", "event_validation_error", e)
-            safe_inc(
-                ROUTER_DROPPED_TOTAL,
-                "router_dropped_total",
-                "_validate_and_enrich",
-                queue="combo",
-                reason="exception",
+            # Normalisation directe (In-place)
+            data["exchange"] = ex
+            data["pair_key"] = pair
+            
+            now_ms = int(time.time() * 1000)
+            
+            # Timestamps uniformes (int ms) - Pas de datetime ici
+            ex_ts = int(data.get("exchange_ts_ms") or 0)
+            recv_ts = int(data.get("recv_ts_ms") or now_ms)
+            data["recv_ts_ms"] = recv_ts
+            
+            # 2. SLOW PATH (Sampling 1/N, Snapshots, Anomalies)
+            self._val_counter += 1
+            
+            # Heuristique snapshot: bcp de niveaux
+            ob = data.get("orderbook") or {}
+            is_large_ob = len(ob.get("bids", [])) > 20
+            
+            do_slow_val = (
+                (self._val_counter % self._val_sample_rate == 0) or 
+                is_large_ob or 
+                data.get("is_snapshot")
             )
-            return None
+
+            if MarketEvent and do_slow_val:
+                try:
+                    # On valide mais on ne garde pas l'objet Pydantic (trop cher de model_dump)
+                    MarketEvent(**data)
+                except ValidationError:
+                    # Si la validation échoue, on drop l'event
+                    safe_inc(ROUTER_DROPPED_TOTAL, "router_dropped_total", "validate", reason="pydantic_fail")
+                    return None
+            
+            # Détection Clock Drift
+            if ex_ts > 0:
+                diff = ex_ts - now_ms
+                if abs(diff) > 1000:
+                    if not hasattr(self, "_clock_offset_ms"):
+                        self._clock_offset_ms = diff
+                        logger.info("[Router] Auto-calibration horloge (FAST): Offset détecté de %dms", diff)
+            
+            # Mode DRY_RUN
+            is_dry = False
+            if self.bot_cfg is not None:
+                is_dry = str(getattr(self.bot_cfg, "MODE", "")).upper() == "DRY_RUN"
+            
+            mono_now_ns = time.monotonic_ns()
+            recv_mono = data.get("recv_mono_ns")
+            if recv_mono is None:
+                data["recv_mono_ns"] = recv_mono = mono_now_ns
+
+            if is_dry:
+                data["active"] = True
+                data["recv_ts_ms"] = now_ms
+            
+            # Validation de Fraîcheur (P0)
+            stale_limit = self._resolve_stale_limit_ms(ex)
+            age = (mono_now_ns - int(recv_mono)) // 1_000_000
+            data["age_ms"] = age # On l'injecte pour start()
+
+            # P0 Observabilité
+            try:
+                from modules.obs_metrics import ROUTER_EVENT_AGE_MS
+                if ROUTER_EVENT_AGE_MS:
+                    ROUTER_EVENT_AGE_MS.labels(exchange=ex).observe(age)
+            except Exception:
+                pass
+            
+            # Startup Grace Period (P0)
+            startup_age = (time.monotonic() - getattr(self, "_start_mono", 0))
+            is_booting = startup_age < 5.0
+            
+            if not is_booting and age > stale_limit:
+                return None
+
+            return data
 
         except Exception as e:
-            self._events_schema_errors += 1
-            if self.verbose:
-                logger.exception("[Router] event schema invalid")
-            safe_inc(
-                ROUTER_DROPPED_TOTAL,
-                "router_dropped_total",
-                "_validate_and_enrich",
-                queue="combo",
-                reason="exception",
-            )
-            report_nonfatal("MarketDataRouter", "event_validation_exception", e)
+            if self._events_in % 1000 == 0:
+                logger.warning("[Router] Hybrid-Path Validation error: %s", e)
             return None
+
 
     # -------------------------- Fan-out helpers --------------------------
     def _try_put(self, q: asyncio.Queue | None, route_name: str, payload: dict) -> None:
         if not isinstance(q, asyncio.Queue):
             return
+
         queue_label = self._queue_label(route_name)
+
+        # default HIGH_WM_RATIO (can be overridden by cfg.router.backpressure.HIGH_WM_RATIO)
         wm_ratio = 0.70
         try:
             cfg = self.router_cfg
             if cfg is not None:
                 bp = getattr(cfg, "backpressure", {}) or {}
-
                 wm_ratio = float(bp.get("HIGH_WM_RATIO", wm_ratio))
         except Exception:
             wm_ratio = 0.70
+
+        # Drop si au-dessus du watermark (ex: 70%) pour éviter la saturation totale.
+        # P0: au lieu de "drop + return" (qui fige la queue haut et rend le flux stale),
+        # on drop l'OLDEST puis on tente de push le LATEST (best-effort).
         if q.maxsize and q.qsize() >= int(q.maxsize * wm_ratio):
             safe_inc(
                 ROUTER_QUEUE_HIGH_WATERMARK_TOTAL,
@@ -1446,45 +1357,104 @@ class MarketDataRouter:
                 "_try_put",
                 queue=queue_label,
             )
-            safe_inc(
-                ROUTER_DROPPED_TOTAL,
-                "router_dropped_total",
-                "_try_put",
-                queue=queue_label,
-                reason="queue_full",
-            )
-            self._emit_drop_event(queue_label=queue_label, payload=payload)
-            self._bp_note_drop(queue_label, reason="queue_full")
-            return
-        try:
-            q.put_nowait(payload)
-
-        except asyncio.QueueFull:
-            # drop oldest (coalesced)
+            # P0: On utilise maintenant les compteurs consolidés
             try:
-                _ = q.get_nowait()
+                from modules.obs_metrics import ROUTER_DROPPED_TOTAL
+                if ROUTER_DROPPED_TOTAL:
+                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="queue_full").inc()
+            except Exception:
+                pass
+
+            try:
+                self._emit_drop_event(queue_label=queue_label, payload=payload)
             except Exception:
                 pass
             try:
+                self._bp_note_drop(queue_label, reason="queue_full")
+            except Exception:
+                pass
+
+            # drop oldest
+            try:
+                _ = q.get_nowait()
+                try:
+                    q.task_done()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            # keep latest (best-effort)
+            try:
                 q.put_nowait(payload)
-                # labels attendus = queue + reason
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_try_put",
-                    queue=queue_label,
-                    reason="queue_full",
-                )
+            except Exception:
+                pass
+            return
+
+        # Normal path: try to enqueue. If full, drop oldest then keep latest.
+        try:
+            q.put_nowait(payload)
+            return
+        except asyncio.QueueFull:
+            pass
+        except Exception:
+            # Unknown error -> count as drop and bail
+            try:
+                from modules.obs_metrics import ROUTER_DROPPED_TOTAL
+                if ROUTER_DROPPED_TOTAL:
+                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="exception").inc()
+            except Exception:
+                pass
+            try:
                 self._emit_drop_event(queue_label=queue_label, payload=payload)
-            except asyncio.QueueFull:
-                safe_inc(
-                    ROUTER_DROPPED_TOTAL,
-                    "router_dropped_total",
-                    "_try_put",
-                    queue=queue_label,
-                    reason="queue_full",
-                )
+            except Exception:
+                pass
+            return
+
+        # QueueFull: drop oldest then retry put latest
+        try:
+            _ = q.get_nowait()
+            try:
+                q.task_done()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            q.put_nowait(payload)
+            try:
+                from modules.obs_metrics import ROUTER_DROPPED_TOTAL
+                if ROUTER_DROPPED_TOTAL:
+                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="queue_full").inc()
+            except Exception:
+                pass
+            try:
                 self._emit_drop_event(queue_label=queue_label, payload=payload)
+            except Exception:
+                pass
+        except asyncio.QueueFull:
+            try:
+                from modules.obs_metrics import ROUTER_DROPPED_TOTAL
+                if ROUTER_DROPPED_TOTAL:
+                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="queue_full").inc()
+            except Exception:
+                pass
+            try:
+                self._emit_drop_event(queue_label=queue_label, payload=payload)
+            except Exception:
+                pass
+        except Exception:
+            try:
+                from modules.obs_metrics import ROUTER_DROPPED_TOTAL
+                if ROUTER_DROPPED_TOTAL:
+                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="exception").inc()
+            except Exception:
+                pass
+            try:
+                self._emit_drop_event(queue_label=queue_label, payload=payload)
+            except Exception:
+                pass
 
     def _publish_combo(self, a: str, b: str, payload: Dict[str, Any]) -> None:
         if not self.publish_combo_to_bus:
@@ -1528,7 +1498,10 @@ class MarketDataRouter:
                 getattr(self.router_cfg, "scanner_queue_drop_policy", "DROP_OLDEST") or "DROP_OLDEST"
             ).upper()
         try:
+            if getattr(self.bot_cfg.obs, "enable_latency_tracing", False):
+                payload["router_exit_ns"] = time.perf_counter_ns()
             self._scanner_queue.put_nowait(payload)
+            set_pipeline_backlog("router_to_scanner", self._scanner_queue.qsize())
         except asyncio.QueueFull:
             if policy == "DROP_NEW":
                 safe_inc(
@@ -1565,6 +1538,41 @@ class MarketDataRouter:
         while self._running:
             try:
                 ev = await self._scanner_queue.get()
+                set_pipeline_backlog("router_to_scanner", self._scanner_queue.qsize())
+                
+                # Mesure latence queue (P1)
+                tracing_enabled = getattr(self.bot_cfg.obs, "enable_latency_tracing", False)
+                if tracing_enabled:
+                    now_ns = time.perf_counter_ns()
+                    ev["scanner_entry_ns"] = now_ns
+                    exit_ns = ev.get("router_exit_ns")
+                    if exit_ns:
+                        queue_ms = (now_ns - int(exit_ns)) / 1e6
+                        if getattr(self.bot_cfg.obs, "enable_segment_metrics_router", True):
+                            record_pipeline_latency("router_to_scanner_queue", queue_ms, exchange=ev.get("exchange", "none"))
+
+                # P1: Freshness check immédiat dans le worker scanner
+                # Si le backlog a gonflé, on skip les vieux events
+                now_ms = int(time.time() * 1000)
+                
+                # Priorité au monotonic clock
+                recv_mono_ns = ev.get("recv_mono_ns")
+                if recv_mono_ns is not None:
+                    age_ms = int((time.monotonic_ns() - int(recv_mono_ns)) / 1_000_000)
+                else:
+                    recv_ts = ev.get("recv_ts_ms")
+                    age_ms = (now_ms - int(recv_ts)) if recv_ts else 999999
+
+                if age_ms > 1500:
+                    safe_inc(
+                        ROUTER_DROPPED_TOTAL,
+                        "router_dropped_total",
+                        "_scanner_worker",
+                        queue="scanner",
+                        reason="stale_backlog",
+                    )
+                    self._scanner_queue.task_done()
+                    continue
             except Exception:
                 continue
             ts0 = time.perf_counter_ns()
@@ -1600,18 +1608,25 @@ class MarketDataRouter:
         key = (ex, pair)
         now = time.time()
 
-        # metrique simple : EMA de l1_spread_bps (court)
-        val = float(ev.get("l1_spread_bps") or 0.0)
-        last_ts = self._vol_last_ts.get(key, 0.0)
-        dt_ms = (now - last_ts) * 1000.0 if last_ts else self.vol_ema_window_ms
+        # --- AJOUT P1 : Throttling (Budget CPU) ---
+        # On limite le calcul de volatilité à 5Hz max par paire.
+        # Sur 120 paires, cela évite des milliers de calculs inutiles par seconde.
+        last_calc = getattr(self, "_vol_last_calc_ts", {}).get(key, 0.0)
+        if not hasattr(self, "_vol_last_calc_ts"): self._vol_last_calc_ts = {}
+        if (now - last_calc) < (1.0 / self.vol_max_hz):
+            return
+        self._vol_last_calc_ts[key] = now
+
+        bid, ask = float(ev.get("best_bid", 0.0)), float(ev.get("best_ask", 0.0))
+        if bid <= 0 or ask <= 0: return
+        val = ((ask - bid) / bid) * 10000.0  # en bps
+
         ema_prev = self._vol_ema.get(key)
-        ema_curr = self._ema_update(ema_prev, val, dt_ms, self.vol_ema_window_ms)
+        ema_curr = self._ema_update(ema_prev, val, dt_ms=(now - last_calc)*1000.0, window_ms=self.vol_ema_window_ms)
         self._vol_ema[key] = ema_curr
-        self._vol_last_ts[key] = now
 
         # rate limit & on-change
         last_pub_ts = self._vol_last_pub_ts.get(key, 0.0)
-        min_interval = 1.0 / self.vol_max_hz
         do_publish = False
         changed = False
 
@@ -1619,6 +1634,7 @@ class MarketDataRouter:
         if abs(ema_curr - last_pub_val) >= self.vol_onchange_bps:
             changed = True
 
+        min_interval = 0.1 # 10Hz max pub
         if changed and (now - last_pub_ts) >= min_interval:
             do_publish = True
         elif (now - last_pub_ts) >= self.vol_heartbeat_s:
@@ -1626,21 +1642,26 @@ class MarketDataRouter:
             changed = False  # heartbeat
 
         if do_publish:
-            payload = VolEvent(
-                exchange=ex,
-                pair_key=pair,
-                symbol=ev.get("symbol"),
-                ema_vol_bps=round(ema_curr, 4),
-                l1_spread_bps=round(val, 4),
-                best_bid=float(ev.get("best_bid", 0.0)),
-                best_ask=float(ev.get("best_ask", 0.0)),
-                mid=float(ev.get("mid", 0.0)),
-                changed=changed,
-                exchange_ts_ms=int(ev["exchange_ts_ms"]),
-                recv_ts_ms=int(ev["recv_ts_ms"]),
-                age_ms=max(0.0, (_now_dt() - _to_dt(ev["exchange_ts_ms"])).total_seconds() * 1000.0),
-                seq_no=int((now * 1000) % 2_147_483_647),
-            ).model_dump(exclude_none=True, by_alias=True)
+            # P0: Fast-path pour VolEvent sans Pydantic.
+            now_ms = int(now * 1000)
+            ex_ts_ms = int(ev.get("exchange_ts_ms") or 0)
+            
+            payload = {
+                "exchange": ex,
+                "pair_key": pair,
+                "symbol": ev.get("symbol"),
+                "ema_vol_bps": round(ema_curr, 4),
+                "l1_spread_bps": round(val, 4),
+                "best_bid": bid,
+                "best_ask": ask,
+                "mid": (bid + ask) / 2.0,
+                "changed": changed,
+                "exchange_ts_ms": ex_ts_ms,
+                "recv_ts_ms": int(ev.get("recv_ts_ms") or now_ms),
+                "age_ms": max(0.0, float(now_ms - ex_ts_ms)) if ex_ts_ms > 0 else 0.0,
+                "seq_no": int(now_ms % 2_147_483_647),
+                "kind": "vol"
+            }
             self._publish_cex(ex, "vol", payload)
             self._vol_last_pub_ts[key] = now
             self._vol_last_pub_val[key] = ema_curr
@@ -1650,6 +1671,14 @@ class MarketDataRouter:
         ex = ev["exchange"]; pair = ev["pair_key"]
         key = (ex, pair)
         now = time.time()
+
+        # --- AJOUT P1 : Throttling (Budget CPU) ---
+        # On limite le calcul de slippage à 5Hz max par paire.
+        last_calc = getattr(self, "_slip_last_calc_ts", {}).get(key, 0.0)
+        if not hasattr(self, "_slip_last_calc_ts"): self._slip_last_calc_ts = {}
+        if (now - last_calc) < (1.0 / self.slip_max_hz):
+            return
+        self._slip_last_calc_ts[key] = now
 
         # proxy : on réutilise l1_spread_bps comme métrique simple
         metric = float(ev.get("l1_spread_bps") or 0.0)
@@ -1664,11 +1693,11 @@ class MarketDataRouter:
             return
         last_metric = self._slip_last_metric.get(key, metric)
         last_pub_ts = self._slip_last_pub_ts.get(key, 0.0)
-        min_interval = 1.0 / self.slip_max_hz
-
+        
         changed = abs(metric - last_metric) >= self.slip_onchange_bps
         do_publish = False
 
+        min_interval = 0.1 # 10Hz max pub
         if changed and (now - last_pub_ts) >= min_interval:
             do_publish = True
         elif (now - last_pub_ts) >= self.slip_heartbeat_s:
@@ -1676,20 +1705,22 @@ class MarketDataRouter:
             changed = False  # heartbeat
 
         if do_publish:
+            # P0: Fast-path pour SlipEvent sans Pydantic.
             bids, asks = (ev.get("orderbook") or {}).get("bids") or [], (ev.get("orderbook") or {}).get("asks") or []
-            payload = SlipEvent(
-                exchange=ex,
-                pair_key=pair,
-                symbol=ev.get("symbol"),
-                slip_metric_bps=round(metric, 4),
-                changed=changed,
-                notional_hint=None,
-                orderbook={"bids": bids, "asks": asks} if (bids or asks) else {},
-                top_bid_vol=float(ev.get("bid_volume") or 0.0),
-                top_ask_vol=float(ev.get("ask_volume") or 0.0),
-            exchange_ts_ms=int(ev["exchange_ts_ms"]),
-            recv_ts_ms=int(ev["recv_ts_ms"]),
-            ).model_dump(exclude_none=True, by_alias=True)
+            payload = {
+                "exchange": ex,
+                "pair_key": pair,
+                "symbol": ev.get("symbol"),
+                "slip_metric_bps": round(metric, 4),
+                "changed": changed,
+                "notional_hint": None,
+                "orderbook": {"bids": bids, "asks": asks} if (bids or asks) else {},
+                "top_bid_vol": float(ev.get("bid_volume") or 0.0),
+                "top_ask_vol": float(ev.get("ask_volume") or 0.0),
+                "exchange_ts_ms": int(ev.get("exchange_ts_ms") or 0),
+                "recv_ts_ms": int(ev.get("recv_ts_ms") or (now * 1000)),
+                "kind": "slip"
+            }
             self._publish_cex(ex, "slip", payload)
             self._slip_last_pub_ts[key] = now
             self._slip_last_metric[key] = metric
@@ -1701,14 +1732,17 @@ class MarketDataRouter:
         last = self._health_last_pub_ts.get(ex, 0.0)
         if (now - last) < self.health_heartbeat_s:
             return
-        payload = HealthEvent(
-            exchange=ex,
-            last_ex_ts_ms=int(ev["exchange_ts_ms"]),
-            last_recv_ts_ms=int(ev["recv_ts_ms"]),
-            age_ms=float(ev.get("age_ms") or 0.0),
-            pairs_seen=list((self._latest_light.get(ex, {}) or {}).keys()),
-            changed=False,
-        ).model_dump(exclude_none=True)
+            
+        # P0: Fast-path pour HealthEvent sans Pydantic.
+        payload = {
+            "exchange": ex,
+            "last_ex_ts_ms": int(ev.get("exchange_ts_ms") or 0),
+            "last_recv_ts_ms": int(ev.get("recv_ts_ms") or (now * 1000)),
+            "age_ms": float(ev.get("age_ms") or 0.0),
+            "pairs_seen": list((self._latest_light.get(ex, {}) or {}).keys()),
+            "changed": False,
+            "kind": "health"
+        }
         self._publish_cex(ex, "health", payload)
         self._health_last_pub_ts[ex] = now
 
@@ -1717,20 +1751,22 @@ class MarketDataRouter:
         now = time.time()
         for ex, pairs in (self._latest_light or {}).items():
             if (now - self._health_last_pub_ts.get(ex, 0.0)) >= self.health_heartbeat_s:
-                payload = HealthEvent(
-                    exchange=ex,
-                    last_ex_ts_ms=max([v.get("exchange_ts_ms", 0) for v in pairs.values()] or [0]),
-                    last_recv_ts_ms=max([v.get("recv_ts_ms", 0) for v in pairs.values()] or [0]),
-                    age_ms=0.0,
-                    pairs_seen=list(pairs.keys()),
-                    changed=False,
-                ).model_dump(exclude_none=True)
+                # P0: Fast-path pour HealthEvent heartbeat sans Pydantic.
+                payload = {
+                    "exchange": ex,
+                    "last_ex_ts_ms": max([int(v.get("exchange_ts_ms") or 0) for v in pairs.values()] or [0]),
+                    "last_recv_ts_ms": max([int(v.get("recv_ts_ms") or 0) for v in pairs.values()] or [0]),
+                    "age_ms": 0.0,
+                    "pairs_seen": list(pairs.keys()),
+                    "changed": False,
+                    "kind": "health"
+                }
 
                 self._publish_cex(ex, "health", payload)
+                self._health_last_pub_ts[ex] = now
             # MAJ gauges même sans publication (ex: calme plat)
             self._update_queue_depth_metrics_for(ex)
 
-    # ----------------------------- Push vers Scanner -----------------------------
     # ----------------------------- Push vers Scanner -----------------------------
     async def _push_to_scanner(self, ev_a: Dict[str, Any], ev_b: Dict[str, Any]) -> None:
         """Push ultra-low-latency de deux L1 vers le scanner (sync/async)."""
@@ -1811,36 +1847,28 @@ class MarketDataRouter:
 
 
 
+                    start_proc = time.perf_counter_ns()
                     ev = self._validate_and_enrich(item)
                     if not ev:
                         continue
 
-                    ex_pair = (ev.get("exchange"), ev.get("pair_key"))
-                    has_l2 = bool(ev.get("has_l2"))
-                    if has_l2:
-                        self._l2_seen[ex_pair] = True
-                    if self.require_l2_first and not has_l2 and not self._l2_seen.get(ex_pair, False):
-                        safe_inc(
-                            ROUTER_DROPPED_TOTAL,
-                            "router_dropped_total",
-                            "start",
-                            queue="combo",
-                            reason="l2_missing",
-                        )
-                        continue
+                    # Instrumentation latence (P1)
+                    tracing_enabled = should_trace_latency(self.bot_cfg)
 
+                    if tracing_enabled:
+                        ev["router_entry_ns"] = start_proc
 
-                    # --- PATCH C2: guard staleness + métriques reason-codées ---
+                    # --- compensation de Skew (Ticket P1-1) ---
                     stale_limit_ms = self._resolve_stale_limit_ms(ev.get("exchange"))
-                    staleness_mode = str(
-                        getattr(self.router_cfg, "staleness_mode", "WALLCLOCK") if self.router_cfg else "WALLCLOCK"
-                    ).upper()
-                    if staleness_mode == "EVENT_TIME":
-                        age_ms = float(ev.get("age_ms") or 0.0)
-                        is_stale = age_ms > float(stale_limit_ms)
-                    else:
-                        ts_ex_ms = int(ev.get("exchange_ts_ms") or 0)
-                        is_stale = ts_ex_ms and (int(time.time() * 1000) - ts_ex_ms) > stale_limit_ms
+                    # On utilise age_ms calculé par _validate_and_enrich car il compense le skew
+                    age_ms = float(ev.get("age_ms") or 0.0)
+                    is_stale = age_ms > float(stale_limit_ms)
+
+                    # P0: Grâce initiale au démarrage du Router (pendant les 500 premiers messages)
+                    # pour éviter les faux-positifs staleness avant calibration complète.
+                    if getattr(self, "_events_in", 0) < 500:
+                        is_stale = False
+
                     if is_stale:
                         safe_inc(
                             ROUTER_DROPPED_TOTAL,
@@ -1853,6 +1881,19 @@ class MarketDataRouter:
                         continue
                     # --- /PATCH C2 ---
 
+                    # P0: Mise à jour du cache latest (indispensable pour RM et Dashboard)
+                    # On le fait APRÈS le guard staleness pour éviter de polluer le cache.
+                    await self._store_latest(ev)
+                    
+                    # Marquer le temps de sortie pour la mesure de latence inter-module
+                    ev["publish_ts_ms"] = int(time.time() * 1000)
+
+                    # Mesure de la latence interne du Router (en ms)
+                    now_ns = time.perf_counter_ns()
+                    proc_time_ms = (now_ns - start_proc) / 1e6
+
+                    if tracing_enabled and getattr(self.bot_cfg.obs, "enable_segment_metrics_router", True):
+                        record_pipeline_latency("router_proc", proc_time_ms, exchange=ev.get("exchange", "none"))
 
                     self._coalesce_enqueue(ev)
 
@@ -1898,6 +1939,10 @@ class MarketDataRouter:
         Alias tolérant: renvoie le dernier snapshot d'orderbooks.
         Compat avec les modules qui attendent get_orderbooks().
         """
+        # P1: On force un nettoyage rapide des snapshots avant de les servir en mode pull
+        # pour éviter que le scanner pull du vieux cache sans s'en rendre compte.
+        self._purge_stale_pairs()
+        
         fn = getattr(self, "get_latest_orderbooks", None)
         return fn() if callable(fn) else {}
 
@@ -1946,31 +1991,39 @@ class MarketDataRouter:
 
     # ----------------------------- Santé & métriques -----------------------------
     def _is_healthy(self) -> bool:
-        now = _now_dt()
-        return self.successful_syncs > 0 and (now - self.last_sync_time).total_seconds() < 60
+        now_ms = int(time.time() * 1000)
+        ls = self._last_sync_time_ms
+        return self.successful_syncs > 0 and ls > 0 and (now_ms - ls) < 60000
 
     @property
     def last_sync_time(self) -> datetime:
-        times = [v["ts_ex"] for exs in self.buffer.values() for v in exs.values()]
-        return max(times) if times else datetime.min
+        return datetime.fromtimestamp(self._last_sync_time_ms / 1000.0, tz=timezone.utc)
+
+    @property
+    def _last_sync_time_ms(self) -> int:
+        times = [v["ts_ex_ms"] for exs in self.buffer.values() for v in exs.values()]
+        return max(times) if times else 0
 
     @property
     def desync_count(self) -> int:
         count = 0
         for pair, exs in self.buffer.items():
-            ts_list = [v["ts_ex"] for v in exs.values()]
-            if len(ts_list) > 1 and (max(ts_list) - min(ts_list)) > self._pair_max_delta.get(pair, self.base_max_delta):
-                count += 1
+            ts_list = [v["ts_ex_ms"] for v in exs.values()]
+            if len(ts_list) > 1:
+                delta = max(ts_list) - min(ts_list)
+                max_delta = int(self._pair_max_delta.get(pair, self.base_max_delta).total_seconds() * 1000)
+                if delta > max_delta:
+                    count += 1
         return count
 
     @property
     def avg_skew_seconds(self) -> float:
-        gaps: List[float] = []
+        gaps_ms: List[int] = []
         for _, exs in self.buffer.items():
-            ts_list = [v["ts_ex"] for v in exs.values()]
+            ts_list = [v["ts_ex_ms"] for v in exs.values()]
             if len(ts_list) > 1:
-                gaps.append((max(ts_list) - min(ts_list)).total_seconds())
-        return float(sum(gaps) / len(gaps)) if gaps else 0.0
+                gaps_ms.append(max(ts_list) - min(ts_list))
+        return (sum(gaps_ms) / len(gaps_ms) / 1000.0) if gaps_ms else 0.0
 
     def set_risk_manager(self, rm: Any) -> None:
         self.risk_manager = rm

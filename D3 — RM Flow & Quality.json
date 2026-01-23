@@ -6,7 +6,7 @@
   "editable": true,
   "style": "dark",
   "tags": ["bot", "rm", "quality"],
-  "refresh": "10s",
+  "refresh": "15s",
   "time": { "from": "now-6h", "to": "now" },
   "fiscalYearStartMonth": 1,
   "graphTooltip": 1,
@@ -172,6 +172,92 @@
         }
       ],
       "gridPos": { "x": 15, "y": 11, "w": 9, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Rebalancing & Operations",
+      "id": 12,
+      "gridPos": { "x": 0, "y": 15, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Rebalancing Ops / sec",
+      "id": 13,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (type) (rate(rebal_operations_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{type}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Rebalancing Plan Build Latency (ms)",
+      "id": 14,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(rebal_plan_build_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 4 }
+    },
+    {
+      "type": "row",
+      "title": "Unified Quality & Robustness",
+      "id": 15,
+      "gridPos": { "x": 0, "y": 20, "w": 24, "h": 1 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Realized Edge Net (bps)",
+      "id": 16,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.5, sum by (branch, le) (rate(edge_net_bps_hist_bucket{job=\"$job\"}[$__rate_interval])))",
+          "legendFormat": "{{branch}} p50",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 21, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Unified Rejects / sec",
+      "id": 17,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (layer, reason) (rate(reject_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{layer}}: {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 8, "y": 21, "w": 8, "h": 4 }
+    },
+    {
+      "type": "timeseries",
+      "title": "Execution Aborts / sec",
+      "id": 18,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (branch, reason) (rate(abort_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{branch}}: {{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": { "x": 16, "y": 21, "w": 8, "h": 4 }
     }
   ]
 }

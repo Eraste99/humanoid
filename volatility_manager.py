@@ -423,11 +423,26 @@ class VolatilityManager:
 
     def ingest_metrics(self, pair: str, metrics: Dict[str, Any]) -> None:
         """
-        Ingestion générique (ex: depuis Scanner):
-            {"exchange": "BINANCE", "spread_bps": 7.2, "ts": ...}
+        Ingestion générique (ex: depuis Scanner ou VolatilityMonitor via RM):
+            - {"exchange": "BINANCE", "spread_bps": 7.2, "ts": ...}
+            - {"spread_volatility_micro": 0.0007, ...} (format VolatilityMonitor)
         """
         if not metrics:
             return
+        pk = _norm_pair(pair)
+        ts = metrics.get("ts") or metrics.get("timestamp") or time.time()
+
+        # Support format VolatilityMonitor (fractions)
+        sv_micro = metrics.get("spread_volatility_micro")
+        if sv_micro is not None:
+            # Conversion fraction -> bps et ingestion comme point de spread
+            self.ingest_spread_bps("MONITOR", pk, float(sv_micro) * 10_000.0, ts=ts)
+
+        pv_micro = metrics.get("price_volatility_micro")
+        if pv_micro is not None:
+            # Ingestion de la vol prix (bps) via l'alias dédié
+            self.ingest_volatility_bps({pk: float(pv_micro) * 10_000.0})
+
         ex = (metrics.get("exchange") or "").upper()
         if not ex:
             return
@@ -437,9 +452,9 @@ class VolatilityManager:
             bid = metrics.get("best_bid", None)
             ask = metrics.get("best_ask", None)
             if bid is not None and ask is not None:
-                self.ingest_orderbook_top(ex, pair, bid, ask, ts=metrics.get("ts"))
+                self.ingest_orderbook_top(ex, pk, bid, ask, ts=ts)
             return
-        self.ingest_spread_bps(ex, pair, sbps, ts=metrics.get("ts"))
+        self.ingest_spread_bps(ex, pk, sbps, ts=ts)
 
     # ------------------------------ Calculs -----------------------------------
 
