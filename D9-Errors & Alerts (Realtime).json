@@ -1,0 +1,502 @@
+{
+  "uid": "errors-alerts",
+  "title": "D9 \u2014 Errors & Alerts (Realtime)",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "style": "dark",
+  "tags": [
+    "bot",
+    "errors",
+    "alerts"
+  ],
+  "refresh": "5s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {
+          "selected": true,
+          "text": "Prometheus",
+          "value": "Prometheus"
+        },
+        "label": "Datasource"
+      },
+      {
+        "name": "job",
+        "type": "constant",
+        "label": "Job (fixed)",
+        "query": "arbitrage-bot",
+        "current": {
+          "selected": true,
+          "text": "arbitrage-bot",
+          "value": "arbitrage-bot"
+        },
+        "hide": 2
+      }
+    ]
+  },
+  "annotations": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Global Health",
+      "id": 1,
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "RM Trading Ready",
+      "id": 2,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "rm_trading_ready{job=\"$job\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 1,
+        "w": 8,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "PWS Health State",
+      "id": 3,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "pws_health_state{job=\"$job\"}",
+          "refId": "A",
+          "legendFormat": "{{exchange}}/{{alias}}"
+        }
+      ],
+      "gridPos": {
+        "x": 8,
+        "y": 1,
+        "w": 8,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "WS Public Connections Open",
+      "id": 4,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "ws_public_connections_open_v2{job=\"$job\"}",
+          "refId": "A",
+          "legendFormat": "{{exchange}}/{{region}}/{{deployment_mode}}"
+        }
+      ],
+      "gridPos": {
+        "x": 16,
+        "y": 1,
+        "w": 8,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "BF Balances Health",
+      "id": 5,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "bf_balances_health_state{job=\"$job\"}",
+          "refId": "A",
+          "legendFormat": "{{exchange}}/{{alias}}"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 8,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Event Loop Lag (ms)",
+      "id": 6,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "event_loop_lag_ms{job=\"$job\"}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 8,
+        "y": 4,
+        "w": 8,
+        "h": 3
+      }
+    },
+    {
+      "type": "row",
+      "title": "Unified Errors / sec (TopK)",
+      "id": 7,
+      "gridPos": {
+        "x": 0,
+        "y": 7,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Rejects / sec (Top Reasons)",
+      "id": 8,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "topk(10, sum by (layer, reason) (rate(reject_total{job=\"$job\"}[$__rate_interval])))",
+          "legendFormat": "{{layer}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 8,
+        "h": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Aborts / sec (Top Reasons)",
+      "id": 9,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "topk(10, sum by (branch, reason) (rate(abort_total{job=\"$job\"}[$__rate_interval])))",
+          "legendFormat": "{{branch}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 8,
+        "y": 8,
+        "w": 8,
+        "h": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Infra Errors / sec",
+      "id": 10,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (exchange, reason) (rate(ws_public_errors_total_v2{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "ws_public/{{exchange}}/{{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (exchange, reason) (rate(pws_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "pws_dropped/{{exchange}}/{{reason}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (exchange, endpoint) (rate(bf_http_errors_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "bf_http/{{exchange}}/{{endpoint}}",
+          "refId": "C"
+        },
+        {
+          "expr": "sum by (route, reason) (rate(router_to_scanner_errors_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "router_to_scanner/{{route}}/{{reason}}",
+          "refId": "D"
+        }
+      ],
+      "gridPos": {
+        "x": 16,
+        "y": 8,
+        "w": 8,
+        "h": 4
+      }
+    },
+    {
+      "type": "row",
+      "title": "Rate-limit & 429 Signals",
+      "id": 11,
+      "gridPos": {
+        "x": 0,
+        "y": 12,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Rate-limit / 429 (per sec)",
+      "id": 12,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (kind, cohort) (rate(scanner_rate_limited_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "scanner/{{kind}}/{{cohort}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (exchange, endpoint) (rate(balance_fetcher_429_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "bf_429/{{exchange}}/{{endpoint}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (exchange) (rate(engine_429_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "engine_429/{{exchange}}",
+          "refId": "C"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 24,
+        "h": 4
+      }
+    },
+    {
+      "type": "row",
+      "title": "Critical Drops / Fail-Closed",
+      "id": 13,
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Critical Drops / sec",
+      "id": 14,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(router_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "router/{{reason}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(pws_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "pws/{{reason}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (reason) (rate(scanner_queue_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "scanner/{{reason}}",
+          "refId": "C"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 18,
+        "w": 24,
+        "h": 4
+      }
+    },
+    {
+      "type": "row",
+      "title": "Logging / DB Issues",
+      "id": 15,
+      "gridPos": {
+        "x": 0,
+        "y": 22,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "LoggerH DB Lane Depth",
+      "id": 16,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "loggerh_db_lane_queue_depth{job=\"$job\"}",
+          "legendFormat": "{{lane}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "LoggerH DB Write p95 (ms)",
+      "id": 17,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(loggerh_db_write_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, op))",
+          "legendFormat": "{{op}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 6,
+        "y": 23,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "LoggerH Write p95 (ms)",
+      "id": 24,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(loggerh_write_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le))",
+          "legendFormat": "p95",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "LoggerH DB Lane Drops / sec",
+      "id": 18,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "sum by (lane, reason) (rate(loggerh_db_lane_dropped_total{job=\"$job\"}[$__rate_interval]))",
+          "legendFormat": "{{lane}}/{{reason}}",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 18,
+        "y": 23,
+        "w": 6,
+        "h": 4
+      }
+    },
+    {
+      "type": "row",
+      "title": "Recent Spike (5m increase)",
+      "id": 19,
+      "gridPos": {
+        "x": 0,
+        "y": 27,
+        "w": 24,
+        "h": 1
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Rejects (5m)",
+      "id": 20,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "increase(reject_total{job=\"$job\"}[5m])",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 0,
+        "y": 28,
+        "w": 6,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Aborts (5m)",
+      "id": 21,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "increase(abort_total{job=\"$job\"}[5m])",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 6,
+        "y": 28,
+        "w": 6,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "WS Public Errors (5m)",
+      "id": 22,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "increase(ws_public_errors_total_v2{job=\"$job\"}[5m])",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 12,
+        "y": 28,
+        "w": 6,
+        "h": 3
+      }
+    },
+    {
+      "type": "stat",
+      "title": "PWS Drops (5m)",
+      "id": 23,
+      "datasource": "$datasource",
+      "targets": [
+        {
+          "expr": "increase(pws_dropped_total{job=\"$job\"}[5m])",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "x": 18,
+        "y": 28,
+        "w": 6,
+        "h": 3
+      }
+    }
+  ]
+}

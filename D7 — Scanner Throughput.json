@@ -47,12 +47,12 @@
       "datasource": "$datasource",
       "targets": [
         {
-          "expr": "histogram_quantile(0.5, sum(rate(scanner_evaluate_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, pair, route))",
+          "expr": "histogram_quantile(0.5, sum(rate(scanner_eval_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, pair, route))",
           "legendFormat": "{{pair}}/{{route}} p50",
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.95, sum(rate(scanner_evaluate_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, pair, route))",
+         "expr": "histogram_quantile(0.95, sum(rate(scanner_eval_ms_bucket{job=\"$job\"}[$__rate_interval])) by (le, pair, route))",
           "legendFormat": "{{pair}}/{{route}} p95",
           "refId": "B"
         }

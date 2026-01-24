@@ -2289,10 +2289,7 @@ class OpportunityScanner:
         quote = _quote_of_pair(pair)
 
         def _record_latency():
-            eval_us = (time.perf_counter() - _t0) * 1_000_000
-            # On ne loggue que les evaluations un peu lourdes
-            if eval_us > 1000: # > 1ms
-                 self.logger.info("[Scanner] Eval %s: %.2fus", pair, eval_us)
+            return None
 
         def _book_fresh(snapshot: dict, ex_name: str) -> bool:
             # P0: On respecte les conditions de fraîcheur même en DRY_RUN 
@@ -3085,9 +3082,7 @@ class OpportunityScanner:
         if dropped:
             self.queue_drops += 1
             self.backpressure_events += 1
-            if (self.backpressure_events % self.backpressure_log_every) == 0:
-                self.logger.warning("[Scanner] Backpressure: queue full (%d); dropped oldest x%d",
-                                    self._maxlen, self.backpressure_events)
+
             try:
                 bump_scanner(queue_drop=1)
             except Exception:
@@ -3113,12 +3108,6 @@ class OpportunityScanner:
                     rec(opp)
             except Exception:
                 logging.exception("Unhandled exception")
-
-        self.logger.info(
-            "✅ Opp %s | %s | net=%.3f%% vol=%s %s",
-            opp["opp_id"], route_combo, opp["spread_net_pct"],
-            f"{opp['volume_selected_quote']:.0f}", quote,
-        )
 
         try:
             strategy = payload.get("strategy", self.scanner_mode)

@@ -1037,6 +1037,12 @@ SLIP_DECISION_TOTAL = _metric(Counter, 'slip_decision_total', 'Slippage decision
 SLIP_P95_BPS = _metric(Gauge, 'slip_p95_bps', 'Slippage p95 (bps)')
 SLIP_P99_BPS = _metric(Gauge, 'slip_p99_bps', 'Slippage p99 (bps)')
 SCANNER_REJECTIONS_TOTAL = _metric(Counter, 'scanner_rejections_total', 'Opportunities rejected', ['reason'])
+SCANNER_QUEUE_DROPPED_TOTAL = _metric(
+    Counter,
+    'scanner_queue_dropped_total',
+    'Scanner queue drops due to backpressure',
+    ['reason'],
+)
 SC_STRATEGY_SCORE = _metric(Gauge, 'sc_strategy_score', 'Strategy score', ['pair', 'route', 'branch'])
 SC_ELIGIBLE = _metric(Gauge, 'sc_eligible', 'Pair eligibility flag', ['pair'])
 SLIP_DROP_TOTAL = _metric(
@@ -3384,6 +3390,28 @@ def ws_public_note_event_ok(
     except Exception:
         return
 
+def ws_public_note_event_received(
+    exchange: str,
+    region: str,
+    deployment_mode: str,
+    *,
+    latency_ms: float,
+) -> None:
+    """
+    Publie une estimation de staleness (secondes) des events WS publics.
+    """
+    try:
+        safe_set(
+            WS_PUBLIC_STALENESS_SECONDS,
+            "ws_public_staleness_seconds",
+            "ws_public_note_event_received",
+            max(0.0, float(latency_ms)) / 1000.0,
+            exchange=(exchange or "UNKNOWN").upper(),
+            region=region or "UNKNOWN",
+            deployment_mode=deployment_mode or "UNKNOWN",
+        )
+    except Exception:
+        return
 
 def ws_public_note_event_dropped(
     exchange: str,
@@ -3486,9 +3514,15 @@ def bump_scanner(
 
     # queue_drop/spread_pct/active_pairs: best-effort (compat), volontairement no-op côté métriques
     # (on préfère ne pas inventer des métriques sans dashboard associé).
+    try:
+        if queue_drop:
+            SCANNER_QUEUE_DROPPED_TOTAL.labels(reason="queue_full").inc(float(queue_drop))
+    except Exception:
+        try:
+            OBS_NOOP_TOTAL.labels(metric="scanner_queue_dropped_total", where="bump_scanner").inc()
+        except Exception:
+            pass
     return None
-
-
 
 
 def set_engine_queue(n: int) -> None:

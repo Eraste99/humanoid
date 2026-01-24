@@ -963,14 +963,6 @@ class WebSocketExchangeClient:
             self._unmapped_seen[ex] += 1
             return
 
-        # ---- HOT PATH: suppression du INFO spammy.
-        # Optionnel: debug *échantillonné* (ne sort que si LOG_LEVEL=DEBUG + verbose=True)
-        if getattr(self, "verbose", False) and ex == "BYBIT":
-            c = getattr(self, "_bybit_emit_ok_ctr", 0) + 1
-            self._bybit_emit_ok_ctr = c
-            if c <= 3 or (c % 5000 == 0):
-                self.log.debug("[WS][BYBIT] emit ok: %s -> %s (lat_ms=%s)", ex_symbol, pk, lat)
-
         if self._exchange_region_disabled(ex, pk):
             self._note_drop(ex, reason="region_disabled_jp", kind="emit")
             return
@@ -1298,17 +1290,12 @@ class WebSocketExchangeClient:
                             # Petit pacing (évite burst)
                             await asyncio.sleep(0.02)
 
-                        # P0: Tracer les 3 premières frames brutes de Bybit pour voir le format exact
-                        bybit_debug_count = 0
                         l2_book: Dict[str, Dict[str, Dict[float, float]]] = defaultdict(lambda: {"bids": {}, "asks": {}})
                         
                         async for msg in ws:
                             recv_ts_ms = int(time.time() * 1000)
 
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                if getattr(self, "verbose", False) and bybit_debug_count < 3:
-                                    self.log.info("[WS][BYBIT] RAW FRAME #%d: %s", bybit_debug_count, msg.data[:200])
-                                    bybit_debug_count += 1
 
                                 self._note_frame_received("BYBIT", recv_ts_ms)
 

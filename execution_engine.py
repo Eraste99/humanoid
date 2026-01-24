@@ -5902,11 +5902,7 @@ class ExecutionEngine:
             pass
 
         # Log optionnel si ctx présent
-        if ctx:
-             self.log.info(f"[{branch}] pipeline abort: {reason}", extra=ctx)
-        else:
-             self.log.info(f"[{branch}] pipeline abort: {reason}")
-
+        return None
     def handle_order_update(self, event: Dict[str, Any]):
         clid = event.get("client_id")
         if not clid:

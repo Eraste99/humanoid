@@ -83,6 +83,7 @@ RM_COST_COMPUTE_ERROR = "RM_COST_COMPUTE_ERROR"
 RM_BELOW_MIN_BPS = "RM_BELOW_MIN_BPS"
 RM_BELOW_MIN_NOTIONAL = "RM_BELOW_MIN_NOTIONAL"
 RM_BALANCE_TTL_BLOCK = "RM_BALANCE_TTL_BLOCK"
+RM_BALANCE_TTL_DEGRADED = "RM_BALANCE_TTL_DEGRADED"
 RM_ENGINE_NOT_READY = "RM_ENGINE_NOT_READY"
 
 RM_ALIAS_COLLAT_CRITICAL = "RM_ALIAS_COLLAT_CRITICAL"
@@ -128,6 +129,7 @@ RM_REASON_PRIORITY = (
 
     # C) Freshness / TTL strict
     "RM_BALANCE_TTL_BLOCK",
+    "RM_BALANCE_TTL_DEGRADED",
     "RM_STALE_VOL",
     "RM_MARKETDATA_STALE",
 
@@ -5001,9 +5003,16 @@ class RiskManager:
             if ok:
                 decision_ctx["submitted"] = True
 
+        def _record_drop_metric(reason: str) -> None:
+            try:
+                from modules.obs_metrics import RM_DROPPED_TOTAL
+                reason_norm = normalize_reason_code(reason) or str(reason)
+                RM_DROPPED_TOTAL.labels(reason=reason_norm).inc()
+            except Exception:
+                pass
         if not self.engine:
-            logging.warning("RM : engine indisponible, drop bundle")
             _record_decision(False, RM_ENGINE_NOT_READY)
+            _record_drop_metric(RM_ENGINE_NOT_READY)
             return False
 
         # 1) BLOCKED/DEGRADED trading_state (private plane / truth) => jamais de bundle Engine
@@ -5011,16 +5020,16 @@ class RiskManager:
             reason = normalize_reason_code(
                 getattr(self, "trading_state_reason", None) or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
             ) or "PWS_QUEUE_BACKPRESSURE_TIMEOUT"
-            logging.warning("RM : trading blocked (%s), drop bundle (trace_id=%s)", reason, bundle.get("trace_id") or "NA")
             _record_decision(False, reason)
+            _record_drop_metric(reason)
             return False
 
         # 2) PIPELINE_READY gate (permet DRY_RUN infra verte)
         ev_pipe = getattr(self, "pipeline_ready_event", None) or getattr(self, "trading_ready_event", None)
         if ev_pipe is not None and (not ev_pipe.is_set()):
             reason = normalize_reason_code("PIPELINE_NOT_READY") or "PIPELINE_NOT_READY"
-            logging.warning("RM : pipeline not ready, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
             _record_decision(False, reason)
+            _record_drop_metric(reason)
             return False
 
         # 3) TRADING gate (respect strict des 3 modes)
@@ -5038,13 +5047,13 @@ class RiskManager:
         if not dry_run:
             if kill:
                 reason = normalize_reason_code("GLOBAL_KILL_SWITCH") or "GLOBAL_KILL_SWITCH"
-                logging.warning("RM : kill switch ON, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
                 _record_decision(False, reason)
+                _record_drop_metric(reason)
                 return False
             if not armed:
                 reason = normalize_reason_code("TRADING_NOT_ARMED") or "TRADING_NOT_ARMED"
-                logging.warning("RM : not armed, drop bundle (trace_id=%s)", bundle.get("trace_id") or "NA")
                 _record_decision(False, reason)
+                _record_drop_metric(reason)
                 return False
 
 
@@ -5093,22 +5102,13 @@ class RiskManager:
         trace_id = meta.get("trace_id") or bundle.get("trace_id") or "NA"
         quote = str(meta.get("quote") or "USDC").upper()
         if not self._is_flow_allowed_under_current_mode(meta):
-            flow_kind = str(meta.get("flow_kind") or "core").lower()
-            risk_effect = str(meta.get("risk_effect") or "risk_increasing").lower()
-            logging.getLogger(__name__).warning(
-                "[RM][FILTER] flow_dropped_by_mode trade_mode=%s flow_kind=%s risk_effect=%s trace_id=%s",
-                getattr(self, "trade_mode", "NORMAL"),
-                flow_kind,
-                risk_effect,
-                trace_id,
-            )
             if self._shadow:
                 try:
                     self._shadow.on_bundle_drop(bundle, "FLOW_FILTERED_BY_MODE")
                 except Exception:
                     pass
             _record_decision(False, "FLOW_FILTERED_BY_MODE")
-
+            _record_drop_metric("FLOW_FILTERED_BY_MODE")
             return False
 
 
@@ -5201,22 +5201,12 @@ class RiskManager:
                 self._schedule_balance_resync_for_alias(ex_ttl, alias_ttl)
 
             if status == "BLOCKED":
-                reason_ttl = f"BALANCE_STALE:{ex_ttl}.{alias_ttl}:{age_s:.1f}s"
+                reason_ttl = RM_BALANCE_TTL_BLOCK
                 self._obs_balance_ttl_breach(ex_ttl, alias_ttl, status)
-                logging.warning(
-                    "RM: drop bundle %s (branch=%s, profile=%s) pour alias %s.%s "
-                    "stale (age=%.1fs, capital_at_risk=%s)",
-                    trace_id,
-                    branch,
-                    profile,
-                    ex_ttl,
-                    alias_ttl,
-                    age_s,
-                    capital_at_risk,
-                )
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason_ttl)
                 _record_decision(False, reason_ttl)
+                _record_drop_metric(reason_ttl)
                 return False
 
             if status == "DEGRADED":
@@ -5236,18 +5226,10 @@ class RiskManager:
                     alias_cap_factor = ttl_cap_factor
 
                 if branch == "MM":
-                    reason_ttl = f"BALANCE_TTL_DEGRADED:{ex_ttl}.{alias_ttl}"
-                    logging.info(
-                        "RM: drop bundle %s branch=MM en mode DEGRADED pour alias %s.%s "
-                        "(age=%.1fs, capital_at_risk=%s)",
-                        trace_id,
-                        ex_ttl,
-                        alias_ttl,
-                        age_s,
-                        capital_at_risk,
-                    )
+                    reason_ttl = RM_BALANCE_TTL_DEGRADED
                     if self._shadow:
                         self._shadow.on_bundle_drop(bundle, reason_ttl)
+                    _record_drop_metric(reason_ttl)
                     return False
 
             # Pour les branches critiques, on laisse passer mais on taggue l'overlay.
@@ -5314,17 +5296,8 @@ class RiskManager:
 
             if worst_state == "CRIT":
                 reason = (
-                    f"MM_COLLAT_CRIT:{worst_alias[0]}.{worst_alias[1]}"
-                    if worst_alias else
                     "MM_COLLAT_CRIT"
                 )
-                logging.info(
-                    "RM: drop bundle %s branch=MM pour collat CRIT sur alias %s.%s",
-                    trace_id,
-                    worst_alias[0] if worst_alias else "NA",
-                    worst_alias[1] if worst_alias else "NA",
-                )
-
                 # Compteur dédié pour les drops MM liés au collat CRIT.
                 if worst_alias:
                     try:
@@ -5338,6 +5311,7 @@ class RiskManager:
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason)
                 _record_decision(False, reason)
+                _record_drop_metric(reason)
                 return False
 
         # 2) Légalité & REB lock
@@ -5349,11 +5323,7 @@ class RiskManager:
             return False
         if legal_reason:
             try:
-                logging.info(
-                    "RM: bundle legality warn-only (%s) trace_id=%s",
-                    legal_reason,
-                    trace_id,
-                )
+                inc_rm_skip(legal_reason)
             except Exception:
                 pass
 
@@ -5471,25 +5441,10 @@ class RiskManager:
                 except Exception:
                     pass
 
-                try:
-                    logging.info(
-                        "RM: drop bundle for combo cap %s (branch=%s, profile=%s, quote=%s, trace_id=%s, ttl_status=%s, inflight_usd=%.4f, notional_usd=%.4f, combo_cap_usd=%.4f)",
-                        combo_key or "NA",
-                        branch,
-                        profile,
-                        quote,
-                        trace_id,
-                        ttl_status,
-                        float(inflight_combo or 0.0),
-                        float(notional_usd or 0.0),
-                        float(combo_cap_usd or 0.0),
-                    )
-                except Exception:
-                    pass
-
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason_combo)
                 _record_decision(False, reason_combo)
+                _record_drop_metric(reason_combo)
                 return False
 
             if combo_key and notional_usd > 0.0:
@@ -5501,19 +5456,10 @@ class RiskManager:
             ok_rl, rl_reason = self._check_sc_softcap_for_bundle(bundle, branch, profile)
             if not ok_rl:
                 reason_sc = rl_reason or "RL_SC_SOFTCAP"
-                try:
-                    logging.info(
-                        "RM: drop bundle %s (branch=%s, profile=%s) pour RL SC (%s)",
-                        trace_id,
-                        branch,
-                        profile,
-                        reason_sc,
-                    )
-                except Exception:
-                    pass
                 if self._shadow:
                     self._shadow.on_bundle_drop(bundle, reason_sc)
                 _record_decision(False, reason_sc)
+                _record_drop_metric(reason_sc)
                 return False
 
 
