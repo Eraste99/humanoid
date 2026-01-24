@@ -109,11 +109,18 @@ OBS_LABEL_MISMATCH_TOTAL = _metric(Counter, "obs_label_mismatch_total", "Labels 
 # --- MANDATORY OBSERVABILITY (P0) ---
 ROUTER_EVENT_AGE_MS = _metric(Histogram, "router_event_age_ms", "Age des events à l'entrée du Router (ms)", ["exchange"], buckets=[10, 50, 100, 250, 500, 1000, 2000, 5000])
 SCANNER_EVENT_AGE_MS = _metric(Histogram, "scanner_event_age_ms", "Age des events à l'évaluation Scanner (ms)", ["exchange", "pair"], buckets=[50, 100, 250, 500, 1000, 1500, 2000, 5000])
-ROUTER_DROPPED_TOTAL = _metric(Counter, "router_dropped_total", "Total des events drop par le Router", ["exchange", "reason"])
+ROUTER_SLO_MISSING_TOTAL = _metric(Counter, "router_slo_missing_total", "SLO manquante lors de la résolution du stale_limit (Router)", ["mode", "exchange"])
+ROUTER_DEPLOYMENT_MODE_INVALID_TOTAL = _metric(Counter, "router_deployment_mode_invalid_total", "Deployment mode invalide (Router)", ["mode"])
+ROUTER_CLOCK_OFFSET_MS = _metric(Gauge, "router_clock_offset_ms", "Offset d'horloge détecté (Router) en ms", ["exchange"])
+WS_PUBLIC_CLOCK_OFFSET_MS = _metric(Gauge, "ws_public_clock_offset_ms", "Offset d'horloge détecté (WS public) en ms", ["exchange", "region", "deployment_mode"])
 PWS_HUB_DROPPED_TOTAL = _metric(Counter, "pws_hub_dropped_total", "Total des events drop par le PrivateWSHub", ["exchange", "reason"])
 PWS_LATENCY_DRAIN_MS = _metric(Histogram, "pws_latency_drain_ms", "Latence de vidage des queues privées (ms)", ["exchange"], buckets=[5, 10, 25, 50, 100, 250, 500])
 LHM_EMIT_ERROR_TOTAL = _metric(Counter, "lhm_emit_error_total", "Total des erreurs d'émission LHM (rupture de logging)", ["log_type"])
-
+RM_CLOCK_SKEW_UNKNOWN_TOTAL = _metric(
+    Counter,
+    "rm_clock_skew_unknown_total",
+    "RM preflight rejected because clock skew could not be measured",
+)
 # --- BEGIN OM-0: STRICT + PROM READY + Noop ---
 try:
     from modules.bot_config import BotConfig as _ObsBotConfig
@@ -713,6 +720,12 @@ RPC_IDEMPOTENCY_HIT_TOTAL = _metric(
     'rpc_idempotency_hit_total',
     'Idempotency cache hits',
     ['method', 'region'],
+)
+ENGINE_IDEMPOTENCY_MISSING_TOTAL = _metric(
+    Counter,
+    "engine_idempotency_missing_total",
+    "Engine submissions rejected due to missing idempotency key",
+    ["branch", "profile"],
 )
 ROUTER_QUEUE_DEPTH = _metric(Gauge, 'router_queue_depth', 'Router queue depth', ['queue'])
 ROUTER_PAIR_QUEUE_DEPTH = _metric(Gauge, 'router_pair_queue_depth', 'Router per-pair queue depth', ['pair', 'tier'])

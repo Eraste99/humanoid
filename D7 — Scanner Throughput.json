@@ -173,7 +173,7 @@
       "datasource": "$datasource",
       "targets": [
         {
-          "expr": "sum by (pair) (vol_bps{job=\"$job\"})",
+         "expr": "sum by (pair) (vol_ewma_bps{job=\"$job\"})",
           "legendFormat": "{{pair}} vol",
           "refId": "A"
         }

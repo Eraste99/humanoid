@@ -63,6 +63,9 @@ try:
         ROUTER_QUEUE_DEPTH_BY_EX,
         ROUTER_QUEUE_HIGH_WATERMARK_TOTAL,
         ROUTER_DROPPED_TOTAL,
+        ROUTER_SLO_MISSING_TOTAL,
+        ROUTER_DEPLOYMENT_MODE_INVALID_TOTAL,
+        ROUTER_CLOCK_OFFSET_MS,
         WS_RECONNECTS_TOTAL,
         note_router_cfg,
         safe_inc,
@@ -86,6 +89,9 @@ except ImportError:  # pragma: no cover
     ROUTER_QUEUE_HIGH_WATERMARK_TOTAL = None
     ROUTER_DROPPED_TOTAL = None
     WS_RECONNECTS_TOTAL = None
+    ROUTER_SLO_MISSING_TOTAL = None
+    ROUTER_DEPLOYMENT_MODE_INVALID_TOTAL = None
+    ROUTER_CLOCK_OFFSET_MS = None
 
 
 # PATCH 1 — Gauge pair-level: router_queue_depths{exchange, pair}
@@ -787,7 +793,7 @@ class MarketDataRouter:
             "drops": int(drops),
             "last_error": last_error,
         }
-        self._ws_backpressure_until = time.time() + self.ws_source_backpressure_cooldown_s
+        self._ws_backpressure_until = time.monotonic() + self.ws_source_backpressure_cooldown_s
         for _ in range(max(1, int(drops))):
             safe_inc(
                 ROUTER_DROPPED_TOTAL,
@@ -807,9 +813,6 @@ class MarketDataRouter:
             for ex in list(self.buffer[pair].keys()):
                 ts_ex_ms = self.buffer[pair][ex]["ts_ex_ms"]
                 if now_ms - ts_ex_ms > purge_threshold_ms:
-                    if self.verbose and time.time() - self.last_log_time[f"purge_{pair}_{ex}"] > 1:
-                        logger.info(f"[Router] 🧹 Purge stale {pair} - {ex}")
-                        self.last_log_time[f"purge_{pair}_{ex}"] = time.time()
                     del self.buffer[pair][ex]
                 self._update_pair_queue_depth(pair, ex, 0)
             if not self.buffer.get(pair):
@@ -818,7 +821,6 @@ class MarketDataRouter:
     # --- PATCH B1: alias attendu par _purge_loop() ---
     def _purge_stale_pairs(self) -> None:
         # P1: Purge globale des caches latest si trop vieux
-        now_ms = int(time.time() * 1000)
         mono_now_ns = time.monotonic_ns()
         
         # On purge tout ce qui a plus de 3 secondes du cache Router
@@ -832,8 +834,7 @@ class MarketDataRouter:
                 if recv_mono_ns is not None:
                     age_ms = int((mono_now_ns - int(recv_mono_ns)) / 1_000_000)
                 else:
-                    recv_ts = snap.get("recv_ts_ms")
-                    age_ms = (now_ms - int(recv_ts)) if recv_ts else 999999
+                    age_ms = 0
                 
                 if age_ms > 3000:
                     del self._latest_books[ex][pair]
@@ -845,7 +846,7 @@ class MarketDataRouter:
     async def _purge_loop(self) -> None:
         flush_every_ms = max(5, int(getattr(self, "coalesce_window_ms", 20)))
         hb_every_ms = 1000
-        last_flush_ms = last_hb_ms = int(time.time() * 1000)
+        last_flush_ms = last_hb_ms = int(time.monotonic() * 1000)
 
         # P0 Marché Public — backpressure piloté par BotConfig.router.backpressure
         bp_cfg = self.router_cfg
@@ -869,7 +870,7 @@ class MarketDataRouter:
         base_maxlen = int(getattr(self, "coalesce_maxlen", 8))
 
         while getattr(self, "_running", False):
-            now_ms = int(time.time() * 1000)
+            now_ms = int(time.monotonic() * 1000)
 
             # FLUSH
             if now_ms - last_flush_ms >= flush_every_ms:
@@ -909,18 +910,18 @@ class MarketDataRouter:
                 getattr(self.router_cfg, "deterministic_backpressure", False)
             ) if self.router_cfg is not None else False
 
-            ws_bp_active = bool(self._ws_backpressure_until and time.time() < self._ws_backpressure_until)
+            ws_bp_active = bool(self._ws_backpressure_until and time.monotonic() < self._ws_backpressure_until)
             if not deterministic:
                 if high or ws_bp_active:
                     self.coalesce_window_ms = base_coalesce_ms + bump_ms
                     self.coalesce_maxlen = base_maxlen + grow
-                    bp_until = max(time.time() + cooldown, self._ws_backpressure_until or 0.0)
-                elif bp_until and time.time() > bp_until:
+                    bp_until = max(time.monotonic() + cooldown, self._ws_backpressure_until or 0.0)
+                elif bp_until and time.monotonic() > bp_until:
                     # retour normal
                     self.coalesce_window_ms = base_coalesce_ms
                     self.coalesce_maxlen = base_maxlen
                     bp_until = 0.0
-                    if self._ws_backpressure_until and time.time() >= self._ws_backpressure_until:
+                    if self._ws_backpressure_until and time.monotonic() >= self._ws_backpressure_until:
                         self._ws_backpressure_until = 0.0
 
             await asyncio.sleep(0.001)
@@ -980,11 +981,15 @@ class MarketDataRouter:
         if not mode_norm:
             mode_norm = "EU_ONLY"
         if mode_norm not in {"EU_ONLY", "SPLIT", "JP_ONLY"}:
-            logger.warning("[Router] unknown deployment_mode=%s; falling back to EU_ONLY", mode_norm)
+            safe_inc(
+                ROUTER_DEPLOYMENT_MODE_INVALID_TOTAL,
+                "router_deployment_mode_invalid_total",
+                "_deployment_mode",
+                mode=mode_norm or "EMPTY",
+            )
             mode_norm = "EU_ONLY"
         if not self._deployment_mode_logged:
             self._deployment_mode_logged = True
-            logger.info("[Router] deployment_mode_resolved=%s", mode_norm)
         return mode_norm
 
     def _resolve_stale_limit_ms(self, exchange: str) -> int:
@@ -1003,29 +1008,23 @@ class MarketDataRouter:
                     if l2_fresh_max_s > 0.0:
                         slo_limit_ms = int(l2_fresh_max_s * 1000.0)
         except Exception:
-            logger.warning(
-                "[Router] unable to resolve SLO-based stale_limit_ms; using router.stale_ms",
-                exc_info=False,
-            )
             return stale_cfg_ms
 
         if slo_limit_ms is None:
             warn_key = (mode_key, exu)
             if warn_key not in self._missing_slo_warned:
                 self._missing_slo_warned.add(warn_key)
-                logger.warning(
-                    "[Router] missing SLO for mode=%s exchange=%s; using router.stale_ms",
-                    mode_key,
-                    exu,
+                safe_inc(
+                    ROUTER_SLO_MISSING_TOTAL,
+                    "router_slo_missing_total",
+                    "_resolve_stale_limit_ms",
+                    mode=mode_key,
+                    exchange=exu,
                 )
             return stale_cfg_ms
 
         resolved = min(stale_cfg_ms, slo_limit_ms)
-        logger.debug(
-            "[Router] stale_limit_ms resolved from cfg/slo",
-            extra={"exchange": exu, "mode": mode_key, "stale_ms": resolved},
-        )
-        return resolved
+
     # ------------------------- Coalescing par paire -------------------------
 
     async def _flush_pair_after(self, pair: str, delay_s: float) -> None:
@@ -1156,7 +1155,7 @@ class MarketDataRouter:
         P2: publication per-CEX avec respect des cadences max_hz par topic et backpressure-aware.
         """
         exu = str(ex).upper()
-        now_ms = int(time.time() * 1000)
+        now_ms = int(time.monotonic() * 1000)
         per_cex_key = self._cex_key(exu)
         qmap = self.out_queues.get(per_cex_key, {})
 
@@ -1277,7 +1276,13 @@ class MarketDataRouter:
                     MarketEvent(**data)
                 except ValidationError:
                     # Si la validation échoue, on drop l'event
-                    safe_inc(ROUTER_DROPPED_TOTAL, "router_dropped_total", "validate", reason="pydantic_fail")
+                    safe_inc(
+                        ROUTER_DROPPED_TOTAL,
+                        "router_dropped_total",
+                        "validate",
+                        queue="validate",
+                        reason="pydantic_fail",
+                    )
                     return None
             
             # Détection Clock Drift
@@ -1286,7 +1291,11 @@ class MarketDataRouter:
                 if abs(diff) > 1000:
                     if not hasattr(self, "_clock_offset_ms"):
                         self._clock_offset_ms = diff
-                        logger.info("[Router] Auto-calibration horloge (FAST): Offset détecté de %dms", diff)
+                        try:
+                            if ROUTER_CLOCK_OFFSET_MS is not None:
+                                ROUTER_CLOCK_OFFSET_MS.labels(exchange=ex).set(float(diff))
+                        except Exception:
+                            pass
             
             # Mode DRY_RUN
             is_dry = False
@@ -1325,8 +1334,13 @@ class MarketDataRouter:
             return data
 
         except Exception as e:
-            if self._events_in % 1000 == 0:
-                logger.warning("[Router] Hybrid-Path Validation error: %s", e)
+            safe_inc(
+                ROUTER_DROPPED_TOTAL,
+                "router_dropped_total",
+                "_validate_and_enrich",
+                exchange="UNKNOWN",
+                reason="validate_exception",
+            )
             return None
 
 
@@ -1361,7 +1375,7 @@ class MarketDataRouter:
             try:
                 from modules.obs_metrics import ROUTER_DROPPED_TOTAL
                 if ROUTER_DROPPED_TOTAL:
-                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="queue_full").inc()
+                    ROUTER_DROPPED_TOTAL.labels(queue=queue_label, reason="queue_full").inc()
             except Exception:
                 pass
 
@@ -1402,7 +1416,7 @@ class MarketDataRouter:
             try:
                 from modules.obs_metrics import ROUTER_DROPPED_TOTAL
                 if ROUTER_DROPPED_TOTAL:
-                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="exception").inc()
+                    ROUTER_DROPPED_TOTAL.labels(queue=queue_label, reason="exception").inc()
             except Exception:
                 pass
             try:
@@ -1426,7 +1440,7 @@ class MarketDataRouter:
             try:
                 from modules.obs_metrics import ROUTER_DROPPED_TOTAL
                 if ROUTER_DROPPED_TOTAL:
-                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="queue_full").inc()
+                    ROUTER_DROPPED_TOTAL.labels(queue=queue_label, reason="queue_full").inc()
             except Exception:
                 pass
             try:
@@ -1437,7 +1451,7 @@ class MarketDataRouter:
             try:
                 from modules.obs_metrics import ROUTER_DROPPED_TOTAL
                 if ROUTER_DROPPED_TOTAL:
-                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="queue_full").inc()
+                    ROUTER_DROPPED_TOTAL.labels(queue=queue_label, reason="queue_full").inc()
             except Exception:
                 pass
             try:
@@ -1448,7 +1462,7 @@ class MarketDataRouter:
             try:
                 from modules.obs_metrics import ROUTER_DROPPED_TOTAL
                 if ROUTER_DROPPED_TOTAL:
-                    ROUTER_DROPPED_TOTAL.labels(exchange=str(getattr(self, "exchange", "UNKNOWN")), reason="exception").inc()
+                    ROUTER_DROPPED_TOTAL.labels(queue=queue_label, reason="exception").inc()
             except Exception:
                 pass
             try:
@@ -1553,15 +1567,11 @@ class MarketDataRouter:
 
                 # P1: Freshness check immédiat dans le worker scanner
                 # Si le backlog a gonflé, on skip les vieux events
-                now_ms = int(time.time() * 1000)
-                
-                # Priorité au monotonic clock
+                now_mono_ns = time.monotonic_ns()
                 recv_mono_ns = ev.get("recv_mono_ns")
-                if recv_mono_ns is not None:
-                    age_ms = int((time.monotonic_ns() - int(recv_mono_ns)) / 1_000_000)
-                else:
-                    recv_ts = ev.get("recv_ts_ms")
-                    age_ms = (now_ms - int(recv_ts)) if recv_ts else 999999
+                if recv_mono_ns is None:
+                    ev["recv_mono_ns"] = recv_mono_ns = now_mono_ns
+                age_ms = int((now_mono_ns - int(recv_mono_ns)) / 1_000_000)
 
                 if age_ms > 1500:
                     safe_inc(
@@ -1606,23 +1616,24 @@ class MarketDataRouter:
         """Émet VolEvent (bps): l1_spread_bps/ema_vol_bps sont exprimés en bps."""
         ex = ev["exchange"]; pair = ev["pair_key"]
         key = (ex, pair)
-        now = time.time()
+        now_mono = time.monotonic()
+        now_ms = int(time.time() * 1000)
 
         # --- AJOUT P1 : Throttling (Budget CPU) ---
         # On limite le calcul de volatilité à 5Hz max par paire.
         # Sur 120 paires, cela évite des milliers de calculs inutiles par seconde.
         last_calc = getattr(self, "_vol_last_calc_ts", {}).get(key, 0.0)
         if not hasattr(self, "_vol_last_calc_ts"): self._vol_last_calc_ts = {}
-        if (now - last_calc) < (1.0 / self.vol_max_hz):
+        if (now_mono - last_calc) < (1.0 / self.vol_max_hz):
             return
-        self._vol_last_calc_ts[key] = now
+        self._vol_last_calc_ts[key] = now_mono
 
         bid, ask = float(ev.get("best_bid", 0.0)), float(ev.get("best_ask", 0.0))
         if bid <= 0 or ask <= 0: return
         val = ((ask - bid) / bid) * 10000.0  # en bps
 
         ema_prev = self._vol_ema.get(key)
-        ema_curr = self._ema_update(ema_prev, val, dt_ms=(now - last_calc)*1000.0, window_ms=self.vol_ema_window_ms)
+        ema_curr = self._ema_update(ema_prev, val, dt_ms=(now_mono - last_calc)*1000.0, window_ms=self.vol_ema_window_ms)
         self._vol_ema[key] = ema_curr
 
         # rate limit & on-change
@@ -1635,15 +1646,15 @@ class MarketDataRouter:
             changed = True
 
         min_interval = 0.1 # 10Hz max pub
-        if changed and (now - last_pub_ts) >= min_interval:
+        if changed and (now_mono - last_pub_ts) >= min_interval:
             do_publish = True
-        elif (now - last_pub_ts) >= self.vol_heartbeat_s:
+        elif (now_mono - last_pub_ts) >= self.vol_heartbeat_s:
             do_publish = True
             changed = False  # heartbeat
 
         if do_publish:
             # P0: Fast-path pour VolEvent sans Pydantic.
-            now_ms = int(now * 1000)
+
             ex_ts_ms = int(ev.get("exchange_ts_ms") or 0)
             
             payload = {
@@ -1658,27 +1669,28 @@ class MarketDataRouter:
                 "changed": changed,
                 "exchange_ts_ms": ex_ts_ms,
                 "recv_ts_ms": int(ev.get("recv_ts_ms") or now_ms),
-                "age_ms": max(0.0, float(now_ms - ex_ts_ms)) if ex_ts_ms > 0 else 0.0,
+                "age_ms": float(ev.get("age_ms") or 0.0),
                 "seq_no": int(now_ms % 2_147_483_647),
                 "kind": "vol"
             }
             self._publish_cex(ex, "vol", payload)
-            self._vol_last_pub_ts[key] = now
+            self._vol_last_pub_ts[key] = now_mono
             self._vol_last_pub_val[key] = ema_curr
 
     def _per_cex_slip(self, ev: Dict[str, Any]) -> None:
         """Proxy slippage très léger (on-change/heartbeat/capHz). Unité: bps (pas fraction)."""
         ex = ev["exchange"]; pair = ev["pair_key"]
         key = (ex, pair)
-        now = time.time()
+        now_mono = time.monotonic()
+        now_ms = int(time.time() * 1000)
 
         # --- AJOUT P1 : Throttling (Budget CPU) ---
         # On limite le calcul de slippage à 5Hz max par paire.
         last_calc = getattr(self, "_slip_last_calc_ts", {}).get(key, 0.0)
         if not hasattr(self, "_slip_last_calc_ts"): self._slip_last_calc_ts = {}
-        if (now - last_calc) < (1.0 / self.slip_max_hz):
+        if (now_mono - last_calc) < (1.0 / self.slip_max_hz):
             return
-        self._slip_last_calc_ts[key] = now
+        self._slip_last_calc_ts[key] = now_mono
 
         # proxy : on réutilise l1_spread_bps comme métrique simple
         metric = float(ev.get("l1_spread_bps") or 0.0)
@@ -1698,9 +1710,9 @@ class MarketDataRouter:
         do_publish = False
 
         min_interval = 0.1 # 10Hz max pub
-        if changed and (now - last_pub_ts) >= min_interval:
+        if changed and (now_mono - last_pub_ts) >= min_interval:
             do_publish = True
-        elif (now - last_pub_ts) >= self.slip_heartbeat_s:
+        elif (now_mono - last_pub_ts) >= self.slip_heartbeat_s:
             do_publish = True
             changed = False  # heartbeat
 
@@ -1718,39 +1730,40 @@ class MarketDataRouter:
                 "top_bid_vol": float(ev.get("bid_volume") or 0.0),
                 "top_ask_vol": float(ev.get("ask_volume") or 0.0),
                 "exchange_ts_ms": int(ev.get("exchange_ts_ms") or 0),
-                "recv_ts_ms": int(ev.get("recv_ts_ms") or (now * 1000)),
+                "recv_ts_ms": int(ev.get("recv_ts_ms") or now_ms),
                 "kind": "slip"
             }
             self._publish_cex(ex, "slip", payload)
-            self._slip_last_pub_ts[key] = now
+            self._slip_last_pub_ts[key] = now_mono
             self._slip_last_metric[key] = metric
 
 
     def _per_cex_health(self, ev: Dict[str, Any]) -> None:
         ex = ev["exchange"]
-        now = time.time()
+        now_mono = time.monotonic()
+        now_ms = int(time.time() * 1000)
         last = self._health_last_pub_ts.get(ex, 0.0)
-        if (now - last) < self.health_heartbeat_s:
+        if (now_mono - last) < self.health_heartbeat_s:
             return
             
         # P0: Fast-path pour HealthEvent sans Pydantic.
         payload = {
             "exchange": ex,
             "last_ex_ts_ms": int(ev.get("exchange_ts_ms") or 0),
-            "last_recv_ts_ms": int(ev.get("recv_ts_ms") or (now * 1000)),
+            "last_recv_ts_ms": int(ev.get("recv_ts_ms") or now_ms),
             "age_ms": float(ev.get("age_ms") or 0.0),
             "pairs_seen": list((self._latest_light.get(ex, {}) or {}).keys()),
             "changed": False,
             "kind": "health"
         }
         self._publish_cex(ex, "health", payload)
-        self._health_last_pub_ts[ex] = now
+        self._health_last_pub_ts[ex] = now_mono
 
     def _maybe_emit_heartbeats(self) -> None:
         """Émet des heartbeats per-CEX en l’absence de changements notables et met à jour les gauges."""
-        now = time.time()
+        now_mono = time.monotonic()
         for ex, pairs in (self._latest_light or {}).items():
-            if (now - self._health_last_pub_ts.get(ex, 0.0)) >= self.health_heartbeat_s:
+            if (now_mono - self._health_last_pub_ts.get(ex, 0.0)) >= self.health_heartbeat_s:
                 # P0: Fast-path pour HealthEvent heartbeat sans Pydantic.
                 payload = {
                     "exchange": ex,
@@ -1763,7 +1776,7 @@ class MarketDataRouter:
                 }
 
                 self._publish_cex(ex, "health", payload)
-                self._health_last_pub_ts[ex] = now
+                self._health_last_pub_ts[ex] = now_mono
             # MAJ gauges même sans publication (ex: calme plat)
             self._update_queue_depth_metrics_for(ex)
 

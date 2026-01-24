@@ -4658,6 +4658,11 @@ class ExecutionEngine:
         idk = meta.get("idempotency_key") or meta.get("idempotence_key")
         bundle_id = meta.get("bundle_id")
         if self.ff_enforce_client_oid_deterministic and not idk:
+            try:
+                from modules.obs_metrics import ENGINE_IDEMPOTENCY_MISSING_TOTAL
+                ENGINE_IDEMPOTENCY_MISSING_TOTAL.labels(branch=branch, profile=profile).inc()
+            except Exception:
+                pass
             self._raise_engine_submit_error("IDEMPOTENCY_MISSING", branch=branch, profile=profile, payload=bundle)
         if self.ff_enforce_client_oid_deterministic and not bundle_id:
             self._raise_engine_submit_error("BUNDLE_ILLEGAL", branch=branch, profile=profile, payload=bundle)
@@ -5051,7 +5056,8 @@ class ExecutionEngine:
                 return
 
         # 4) Enqueue + obs
-        t0 = time.time()
+        t0 = time.perf_counter()
+        now_wall = time.time()
         job = dict(bundle)
         job.setdefault("type", "bundle")
         job["cid"] = cid
@@ -5072,14 +5078,14 @@ class ExecutionEngine:
         try:
             await self.order_queue.put(job)
             set_pipeline_backlog("engine", self.order_queue.qsize())
-            self._seen_cid_store.mark(cid, now)
+            self._seen_cid_store.mark(cid, now_wall)
         except Exception:
             self._decrement_active_bundle(branch, profile)
             self._decrement_branch_depth(branch)
             raise
         try:
             if hasattr(self, "obs_hist"):
-                self.obs_hist("engine_enqueue_ms", (time.time() - t0) * 1000.0)
+                self.obs_hist("engine_enqueue_ms", (time.perf_counter() - t0) * 1000.0)
         except Exception:
             pass
 
@@ -5435,7 +5441,7 @@ class ExecutionEngine:
                     self._handle_worker_nonfatal(e, phase=f"pre-payload-W{wid}")
                     continue
 
-                t0 = time.time()
+                t0 = time.perf_counter()
                 try:
                     t_lower = str((payload or {}).get("type", "") or "").lower()
 
@@ -5456,7 +5462,7 @@ class ExecutionEngine:
                     self.stats.total_failed += 1
                     self.stats.error_count += 1
                 finally:
-                    self.stats.execution_latency = time.time() - t0
+                    self.stats.execution_latency = time.perf_counter() - t0
                     self.stats.last_trade_time = time.time()
                     observe_engine_latency(self.stats.execution_latency)
 

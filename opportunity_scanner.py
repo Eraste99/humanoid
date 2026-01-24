@@ -592,7 +592,7 @@ class OpportunityScanner:
         self._tb_pair = {}
 
         # P0: On mémorise le temps de boot pour une grâce initiale sur le staleness
-        self._boot_ts = time.time()
+        self._boot_ts = time.monotonic()
 
         # --- Shedding pilotable ---
         self._shed_load_threshold = float(getattr(s, "shed_load_threshold", 0.95))
@@ -1009,7 +1009,7 @@ class OpportunityScanner:
         try:
             ex_for_fresh = _norm_ex(data.get("exchange"))
             if ex_for_fresh:
-                self._last_seen_books_by_ex[ex_for_fresh] = time.time()
+                self._last_seen_books_by_ex[ex_for_fresh] = time.monotonic()
         except Exception:
             pass
 
@@ -1034,18 +1034,11 @@ class OpportunityScanner:
         # P0: Calcul d'âge par MONOTONIC (Précis, Athlétique, Insensible aux sauts d'heure)
         now_mono_ns = time.monotonic_ns()
         recv_mono_ns = data.get("recv_mono_ns")
-        
-        if recv_mono_ns is not None:
-            age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
-        else:
-            # Fallback sur recv_ts_ms si mono absent (vieux events ou tests)
-            now_ms = int(time.time() * 1000)
-            recv_ts_ms = data.get("recv_ts_ms")
-            if recv_ts_ms is not None:
-                age_ms = now_ms - int(recv_ts_ms)
-            else:
-                self._record_rejection(reason="schema_missing_field", route="*", pair=pair, ctx={"exchange": ex, "field": "recv_ts_ms"})
-                return
+
+        if recv_mono_ns is None:
+            recv_mono_ns = now_mono_ns
+            data["recv_mono_ns"] = recv_mono_ns
+        age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
 
         book_ttl_ms = data.get("book_ttl_ms")
         if book_ttl_ms is None:
@@ -1064,7 +1057,7 @@ class OpportunityScanner:
                 pass
 
             # P0: Grâce initiale de 5s au démarrage du Scanner
-            if (time.time() - self._boot_ts) < 5.0:
+            if (time.monotonic() - self._boot_ts) < 5.0:
                 return
 
             self._record_rejection(
@@ -1173,7 +1166,7 @@ class OpportunityScanner:
             # P1: Purge agressive pendant la phase de boot (5s)
             # Si on accumule trop dans la file d'une paire alors qu'on n'a pas encore fini de booter,
             # on ne garde que le plus frais pour éviter le burst de staleness à T=5.01s.
-            if (time.time() - self._boot_ts) < 5.0 and len(dq) >= 1:
+            if (time.monotonic() - self._boot_ts) < 5.0 and len(dq) >= 1:
                 dq.clear()
 
             if self._pair_queue_max and len(dq) >= self._pair_queue_max:
@@ -1421,7 +1414,7 @@ class OpportunityScanner:
             age_ms = int(time.time() * 1000) - int(recv_ts_ms)
 
         if age_ms > int(book_ttl_ms or 1500):
-            if (time.time() - getattr(self, "_boot_ts", 0)) < 5.0:
+            if (time.monotonic() - getattr(self, "_boot_ts", 0)) < 5.0:
                 return None
             if age_ms > 60000:
                 self.logger.warning("[Scanner] ABSURD AGE detected in _snapshot_ts_seconds for %s: %sms", pair_key, age_ms)
@@ -2322,7 +2315,7 @@ class OpportunityScanner:
             book_ttl_ms = snapshot.get("book_ttl_ms")
             
             # P0: Grâce initiale de 5s au démarrage du Scanner
-            if (time.time() - getattr(self, "_boot_ts", 0)) < 5.0:
+            if (time.monotonic() - getattr(self, "_boot_ts", 0)) < 5.0:
                 return True
 
             if book_ttl_ms is None:
@@ -3028,15 +3021,18 @@ class OpportunityScanner:
         score_net = (spread_net - vol_penalty_frac) * target_quote
 
         # Latence WS→Scanner (estimation robuste)
-        buy_ms = int(payload.get("ts_buy_ex_ms") or 0)
-        sell_ms = int(payload.get("ts_sell_ex_ms") or 0)
-        if buy_ms and sell_ms:
-            sec = max(0.0, (time.time() * 1000.0 - min(buy_ms, sell_ms)) / 1000.0)
+        # Latence WS→Scanner (estimation robuste, monotonic)
+        now_mono_ns = time.monotonic_ns()
+        buy_mono_ns = buy_data.get("recv_mono_ns")
+        sell_mono_ns = sell_data.get("recv_mono_ns")
+        if buy_mono_ns and sell_mono_ns:
+            sec = max(0.0, (now_mono_ns - min(int(buy_mono_ns), int(sell_mono_ns))) / 1_000_000_000.0)
         else:
+            now_mono = time.monotonic()
             t_buy = float(self._last_seen_books_by_ex.get(buy_ex, 0.0) or 0.0)
             t_sell = float(self._last_seen_books_by_ex.get(sell_ex, 0.0) or 0.0)
             last_both = min(t_buy, t_sell) if (t_buy and t_sell) else 0.0
-            sec = max(0.0, time.time() - last_both) if last_both > 0 else 0.0
+            sec = max(0.0, now_mono - last_both) if last_both > 0 else 0.0
         latency_ws_to_scan_ms = int(round(sec * 1000.0))
 
         opp = {
@@ -3530,7 +3526,7 @@ class OpportunityScanner:
         except Exception:
             pk = (pair or "").replace("-", "").upper()
 
-        now = time.time()
+        now = time.monotonic()
         last = float(self._last_scan_ts_by_pair.get(pk, 0.0) or 0.0)
         if last and (now - last) < window:
             # On compte dans le bloc "dedup" mais sans spammer les logs
@@ -3583,11 +3579,10 @@ class OpportunityScanner:
                 try:
                     ev = dq.pop() # LIFO
                     recv_mono_ns = ev.get("recv_mono_ns")
-                    if recv_mono_ns is not None:
-                        age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
-                    else:
-                        recv_ts = ev.get("recv_ts_ms")
-                        age_ms = (int(time.time() * 1000) - int(recv_ts)) if recv_ts else 999999
+                    if recv_mono_ns is None:
+                        recv_mono_ns = now_mono_ns
+                        ev["recv_mono_ns"] = recv_mono_ns
+                    age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
 
                     if age_ms > ttl_ms:
                         continue
@@ -3610,11 +3605,10 @@ class OpportunityScanner:
             if pk in (per_pair or {}):
                 data = per_pair[pk]
                 recv_mono_ns = data.get("recv_mono_ns")
-                if recv_mono_ns is not None:
-                    age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
-                else:
-                    recv_ts = data.get("recv_ts_ms")
-                    age_ms = (int(time.time() * 1000) - int(recv_ts)) if recv_ts else 999999
+                if recv_mono_ns is None:
+                    recv_mono_ns = now_mono_ns
+                    data["recv_mono_ns"] = recv_mono_ns
+                age_ms = (now_mono_ns - int(recv_mono_ns)) // 1_000_000
 
                 if age_ms > 2000: # Cache trop vieux
                     continue

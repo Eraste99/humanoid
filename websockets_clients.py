@@ -52,6 +52,7 @@ try:
         WS_CONNECTIONS_OPEN,
         note_ws_public_cfg,
         WS_SYMBOL_UNMAPPED_TOTAL,
+        WS_PUBLIC_CLOCK_OFFSET_MS,
     )
 except Exception:  # pragma: no cover
     class _Noop:
@@ -64,6 +65,7 @@ except Exception:  # pragma: no cover
     WS_CONNECTIONS_OPEN = _Noop()
     WS_PUBLIC_DROPPED_TOTAL = _Noop()
     WS_SYMBOL_UNMAPPED_TOTAL = _Noop()
+    WS_PUBLIC_CLOCK_OFFSET_MS = _Noop()
 
     def note_ws_public_cfg(*_a, **_k):
         return None
@@ -354,6 +356,11 @@ class WebSocketExchangeClient:
         now_ms = int(time.time() * 1000)
         # 0 = jamais reçu (fail-closed : staleness doit monter tant qu'aucun frame)
         self._last_recv_ts_ms: Dict[str, int] = {
+            "BINANCE": 0,
+            "COINBASE": 0,
+            "BYBIT": 0,
+        }
+        self._last_recv_mono_ns: Dict[str, int] = {
             "BINANCE": 0,
             "COINBASE": 0,
             "BYBIT": 0,
@@ -664,6 +671,16 @@ class WebSocketExchangeClient:
         except Exception:
             logger.exception("Erreur lors du log de reconnect WS")
 
+    def _note_clock_offset(self, exchange: str, offset_ms: int) -> None:
+        ex = str(exchange).upper()
+        try:
+            WS_PUBLIC_CLOCK_OFFSET_MS.labels(
+                exchange=ex,
+                region=getattr(self, "region", "EU"),
+                deployment_mode=getattr(self, "deployment_mode", "EU_ONLY"),
+            ).set(float(offset_ms))
+        except Exception:
+            pass
 
     # ------------------- mapping utils -------------------
     def _rebuild_inv_map(self):
@@ -751,16 +768,12 @@ class WebSocketExchangeClient:
         ex_low = str(exchange).lower()
         sym_up = str(exchange_symbol).upper()
         res = self._inv_map.get(ex_low, {}).get(sym_up)
-        
-        if not res and ex_low == "bybit":
-            # On ne loggue que si on a vraiment reçu un symbole (pas une chaîne vide)
-            if sym_up:
-                self.log.warning("[WS][BYBIT] REJET: Symbole '%s' inconnu. Dispos: %s", 
-                                 sym_up, list(self._inv_map.get("bybit", {}).keys()))
+
         return res
 
     def _note_frame_received(self, exchange: str, recv_ts_ms: int) -> None:
         self._last_recv_ts_ms[exchange.upper()] = int(recv_ts_ms)
+        self._last_recv_mono_ns[exchange.upper()] = time.monotonic_ns()
         try:
             from modules.obs_metrics import ws_public_note_frame_received
             ws_public_note_frame_received(
@@ -789,17 +802,17 @@ class WebSocketExchangeClient:
         interval_s = float(getattr(wscfg, "staleness_interval_s", 1.0))
         slo_s = getattr(wscfg, "staleness_slo_s", None)
         while self._running:
-            now_ms = int(time.time() * 1000)
+            now_mono_ns = time.monotonic_ns()
             for ex in ("BINANCE", "COINBASE", "BYBIT"):
                 if ex not in self.enabled_exchanges:
                     continue
                 if self._exchange_disabled_by_flag(ex):
                     continue
-                last_ms = int(self._last_recv_ts_ms.get(ex, 0) or 0)
-                if last_ms <= 0:
+                    last_mono_ns = int(self._last_recv_mono_ns.get(ex, 0) or 0)
+                if last_mono_ns <= 0:
                     staleness_s = 1e9  # jamais reçu => stale massif
                 else:
-                    staleness_s = max(0.0, (now_ms - last_ms) / 1000.0)
+                    staleness_s = max(0.0, (now_mono_ns - last_mono_ns) / 1_000_000_000.0)
 
                 ws_public_staleness(
                     ex,
@@ -1001,14 +1014,8 @@ class WebSocketExchangeClient:
 
         ok = await self._publish_event(event, exchange=ex, reason="emit")
         if not ok:
-            now = time.time()
-            if (now - self._bp_last_log_ts[ex]) >= 1.0:
-                logger.warning(
-                    "[WS] out_queue saturated (exchange=%s, symbol=%s) — event dropped",
-                    ex,
-                    ex_symbol,
-                )
-                self._bp_last_log_ts[ex] = now
+            now_mono = time.monotonic()
+            self._bp_last_log_ts[ex] = now_mono
 
     async def _publish_event(self, payload: Dict[str, Any], *, exchange: str, reason: str) -> bool:
         """
@@ -1061,19 +1068,9 @@ class WebSocketExchangeClient:
 
 
         self._note_drop(ex, reason=reason, kind="combo")
-
-        try:
-            logger.warning(
-                "Backpressure on out_queue for %s, drop #%d, reason=%s",
-                ex,
-                self._out_queue_drops[ex],
-                reason,
-            )
-        except Exception:
-            logger.exception("Erreur lors du log de backpressure")
-
         now = time.time()
-        if (now - self._bp_last_emit_ts[ex]) >= 1.0:
+        now_mono = time.monotonic()
+        if (now_mono - self._bp_last_emit_ts[ex]) >= 1.0:
             payload = {
                 "__ws_backpressure__": True,
                 "exchange": ex,
@@ -1082,7 +1079,7 @@ class WebSocketExchangeClient:
                 "queue_depth": getattr(self.out_queue, "qsize", lambda: 0)(),
                 "ts_ms": int(now * 1000),
             }
-            self._bp_last_emit_ts[ex] = now
+            self._bp_last_emit_ts[ex] = now_mono
             self._queue_control_event(payload)
 
     def _queue_control_event(self, payload: Dict[str, Any]) -> None:
@@ -1309,7 +1306,7 @@ class WebSocketExchangeClient:
                             recv_ts_ms = int(time.time() * 1000)
 
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                if bybit_debug_count < 3:
+                                if getattr(self, "verbose", False) and bybit_debug_count < 3:
                                     self.log.info("[WS][BYBIT] RAW FRAME #%d: %s", bybit_debug_count, msg.data[:200])
                                     bybit_debug_count += 1
 
@@ -1322,12 +1319,17 @@ class WebSocketExchangeClient:
                                     ts_root = data.get("ts")
 
                                     # P0: Calibration temporelle Bybit
-                                    if ts_root and not hasattr(self, "_clock_offset_ms"):
+                                    if ts_root:
                                         try:
                                             diff = int(ts_root) - int(time.time() * 1000)
                                             if abs(diff) > 1000:
-                                                self._clock_offset_ms = diff
-                                                self.log.info("[WS][BYBIT] Calibration horloge: Offset=%dms", diff)
+                                                now_mono = time.monotonic()
+                                                last_note = float(getattr(self, "_clock_offset_last_mono", 0.0) or 0.0)
+                                                if not hasattr(self, "_clock_offset_ms") or (
+                                                    now_mono - last_note) >= 60.0:
+                                                    self._clock_offset_ms = diff
+                                                    self._clock_offset_last_mono = now_mono
+                                                    self._note_clock_offset("BYBIT", diff)
                                         except Exception:
                                             pass
 

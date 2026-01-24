@@ -8423,6 +8423,11 @@ class RiskManager:
                 ctx["time_skew_ms"] = float(get_time_skew_ms())
             except Exception:
                 # Fail-closed: si on ne peut pas vérifier le skew, on rejette l'opportunité
+                try:
+                    from modules.obs_metrics import RM_CLOCK_SKEW_UNKNOWN_TOTAL
+                    RM_CLOCK_SKEW_UNKNOWN_TOTAL.inc()
+                except Exception:
+                    pass
                 return (False, "RM_CLOCK_SKEW_UNKNOWN", ctx)
             if ctx["time_skew_ms"] > float(self.max_clock_skew_ms):
                 try:
@@ -12985,7 +12990,7 @@ class RiskManager:
         quote = _pair_quote(pk)
         combo_key = f"{pk}|{quote}|{str(buy_exchange).upper()}->{str(sell_exchange).upper()}"
         expiry = float(self._reb_locks.get(combo_key, 0.0) or 0.0)
-        now = time.time()
+        now = time.monotonic()
         if expiry <= now:
             if combo_key in self._reb_locks:
                 self._reb_locks.pop(combo_key, None)
@@ -15534,7 +15539,7 @@ class RiskManager:
             logger.warning("[RiskManager] P1: Schema violation from scanner, invalid or empty legs")
             return None
 
-        now = time.time()
+        now = time.monotonic()
         decision_ctx = decision_ctx if isinstance(decision_ctx, dict) else {"submitted": False, "attempted": False,
                                                                     "reasons": []}
         # P0A (fallback): si le Scanner fournit book_ts_ms / book_age_ms, on met à jour
