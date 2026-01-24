@@ -1500,6 +1500,19 @@ ENGINE_RETRIES_TOTAL = _metric(Counter, 'engine_retries_total', 'Engine retries'
 ENGINE_QUEUEPOS_BLOCKED_TOTAL = _metric(Counter, 'engine_queuepos_blocked_total', 'Engine TM queuepos blocked', ['exchange', 'pair'])
 ENGINE_SUBMIT_QUEUE_DEPTH = _metric(Gauge, 'engine_submit_queue_depth', 'Engine submit queue depth')
 INFLIGHT_GAUGE = _metric(Gauge, 'engine_inflight', 'Engine inflight orders')
+INFLIGHT_LANE_INUSE = _metric(
+    Gauge,
+    'engine_inflight_lane_inuse',
+    'Engine inflight orders by lane',
+    ['exchange', 'lane'],
+)
+INFLIGHT_LANE_WAIT_MS = _metric(
+    Histogram,
+    'engine_inflight_lane_wait_ms',
+    'Engine inflight wait time by lane (ms)',
+    ['exchange', 'lane'],
+    buckets=BUCKETS_MS if 'BUCKETS_MS' in globals() else (1, 2, 5, 10, 25, 50, 100, 250, 500, 1000),
+)
 ENGINE_DEDUP_HITS_TOTAL = _metric(Counter, 'engine_dedup_hits_total', 'Engine dedupe hits', ['source'])
 # --- PnL live (Engine → Prometheus) ---
 # PNL_LIVE_DAY_USD :

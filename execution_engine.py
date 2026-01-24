@@ -855,6 +855,8 @@ try:
         ENGINE_RETRIES_TOTAL,
         ENGINE_SUBMIT_QUEUE_DEPTH,
         INFLIGHT_GAUGE,
+        INFLIGHT_LANE_INUSE,
+        INFLIGHT_LANE_WAIT_MS,
         ENGINE_DEDUP_HITS_TOTAL,
         REBAL_CROSS_TOO_EXPENSIVE_TOTAL,
         MM_FILLS_BOTH,
@@ -946,6 +948,14 @@ try:
     INFLIGHT_GAUGE
 except NameError:
     INFLIGHT_GAUGE = _NoopMetric()
+try:
+    INFLIGHT_LANE_INUSE
+except NameError:
+    INFLIGHT_LANE_INUSE = _NoopMetric()
+try:
+    INFLIGHT_LANE_WAIT_MS
+except NameError:
+    INFLIGHT_LANE_WAIT_MS = _NoopMetric()
 try:
     REBAL_CROSS_TOO_EXPENSIVE_TOTAL
 except NameError:
@@ -2075,12 +2085,25 @@ class ExecutionEngine:
             cancel_res = getattr(engine_cfg, "inflight_reserved_cancel_by_exchange_by_profile", {}) or {}
         except Exception:
             hedge_res, cancel_res = {}, {}
+        strict_inflight = False
+        try:
+            strict_inflight = bool(
+                getattr(getattr(getattr(self.cfg, "rm", None), "switch_knobs", None), "rm_invariant_strict", False)
+                or getattr(self.cfg, "RM_INVARIANT_STRICT", False)
+            )
+        except Exception:
+            strict_inflight = False
 
         def _caps_for(ex: str, total: int) -> tuple[int, int, int]:
             hedge_cap = max(1, _reserved(hedge_res, ex, 1))
             cancel_cap = max(0, _reserved(cancel_res, ex, 1))
             maker_cap = max(1, total - hedge_cap - cancel_cap)
             if hedge_cap + cancel_cap >= total:
+                if strict_inflight:
+                    raise ValueError(
+                        f"inflight reserved lanes exceed total: exchange={ex} total={total} "
+                        f"hedge={hedge_cap} cancel={cancel_cap}"
+                    )
                 maker_cap = 1
                 if hedge_cap + cancel_cap > total:
                     logger.critical(
@@ -2796,11 +2819,20 @@ class ExecutionEngine:
         try:
             self._inflight_curr = getattr(self, "_inflight_curr", {})
             self._inflight_curr[ex] = int(self._inflight_curr.get(ex, 0)) + 1
+            self._inflight_curr_lane = getattr(self, "_inflight_curr_lane", {})
+            lane_curr = self._inflight_curr_lane.get(lane_key) or {}
+            lane_curr[ex] = int(lane_curr.get(ex, 0)) + 1
+            self._inflight_curr_lane[lane_key] = lane_curr
             try:
                 INFLIGHT_GAUGE.labels(exchange=ex).set(self._inflight_curr[ex])  # noqa: PROM gauge
+                INFLIGHT_LANE_INUSE.labels(exchange=ex, lane=lane_key).set(lane_curr[ex])
             except Exception as e:
                 ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL.labels(exchange=ex).inc()
                 logging.getLogger("ExecutionEngine").debug("[Engine] INFLIGHT_GAUGE.set failed: %s", e, exc_info=False)
+            try:
+                INFLIGHT_LANE_WAIT_MS.labels(exchange=ex, lane=lane_key).observe(inflight_wait_ms)
+            except Exception:
+                pass
             if inflight_wait_ms > 0:
                 try:
                     warn_thresh = float(getattr(self.config, "inflight_wait_warn_ms", 500.0))
@@ -2830,8 +2862,13 @@ class ExecutionEngine:
         finally:
             try:
                 self._inflight_curr[ex] = max(0, int(self._inflight_curr.get(ex, 1)) - 1)
+                self._inflight_curr_lane = getattr(self, "_inflight_curr_lane", {})
+                lane_curr = self._inflight_curr_lane.get(lane_key) or {}
+                lane_curr[ex] = max(0, int(lane_curr.get(ex, 1)) - 1)
+                self._inflight_curr_lane[lane_key] = lane_curr
                 try:
                     INFLIGHT_GAUGE.labels(exchange=ex).set(self._inflight_curr[ex])
+                    INFLIGHT_LANE_INUSE.labels(exchange=ex, lane=lane_key).set(lane_curr[ex])
                 except Exception as e:
                     ENGINE_INFLIGHT_GAUGE_SET_ERRORS_TOTAL.labels(exchange=ex).inc()
                     logging.getLogger("ExecutionEngine").debug("[Engine] INFLIGHT_GAUGE.set failed: %s", e,
