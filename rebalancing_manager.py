@@ -215,6 +215,7 @@ class RebalancingManager:
         self.internal_transfer_threshold = float(internal_transfer_threshold)
         self.overlay_comp_threshold = float(overlay_comp_threshold)
         self.cross_cex_haircut = float(cross_cex_haircut)
+        self.transfer_id_bucket_s = float(getattr(reb_cfg, "transfer_id_bucket_s", 300.0))
 
         # Wallets (compat)
         self.wallet_types = [w.upper() for w in (wallet_types or ["SPOT", "FUNDING"])]
@@ -380,6 +381,9 @@ class RebalancingManager:
             "amount": op.get("amount"),
             "type": transfer_type,
         }
+        transfer_bucket = op.get("transfer_bucket")
+        if transfer_bucket is not None:
+            payload["transfer_bucket"] = transfer_bucket
         transfer_id = self._canonical_transfer_id(payload)
         if transfer_id:
             op["transfer_id"] = transfer_id
@@ -812,7 +816,10 @@ class RebalancingManager:
                         amt = round(min(remaining, have), 2)
                         if amt <= 0:
                             continue
-                        plans.append({
+                        created_ts = _now()
+                        transfer_bucket = int(
+                            created_ts // self.transfer_id_bucket_s) if self.transfer_id_bucket_s > 0 else None
+                        plan = {
                             "exchange": ex,
                             "alias": alias,
                             "from_alias": alias,
@@ -821,8 +828,11 @@ class RebalancingManager:
                             "amount": amt, "ccy": q,
                             "type": "transfer", "scope": "intra_cex",
                             "priority": "CASH", "ttl_s": self.rebal_hint_ttl_s,
-                            "created_ts": _now(), "reason": "cash_rebalance_wallet",
-                        })
+                            "created_ts": created_ts, "reason": "cash_rebalance_wallet",
+                        }
+                        if transfer_bucket is not None:
+                            plan["transfer_bucket"] = transfer_bucket
+                        plans.append(plan)
                         remaining = round(remaining - amt, 2)
                         if remaining <= 0:
                             break
@@ -850,14 +860,20 @@ class RebalancingManager:
                             continue
                         if move < max(self.internal_transfer_threshold, self.rebal_quantum_min_quote):
                             continue
-                        plans.append({
+                        created_ts = _now()
+                        transfer_bucket = int(
+                            created_ts // self.transfer_id_bucket_s) if self.transfer_id_bucket_s > 0 else None
+                        plan = {
                             "exchange": ex,
                             "from": {"alias": ra}, "to": {"alias": wa},
                             "amount": move, "ccy": q,
                             "type": "transfer", "scope": "intra_cex",
                             "priority": "CASH", "ttl_s": self.rebal_hint_ttl_s,
-                            "created_ts": _now(), "reason": "cash_rebalance_alias",
-                        })
+                            "created_ts": created_ts, "reason": "cash_rebalance_alias",
+                        }
+                        if transfer_bucket is not None:
+                            plan["transfer_bucket"] = transfer_bucket
+                        plans.append(plan)
                         holdings[ra] -= move
                         holdings[wa] += move
                         if holdings[wa] >= target_min:

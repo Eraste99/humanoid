@@ -3962,6 +3962,16 @@ class ExecutionEngine:
             amt_buy = a_amt if buy_ex == a_ex else b_amt
             bundle_id = f"MM-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
             branch_mm = bundle.get("branch") or "MM"
+            ladder_levels, ladder_weights, ladder_step_ticks = self._resolve_mm_ladder_config(
+                variant=variant,
+                profile=profile,
+                is_cross=is_cross,
+            )
+            try:
+                from modules.obs_metrics import MM_LADDER_LEVELS_USED
+                MM_LADDER_LEVELS_USED.labels(variant=variant, profile=profile).set(ladder_levels)
+            except Exception:
+                pass
 
             # Historisation "planning"
             await self._hist("trade", {
@@ -3973,12 +3983,62 @@ class ExecutionEngine:
             })
 
             # 1) Place makers
-            sell_cid = await self._mm_place_maker(pair_key=pair, exchange=sell_ex, side="SELL",
-                                                  amount_quote=amt_sell, bundle_id=bundle_id, ttl_ms=ttl_ms, branch=branch_mm,
-                                                  meta=meta_m)
-            buy_cid = await self._mm_place_maker(pair_key=pair, exchange=buy_ex, side="BUY",
-                                                 amount_quote=amt_buy, bundle_id=bundle_id, ttl_ms=ttl_ms, branch=branch_mm,
-                                                 meta=meta_m)
+            if ladder_levels <= 1:
+                sell_cid = await self._mm_place_maker(
+                    pair_key=pair,
+                    exchange=sell_ex,
+                    side="SELL",
+                    amount_quote=amt_sell,
+                    bundle_id=bundle_id,
+                    ttl_ms=ttl_ms,
+                    branch=branch_mm,
+                    meta=meta_m,
+                )
+                buy_cid = await self._mm_place_maker(
+                    pair_key=pair,
+                    exchange=buy_ex,
+                    side="BUY",
+                    amount_quote=amt_buy,
+                    bundle_id=bundle_id,
+                    ttl_ms=ttl_ms,
+                    branch=branch_mm,
+                    meta=meta_m,
+                )
+            else:
+                sell_cid = ""
+                buy_cid = ""
+                for idx, weight in enumerate(ladder_weights):
+                    if weight <= 0:
+                        continue
+                    meta_i = dict(meta_m or {})
+                    meta_i["mm_ladder_idx"] = idx
+                    meta_i["mm_ladder_levels"] = ladder_levels
+                    meta_i["mm_ladder_weight"] = float(weight)
+                    meta_i["mm_ladder_step_ticks"] = float(ladder_step_ticks)
+                    sell_amt = float(amt_sell) * float(weight)
+                    buy_amt = float(amt_buy) * float(weight)
+                    if sell_amt > 0:
+                        sell_cid = await self._mm_place_maker(
+                            pair_key=pair,
+                            exchange=sell_ex,
+                            side="SELL",
+                            amount_quote=sell_amt,
+                            bundle_id=bundle_id,
+                            ttl_ms=ttl_ms,
+                            branch=branch_mm,
+                            meta=meta_i,
+                        )
+                    if buy_amt > 0:
+                        buy_cid = await self._mm_place_maker(
+                            pair_key=pair,
+                            exchange=buy_ex,
+                            side="BUY",
+                            amount_quote=buy_amt,
+                            bundle_id=bundle_id,
+                            ttl_ms=ttl_ms,
+                            branch=branch_mm,
+                            meta=meta_i,
+                        )
 
             # --- Contrat MM (RM -> Engine) ---
             # Entrée attendue côté RM (branch == "MM") :
@@ -6113,9 +6173,13 @@ class ExecutionEngine:
             except Exception:
                 logger.exception("[Engine] adjust_virtual_balance failed")
         else:
-            logger.info(
-                "↔️  (LIVE) Transfer interne %s [%s]: %s→%s  %.2f %s (stub)", ex, transfer_id, from_alias, to_alias, amt, ccy
+            report_nonfatal("ExecutionEngine", "internal_transfer_live_stub_blocked", None,
+                            phase="_handle_internal_transfer")
+            logger.warning(
+                "[Engine] internal_transfer blocked in LIVE (no transfer client): %s [%s] %s→%s %.2f %s",
+                ex, transfer_id, from_alias, to_alias, amt, ccy,
             )
+            return
 
     def _best_price_from_rm(self, exchange: str, pair_key: str, side: str) -> Tuple[float, Optional[int]]:
         try:
@@ -6835,6 +6899,108 @@ class ExecutionEngine:
 
         return None
 
+    def _mm_default_ladder_levels(self, profile: str) -> int:
+        prof = str(profile or "LARGE").upper()
+        if prof in {"NANO", "MICRO"}:
+            return 1
+        if prof == "SMALL":
+            return 2
+        if prof == "MID":
+            return 3
+        return 4
+
+    def _mm_default_ladder_weights(self, profile: str, levels: int) -> list[float]:
+        prof = str(profile or "LARGE").upper()
+        defaults = {
+            "NANO": [1.0],
+            "MICRO": [1.0],
+            "SMALL": [0.7, 0.3],
+            "MID": [0.5, 0.3, 0.2],
+            "LARGE": [0.4, 0.25, 0.2, 0.15],
+        }
+        base = list(defaults.get(prof, defaults["LARGE"]))
+        if levels <= len(base):
+            return base[:levels]
+        tail = max(0.05, base[-1] * 0.5)
+        base.extend([tail] * (levels - len(base)))
+        return base
+
+    def _mm_normalize_ladder_weights(self, raw: Any, levels: int, profile: str) -> list[float]:
+        if levels <= 0:
+            return []
+        weights: list[float] = []
+        if isinstance(raw, str):
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            for p in parts:
+                try:
+                    weights.append(float(p))
+                except Exception:
+                    continue
+        elif isinstance(raw, (list, tuple)):
+            for w in raw:
+                try:
+                    weights.append(float(w))
+                except Exception:
+                    continue
+        if not weights:
+            weights = self._mm_default_ladder_weights(profile, levels)
+        if len(weights) < levels:
+            weights.extend([weights[-1]] * (levels - len(weights)))
+        if len(weights) > levels:
+            weights = weights[:levels]
+        weights = [max(0.0, w) for w in weights]
+        total = sum(weights)
+        if total <= 0:
+            weights = [1.0] * levels
+            total = float(levels)
+        return [w / total for w in weights]
+
+    def _resolve_mm_ladder_config(
+            self,
+            *,
+            variant: str,
+            profile: str,
+            is_cross: bool,
+    ) -> tuple[int, list[float], float]:
+        ladder_levels_raw = self._get_mm_knob("ladder_levels", variant, profile)
+        explicit_levels = ladder_levels_raw is not None
+        try:
+            ladder_levels = int(ladder_levels_raw) if ladder_levels_raw is not None else None
+        except Exception:
+            ladder_levels = None
+        if ladder_levels is None or ladder_levels <= 0:
+            ladder_levels = self._mm_default_ladder_levels(profile)
+        ladder_step_ticks = float(self._get_mm_knob("ladder_step_ticks", variant, profile) or 1.0)
+        if ladder_step_ticks <= 0:
+            ladder_step_ticks = 1.0
+
+        if is_cross and not self.mm_allow_auto_hedge and not explicit_levels:
+            ladder_levels = 1
+
+        place_limit = int(
+            self._get_mm_knob("place_rate_limit_per_pair", variant, profile) or self.mm_place_rate_limit_per_pair)
+        max_levels_by_place = None
+        if place_limit > 0:
+            max_levels_by_place = max(1, int(place_limit // 2))
+
+        cancel_budget = int(
+            self._get_mm_knob("cancel_budget_per_min", variant, profile) or self.mm_cancel_budget_per_pair_min)
+        max_levels_by_cancel = None
+        if cancel_budget > 0:
+            max_levels_by_cancel = max(1, int(cancel_budget // 10))
+
+        max_levels_hard = 6 if explicit_levels else 4
+        limits = [max_levels_hard]
+        if max_levels_by_place is not None:
+            limits.append(max_levels_by_place)
+        if max_levels_by_cancel is not None:
+            limits.append(max_levels_by_cancel)
+        ladder_levels = max(1, min(ladder_levels, *limits))
+
+        weights_raw = self._get_mm_knob("ladder_weights", variant, profile)
+        weights = self._mm_normalize_ladder_weights(weights_raw, ladder_levels, profile)
+        return ladder_levels, weights, ladder_step_ticks
+
     def _mm_throttle(self, *, exchange: str, pair_key: str, kind: str, meta: dict | None = None) -> bool:
         """Contrôle de débit par paire/CEX pour les ordres MM.
 
@@ -6951,6 +7117,7 @@ class ExecutionEngine:
             price: float = 0.0,
             side: str = "",
             variant: str = "neutral",
+            ladder_idx: Optional[int] = None,
     ) -> None:
         """Track MM makers for TTL & preemption."""
         alias = str(account_alias or "").upper()
@@ -6958,7 +7125,13 @@ class ExecutionEngine:
         self._mm_active_by_pair[key].add(client_id)
         expiry = time.time() + max(0.0, ttl_ms) / 1000.0
         self._mm_expiry_by_cid[client_id] = (exchange.upper(), alias, pair_key.upper(), expiry)
-        self._mm_active_orders_info[client_id] = {"price": price, "side": str(side).upper(), "variant": variant}
+        self._mm_active_orders_info[client_id] = {
+            "price": price,
+            "side": str(side).upper(),
+            "variant": variant,
+            "ladder_idx": int(ladder_idx or 0),
+        }
+
         if ttl_ms > 0:
             self._spawn(self._mm_cancel_on_ttl(client_id, expiry, bundle_id=bundle_id, variant=variant), name=f"mm-ttl-{client_id[-6:]}")
 
@@ -7009,6 +7182,10 @@ class ExecutionEngine:
         # Résolution dynamique des paramètres MM (Ticket D2)
         mm_pad_resolved = float(self._get_mm_knob("pad_ticks_base", variant, profile) or self.mm_pad_ticks_base)
         mm_size_factor_resolved = float(self._get_mm_knob("size_factor_base", variant, profile) or getattr(self, "mm_size_factor_base", 1.0))
+        ladder_idx = int((meta or {}).get("mm_ladder_idx", 0) or 0)
+        ladder_step_ticks = float((meta or {}).get("mm_ladder_step_ticks", 1.0) or 1.0)
+        if ladder_step_ticks <= 0:
+            ladder_step_ticks = 1.0
 
         # 1) Throttle RPS + Budget Cancel
         if self._mm_throttle(exchange=ex, pair_key=sym, kind="place", meta=meta):
@@ -7098,7 +7275,16 @@ class ExecutionEngine:
         if best > 0:
             bid, ask = getattr(self.risk_manager, "get_top_of_book", lambda *a: (0.0, 0.0))(ex, sym) or (0.0, 0.0)
             if bid > 0 and ask > 0:
-                price = self._price_ladder_maker(ex, sym, side_u, bid, ask, idx=0, extra_pad=pad_eff)
+                idx_effective = max(0.0, ladder_idx * ladder_step_ticks)
+                price = self._price_ladder_maker(
+                    ex,
+                    sym,
+                    side_u,
+                    bid,
+                    ask,
+                    idx=idx_effective,
+                    extra_pad=pad_eff,
+                )
 
         # 3.5) Guard QPos MM (Hysteresis)
         ok_qpos, reason_qpos = self._check_mm_qpos_with_hysteresis(ex, sym, side_u, price, mm_plan)
@@ -7135,6 +7321,8 @@ class ExecutionEngine:
         for clid in active_cids:
             info = self._mm_active_orders_info.get(clid)
             if not info or info.get("side") != side_u:
+                continue
+            if int(info.get("ladder_idx", 0) or 0) != ladder_idx:
                 continue
 
             fsm = self._order_fsm.get(clid)
@@ -7176,6 +7364,9 @@ class ExecutionEngine:
                 "mm_single_phase": (meta or {}).get("mm_single_phase"),
                 "mm_single_min_quote_lifetime_ms": (meta or {}).get("mm_single_min_quote_lifetime_ms"),
                 "mm_single_cancel_budget": (meta or {}).get("mm_single_cancel_budget"),
+                "mm_ladder_idx": ladder_idx,
+                "mm_ladder_step_ticks": ladder_step_ticks,
+
             },
         }
 
@@ -7196,7 +7387,7 @@ class ExecutionEngine:
                     MM_EXPECTED_CAPTURE_BPS.labels(pair=sym).observe(capture)
         except Exception: pass
 
-        await self._exec_single(order)  # passe par la file + guards existants
+        ok = await self._exec_single(order)  # passe par la file + guards existants
         try:
             ttl_override = int(ttl_ms) if ttl_ms is not None else int(getattr(self, "mm_ttl_ms", 0))
             self._mm_register(
@@ -7208,9 +7399,25 @@ class ExecutionEngine:
                 account_alias=order["meta"]["account_alias"],
                 price=price,
                 side=side_u,
+                variant=variant,
+                ladder_idx=ladder_idx,
+
             )
         except Exception:
             pass
+        if ok:
+            try:
+                from modules.obs_metrics import MM_LADDER_PLACES_TOTAL
+                MM_LADDER_PLACES_TOTAL.labels(
+                    exchange=ex,
+                    side=side_u,
+                    variant=variant,
+                    profile=profile,
+                    level_idx=str(ladder_idx),
+                ).inc()
+            except Exception:
+                pass
+
         return clid
 
     async def _mm_panic_hedge_ioc(self, *, pair_key: str, exchange: str, side: str,

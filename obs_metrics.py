@@ -1691,6 +1691,19 @@ MM_FILLS_TOTAL = _metric(Counter, "mm_fills_total", "Total MM fills", ["exchange
 MM_REJECT_TOTAL = _metric(Counter, "mm_reject_total", "Total MM order rejects", ["reason"])
 MM_ABORT_TOTAL = _metric(Counter, "mm_abort_total", "Total MM pipeline aborts", ["reason"])
 MM_PAUSE_TOTAL = _metric(Counter, "mm_pause_total", "Total MM pauses (circuit breakers)", ["reason"])
+MM_LADDER_PLACES_TOTAL = _metric(
+    Counter,
+    "mm_ladder_places_total",
+    "Total MM ladder placements",
+    ["exchange", "side", "variant", "profile", "level_idx"],
+)
+MM_LADDER_LEVELS_USED = _metric(
+    Gauge,
+    "mm_ladder_levels_used",
+    "MM ladder levels used (latest)",
+    ["variant", "profile"],
+)
+
 MM_POSTFILL_MOVE_BPS = _metric(Histogram, "mm_postfill_move_bps", "Price move after MM fill (bps)", ["exchange", "pair"], buckets=[-50, -20, -10, -5, 0, 5, 10, 20, 50])
 MM_EXPECTED_CAPTURE_BPS = _metric(Histogram, "mm_expected_capture_bps", "Expected capture at MM placement", ["pair"], buckets=[0, 2, 5, 10, 20, 50, 100])
 MM_INVENTORY_DRIFT_BPS = _metric(Gauge, "mm_inventory_drift_bps", "MM inventory drift from target", ["pair"])

@@ -321,6 +321,8 @@ class MultiBalanceFetcher:
         #  - Reconciler: get_alias_status_snapshot(ex, alias) -> dict
         self._ws_hub_status_provider = None
         self._ws_reco_status_provider = None
+        # Horodatage monotone pour immuniser la fraîcheur aux sauts NTP.
+        self._last_ws_update_mono: Dict[Tuple[str, str], float] = {}
 
         # P0: alias de compat pour lecture uniforme des paramètres éventuels
         if not hasattr(self, "cfg"):
@@ -400,7 +402,11 @@ class MultiBalanceFetcher:
         async with self._ws_lock:
             if not self._enable_ws_balance_merge:
                 return None
-            self._ws_balances[key] = {"ts": time.time(), "data": {k.upper(): float(v) for k,v in (balances or {}).items()}}
+            self._ws_balances[key] = {
+                "ts": time.time(),
+                "ts_mono": time.monotonic(),
+                "data": {k.upper(): float(v) for k, v in (balances or {}).items()},
+            }
 
     async def _get_ws_balances_if_fresh(self, exchange: str, alias: str) -> Dict[str, float] | None:
         import time
@@ -408,7 +414,10 @@ class MultiBalanceFetcher:
         async with self._ws_lock:
             rec = self._ws_balances.get(key)
             if not rec: return None
-            if (time.time() - float(rec.get("ts", 0.0))) > self._ws_ttl_s:
+            ts_mono = float(rec.get("ts_mono", 0.0) or 0.0)
+            if ts_mono > 0.0 and (time.monotonic() - ts_mono) > self._ws_ttl_s:
+                return None
+            if ts_mono <= 0.0 and (time.time() - float(rec.get("ts", 0.0))) > self._ws_ttl_s:
                 return None
             return dict(rec.get("data") or {})
 
@@ -800,6 +809,7 @@ class MultiBalanceFetcher:
         interval = max(5.0, float(getattr(self, "_wallet_missing_log_interval_s", 60.0)))
         key = (str(exchange).upper(), str(alias).upper(), str(wallet).upper())
         now = time.time()
+        now_mono = time.monotonic()
         last = float(self._wallet_missing_log.get(key, 0.0))
         if now - last < interval:
             return
@@ -1467,19 +1477,27 @@ class MultiBalanceFetcher:
 
         meta_fee: Dict[str, Dict[str, Dict[str, Any]]] = {}
         meta_bal_health: Dict[str, Dict[str, Any]] = {}
-        now = time.time()
+        now_wall = time.time()
+        now_mono = time.monotonic()
         age_s = float("inf")
         for (ex, al), rec in list(getattr(self, "_snap", {}).items()):
-            ts = float(rec.get("ts", 0.0) or 0.0)
-            if ts > 0.0:
-                age_s = min(age_s, max(0.0, now - ts)) if age_s != float("inf") else max(0.0, now - ts)
-            bal_age = max(0.0, now - ts) if ts > 0.0 else float("inf")
+            ts_wall = float(rec.get("ts", 0.0) or 0.0)
+            ts_mono = float(rec.get("ts_mono", 0.0) or 0.0)
+            if ts_mono > 0.0:
+                age_now = max(0.0, now_mono - ts_mono)
+            elif ts_wall > 0.0:
+                age_now = max(0.0, now_wall - ts_wall)
+            else:
+                age_now = float("inf")
+            if age_now != float("inf"):
+                age_s = min(age_s, age_now) if age_s != float("inf") else age_now
+            bal_age = age_now
             t_norm, t_deg, t_blk = self._get_bal_ttls_for_exchange(ex)
             state = self._classify_balance_health(bal_age, t_norm, t_deg, t_blk)
             prev = self._balances_health.get((ex, al), {}).get("state")
-            last_change_ts = self._balances_health.get((ex, al), {}).get("last_change_ts", now)
+            last_change_ts = self._balances_health.get((ex, al), {}).get("last_change_ts", now_wall)
             if prev != state:
-                last_change_ts = now
+                last_change_ts = now_wall
             self._balances_health[(ex, al)] = {
                 "state": state,
                 "last_age_s": bal_age,
@@ -1606,11 +1624,13 @@ class MultiBalanceFetcher:
     async def _record_snapshot_sync(self, exchange: str, alias: str, balances: Dict[str, float]) -> None:
         ex, al = _upper(exchange), _upper(alias)
         now = time.time()
+        now_mono = time.monotonic()
         rec = self._snap.get((ex, al), {"balances": {}, "fee_tokens": {}, "vip": {}, "vip_ts": 0.0})
 
         # Snapshot brut des soldes
         rec["balances"] = dict(balances or {})
         rec["ts"] = now
+        rec["ts_mono"] = now_mono
 
         # Normalisation des niveaux de tokens de fees pour RM / caps.
         # Source de seuils: FEE_TOKEN_LOW_WATERMARKS (par token) via BotConfig.
@@ -1767,7 +1787,8 @@ class MultiBalanceFetcher:
         - Utilise un cache read-only rafraîchi toutes les 200ms si cached_only=True.
         - Évite les doubles copies défensives et les model_dump() coûteux.
         """
-        now = time.time()
+        now_wall = time.time()
+        now_mono = time.monotonic()
         view = (mode or "real").lower()
         if view not in ("real", "virtual", "merged"):
             view = "real"
@@ -1775,7 +1796,7 @@ class MultiBalanceFetcher:
         # P1: Fast-path cache (200ms) pour le RiskManager/Scanner
         if cached_only and view in self._rm_snapshot_cache:
             last_ts = self._last_rm_snapshot_ts.get(view, 0.0)
-            if (now - last_ts) < self._rm_snapshot_cache_interval_s:
+            if (now_wall - last_ts) < self._rm_snapshot_cache_interval_s:
                 return self._rm_snapshot_cache[view]
 
         # Vue brute selon le mode choisi (real/virtual/merged)
@@ -1795,18 +1816,30 @@ class MultiBalanceFetcher:
 
         # Parcours du cache interne _snap pour enrichir meta + backfill éventuel
         for (ex, al), rec in list(self._snap.items()):
-            ts = float(rec.get("ts", 0.0))
-            age_rest = max(0.0, now - ts) if ts > 0.0 else float("inf")
+            ts_wall = float(rec.get("ts", 0.0) or 0.0)
+            ts_mono = float(rec.get("ts_mono", 0.0) or 0.0)
+            if ts_mono > 0.0:
+                age_rest = max(0.0, now_mono - ts_mono)
+            elif ts_wall > 0.0:
+                age_rest = max(0.0, now_wall - ts_wall)
+            else:
+                age_rest = float("inf")
 
             # Ticket P0-MBF-WS-02: Prise en compte de la fraîcheur WS
-            ts_ws = self._last_ws_update_ts.get((ex, al), 0.0)
-            age_ws = max(0.0, now - ts_ws) if ts_ws > 0.0 else float("inf")
+            ts_ws_mono = float(self._last_ws_update_mono.get((ex, al), 0.0) or 0.0)
+            ts_ws_wall = float(self._last_ws_update_ts.get((ex, al), 0.0) or 0.0)
+            if ts_ws_mono > 0.0:
+                age_ws = max(0.0, now_mono - ts_ws_mono)
+            elif ts_ws_wall > 0.0:
+                age_ws = max(0.0, now_wall - ts_ws_wall)
+            else:
+                age_ws = float("inf")
 
             # On retient le plus frais des deux (REST ou WS) comme base de TTL
             age = min(age_rest, age_ws)
             meta_age[f"{ex}.{al}"] = age
             # Observabilité TTL cache par alias (gauge Prometheus)
-            if ts > 0.0:
+            if ts_wall > 0.0 or ts_mono > 0.0:
                 try:
                     BF_CACHE_AGE_SECONDS.labels(ex, al).set(float(age))
                 except Exception:
@@ -1836,9 +1869,9 @@ class MultiBalanceFetcher:
             t_norm, t_deg, t_blk = self._get_bal_ttls_for_exchange(ex)
             state = self._classify_balance_health(age, t_norm, t_deg, t_blk)
             prev = self._balances_health.get((ex, al), {}).get("state")
-            last_change_ts = self._balances_health.get((ex, al), {}).get("last_change_ts", now)
+            last_change_ts = self._balances_health.get((ex, al), {}).get("last_change_ts", now_wall)
             if prev != state:
-                last_change_ts = now
+                last_change_ts = now_wall
             self._balances_health[(ex, al)] = {
                 "state": state,
                 "last_age_s": age,
@@ -1895,7 +1928,7 @@ class MultiBalanceFetcher:
 
         # P1: Mise à jour du cache pour les prochains appels fast-path
         self._rm_snapshot_cache[view] = res
-        self._last_rm_snapshot_ts[view] = now
+        self._last_rm_snapshot_ts[view] = now_wall
 
         return res
 
@@ -2024,6 +2057,7 @@ class MultiBalanceFetcher:
         # Mise à jour de la fraîcheur WS si mise à jour critique ou hautement fiable
         if has_critical or is_authoritative:
             self._last_ws_update_ts[(exu, alu)] = time.time()
+            self._last_ws_update_mono[(exu, alu)] = time.monotonic()
 
         # 2) Merge non-destructif pour latest_balances (seulement si wallet par défaut)
         default_wallet = (self._default_wallet_type or "SPOT").upper()

@@ -1004,17 +1004,19 @@ class TransferController:
     def _op_id(transfer_id: str) -> str:
         return f"XFER/{transfer_id}"
 
-    def rehydrate(self, inflight: list[dict[str, Any]], now_ms: Optional[int] = None) -> None:
+    def rehydrate(self, inflight: list[dict[str, Any]], now_ms: Optional[int] = None, now_mono: Optional[float] = None) -> None:
         now_ms = now_ms or int(time.time() * 1000)
+        now_mono = now_mono or time.monotonic()
         for row in inflight or []:
             op_id = str(row.get("op_id") or "")
             if not op_id.startswith("XFER/"):
                 continue
             transfer_id = op_id.split("/", 1)[-1]
-            self._set_state_from_row(row=row, transfer_id=transfer_id, now_ms=now_ms)
+            self._set_state_from_row(row=row, transfer_id=transfer_id, now_ms=now_ms, now_mono=now_mono)
 
-    def restore_from_journal(self, *, now_ms: Optional[int] = None) -> None:
+    def restore_from_journal(self, *, now_ms: Optional[int] = None, now_mono: Optional[float] = None) -> None:
         now_ms = now_ms or int(time.time() * 1000)
+        now_mono = now_mono or time.monotonic()
         if not self._lhm:
             return
         try:
@@ -1022,23 +1024,31 @@ class TransferController:
         except Exception:
             logger.exception("[TransferController] restore_from_journal failed")
             return
-        self.rehydrate(inflight, now_ms=now_ms)
+        self.rehydrate(inflight, now_ms=now_ms, now_mono=now_mono)
         try:
             set_transfer_inflight(self.inflight_count())
         except Exception:
             pass
 
-    def _set_state_from_row(self, *, row: dict[str, Any], transfer_id: str, now_ms: int) -> None:
+    def _set_state_from_row(self, *, row: dict[str, Any], transfer_id: str, now_ms: int, now_mono: float) -> None:
         expires = row.get("expires_ts_ms")
         state = str(row.get("status") or "SUBMITTED").upper()
         last_ts = float(row.get("updated_ts_ms") or row.get("created_ts_ms") or now_ms) / 1000.0
         payload = row.get("payload")
         attempts = row.get("attempt_count")
+        expires_mono = None
+        if expires is not None:
+            try:
+                remaining_s = max(0.0, (float(expires) - float(now_ms)) / 1000.0)
+                expires_mono = now_mono + remaining_s
+            except Exception:
+                expires_mono = None
 
         self._states[transfer_id] = {
             "state": state,
             "last_ts": last_ts,
             "expires_ts_ms": expires,
+            "expires_ts_mono": expires_mono,
             "payload": payload,
             "attempts": attempts,
         }
@@ -1081,13 +1091,20 @@ class TransferController:
         if not self._states:
             return
         now_ms = int(time.time() * 1000)
+        now_mono = time.monotonic()
         for transfer_id, state in list(self._states.items()):
             cur_state = state.get("state")
             if cur_state not in {"SUBMITTED", "REQUESTED", "PREPARED"}:
                 continue
-            
-            expires = state.get("expires_ts_ms")
-            if expires is not None and int(expires) <= now_ms:
+
+            expires_mono = state.get("expires_ts_mono")
+            expires_ms = state.get("expires_ts_ms")
+            is_expired = False
+            if expires_mono is not None and float(expires_mono) <= now_mono:
+                is_expired = True
+            elif expires_ms is not None and int(expires_ms) <= now_ms:
+                is_expired = True
+            if is_expired:
                 # AJOUT P0: Avant de fail-close, on pourrait tenter un refresh REST final
                 # Mais ici TransferController est passif (data class). 
                 # On délègue la décision de polling à RiskManager.
@@ -1175,6 +1192,7 @@ class TransferController:
             new_state: str,
             payload: Optional[dict[str, Any]] = None,
             expires_ts_ms: Optional[int] = None,
+            expires_ts_mono: Optional[float] = None,
             error: Optional[str] = None,
             attempts: Optional[int] = None,
             reason: Optional[str] = None,
@@ -1195,6 +1213,8 @@ class TransferController:
             "payload": payload,
             "expires_ts_ms": expires_ts_ms,
         }
+        if expires_ts_mono is not None:
+            state_entry["expires_ts_mono"] = expires_ts_mono
         if error is not None:
             state_entry["error"] = error
         if attempts is not None:
@@ -1227,6 +1247,17 @@ class TransferController:
         payload["transfer_id"] = transfer_id
         op_id = self._op_id(transfer_id)
         state = self._states.get(transfer_id)
+        if state and str(state.get("state") or "").upper() == "SETTLED":
+            try:
+                inc_transfer_fsm_event("SETTLED", "TRANSFER_FSM_ALREADY_SETTLED")
+            except Exception:
+                pass
+            return {
+                "status": "SETTLED",
+                "transfer_id": transfer_id,
+                "replayed": True,
+                "reason": "TRANSFER_FSM_ALREADY_SETTLED",
+            }
         if self._state_is_in_progress(state):
             try:
                 inc_transfer_fsm_event(state.get("state"), "TRANSFER_FSM_IN_PROGRESS_SKIP")
@@ -1243,6 +1274,17 @@ class TransferController:
             if existing:
                 self._set_state_from_row(row=existing, transfer_id=transfer_id, now_ms=int(time.time() * 1000))
                 state = self._states.get(transfer_id)
+            if state and str(state.get("state") or "").upper() == "SETTLED":
+                try:
+                    inc_transfer_fsm_event("SETTLED", "TRANSFER_FSM_ALREADY_SETTLED")
+                except Exception:
+                    pass
+                return {
+                    "status": "SETTLED",
+                    "transfer_id": transfer_id,
+                    "replayed": True,
+                    "reason": "TRANSFER_FSM_ALREADY_SETTLED",
+                }
             if self._state_is_in_progress(state):
                 try:
                     inc_transfer_fsm_event(state.get("state"), "TRANSFER_FSM_IN_PROGRESS_SKIP")
@@ -1257,6 +1299,7 @@ class TransferController:
 
         state_payload = self._state_payload(payload)
         expires_ts_ms = int(time.time() * 1000 + (self._submitted_timeout_s * 1000.0))
+        expires_ts_mono = time.monotonic() + float(self._submitted_timeout_s or 0.0)
         ex = str(payload.get("exchange") or venue.split(":")[0]).upper()
 
         self._transition(
@@ -1264,12 +1307,14 @@ class TransferController:
             new_state="REQUESTED",
             payload=state_payload,
             expires_ts_ms=expires_ts_ms,
+            expires_ts_mono=expires_ts_mono,
         )
         self._transition(
             transfer_id=transfer_id,
             new_state="PREPARED",
             payload=state_payload,
             expires_ts_ms=expires_ts_ms,
+            expires_ts_mono=expires_ts_mono,
         )
 
         # Rate limiting (internal transfers often have strict quotas)
@@ -1313,6 +1358,7 @@ class TransferController:
                 new_state="SUBMITTED",
                 payload=state_payload,
                 expires_ts_ms=expires_ts_ms,
+                expires_ts_mono=expires_ts_mono,
                 attempts=outcome.attempts,
             )
             return {"status": "SUBMITTED", "transfer_id": transfer_id, "attempts": outcome.attempts}
@@ -1341,11 +1387,20 @@ class TransferController:
     ) -> None:
         if not transfer_id:
             return
+        expires_ts_mono = None
+        if expires_ts_ms is not None:
+            try:
+                now_ms = int(time.time() * 1000)
+                remaining_s = max(0.0, (float(expires_ts_ms) - float(now_ms)) / 1000.0)
+                expires_ts_mono = time.monotonic() + remaining_s
+            except Exception:
+                expires_ts_mono = None
         self._transition(
             transfer_id=transfer_id,
             new_state="SUBMITTED",
             payload=payload,
             expires_ts_ms=expires_ts_ms,
+            expires_ts_mono=expires_ts_mono,
             attempts=attempts,
         )
 
@@ -1423,6 +1478,22 @@ class RiskManager:
         )
         return live_mode and bool(getattr(g_cfg, "live_trading_armed", False))
 
+    def _transfer_region_allowed(self, exchange: str) -> bool:
+        cfg_root = getattr(self, "_cfg_root", None) or getattr(self, "cfg", None)
+        g_cfg = getattr(cfg_root, "g", None)
+        if g_cfg is None:
+            return True
+        dm = str(getattr(g_cfg, "deployment_mode", "SPLIT")).upper()
+        if dm == "SPLIT":
+            return True
+        expected_region = "EU" if dm == "EU_ONLY" else "JP" if dm == "JP_ONLY" else None
+        if expected_region is None:
+            return True
+        region_map = getattr(g_cfg, "exchange_region_map", {}) or {}
+        ex_region = str(region_map.get(str(exchange).upper(), "") or "").upper()
+        if not ex_region:
+            return False
+        return ex_region == expected_region
     def _is_mm_family(self, branch: str, kind: str = "") -> bool:
         br = str(branch or "").upper()
         k = str(kind or "").upper()
@@ -2073,7 +2144,7 @@ class RiskManager:
         )
         try:
             now_ms = int(time.time() * 1000)
-            self._transfer_controller.restore_from_journal(now_ms=now_ms)
+            self._transfer_controller.restore_from_journal(now_ms=now_ms, now_mono=time.monotonic())
             if getattr(self, "rebalancing", None) and hasattr(
                     self.rebalancing, "restore_inflight_from_journal"
             ):
@@ -12754,6 +12825,9 @@ class RiskManager:
 
     async def _exec_internal_wallet_transfer(self, op: Dict[str, Any]) -> None:
         ex = str(op.get("exchange")).upper()
+        if not self._transfer_region_allowed(ex):
+            logger.warning("[RiskManager] wallet transfer blocked by region policy for %s", ex)
+            return
         alias = str(op.get("alias") or op.get("account_alias") or "").upper()
         from_alias = str(op.get("from_alias") or "").upper()
         to_alias = str(op.get("to_alias") or "").upper()
@@ -12805,6 +12879,8 @@ class RiskManager:
                 "amount": amount,
 
             }
+            if op.get("transfer_bucket") is not None:
+                payload["transfer_bucket"] = op.get("transfer_bucket")
             expected_id = TransferController.canonical_transfer_id(payload)
             transfer_id = op.get("transfer_id")
             if not transfer_id:
@@ -12835,6 +12911,9 @@ class RiskManager:
 
     async def _exec_internal_subaccount_transfer(self, op: Dict[str, Any]) -> None:
         ex = str(op.get("exchange")).upper()
+        if not self._transfer_region_allowed(ex):
+            logger.warning("[RiskManager] subaccount transfer blocked by region policy for %s", ex)
+            return
         from_alias = str(op.get("from_alias") or "").upper()
         to_alias = str(op.get("to_alias") or "").upper()
         if not from_alias or not to_alias:
@@ -12874,6 +12953,8 @@ class RiskManager:
                 "amount": amount,
                 "transfer_id": transfer_id,
             }
+            if op.get("transfer_bucket") is not None:
+                payload["transfer_bucket"] = op.get("transfer_bucket")
             outcome = await self._transfer_controller.submit(
                 payload=payload,
                 submit_fn=_submit,
@@ -15527,7 +15608,11 @@ class RiskManager:
         """
         if not opp:
             return None
-            
+        # Canonisation défensive pour compat scanner_consumer (payload encapsulé).
+        try:
+            self._canonize_opportunity(opp)
+        except Exception:
+            pass
         required = ("branch", "pair", "legs")
         for f in required:
             if opp.get(f) is None:

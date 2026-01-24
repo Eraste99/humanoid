@@ -1740,6 +1740,7 @@ KNOWN_REASON_CODES = {
     "HEALTH_QUEUE_BACKLOG",
     "ROUTER_QUEUE_FULL_PAIR_FROZEN",
     "TRANSFER_FSM_IN_PROGRESS_SKIP",
+    "TRANSFER_FSM_ALREADY_SETTLED",
     "TRANSFER_FSM",
     "ENGINE_TT_POLICY_NO_PLAN",
     "ENGINE_TT_POLICY_DEGRADED_STAGGERED",
@@ -1772,6 +1773,8 @@ def canonical_transfer_id(payload: Dict[str, Any]) -> str:
         "amount": float(payload.get("amount") or payload.get("amount_quote") or payload.get("amount_usdc") or 0.0),
         "type": str(payload.get("type") or payload.get("kind") or "transfer"),
     }
+    if payload.get("transfer_bucket") is not None:
+        base["transfer_bucket"] = int(payload.get("transfer_bucket") or 0)
     data = json.dumps(base, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha1(data.encode("utf-8")).hexdigest()
 

@@ -1364,6 +1364,8 @@ class EngineCfg:
     mm_cross_defensive_pad_ticks: int = 3
     mm_cross_defensive_lifetime_mult: float = 1.5
     mm_cross_429_threshold: float = 0.05
+    # Exemple (ENV ENGINE_MM_VARIANTS, JSON):
+    # {"neutral":{"SMALL":{"ladder_levels":2,"ladder_weights":[0.7,0.3],"ladder_step_ticks":1.0}}}
     mm_variants: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     vol_soft_cap_bps: float = 45.0
     vol_hard_cap_bps: float = 80.0
