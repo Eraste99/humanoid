@@ -848,6 +848,7 @@ class LogWriter:
             "hour_local": "INTEGER",
             "weekday_local": "INTEGER",
             "local_day": "TEXT",
+            "reason_detail": "TEXT",
         })
 
         # opportunities: même dérivés pour analytiques par heure

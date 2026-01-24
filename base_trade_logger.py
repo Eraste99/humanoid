@@ -536,6 +536,12 @@ class BaseTradeLogger:
                 or trade.get("failure_reason")
                 or trade.get("cancel_reason")
         )
+        reason_detail = (
+                trade.get("reason_detail")
+                or trade.get("reject_detail")
+                or trade.get("guard_detail")
+                or trade.get("failure_detail")
+        )
 
         # --------- construction finale ---------
         entry: Dict[str, Any] = {
@@ -598,7 +604,7 @@ class BaseTradeLogger:
             "pair_rank": pair_rank,
 
             "reason": reason,  # ← **nouveau** pour audit/guard dans la DB
-
+            "reason_detail": reason_detail,
             "raw_json": json.dumps(trade, separators=(",", ":"), ensure_ascii=False),
         }
         if trade.get("filter_error") is not None:

@@ -570,7 +570,7 @@ class LoggerHistoriqueManager:
             batch_size=int(getattr(L, "LHM_TRADE_BATCH_SIZE", trade_batch_size)),
             flush_interval=float(getattr(L, "LHM_TRADE_FLUSH_INTERVAL_S", trade_flush_interval)),
             queue_maxsize=self._q_stream_max,
-            drop_when_full=self._drop_when_full,
+            drop_when_full=False,
             high_watermark_ratio=self._high_watermark,
             critical_streams=list(self._logging_critical_streams) or None,
         )
@@ -638,6 +638,7 @@ class LoggerHistoriqueManager:
         # -------- Contexte runtime / lifecycle --------------------
         self._started = False
         self._rotation_task = None  # type: asyncio.Task | None
+        self._eod_lock = asyncio.Lock()
         # rotate_every_s > tracker_config.rotation_interval > fallback 3600s
         _tracker_rot = getattr(self._tracker_cfg, "rotation_interval", 3600.0)
         self._rotate_interval = float(rotate_every_s if rotate_every_s is not None else _tracker_rot)
@@ -1041,7 +1042,10 @@ class LoggerHistoriqueManager:
         item = ("bulk", str(op), list(batch), None)
 
         try:
-            q.put_nowait(item)
+            if op == "trades":
+                await q.put(item)
+            else:
+                q.put_nowait(item)
         except asyncio.QueueFull:
             self._db_lane_record_drop(op, "LOGGERH_DB_LANE_QUEUE_FULL")
             try:
@@ -2497,245 +2501,278 @@ class LoggerHistoriqueManager:
         }
         """
 
-        started_ts_ms = int(time.time() * 1000)
-        day = str(local_day or datetime.utcnow().strftime("%Y-%m-%d"))
-        region = str(pod_region or getattr(self, "_pod_region", "")) or "NA"
-        region = region.upper()
-
-        meta: dict[str, Any] = {
-            "schema_version": "lhm.eod.1",
-            "status": "OK",
-            "local_day": day,
-            "pod_region": region,
-            "started_ts_ms": started_ts_ms,
-            "ended_ts_ms": None,
-            "duration_ms": None,
-            "finalize": {},
-            "errors": [],
-            "pnl_reconciliation": None,
-        }
-        try:
-            cfg = getattr(self, "cfg", None)
-            g_cfg = getattr(cfg, "g", None) if cfg is not None else None
-            g_enable = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else False
-            cfg_enable = getattr(cfg, "enable_jp", None) if cfg is not None else None
-            if cfg_enable is not None and bool(cfg_enable) != g_enable:
-                logger.warning(
-                    "cfg.enable_jp is deprecated and differs from cfg.g.enable_jp; using cfg.g.enable_jp"
-                )
-            enable_jp = g_enable
-        except Exception:
-            enable_jp = False
-        if region == "JP" and not enable_jp:
-            self._on_schema_violation("region_unsupported_jp")
-            self._log_drop_event(
-                stream="eod",
-                reason_code="REGION_UNSUPPORTED_JP",
-                payload={"region": region},
-            )
-            meta.update(
-                {
-                    "status": "SKIPPED",
-                    "errors": [{"stage": "region_guard", "err": "unsupported_jp"}],
-                    "pnl_reconciliation": {
-                        "component": "pnl_reconciliation",
-                        "status": "SKIPPED",
-                        "reason": "unsupported_region",
-                        "local_day": day,
-                        "region": region,
-                    },
-                }
-            )
-            self._emit_eod_metrics(meta)
-            return meta
-
-        marker_path = Path(self._out_dir) / "eod" / f"eod-{day}.done.json"
-
-        if marker_path.exists():
-            try:
-                with marker_path.open("r", encoding="utf-8") as fh:
-                    previous = json.load(fh)
-                if isinstance(previous, dict):
-                    meta = {**previous, "local_day": day, "pod_region": region}
-                else:
-                    meta.update({
-                        "status": "SKIPPED",
-                        "errors": [{"stage": "idempotence", "err": "corrupted_marker"}],
-                    })
-            except Exception as exc:
-                meta.update({
-                    "status": "SKIPPED",
-                    "errors": [{"stage": "idempotence", "err": f"read_failed:{exc}"}],
-                })
-            meta["idempotent_skip"] = True
-            if not meta.get("pnl_reconciliation"):
-                meta["pnl_reconciliation"] = {
-                    "component": "pnl_reconciliation",
-                    "status": "SKIPPED",
-                    "reason": "idempotent_skip",
-                    "local_day": day,
-                    "region": region,
-                }
-            self._emit_eod_metrics(meta)
-            return meta
-
-        # Flush fort (timebox)
-        try:
-            await asyncio.wait_for(self.flush_now(rotate=True), timeout=timeout_flush_s)
-        except asyncio.TimeoutError:
-            meta["status"] = "PARTIAL"
-            meta.setdefault("errors", []).append({"stage": "flush", "err": "timeout"})
-        except Exception as exc:
-            meta["status"] = "PARTIAL"
-            meta.setdefault("errors", []).append({"stage": "flush", "err": str(exc)})
-
-        # PnL reconciliation (best-effort)
-        pnl_meta: dict[str, Any] | None = None
-        if skip_cex:
-            pnl_meta = {
-                "component": "pnl_reconciliation",
-                "status": "SKIPPED",
-                "state": "SKIPPED",
-                "reason_code": "PNL_RECO_SKIPPED_FLAG",
-                "reason": "skip_cex_flag",
-                "local_day": day,
-                "region": region,
-            }
-        elif fetch_pnl_cex_fn is None:
-            pnl_meta = {
-                "component": "pnl_reconciliation",
-                "status": "SKIPPED",
-                "state": "SKIPPED",
-                "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
-                "reason": "missing_fetch_fn",
-                "local_day": day,
-                "region": region,
-            }
-        else:
-            try:
-                pnl_meta = await asyncio.wait_for(
-                    self.run_pnl_reconciliation_for_day(
-                        local_day=day,
-                        pod_region=region,
-                        fetch_pnl_cex_fn=fetch_pnl_cex_fn,
-                        dry_run=dry_run,
-                    ),
-                    timeout=timeout_pnl_reco_s,
-                )
-                if isinstance(pnl_meta, dict):
-                    state = pnl_meta.get("state")
-                    if state is None:
-                        pnl_meta["status"] = "SKIPPED"
-                    elif state == "ERROR":
-                        pnl_meta["status"] = "ERROR"
-                    elif state == "SKIPPED":
-                        pnl_meta["status"] = "SKIPPED"
-                    elif state == "PARTIAL":
-                        pnl_meta["status"] = "PARTIAL"
-                    elif state == "MISMATCH":
-                        pnl_meta["status"] = "WARN"
-                    else:
-                        pnl_meta["status"] = "OK"
-            except asyncio.TimeoutError:
-                meta["status"] = "PARTIAL"
-                meta.setdefault("errors", []).append({"stage": "pnl_reconciliation", "err": "timeout"})
-                pnl_meta = {
-                    "component": "pnl_reconciliation",
-                    "status": "PARTIAL",
-                    "state": "ERROR",
-                    "reason_code": "PNL_RECO_EXCEPTION",
-                    "reason": "timeout",
-                    "local_day": day,
-                    "region": region,
-                }
-            except Exception as exc:
-                meta["status"] = "PARTIAL"
-                meta.setdefault("errors", []).append({"stage": "pnl_reconciliation", "err": str(exc)})
-                pnl_meta = {
-                    "component": "pnl_reconciliation",
-                    "status": "ERROR",
-                    "state": "ERROR",
-                    "reason_code": "PNL_RECO_EXCEPTION",
-                    "reason": "exception",
-                    "err": str(exc),
-                    "local_day": day,
-                    "region": region,
-                }
-
-        if isinstance(pnl_meta, dict):
-            meta["pnl_reconciliation"] = pnl_meta
-            pnl_state = pnl_meta.get("state")
-            if pnl_state == "ERROR":
-                meta["status"] = "ERROR"
-            elif pnl_state == "SKIPPED":
-                if meta.get("status") != "ERROR":
-                    meta["status"] = "PARTIAL"
-            elif pnl_state == "MISMATCH":
-                if meta.get("status") != "ERROR":
-                    meta["status"] = "PARTIAL"
-            elif pnl_state == "PARTIAL":
-                if meta.get("status") == "OK":
-                    meta["status"] = "PARTIAL"
-            # Finalize DB (writer)
-            finalize_meta: dict[str, Any] | None = None
-            if skip_finalize:
-                meta["finalize"] = {"status": "SKIPPED"}
-            else:
-                try:
-                    finalize_meta = await asyncio.wait_for(
-                        self._db_lane_call("finalize_day", {"sign_priv_pem_path": sign_priv_pem_path}),
-                        timeout=timeout_finalize_s,
-                    )
-                    if isinstance(finalize_meta, dict):
-                        meta["finalize"] = finalize_meta
-                except asyncio.TimeoutError:
-                    meta["status"] = "PARTIAL"
-                    meta.setdefault("errors", []).append({"stage": "finalize", "err": "timeout"})
-                except Exception as exc:
-                    meta["status"] = "ERROR"
-                    meta.setdefault("errors", []).append({"stage": "finalize", "err": str(exc)})
-
-            meta["ended_ts_ms"] = int(time.time() * 1000)
-            meta["duration_ms"] = int(meta["ended_ts_ms"]) - int(meta["started_ts_ms"])
-
-            if meta.get("status") == "OK" and meta.get("errors"):
-                meta["status"] = "PARTIAL"
-
-            # Marqueur JSONL canon (best effort)
-            marker_event = {
+        lock = getattr(self, "_eod_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._eod_lock = lock
+        if lock.locked():
+            now_ms = int(time.time() * 1000)
+            day = str(local_day or datetime.utcnow().strftime("%Y-%m-%d"))
+            region = str(pod_region or getattr(self, "_pod_region", "") or "NA").upper()
+            meta = {
                 "schema_version": "lhm.eod.1",
-                "event_type": "eod",
-                "log_type": "eod",
-                "ts_ms": int(time.time() * 1000),
+                "status": "SKIPPED",
                 "local_day": day,
                 "pod_region": region,
-                "status": meta.get("status"),
-                "meta": meta,
+                "started_ts_ms": now_ms,
+                "ended_ts_ms": now_ms,
+                "duration_ms": 0,
+                "finalize": {"status": "SKIPPED"},
+                "errors": [{"stage": "lock", "err": "eod_already_running"}],
+                "pnl_reconciliation": {
+                    "component": "pnl_reconciliation",
+                    "status": "SKIPPED",
+                    "state": "SKIPPED",
+                    "reason_code": "EOD_ALREADY_RUNNING",
+                    "reason": "lock",
+                    "local_day": day,
+                    "region": region,
+                },
             }
-        try:
-            await self._enqueue_jsonl(
-                "events",
-                self._build_envelope(
+            self._emit_eod_metrics(meta)
+            return meta
+        async with lock:
+
+            started_ts_ms = int(time.time() * 1000)
+            day = str(local_day or datetime.utcnow().strftime("%Y-%m-%d"))
+            region = str(pod_region or getattr(self, "_pod_region", "")) or "NA"
+            region = region.upper()
+
+            meta: dict[str, Any] = {
+                "schema_version": "lhm.eod.1",
+                "status": "OK",
+                "local_day": day,
+                "pod_region": region,
+                "started_ts_ms": started_ts_ms,
+                "ended_ts_ms": None,
+                "duration_ms": None,
+                "finalize": {},
+                "errors": [],
+                "pnl_reconciliation": None,
+            }
+            try:
+                cfg = getattr(self, "cfg", None)
+                g_cfg = getattr(cfg, "g", None) if cfg is not None else None
+                g_enable = bool(getattr(g_cfg, "enable_jp", False)) if g_cfg is not None else False
+                cfg_enable = getattr(cfg, "enable_jp", None) if cfg is not None else None
+                if cfg_enable is not None and bool(cfg_enable) != g_enable:
+                    logger.warning(
+                        "cfg.enable_jp is deprecated and differs from cfg.g.enable_jp; using cfg.g.enable_jp"
+                    )
+                enable_jp = g_enable
+            except Exception:
+                enable_jp = False
+            if region == "JP" and not enable_jp:
+                self._on_schema_violation("region_unsupported_jp")
+                self._log_drop_event(
+                    stream="eod",
+                    reason_code="REGION_UNSUPPORTED_JP",
+                    payload={"region": region},
+                )
+                meta.update(
+                    {
+                        "status": "SKIPPED",
+                        "errors": [{"stage": "region_guard", "err": "unsupported_jp"}],
+                        "pnl_reconciliation": {
+                            "component": "pnl_reconciliation",
+                            "status": "SKIPPED",
+                            "reason": "unsupported_region",
+                            "local_day": day,
+                            "region": region,
+                        },
+                    }
+                )
+                self._emit_eod_metrics(meta)
+                return meta
+
+            marker_path = Path(self._out_dir) / "eod" / f"eod-{day}.done.json"
+
+            if marker_path.exists():
+                try:
+                    with marker_path.open("r", encoding="utf-8") as fh:
+                        previous = json.load(fh)
+                    if isinstance(previous, dict):
+                        meta = {**previous, "local_day": day, "pod_region": region}
+                    else:
+                        meta.update({
+                            "status": "SKIPPED",
+                            "errors": [{"stage": "idempotence", "err": "corrupted_marker"}],
+                        })
+                except Exception as exc:
+                    meta.update({
+                        "status": "SKIPPED",
+                        "errors": [{"stage": "idempotence", "err": f"read_failed:{exc}"}],
+                    })
+                meta["idempotent_skip"] = True
+                if not meta.get("pnl_reconciliation"):
+                    meta["pnl_reconciliation"] = {
+                        "component": "pnl_reconciliation",
+                        "status": "SKIPPED",
+                        "reason": "idempotent_skip",
+                        "local_day": day,
+                        "region": region,
+                    }
+                self._emit_eod_metrics(meta)
+                return meta
+
+            # Flush fort (timebox)
+            try:
+                await asyncio.wait_for(self.flush_now(rotate=True), timeout=timeout_flush_s)
+
+            except asyncio.TimeoutError:
+                meta["status"] = "PARTIAL"
+                meta.setdefault("errors", []).append({"stage": "flush", "err": "timeout"})
+            except Exception as exc:
+                meta["status"] = "PARTIAL"
+                meta.setdefault("errors", []).append({"stage": "flush", "err": str(exc)})
+            # PnL reconciliation (best-effort)
+            pnl_meta: dict[str, Any] | None = None
+            if skip_cex:
+                pnl_meta = {
+                    "component": "pnl_reconciliation",
+                    "status": "SKIPPED",
+                    "state": "SKIPPED",
+                    "reason_code": "PNL_RECO_SKIPPED_FLAG",
+                    "reason": "skip_cex_flag",
+                    "local_day": day,
+                    "region": region,
+                }
+            elif fetch_pnl_cex_fn is None:
+                pnl_meta = {
+                    "component": "pnl_reconciliation",
+                    "status": "SKIPPED",
+                    "state": "SKIPPED",
+                    "reason_code": "PNL_RECO_SKIPPED_ADAPTER_MISSING",
+                    "reason": "missing_fetch_fn",
+                    "local_day": day,
+                    "region": region,
+                }
+
+            else:
+                try:
+                    pnl_meta = await asyncio.wait_for(
+                        self.run_pnl_reconciliation_for_day(
+                            local_day=day,
+                            pod_region=region,
+                            fetch_pnl_cex_fn=fetch_pnl_cex_fn,
+                            dry_run=dry_run,
+                        ),
+                        timeout=timeout_pnl_reco_s,
+                    )
+                    if isinstance(pnl_meta, dict):
+                        state = pnl_meta.get("state")
+                        if state is None:
+                            pnl_meta["status"] = "SKIPPED"
+                        elif state == "ERROR":
+                            pnl_meta["status"] = "ERROR"
+                        elif state == "SKIPPED":
+                            pnl_meta["status"] = "SKIPPED"
+                        elif state == "PARTIAL":
+                            pnl_meta["status"] = "PARTIAL"
+                        elif state == "MISMATCH":
+                            pnl_meta["status"] = "WARN"
+                        else:
+                            pnl_meta["status"] = "OK"
+                except asyncio.TimeoutError:
+                    meta["status"] = "PARTIAL"
+                    meta.setdefault("errors", []).append({"stage": "pnl_reconciliation", "err": "timeout"})
+                    pnl_meta = {
+                        "component": "pnl_reconciliation",
+                        "status": "PARTIAL",
+                        "state": "ERROR",
+                        "reason_code": "PNL_RECO_EXCEPTION",
+                        "reason": "timeout",
+                        "local_day": day,
+                        "region": region,
+                    }
+                except Exception as exc:
+                    meta["status"] = "PARTIAL"
+                    meta.setdefault("errors", []).append({"stage": "pnl_reconciliation", "err": str(exc)})
+                    pnl_meta = {
+                        "component": "pnl_reconciliation",
+                        "status": "ERROR",
+                        "state": "ERROR",
+                        "reason_code": "PNL_RECO_EXCEPTION",
+                        "reason": "exception",
+                        "err": str(exc),
+                        "local_day": day,
+                        "region": region,
+                    }
+
+            if isinstance(pnl_meta, dict):
+                meta["pnl_reconciliation"] = pnl_meta
+                pnl_state = pnl_meta.get("state")
+                if pnl_state == "ERROR":
+                    meta["status"] = "ERROR"
+                elif pnl_state == "SKIPPED":
+                    if meta.get("status") != "ERROR":
+                        meta["status"] = "PARTIAL"
+                elif pnl_state == "MISMATCH":
+                    if meta.get("status") != "ERROR":
+                        meta["status"] = "PARTIAL"
+                elif pnl_state == "PARTIAL":
+                    if meta.get("status") == "OK":
+                        meta["status"] = "PARTIAL"
+                # Finalize DB (writer)
+                finalize_meta: dict[str, Any] | None = None
+                if skip_finalize:
+                    meta["finalize"] = {"status": "SKIPPED"}
+                else:
+                    try:
+                        finalize_meta = await asyncio.wait_for(
+                            self._db_lane_call("finalize_day", {"sign_priv_pem_path": sign_priv_pem_path}),
+                            timeout=timeout_finalize_s,
+                        )
+                        if isinstance(finalize_meta, dict):
+                            meta["finalize"] = finalize_meta
+                    except asyncio.TimeoutError:
+                        meta["status"] = "PARTIAL"
+                        meta.setdefault("errors", []).append({"stage": "finalize", "err": "timeout"})
+                    except Exception as exc:
+                        meta["status"] = "ERROR"
+                        meta.setdefault("errors", []).append({"stage": "finalize", "err": str(exc)})
+
+                meta["ended_ts_ms"] = int(time.time() * 1000)
+                meta["duration_ms"] = int(meta["ended_ts_ms"]) - int(meta["started_ts_ms"])
+
+                if meta.get("status") == "OK" and meta.get("errors"):
+                    meta["status"] = "PARTIAL"
+
+                    # Marqueur JSONL canon (best effort)
+                    marker_event = {
+                        "schema_version": "lhm.eod.1",
+                        "event_type": "eod",
+                        "log_type": "eod",
+                        "ts_ms": int(time.time() * 1000),
+                        "local_day": day,
+                        "pod_region": region,
+                        "status": meta.get("status"),
+                        "meta": meta,
+                    }
+                try:
+                    await self._enqueue_jsonl(
                     "events",
-                    marker_event,
-                    log_type="eod",
-                    event_type="eod",
-                    schema_version="lhm.eod.1",
-                ),
-            )
-        except Exception:
-            logger.exception("EOD: enqueue jsonl failed")
+                        self._build_envelope(
+                            "events",
+                            marker_event,
+                            log_type="eod",
+                            event_type="eod",
+                            schema_version="lhm.eod.1",
+                        ),
+                    )
+                except Exception:
+                    logger.exception("EOD: enqueue jsonl failed")
 
-            # Marker fichier pour idempotence
-        try:
-            marker_path.parent.mkdir(parents=True, exist_ok=True)
-            with marker_path.open("w", encoding="utf-8") as fh:
-                json.dump(meta, fh, ensure_ascii=False, indent=2, sort_keys=True, default=str)
-        except Exception:
-            logger.exception("EOD: failed to write idempotence marker")
+                # Marker fichier pour idempotence
+            try:
+                marker_path.parent.mkdir(parents=True, exist_ok=True)
+                with marker_path.open("w", encoding="utf-8") as fh:
+                    json.dump(meta, fh, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+            except Exception:
+                logger.exception("EOD: failed to write idempotence marker")
 
-        self._emit_eod_metrics(meta)
-        return meta
+            self._emit_eod_metrics(meta)
+            return meta
 
     async def run_eod_reconciliation(self, *, sign_priv_pem_path: str | None = None, **kwargs) -> dict:
         """
