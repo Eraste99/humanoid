@@ -90,6 +90,7 @@ RM_ALIAS_COLLAT_LOW = "RM_ALIAS_COLLAT_LOW"
 BUNDLE_ILLEGAL = "BUNDLE_ILLEGAL"
 REB_LOCK = "REB_LOCK"
 REB_LOCK_CHECK_FAILED = "REB_LOCK_CHECK_FAILED"
+CAPS_PREEMPT = "CAPS_PREEMPT"
 TT_CONTRACT_INVALID = "TT_CONTRACT_INVALID"
 TM_CONTRACT_INVALID = "TM_CONTRACT_INVALID"
 REB_CONTRACT_INVALID = "REB_CONTRACT_INVALID"
@@ -5418,14 +5419,20 @@ class RiskManager:
             profile=profile,
         )
         if not ok:
+            drop_reason = CAPS_PREEMPT
+            try:
+                drop_reason = str((bundle.get("meta") or {}).get("rm_drop_reason") or drop_reason)
+            except Exception:
+                drop_reason = CAPS_PREEMPT
+
             if self._shadow:
-                drop_reason = "CAPS_PREEMPT"
-                try:
-                    drop_reason = str((bundle.get("meta") or {}).get("rm_drop_reason") or drop_reason)
-                except Exception:
-                    pass
                 self._shadow.on_bundle_drop(bundle, drop_reason)
-            _record_decision(False, "REB_LOCK")
+            try:
+                inc_rm_reject(reason=drop_reason)
+            except Exception:
+                pass
+            _record_decision(False, drop_reason)
+
             return False
 
 

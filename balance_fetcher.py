@@ -74,6 +74,7 @@ try:
         FEE_TOKEN_BALANCE,
         BF_HTTP_LATENCY_SECONDS,
         BF_HTTP_ERRORS_TOTAL,
+        BF_429_TOTAL,
         BF_FEE_TOKEN_LEVEL,
         BF_FEE_TOKEN_LOW_TOTAL,
         BF_BALANCES_TTL_NORMAL_SECONDS,
@@ -96,7 +97,7 @@ except Exception:  # pragma: no cover
             return contextlib.nullcontext()
 
     BF_API_LATENCY_MS = BF_API_ERRORS_TOTAL = BF_CACHE_AGE_SECONDS = BF_LAST_SUCCESS_TS = FEE_TOKEN_BALANCE = _NoopMetric()
-    BF_HTTP_LATENCY_SECONDS = BF_HTTP_ERRORS_TOTAL = BF_FEE_TOKEN_LEVEL = BF_FEE_TOKEN_LOW_TOTAL = _NoopMetric()
+    BF_HTTP_LATENCY_SECONDS = BF_HTTP_ERRORS_TOTAL = BF_429_TOTAL = BF_FEE_TOKEN_LEVEL = BF_FEE_TOKEN_LOW_TOTAL = _NoopMetric()
     BF_BALANCES_TTL_NORMAL_SECONDS = BF_BALANCES_TTL_DEGRADED_SECONDS = BF_BALANCES_TTL_BLOCK_SECONDS = BF_BALANCES_HEALTH_STATE = _NoopMetric()
     MBF_WS_DELTA_APPLIED_TOTAL = MBF_WS_DELTA_REJECTED_TOTAL = MBF_WALLET_ASSET_COUNT = _NoopMetric()
 else:
@@ -121,6 +122,16 @@ except Exception:
 def _upper(x: Optional[str]) -> str:
     return (x or "").upper()
 
+def _retry_after_seconds(headers: Optional[Dict[str, str]]) -> float:
+    if not headers:
+        return 0.0
+    raw = headers.get("Retry-After")
+    if raw is None:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return 0.0
 
 class MultiBalanceFetcher:
     """
@@ -917,19 +928,42 @@ class MultiBalanceFetcher:
                     return js
 
             except Exception as e:
+                status = getattr(e, "status", None)
+                reason = "ratelimit" if status == 429 else "other"
                 try:
                     BF_HTTP_ERRORS_TOTAL.labels(ex_label, al_label, endpoint).inc()
-                    BF_API_ERRORS_TOTAL.labels(ex_label, al_label, endpoint, "other").inc()
+                    BF_API_ERRORS_TOTAL.labels(ex_label, al_label, endpoint, reason).inc()
                 except Exception:
                     pass
                 self.error_count += 1
                 self.last_error = str(e)
+                retry_after_s = 0.0
+                if aiohttp and isinstance(e, aiohttp.ClientResponseError) and e.status == 429:
+                    try:
+                        BF_429_TOTAL.labels(ex_label, al_label, endpoint).inc()
+                    except Exception:
+                        pass
+                    retry_after_s = _retry_after_seconds(getattr(e, "headers", None))
                 if attempt >= self.max_retries:
                     if self.verbose:
                         logger.error(f"[HTTP] {method} {url} failed after {attempt}: {e}")
                     raise
                 backoff = min(self.retry_max_delay, self.retry_base_delay * (2 ** (attempt - 1)))
                 backoff *= (0.7 + 0.6 * random.random())
+                if retry_after_s > backoff:
+                    backoff = retry_after_s
+                if status == 429:
+                    retry_after = None
+                    try:
+                        hdrs = getattr(e, "headers", None) or {}
+                        ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+                        if ra is not None:
+                            retry_after = float(ra)
+                    except Exception:
+                        retry_after = None
+                    if retry_after is not None:
+                        backoff = max(backoff, retry_after)
+                        backoff *= (0.9 + 0.2 * random.random())
                 if self.verbose:
                     logger.warning(f"[HTTP] retry in {backoff:.2f}s — {e}")
                 await asyncio.sleep(backoff)

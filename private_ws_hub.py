@@ -176,6 +176,9 @@ def _now() -> float:
 def _upper(x: Optional[str]) -> str:
     return (x or "").upper()
 
+def _now_mono() -> float:
+    return time.monotonic()
+
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         return float(x)
@@ -193,10 +196,6 @@ def _log_callback_exception(task: "asyncio.Task", label: str) -> None:
         return
     try:
         PWS_CALLBACK_ERRORS_TOTAL.labels(label).inc()
-    except Exception:
-        pass
-    try:
-        log.warning("[PrivateWSHub] callback %s raised: %s", label, exc)
     except Exception:
         pass
 
@@ -1530,7 +1529,10 @@ class PrivateWSHub:
         self._critical_drop_seen = False
         self._last_critical_drop_reason = None
         self._last_critical_drop_ts = 0.0
-        
+
+        self._critical_drop_by_alias: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._critical_drop_ttl_s = float(getattr(pws_cfg, "PWS_CRITICAL_DROP_TTL_S", 30.0))
+
         self._ff_no_drop_critical_enforced = bool(getattr(pws_cfg, "ff_pws_no_drop_critical_enforced", False))
         self._ff_strict_dedup_enforced = bool(getattr(pws_cfg, "ff_pws_strict_dedup_enforced", False))
         
@@ -1565,6 +1567,7 @@ class PrivateWSHub:
         self._pws_gap_slo_default: float = float(getattr(pws_cfg, "PWS_HEARTBEAT_MAX_GAP_S", 30.0))
         self._refresh_pws_gap_slo_from_slo()
         self._pws_health: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._wiring_alerted: set[Tuple[str, str, str]] = set()
 
         # ------------------------- QoS / métriques / drain -------------------------
         
@@ -1639,17 +1642,42 @@ class PrivateWSHub:
     def _record_queue_drop(self, dropped: Optional[dict], *, exchange: str, alias: str, reason: str) -> None:
         ev = dropped or {}
         critical = self._is_critical_event(ev)
-        label = "queue_full_critical" if critical else "queue_full_other"
+        canon = normalize_reason_code(reason) or reason
+        label = canon
         try:
             from modules.obs_metrics import PWS_HUB_DROPPED_TOTAL
             if PWS_HUB_DROPPED_TOTAL:
-                PWS_HUB_DROPPED_TOTAL.labels(exchange=exchange, reason=reason).inc()
+                PWS_HUB_DROPPED_TOTAL.labels(exchange=exchange, reason=canon).inc()
             PWS_DROPPED_TOTAL.labels(exchange, alias, label).inc()
         except Exception:
             pass
         if critical:
             kind = str(ev.get("type") or "other").lower()
-            self._record_critical_drop(exchange=exchange, alias=alias, reason=reason, kind=kind)
+            self._record_critical_drop(exchange=exchange, alias=alias, reason=canon, kind=kind)
+
+    def _record_event_drop(
+            self,
+            ev: Optional[dict],
+            *,
+            exchange: str,
+            alias: str,
+            reason: str,
+            critical: bool = False,
+    ) -> None:
+        payload = ev or {}
+        canon = normalize_reason_code(reason) or reason
+        label = canon or "drop"
+        try:
+            from modules.obs_metrics import PWS_HUB_DROPPED_TOTAL
+            if PWS_HUB_DROPPED_TOTAL:
+                PWS_HUB_DROPPED_TOTAL.labels(exchange=exchange, reason=canon).inc()
+            PWS_DROPPED_TOTAL.labels(exchange, alias, label).inc()
+        except Exception:
+            pass
+        if critical:
+            kind = str(payload.get("type") or "other").lower()
+            self._record_critical_drop(exchange=exchange, alias=alias, reason=canon, kind=kind)
+
     def on_event(self, event: dict) -> None:
         """
         Entrée unique: QoS, métriques (ACK/FILL + lag + heartbeats), drain minimal.
@@ -1707,36 +1735,21 @@ class PrivateWSHub:
             has_id = bool(ev.get("client_id") or ev.get("exchange_order_id"))
             if missing or not has_id:
                 reason = "invalid_fill_contract"
-                try:
-                    PWS_DROPPED_TOTAL.labels(exu, alu, reason).inc()
-                except Exception:
-                    pass
-                try:
-                    log.warning(
-                        "[PrivateWSHub] évènement FILL/PARTIAL invalide, drop: "
-                        "missing=%s has_id=%s ev_head=%s",
-                        missing,
-                        has_id,
-                        {
-                            "exchange": ev.get("exchange"),
-                            "alias": ev.get("alias"),
-                            "symbol": ev.get("symbol"),
-                            "side": ev.get("side"),
-                            "status": ev.get("status"),
-                            "type": ev.get("type"),
-                            "client_id": ev.get("client_id"),
-                            "exchange_order_id": ev.get("exchange_order_id"),
-                        },
-                    )
-                except Exception:
-                    pass
+                reason = "PWS_INVALID_FILL_CONTRACT"
+                self._record_event_drop(
+                    ev,
+                    exchange=exu,
+                    alias=alu,
+                    reason=reason,
+                    critical=True,
+                )
                 return
 
         ev.setdefault("ts_local", _t.time())
         key = (exu, alu)
 
         # Heartbeat frais
-        self._last_hb[key] = ev["ts_local"]
+        self._last_hb[key] = _now_mono()
         try:
             PWS_HEARTBEAT_GAP_SECONDS.labels(exu, alu).set(0.0)
         except Exception:
@@ -1788,7 +1801,7 @@ class PrivateWSHub:
                                 dropped,
                                 exchange=exu,
                                 alias=alu,
-                                reason="queue_full_critical",
+                                reason="PWS_QUEUE_FULL_CRITICAL",
                             )
                         except Exception:
                             break
@@ -1804,7 +1817,7 @@ class PrivateWSHub:
                                 dropped,
                                 exchange=exu,
                                 alias=alu,
-                                reason="queue_full_critical",
+                                reason="PWS_QUEUE_FULL_OTHER",
                             )
                         except Exception:
                             pass
@@ -1813,13 +1826,13 @@ class PrivateWSHub:
                             ev,
                             exchange=exu,
                             alias=alu,
-                            reason="queue_full_critical",
+                            reason="PWS_QUEUE_FULL_OTHER",
                         )
                         return
                 q.append(ev)
         except Exception:
             try:
-                PWS_DROPPED_TOTAL.labels(exu, alu, "exception").inc()
+                PWS_DROPPED_TOTAL.labels(exu, alu, "PWS_QUEUE_EXCEPTION").inc()
             except Exception:
                 pass
             return
@@ -1836,7 +1849,10 @@ class PrivateWSHub:
             except Exception:
                 pass
         except Exception:
-            log.exception("[PrivateWSHub] drain_one error")
+            try:
+                PWS_DROPPED_TOTAL.labels(exu, alu, "PWS_DRAIN_EXCEPTION").inc()
+            except Exception:
+                pass
 
     def _pws_drain_one(self, key: tuple) -> None:
         """
@@ -1868,23 +1884,29 @@ class PrivateWSHub:
         # Wiring incomplet → alerte explicite (prod / test visibles)
         try:
             if rm_cb is None:
-                self._notify_alert(
-                    severity="ERROR",
-                    reason="missing_rm_callback",
-                    exchange=ex,
-                    alias=al,
-                    kind=kind,
-                    message="PrivateWSHub: événement privé sans callback RiskManager",
-                )
+                alert_key = ("missing_rm_callback", ex, al)
+                if alert_key not in self._wiring_alerted:
+                    self._wiring_alerted.add(alert_key)
+                    self._notify_alert(
+                        severity="ERROR",
+                        reason="missing_rm_callback",
+                        exchange=ex,
+                        alias=al,
+                        kind=kind,
+                        message="PrivateWSHub: événement privé sans callback RiskManager",
+                    )
             if eng_cb is None:
-                self._notify_alert(
-                    severity="ERROR",
-                    reason="missing_engine_callback",
-                    exchange=ex,
-                    alias=al,
-                    kind=kind,
-                    message="PrivateWSHub: événement privé sans callback ExecutionEngine",
-                )
+                alert_key = ("missing_engine_callback", ex, al)
+                if alert_key not in self._wiring_alerted:
+                    self._wiring_alerted.add(alert_key)
+                    self._notify_alert(
+                        severity="ERROR",
+                        reason="missing_engine_callback",
+                        exchange=ex,
+                        alias=al,
+                        kind=kind,
+                        message="PrivateWSHub: événement privé sans callback ExecutionEngine",
+                    )
         except Exception:
             pass
 
@@ -1921,11 +1943,12 @@ class PrivateWSHub:
                             PWS_DROPPED_TOTAL.labels("-", "-", "PWS_CALLBACK_NO_LOOP").inc()
                         except Exception:
                             pass
-                        log.warning(
-                            "[PrivateWSHub] %s callback coroutine sans boucle active", label
-                        )
+
         except Exception:
-            log.exception("[PrivateWSHub] %s callback failed", label)
+            try:
+                PWS_CALLBACK_ERRORS_TOTAL.labels(label).inc()
+            except Exception:
+                pass
 
     def _ensure_callback_loop(self) -> Optional[asyncio.AbstractEventLoop]:
         if self._callback_loop and self._callback_loop.is_running():
@@ -1969,6 +1992,26 @@ class PrivateWSHub:
         self._critical_drop_seen = True
         self._last_critical_drop_reason = reason
         self._last_critical_drop_ts = _now()
+        exu, alu = _upper(exchange), _upper(alias)
+        self._critical_drop_by_alias[(exu, alu)] = {
+            "reason": reason,
+            "kind": kind,
+            "ts": self._last_critical_drop_ts,
+            "ts_mono": _now_mono(),
+        }
+        try:
+            entry = self._pws_health.get((exu, alu), {})
+            entry.update(
+                {
+                    "state": "CRITICAL_DROP",
+                    "last_change_ts": self._last_critical_drop_ts,
+                    "last_reason": reason,
+                }
+            )
+            self._pws_health[(exu, alu)] = entry
+            PWS_HEALTH_STATE.labels(exu, alu).set(2)
+        except Exception:
+            pass
         if self._ff_no_drop_critical_enforced:
             self._emit_pws_health_event(
                 exchange=exchange,
@@ -2107,24 +2150,46 @@ class PrivateWSHub:
             ev.setdefault("alias", alu)
             try:
                 key_d, key_meta = self._dedup_key(ev)
-                if (
-                        self._ff_strict_dedup_enforced
-                        and self._is_critical_event(ev)
-                        and key_meta.get("unsafe_reason")
-                ):
+                if self._is_critical_event(ev) and key_meta.get("unsafe_reason"):
                     self._handle_unsafe_dedup(ev, key_meta)
+                    self._record_event_drop(
+                        ev,
+                        exchange=exu,
+                        alias=alu,
+                        reason="PWS_UNSAFE_DEDUP",
+                        critical=True,
+                    )
+                    return
                 if self._dedup_seen(key_d):
                     try:
                         PWS_DEDUP_HITS_TOTAL.labels(exchange=exu, alias=alu).inc()
                     except Exception:
-                        pass
+                        try:
+                            self._record_event_drop(
+                                ev,
+                                exchange=exu,
+                                alias=alu,
+                                reason="PWS_DEDUP_EXCEPTION",
+                                critical=self._is_critical_event(ev),
+                            )
+                        except Exception:
+                            pass
                     return
             except Exception:
                 pass
             try:
                 self.on_event(ev)
             except Exception:
-                log.exception("[PrivateWSHub] dispatch(ev) failure")
+                try:
+                    self._record_event_drop(
+                        ev,
+                        exchange=exu,
+                        alias=alu,
+                        reason="PWS_DISPATCH_EXCEPTION",
+                        critical=self._is_critical_event(ev),
+                    )
+                except Exception:
+                    pass
             return
 
         # Fabrique de closure
@@ -2140,25 +2205,46 @@ class PrivateWSHub:
                 self._normalize_event_fields(e)
                 try:
                     key_d, key_meta = self._dedup_key(e)
-                    if (
-                            self._ff_strict_dedup_enforced
-                            and self._is_critical_event(e)
-                            and key_meta.get("unsafe_reason")
-                    ):
+                    if self._is_critical_event(e) and key_meta.get("unsafe_reason"):
                         self._handle_unsafe_dedup(e, key_meta)
+                        self._record_event_drop(
+                            e,
+                            exchange=exu,
+                            alias=alu,
+                            reason="PWS_UNSAFE_DEDUP",
+                            critical=True,
+                        )
+                        return
                     if self._dedup_seen(key_d):
                         try:
                             PWS_DEDUP_HITS_TOTAL.labels(exchange=exu, alias=alu).inc()
                         except Exception:
-                            pass
+                            try:
+                                self._record_event_drop(
+                                    e,
+                                    exchange=exu,
+                                    alias=alu,
+                                    reason="PWS_DEDUP_EXCEPTION",
+                                    critical=self._is_critical_event(e),
+                                )
+                            except Exception:
+                                pass
                         return
                 except Exception:
                     pass
                 try:
                     self.on_event(e)
                 except Exception:
-                    log.exception("[PrivateWSHub] on_event pipeline error")
-
+                    try:
+                        self._record_event_drop(
+                            e,
+                            exchange=exu,
+                            alias=alu,
+                            reason="PWS_DISPATCH_EXCEPTION",
+                            critical=self._is_critical_event(e),
+                        )
+                    except Exception:
+                        pass
             return _inner
 
         raise TypeError("Invalid _dispatch usage. Use _dispatch(ev_dict) or _dispatch(alias, exchange).")
@@ -2252,7 +2338,7 @@ class PrivateWSHub:
         import time, asyncio
         try:
             while True:
-                now = time.time()
+                now = _now_mono()
                 try:
                     for (ex, alias), last in list(self._last_hb.items()):
                         gap = max(0.0, now - float(last))
@@ -2382,12 +2468,13 @@ class PrivateWSHub:
         period = float(getattr(pws, "PWS_ALERT_PERIOD_S", 30.0))
 
         while getattr(self, "_started", False):
-            now = _now()
+            now_wall = _now()
+            now_mono = _now_mono()
 
             # 1) Heartbeat gaps
             try:
                 for (ex, al), last in list(self._last_hb.items()):
-                    gap = max(0.0, now - float(last))
+                    gap = max(0.0, now_mono - float(last))
                     hb_crit = self._pws_gap_slo_by_ex.get(ex, self._pws_gap_slo_default)
                     hb_warn = 0.7 * hb_crit
 
@@ -2395,7 +2482,7 @@ class PrivateWSHub:
                         "state": "HEALTHY",
                         "last_gap_s": 0.0,
                         "gap_slo_s": hb_crit,
-                        "last_change_ts": now,
+                        "last_change_ts": now_wall,
                         "healthy_streak": 0,
                         "warn_streak": 0,
                         "critical_streak": 0,
@@ -2429,7 +2516,7 @@ class PrivateWSHub:
 
                     if new_state != old_state:
                         entry["state"] = new_state
-                        entry["last_change_ts"] = now
+                        entry["last_change_ts"] = now_wall
                     self._pws_health[(ex, al)] = entry
 
                     try:
@@ -2457,8 +2544,13 @@ class PrivateWSHub:
 
             # 2) Queue saturation
             try:
-                for (ex, al, kind), dq in list(self._queues.items()):
-                    maxlen = getattr(dq, "maxlen", 0) or 0
+                for key, dq in list(self._queues.items()):
+                    if isinstance(key, tuple) and len(key) == 2:
+                        ex, al = key
+                        kind = "mixed"
+                    else:
+                        ex, al, kind = key
+                    maxlen = getattr(dq, "maxlen", 0) or self._queue_max
                     fill = 0.0 if maxlen <= 0 else (len(dq) / float(maxlen))
                     try:
                         PWS_QUEUE_FILL_RATIO.labels(ex, al, kind).set(fill)
@@ -3146,7 +3238,30 @@ class PrivateWSHub:
 
 
         gap = heartbeat_gap_s if heartbeat_gap_s is not None else None
-
+        # Fail-closed sur drop critique récent (ACK/FILL)
+        critical_drop = self._critical_drop_by_alias.get((exu, alu))
+        if critical_drop:
+            try:
+                age = _now_mono() - float(critical_drop.get("ts_mono", 0.0) or 0.0)
+            except Exception:
+                age = float("inf")
+            if age <= float(self._critical_drop_ttl_s or 0.0):
+                return {
+                    "exchange": exu,
+                    "alias": alu,
+                    "status": "WS_DOWN",
+                    "healthy": False,
+                    "heartbeat_gap_s": heartbeat_gap_s,
+                    "last_event_ts": last_ts,
+                    "errors_total": errors_total,
+                    "reconnects_total": reconnects_total,
+                    "clients": clients,
+                    "critical_drop": {
+                        "reason": critical_drop.get("reason"),
+                        "kind": critical_drop.get("kind"),
+                        "ts": critical_drop.get("ts"),
+                    },
+                }
         if gap is None:
             # Pas encore d'events; on considère l'alias comme dégradé tant qu'on n'a pas vu de trafic
             if any_healthy:
@@ -3166,7 +3281,7 @@ class PrivateWSHub:
                 status = "WS_OK"
                 healthy = True
 
-        return {
+        out = {
             "exchange": exu,
             "alias": alu,
             "status": status,
@@ -3177,6 +3292,13 @@ class PrivateWSHub:
             "reconnects_total": reconnects_total,
             "clients": clients,
         }
+        if critical_drop:
+            out["critical_drop"] = {
+                "reason": critical_drop.get("reason"),
+                "kind": critical_drop.get("kind"),
+                "ts": critical_drop.get("ts"),
+            }
+        return out
 
     def get_all_alias_ws_status(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """

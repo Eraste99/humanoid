@@ -10687,6 +10687,11 @@ class ExecutionEngine:
             reason = "EXCHANGE_ERROR"
             if any(t in msg for t in ("429", "too many", "rate limit")):
                 reason = "RATE_LIMIT"
+                try:
+                    from modules.obs_metrics import ENGINE_429_TOTAL_COUNTER
+                    ENGINE_429_TOTAL_COUNTER.labels(exchange=ex).inc()
+                except Exception:
+                    pass
             elif any(t in msg for t in ("insufficient", "balance", "funds")):
                 reason = "INSUFFICIENT_BALANCE"
             elif any(t in msg for t in ("400", "bad request", "invalid")):

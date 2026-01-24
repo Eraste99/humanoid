@@ -30,7 +30,7 @@ except Exception:
 
 def _now() -> float:
     """Horodatage local en secondes (float)."""
-    return time.time()
+    return time.monotonic()
 
 
 log = logging.getLogger("PrivateWSReconciler")
@@ -163,6 +163,9 @@ class PrivateWSReconciler:
         # Misses & cooldowns par (exchange, alias)
         self._alias_miss_counter: Dict[Tuple[str, str], int] = {}
         self._last_alias_resync: Dict[Tuple[str, str], float] = {}
+        self._last_alias_resync_mono: Dict[Tuple[str, str], float] = {}
+        self._resync_inflight: Set[Tuple[str, str, str]] = set()
+        self._resync_lock = asyncio.Lock()
 
         # Hooks P0 posés ultérieurement par l'orchestrateur
         self._lookup: Optional[Callable[[str, str, str], Any]] = None
@@ -347,10 +350,35 @@ class PrivateWSReconciler:
         except Exception:
             pass
 
+    async def _begin_resync(self, exchange: str, alias: str, scope: str) -> bool:
+        key = (exchange, alias, scope)
+        async with self._resync_lock:
+            if key in self._resync_inflight:
+                return False
+            self._resync_inflight.add(key)
+            return True
+
+    async def _end_resync(self, exchange: str, alias: str, scope: str) -> None:
+        key = (exchange, alias, scope)
+        async with self._resync_lock:
+            self._resync_inflight.discard(key)
+
+    def _record_resync_skip(self, exchange: str, alias: str, scope: str, reason: str) -> None:
+        try:
+            RECONCILE_RESYNC_FAILED_TOTAL.labels(exchange, alias, scope).inc()
+        except Exception:
+            pass
+        self._emit_event(
+            "reco_resync_skipped",
+            exchange=exchange,
+            alias=alias,
+            scope=scope,
+            reason=reason,
+        )
     def _observe_resync_latency(self, exchange: str, alias: str, scope: str, start_ts: float) -> None:
         try:
             RECONCILE_RESYNC_LATENCY_MS.labels(exchange, alias, scope).observe(
-                max(0.0, (time.time() - start_ts) * 1000.0)
+                max(0.0, (time.perf_counter() - start_ts) * 1000.0)
             )
         except Exception:
             pass
@@ -563,20 +591,7 @@ class PrivateWSReconciler:
                 self._record_miss()
             except Exception:
                 pass
-            try:
-                log.warning(
-                    "[Reconciler:%s:%s] observe_fill_event sans client_id/exchange_order_id, drop head=%s",
-                    ex,
-                    al,
-                    {
-                        "symbol": ev.get("symbol"),
-                        "side": ev.get("side"),
-                        "status": ev.get("status"),
-                        "type": ev.get("type"),
-                    },
-                )
-            except Exception:
-                pass
+
             # On incrémente le compteur de miss alias pour déclencher la logique de resync
             self._alias_miss_counter[key] = int(self._alias_miss_counter.get(key, 0)) + 1
             return
@@ -613,7 +628,7 @@ class PrivateWSReconciler:
         if misses <= 0:
             return
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         scope = None
         ok = False
         attempted = False
@@ -623,6 +638,9 @@ class PrivateWSReconciler:
                 if callable(self._resync_order):
                     scope = "order"
                     attempted = True
+                    if not await self._begin_resync(exchange, alias, scope):
+                        self._record_resync_skip(exchange, alias, scope, "inflight")
+                        return
                     order_ok = False
                     order_exc: Optional[BaseException] = None
                     try:
@@ -641,6 +659,7 @@ class PrivateWSReconciler:
                         self._on_resync_failure(exchange, alias, scope, "exception", error=exc)
                     finally:
                         self._record_resync_metric(exchange, alias, scope)
+                        await self._end_resync(exchange, alias, scope)
                     if order_exc is None and not order_ok:
                         self._on_resync_failure(exchange, alias, scope, "returned_false")
                     ok = order_ok
@@ -651,10 +670,13 @@ class PrivateWSReconciler:
             # 2) resync alias si besoin
             if (not ok) and misses >= 2:
                 if callable(self._resync_alias):
-                    last = float(self._last_alias_resync.get(key, 0.0))
-                    if (time.time() - last) >= self._cooldown_s:
+                    last_mono = float(self._last_alias_resync_mono.get(key, 0.0))
+                    if (time.monotonic() - last_mono) >= self._cooldown_s:
                         scope = "alias"
                         attempted = True
+                        if not await self._begin_resync(exchange, alias, scope):
+                            self._record_resync_skip(exchange, alias, scope, "inflight")
+                            return
                         alias_ok = False
                         alias_exc: Optional[BaseException] = None
                         try:
@@ -666,8 +688,10 @@ class PrivateWSReconciler:
                             self._on_resync_failure(exchange, alias, scope, "exception", error=exc)
                         finally:
                             self._record_resync_metric(exchange, alias, scope)
+                            await self._end_resync(exchange, alias, scope)
                         if alias_exc is None:
                             self._last_alias_resync[key] = time.time()
+                            self._last_alias_resync_mono[key] = time.monotonic()
                             if not alias_ok:
                                 self._on_resync_failure(exchange, alias, scope, "returned_false")
                         ok = alias_ok
@@ -703,8 +727,11 @@ class PrivateWSReconciler:
             return False
         scope = "bundle"
         ok = False
-        t0 = time.time()
+        t0 = time.perf_counter()
         try:
+            if not await self._begin_resync(exchange, alias, scope):
+                self._record_resync_skip(exchange, alias, scope, "inflight")
+                return False
             if callable(self._resync_bundle):
                 params = {
                     "exchange": exchange,
@@ -745,6 +772,7 @@ class PrivateWSReconciler:
                 self._observe_resync_latency(exchange, alias, scope, t0)
             except Exception:
                 pass
+            await self._end_resync(exchange, alias, scope)
         if not ok:
             self._on_resync_failure(exchange, alias, scope, "returned_false")
         return ok
@@ -884,7 +912,8 @@ class PrivateWSReconciler:
         key = (ex_u, alias_u)
 
         last = float(self._last_alias_resync.get(key, 0.0))
-        age = (time.time() - last) if last else None
+        last_mono = float(self._last_alias_resync_mono.get(key, 0.0))
+        age = (time.monotonic() - last_mono) if last_mono else None
 
         wiring = {
             "lookup": callable(getattr(self, "_lookup", None)),

@@ -56,6 +56,7 @@ try:
     from modules.obs_metrics import (
         discovery_note_api_error,
         discovery_note_filtered,
+        discovery_note_rate_limit,
         discovery_note_stage,
         discovery_observe_run_ms,
     )
@@ -71,6 +72,9 @@ except Exception:  # pragma: no cover
     def discovery_note_api_error(*_, **__):
         return None
 
+
+    def discovery_note_rate_limit(*_, **__):
+        return None
 
     def discovery_observe_run_ms(*_, **__):
         return None
@@ -205,6 +209,7 @@ async def _fetch_json(
             try:
                 async with session.get(url, timeout=timeout) as r:
                     if r.status == 429:
+                        discovery_note_rate_limit(exchange)
                         _note_error("api_error")
                         noted_error = True
                         ra = r.headers.get("Retry-After")
