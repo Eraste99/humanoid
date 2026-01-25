@@ -66,6 +66,7 @@ try:
         ROUTER_SLO_MISSING_TOTAL,
         ROUTER_DEPLOYMENT_MODE_INVALID_TOTAL,
         ROUTER_CLOCK_OFFSET_MS,
+        ROUTER_EVENT_SINK_ERRORS_TOTAL,
         WS_RECONNECTS_TOTAL,
         note_router_cfg,
         safe_inc,
@@ -73,6 +74,7 @@ try:
         record_pipeline_latency,
         set_pipeline_backlog,
         should_trace_latency,
+
     )
 except ImportError:  # pragma: no cover
     # On laisse obs_metrics gérer ses propres fallbacks si possible, 
@@ -92,6 +94,7 @@ except ImportError:  # pragma: no cover
     ROUTER_SLO_MISSING_TOTAL = None
     ROUTER_DEPLOYMENT_MODE_INVALID_TOTAL = None
     ROUTER_CLOCK_OFFSET_MS = None
+    ROUTER_EVENT_SINK_ERRORS_TOTAL = None
 
 
 # PATCH 1 — Gauge pair-level: router_queue_depths{exchange, pair}
@@ -620,7 +623,12 @@ class MarketDataRouter:
                 for _ in range(len(dq) // 2):
                     if dq: dq.popleft()
         except Exception:
-            logger.exception("[Router] backpressure note_drop failed")
+            safe_inc(
+                ROUTER_EVENT_SINK_ERRORS_TOTAL,
+                "router_event_sink_errors_total",
+                "router",
+                reason="bp_note_drop",
+            )
 
     def _extract_pair_for_drop(self, payload: dict) -> Optional[str]:
         """Best-effort: retourne la paire si elle est déjà présente dans le payload."""
@@ -648,7 +656,12 @@ class MarketDataRouter:
         try:
             self._event_sink(evt)
         except Exception:
-            logger.exception("[Router] event_sink drop dispatch failed")
+            safe_inc(
+                ROUTER_EVENT_SINK_ERRORS_TOTAL,
+                "router_event_sink_errors_total",
+                "router",
+                reason="drop_dispatch",
+            )
 
     # ----------------------- Latest store (full & light) -----------------------
     def _light_from_full(self, b: Dict[str, Any]) -> Dict[str, Any]:

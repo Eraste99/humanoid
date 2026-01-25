@@ -97,6 +97,7 @@ try:
         SC_ROTATION_AUDITION_SIZE,    # gauge
         SC_STRATEGY_SCORE,            # gauge
         SC_ELIGIBLE,                  # gauge
+        SCANNER_ROTATION_ERRORS_TOTAL,
         SIM_PRIME_TOTAL,
         SIM_PRIME_ERROR_TOTAL,
         inc_blocked,                  # function(module, reason, pair)
@@ -119,6 +120,7 @@ except Exception:
     SC_ROTATION_AUDITION_SIZE = _MetricNoOp()
     SC_STRATEGY_SCORE = _MetricNoOp()
     SC_ELIGIBLE = _MetricNoOp()
+    SCANNER_ROTATION_ERRORS_TOTAL = _MetricNoOp()
     SIM_PRIME_TOTAL = _MetricNoOp()
     SIM_PRIME_ERROR_TOTAL = _MetricNoOp()
 
@@ -193,7 +195,7 @@ class _Rotation:
         self._state_change_cb = None
 
     def ban(self, pair: str) -> None:
-        now = time.time()
+        now = time.monotonic()
         self._banned_until[pair] = now + self.ban_ttl
         if pair in self.primary:
             self.primary.remove(pair)
@@ -212,10 +214,10 @@ class _Rotation:
                 pass
             
     def is_banned(self, pair: str) -> bool:
-        return time.time() < self._banned_until.get(pair, 0.0)
+        return time.monotonic() < self._banned_until.get(pair, 0.0)
 
     def update(self, *, ranked_pairs: List[str], allow_promote: bool = True) -> None:
-        now = time.time()
+        now = time.monotonic()
         rp = [p for p in ranked_pairs if not self.is_banned(p)]
         seen: Set[str] = set()
         rp = [p for p in rp if not (p in seen or seen.add(p))]
@@ -848,20 +850,23 @@ class OpportunityScanner:
     def ingest_volatility_bps(self, pair: str, exchange: str, vol_bps: float, ts: float | None = None) -> None:
         self._vol_ema = getattr(self, "_vol_ema", {})
         self._vol_ts = getattr(self, "_vol_ts", {})
+        self._vol_ts_mono = getattr(self, "_vol_ts_mono", {})
         key = (str(exchange).upper(), (pair or "").replace("-", "").upper())
         lam = float(getattr(self, "vol_ema_lambda", 0.7))
         prev = self._vol_ema.get(key)
         v = float(vol_bps)
         self._vol_ema[key] = (lam * prev + (1 - lam) * v) if isinstance(prev, (int, float)) else v
         self._vol_ts[key] = float(ts or time.time())
+        self._vol_ts_mono[key] = time.monotonic()
 
     def get_volatility_bps(self, pair: str, ema: bool = True, ttl_s: float | None = None) -> float | None:
         self._vol_ema = getattr(self, "_vol_ema", {})
         self._vol_ts = getattr(self, "_vol_ts", {})
+        self._vol_ts_mono = getattr(self, "_vol_ts_mono", {})
         pk = (pair or "").replace("-", "").upper()
         # agrège sur les CEX connus (max) ; autre stratégie possible (p95, avg)
         vals = []
-        now = time.time()
+        now_mono = time.monotonic()
         # TTL vol : priorité à l'argument, sinon SLO public, sinon cfg.vol.ttl_s
         if ttl_s is not None:
             ttl = float(ttl_s)
@@ -873,8 +878,10 @@ class OpportunityScanner:
         for (ex, p), v in list(self._vol_ema.items()):
             if p != pk:
                 continue
-            age = now - float(self._vol_ts.get((ex, p), 0.0))
-            if age <= ttl:
+            ts_val = self._vol_ts_mono.get((ex, p)) or self._vol_ts.get((ex, p), 0.0)
+            age = now_mono - float(ts_val)
+
+        if age <= ttl:
                 vals.append(float(v))
         return max(vals) if vals else None
 
@@ -1334,13 +1341,19 @@ class OpportunityScanner:
         threshold_bps: Optional[float] = None,
     ) -> None:
         ex = _norm_ex(exchange); pk = _norm_pair(pair_key)
-        d = self._slip_cache.setdefault((ex, pk), {"buy": None, "sell": None, "recent": None, "ts": 0.0})
+        d = self._slip_cache.setdefault(
+            (ex, pk),
+            {"buy": None, "sell": None, "recent": None, "ts": 0.0, "ts_mono": 0.0},
+        )
         if buy is not None:  d["buy"] = float(max(0.0, buy))
         if sell is not None: d["sell"] = float(max(0.0, sell))
         if recent is not None: d["recent"] = float(max(0.0, recent))
-        ts_now = time.time()
-        d["ts"] = ts_now
-        self._slip_ts[_norm_pair(pair_key)] = ts_now
+        ts_now_wall = time.time()
+        ts_now_mono = time.monotonic()
+        d["ts"] = ts_now_wall
+        d["ts_mono"] = ts_now_mono
+        self._slip_ts[_norm_pair(pair_key)] = ts_now_mono
+
         if threshold_bps is not None:
             self._slip_threshold_bps[pk] = float(max(0.0, threshold_bps))
 
@@ -1909,7 +1922,10 @@ class OpportunityScanner:
             try:
                 fn(**kwargs)
             except Exception:
-                self.logger.exception("[Scanner] log_rotation_decision failed", exc_info=True)
+                try:
+                    SCANNER_ROTATION_ERRORS_TOTAL.labels("log_rotation_decision").inc()
+                except Exception:
+                    pass
 
     def _rotation_tick_mm(self, *, candidate_pairs: List[str]) -> None:
         """
@@ -1941,14 +1957,20 @@ class OpportunityScanner:
                 if ranked_from_history:
                     ranked_pairs = list(dict.fromkeys(ranked_from_history + ranked_pairs))
             except Exception:
-                logger.exception("[Scanner][MM] pairhistory ranking unavailable", exc_info=True)
+                try:
+                    SCANNER_ROTATION_ERRORS_TOTAL.labels("pairhistory_unavailable").inc()
+                except Exception:
+                    pass
 
         self._rot_mm.update(ranked_pairs=ranked_pairs, allow_promote=True)
         try:
             after = _snapshot_state()
             self._log_mm_rotation_changes(before, after)
         except Exception:
-            self.logger.exception("[Scanner][MM] rotation logging failed", exc_info=True)
+            try:
+                SCANNER_ROTATION_ERRORS_TOTAL.labels("rotation_logging").inc()
+            except Exception:
+                pass
 
     def _log_mm_rotation_changes(self, before: Dict[str, Set[str]], after: Dict[str, Set[str]]) -> None:
         def _state_of(pair: str, state: Dict[str, Set[str]]) -> Optional[str]:
@@ -2137,12 +2159,12 @@ class OpportunityScanner:
     # opportunity_scanner.py (dans la classe)
     def _slip_age_seconds(self, pair: str) -> float:
         p = self._norm_pair(pair)
-        now = time.time()
+        now = time.monotonic()
         ages = []
         for (ex, pk), meta in getattr(self, "_slip_cache", {}).items():
             if pk != p:
                 continue
-            ts_val = meta.get("ts")
+            ts_val = meta.get("ts_mono") or meta.get("ts")
             if ts_val:
                 ages.append(max(0.0, now - float(ts_val)))
 
@@ -2155,13 +2177,15 @@ class OpportunityScanner:
 
     def _vol_age_seconds(self, pair: str) -> float:
         p = self._norm_pair(pair)
-        now = time.time()
+        now = time.monotonic()
         ages = []
+        ts_mono = getattr(self, "_vol_ts_mono", {})
         for (ex, pk), ts in getattr(self, "_vol_ts", {}).items():
             if pk != p:
                 continue
-            if ts:
-                ages.append(max(0.0, now - float(ts)))
+            ts_val = ts_mono.get((ex, pk)) or ts
+            if ts_val:
+                ages.append(max(0.0, now - float(ts_val)))
 
         return min(ages) if ages else float("inf")
 
@@ -2394,9 +2418,11 @@ class OpportunityScanner:
         )
         def _leg_age(ex_name: str) -> float:
             try:
-                ts_val = (self._slip_cache.get((_norm_ex(ex_name), _norm_pair(pair))) or {}).get("ts")
+                meta = (self._slip_cache.get((_norm_ex(ex_name), _norm_pair(pair))) or {})
+                ts_val = meta.get("ts_mono") or meta.get("ts")
+
                 if ts_val:
-                    return max(0.0, now - float(ts_val))
+                    return max(0.0, time.monotonic() - float(ts_val))
             except Exception:
                 pass
             return float("inf")
@@ -2502,6 +2528,13 @@ class OpportunityScanner:
             )
             return
         if fb is None or fs is None or float(fb) <= 0.0 or float(fs) <= 0.0:
+            self._record_rejection(
+                reason="fee_unknown",
+                route=route_combo,
+                pair=pair,
+                ctx={"buy_ex": buy_ex, "sell_ex": sell_ex},
+            )
+
             return
 
         fees_buy_taker = float(fb)

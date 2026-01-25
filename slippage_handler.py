@@ -810,11 +810,14 @@ class SlippageHandler:
     def last_age_seconds(self, exchange: str, pair_key: str) -> Optional[float]:
         ex = (exchange or "").upper()
         pk = (pair_key or "").replace("-", "").upper()
-        tsd = getattr(self, "_slip_ts", {})
+        tsd = getattr(self, "_slip_ts_mono", None)
+        if tsd is None:
+            tsd = getattr(self, "_slip_ts", {})
+
         t = tsd.get((ex, pk))
         if t is None:
             return None
-        return max(0.0, time.time() - float(t))
+        return max(0.0, time.monotonic() - float(t))
 
     def update_config(
         self,
@@ -931,7 +934,10 @@ class SlippageHandler:
                     # IMPORTANT: on_slip est async -> await
                     await self.on_slip(msg)
                 except Exception:
-                    logging.exception("Unhandled exception in slip consumer")
+                    try:
+                        self._note_drop("consumer_error", ex, "UNKNOWN")
+                    except Exception:
+                        pass
                 finally:
                     try:
                         q.task_done()
@@ -1031,6 +1037,7 @@ class SlippageHandler:
 
             self._slip_bps = getattr(self, "_slip_bps", {})
             self._slip_ts = getattr(self, "_slip_ts", {})
+            self._slip_ts_mono = getattr(self, "_slip_ts_mono", {})
             ts_ms = (
                     msg.get("recv_ts_ms")
                     or msg.get("exchange_ts_ms")
@@ -1038,15 +1045,17 @@ class SlippageHandler:
                     or msg.get("ts_ex_ms")
                     or 0
             )
-            now_s = (float(ts_ms) / 1000.0) if ts_ms else time.time()
+            now_wall_s = (float(ts_ms) / 1000.0) if ts_ms else time.time()
+            now_mono_s = time.monotonic()
             if slip_buy_bps is not None:
                 self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
             if slip_sell_bps is not None:
                 self._slip_bps[(ex, pair, "sell")] = float(slip_sell_bps)
-            self._slip_ts[(ex, pair)] = now_s
+            self._slip_ts[(ex, pair)] = now_wall_s
+            self._slip_ts_mono[(ex, pair)] = now_mono_s
 
             try:
-                event_age_s = max(0.0, now_s - float(ts_ms) / 1000.0) if ts_ms else 0.0
+                event_age_s = max(0.0, now_wall_s - float(ts_ms) / 1000.0) if ts_ms else 0.0
                 if slip_buy_bps is not None:
                     set_slip_age_seconds(pair, ex, "buy", event_age_s)
                 if slip_sell_bps is not None:
@@ -1055,7 +1064,11 @@ class SlippageHandler:
                 pass
 
         except Exception:
-            logging.exception("[Slip] on_slip error")
+            try:
+                self._note_drop("on_slip_error", msg.get("exchange", "UNKNOWN"), msg.get("pair_key", "UNKNOWN"))
+            except Exception:
+                pass
+
             try:
                 self._note_drop("parse_error", msg.get("exchange", "UNKNOWN"), msg.get("pair_key", "UNKNOWN"))
             except Exception:

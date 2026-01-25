@@ -684,14 +684,21 @@ class RPCServer:
             raise
 
         expires_ts_ms: Optional[int] = None
+        expires_mono_ms: Optional[int] = None
         if self.settings.idempotency_ttl_s > 0:
-            expires_ts_ms = int(time.time() * 1000 + max(0, self.settings.idempotency_ttl_s) * 1000)
+            ttl_ms = int(max(0, self.settings.idempotency_ttl_s) * 1000)
+            expires_mono_ms = int(time.monotonic() * 1000 + ttl_ms)
+            expires_ts_ms = int(time.time() * 1000 + ttl_ms)
 
         try:
+            payload_safe = self._safe_rpc_payload(method, payload)
+            if expires_mono_ms is not None:
+                payload_safe["expires_mono_ms"] = expires_mono_ms
+
             await asyncio.to_thread(
                 lhm.mark_rpc_idem_done,
                 op_id=op_id,
-                payload=self._safe_rpc_payload(method, payload),
+                payload=payload_safe,
                 response=res if self.settings.memoize_response else None,
                 expires_ts_ms=expires_ts_ms,
             )

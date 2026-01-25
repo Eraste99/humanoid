@@ -4415,8 +4415,14 @@ class LoggerHistoriqueManager:
                 return None
             entry = rows[0]
             expires = entry.get("expires_ts_ms")
-            if entry.get("status") == "DONE" and expires is not None and int(expires) <= int(time.time() * 1000):
-                return None
+            payload = entry.get("payload") or {}
+            expires_mono_ms = payload.get("expires_mono_ms")
+            if entry.get("status") == "DONE":
+                if expires_mono_ms is not None and int(time.monotonic() * 1000) >= int(expires_mono_ms):
+                    return None
+                if expires_mono_ms is None and expires is not None and int(expires) <= int(time.time() * 1000):
+                    return None
+
             return entry
         except Exception:
             logger.exception("get_rpc_idem_state failed")

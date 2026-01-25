@@ -5562,7 +5562,35 @@ class RiskManager:
 
         if not accepted and self._shadow:
             self._shadow.on_bundle_drop(bundle, "ENGINE_REJECT")
-        _record_decision(bool(accepted), "ENGINE_REJECT" if not accepted else "")
+        
+        final_ok = bool(accepted)
+        if isinstance(accepted, dict):
+            state = str(accepted.get("state") or "").upper()
+            if state and state != "ENGINE_ACCEPTED":
+                final_ok = False
+
+        # --- REB L2 Lock Placement ------------------------------------------------
+        if final_ok and branch == "REB":
+            try:
+                combo = self._bundle_combo_signature(bundle)
+                if combo:
+                    pair_s, buy_s, sell_s = combo
+                    reb_level = str(meta.get("reb_level") or "").upper()
+                    
+                    # Lock L2 si cross-cex effectif OU tag explicit CROSS_TRADE / BRIDGE
+                    is_cross = (buy_s != sell_s)
+                    is_l2_tag = (reb_level in ("CROSS_TRADE", "BRIDGE"))
+                    
+                    if is_cross or is_l2_tag:
+                        ttl_lock = float(getattr(self.cfg.rm, "rebal_lock_ttl_s", 15.0))
+                        source = str(meta.get("reb_source") or meta.get("source") or "ENGINE_ENQUEUE")
+                        pair_quote = _pair_quote(pair_s)
+                        self._set_reb_lock(pair_s, pair_quote, buy_s, sell_s, ttl_lock, source)
+            except Exception:
+                if getattr(self, "log", None):
+                    self.log.exception("RM.engine_enqueue_bundle: failed to set REB lock")
+
+        _record_decision(final_ok, "ENGINE_REJECT" if not final_ok else "")
         return accepted
 
 
@@ -5694,34 +5722,17 @@ class RiskManager:
     def _is_rebal_lock_active(self, bundle: Dict[str, Any]) -> Tuple[bool, str]:
         """
         Lock combo REB partagé avec TT/TM/MM.
-
-        Principe business :
-        - un REB qui démarre sur un combo (pair, buy_ex, sell_ex) pose un lock TTL
-          via _reb_locks / is_rebalancing_locked(...),
-        - pendant ce lock, on gèle TT/TM/MM sur ce même combo pour éviter
-          sur-exposition et “course poursuite” REB vs TT/TM.
-
-        Détails d’implémentation :
-        - on ne bloque que les branches TT/TM/MM (pas REB, pas HEDGE isolé),
-        - on derive le combo depuis bundle['route'] ou bundle['meta'],
-        - on délègue la décision finale à is_rebalancing_locked(...)
-          qui s’appuie sur _reb_locks et nettoie les expirations.
         """
-        # 1) Sanity minimal sur la structure
         if not isinstance(bundle, dict):
             return False, ""
 
         meta = bundle.get("meta") or {}
-
-        # 2) Branch du bundle (TT/TM/MM uniquement)
         try:
             branch = self._branch_of(meta, bundle)
         except Exception:
             branch = "UNKNOWN"
 
-        # On ne gèle que les branches de trading “classiques”
         if branch not in ("TT", "TM", "MM"):
-            # REB lui-même, HEDGE internes, etc. ne sont pas bloqués par ce hook.
             return False, ""
 
         combo = self._bundle_combo_signature(bundle)
@@ -5730,26 +5741,11 @@ class RiskManager:
                 return True, REB_LOCK_CHECK_FAILED
             return False, ""
 
-        # 4) Délégation à la fonction canonique de lock REB
-        lock_fn = getattr(self, "is_rebalancing_locked", None)
-        if not callable(lock_fn):
-            if bool(getattr(getattr(self.cfg, "rm", None), "ff_fail_closed_reb_lock", False)):
-                return True, REB_LOCK_CHECK_FAILED
-            return False, ""
+        pair, buy_ex, sell_ex = combo
+        if self.is_rebalancing_locked(pair, buy_ex, sell_ex):
+            return True, REB_LOCK
 
-        try:
-            locked = lock_fn(combo[0], combo[1], combo[2])
-            if locked is None:
-                raise RuntimeError("reb_lock_check_none")
-            if bool(locked):
-                return True, REB_LOCK
-            return False, ""
-
-        except Exception:
-            # En cas de problème de lock, on préfère bloquer si le flag est actif.
-            if bool(getattr(getattr(self.cfg, "rm", None), "ff_fail_closed_reb_lock", False)):
-                return True, REB_LOCK_CHECK_FAILED
-            return False, ""
+        return False, ""
 
     def _get_combo_key_from_bundle(self, bundle: Dict[str, Any]) -> Optional[str]:
         """
@@ -9169,7 +9165,7 @@ class RiskManager:
                 alert_type="WARNING"
             )
 
-            now = time.time()
+            now = time.monotonic()
             self._rebalancing_until = max(self._rebalancing_until, now + self.rebal_active_ttl_s)
 
             # Construire les opérations et les router (cooldown respecté)
@@ -9774,7 +9770,7 @@ class RiskManager:
                         alert_type="WARNING"
                     )
 
-                    now = time.time()
+                    now = time.monotonic()
                     self._rebalancing_until = max(self._rebalancing_until, now + self.rebal_active_ttl_s)
 
                     ops: List[Dict[str, Any]] = []
@@ -9917,7 +9913,10 @@ class RiskManager:
                 logger.info(f"[RiskManager] MM_MONO Critical drift on {ex}:{asset} ({drift_usd:.1f}$) -> using intra-cex rebalancing")
                 await self._mm_plan_intra_cex_transfers(ex, alias_mm, asset, drift_usd)
             else:
-                await self._mm_trigger_cross_cex_reb(ex, alias_mm, asset, drift_usd)
+                # CRITICAL non-mono : tenter d'abord intra-cex (L0), sinon cross-cex (L2)
+                emitted_l0 = await self._mm_plan_intra_cex_transfers(ex, alias_mm, asset, drift_usd)
+                if not emitted_l0:
+                    await self._mm_trigger_cross_cex_reb(ex, alias_mm, asset, drift_usd)
 
     def _mm_trigger_self_rebal(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> None:
         if not getattr(self, "mm_inventory_enabled", False):
@@ -9933,13 +9932,13 @@ class RiskManager:
         }
         self._maybe_fire_mm_inventory_single(opp, reason="mm_reb_alert", branch=alias_mm)
 
-    async def _mm_plan_intra_cex_transfers(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> None:
+    async def _mm_plan_intra_cex_transfers(self, ex: str, alias_mm: str, asset: str, drift_usd: float) -> bool:
         if self.rebalancing is None:
-            return
+            return False
 
         now = time.time()
         if now < getattr(self, "_rebal_emit_next_allowed", 0.0):
-            return
+            return False
 
         imbalance = {
             "CRYPTO": {ex: {alias_mm: {asset: drift_usd}}},
@@ -9951,26 +9950,31 @@ class RiskManager:
             plan = self.rebalancing.build_plan(imbalance)
         except Exception:
             logger.exception("[RiskManager] mm_reb build_plan failed")
-            return
+            return False
 
         try:
             ops = list(self.rebalancing.plan_to_operations(plan) or [])
         except Exception:
             logger.exception("[RiskManager] mm_reb plan_to_operations failed")
-            return
+            return False
 
         allowed_types = {"internal_subaccount_transfer", "internal_wallet_transfer"}
         ops = [op for op in ops if (op or {}).get("type") in allowed_types]
         if not ops:
-            return
+            return False
 
+        emitted_any = False
         for op in ops:
             try:
                 await self._handle_rebalancing_op(op)
+                emitted_any = True
             except Exception:
                 logger.exception("[RiskManager] mm_reb handle op failed")
 
-        self._rebal_emit_next_allowed = now + self.rebal_emit_cooldown_s
+        if emitted_any:
+            self._rebal_emit_next_allowed = now + self.rebal_emit_cooldown_s
+        
+        return emitted_any
 
     def _mm_pick_reb_counterparty_exchange(self, ex_mm: str, asset: str) -> Optional[str]:
         # P0 : sélection naive, à raffiner (capital dispo, slippage, etc.)
@@ -10028,11 +10032,14 @@ class RiskManager:
         meta.setdefault("source", "MM_REB_CRITICAL")
         meta.setdefault("type", "rebalancing")
         meta.setdefault("branch", "REB")
+        meta["reb_level"] = "CROSS_TRADE"
+        meta["reb_source"] = "MM_CRITICAL"
         meta["allow_final_loss_bps"] = float(self.mm_reb_allow_loss_bps)
         meta["allow_loss_bps"] = float(self.mm_reb_allow_loss_bps)
 
         try:
-            await self.engine.execute(bundle)
+            decision_ctx = {"source": "mm_cross_reb"}
+            self.engine_enqueue_bundle(bundle, decision_ctx=decision_ctx)
         except Exception:
             logger.exception("[RiskManager] mm_reb cross-cex execution failed")
 
@@ -11694,7 +11701,7 @@ class RiskManager:
         self._rebalancing_cb = cb
 
     def is_rebalancing_active(self) -> bool:
-        return time.time() < float(self._rebalancing_until)
+        return time.monotonic() < float(self._rebalancing_until)
 
     def get_balance_snapshot_for_rebal(
             self,
@@ -13017,17 +13024,56 @@ class RiskManager:
             actions.append(x)
         return actions
 
+    def _reb_lock_key(self, pair: str, quote: str, buy_ex: str, sell_ex: str) -> str:
+        pk = self._norm_pair(pair)
+        qu = str(quote).upper()
+        be = str(buy_ex).upper()
+        se = str(sell_ex).upper()
+        return f"{pk}|{qu}|{be}->{se}"
+
+    def _set_reb_lock(self, pair: str, quote: str, buy_ex: str, sell_ex: str, ttl_s: float, source: str) -> None:
+        if not hasattr(self, "_reb_locks"):
+            self._reb_locks = {}
+        
+        combo_key = self._reb_lock_key(pair, quote, buy_ex, sell_ex)
+        now = time.monotonic()
+        new_expiry = now + float(ttl_s)
+        
+        old_expiry = float(self._reb_locks.get(combo_key, 0.0) or 0.0)
+        if new_expiry > old_expiry:
+            self._reb_locks[combo_key] = new_expiry
+            
+            # Instrumentation
+            try:
+                from modules.obs_metrics import RM_REB_LOCK_SET_TOTAL, RM_REB_LOCK_ACTIVE
+                if RM_REB_LOCK_SET_TOTAL:
+                    RM_REB_LOCK_SET_TOTAL.labels(
+                        pair=self._norm_pair(pair),
+                        route=f"{str(buy_ex).upper()}->{str(sell_ex).upper()}",
+                        source=str(source)
+                    ).inc()
+                if RM_REB_LOCK_ACTIVE:
+                    RM_REB_LOCK_ACTIVE.set(len(self._reb_locks))
+            except Exception:
+                pass
+
     def is_rebalancing_locked(self, pair_key: str, buy_exchange: str, sell_exchange: str) -> bool:
         if not hasattr(self, "_reb_locks"):
             self._reb_locks = {}
         pk = self._norm_pair(pair_key)
         quote = _pair_quote(pk)
-        combo_key = f"{pk}|{quote}|{str(buy_exchange).upper()}->{str(sell_exchange).upper()}"
+        combo_key = self._reb_lock_key(pk, quote, buy_exchange, sell_exchange)
         expiry = float(self._reb_locks.get(combo_key, 0.0) or 0.0)
         now = time.monotonic()
         if expiry <= now:
             if combo_key in self._reb_locks:
                 self._reb_locks.pop(combo_key, None)
+                try:
+                    from modules.obs_metrics import RM_REB_LOCK_ACTIVE
+                    if RM_REB_LOCK_ACTIVE:
+                        RM_REB_LOCK_ACTIVE.set(len(self._reb_locks))
+                except Exception:
+                    pass
             return False
         return True
 
@@ -15774,12 +15820,12 @@ class RiskManager:
         # --- 1) Contexte & combo --------------------------------------------------
         buy_ex = (opp.get("buy_ex") or opp.get("route", {}).get("buy_ex") or "").upper()
         sell_ex = (opp.get("sell_ex") or opp.get("route", {}).get("sell_ex") or "").upper()
-        combo_key = f"{self._norm_pair(pair)}|{pair_quote}|{buy_ex}->{sell_ex}"
+        combo_key = self._reb_lock_key(pair, pair_quote, buy_ex, sell_ex)
 
         if not hasattr(self, "_reb_locks"): self._reb_locks = {}
 
         # --- 2) REB lock ----------------------------------------------------------
-        if self._reb_locks.get(combo_key, 0) > now:
+        if self.is_rebalancing_locked(pair, buy_ex, sell_ex):
             if getattr(self, "log", None): self.log.debug(f"RM.REB_LOCK active for {combo_key}")
             _record_reason(REB_LOCK)
             try:
@@ -15789,16 +15835,6 @@ class RiskManager:
             except Exception:
                 pass
             return
-
-        needs_reb = False
-        try:
-            needs_reb = bool(getattr(self, "needs_rebalance_for_combo")(combo_key))
-        except Exception:
-            needs_reb = False
-
-        if needs_reb:
-            lock_ttl = float(getattr(self.cfg.rm, "rebal_lock_ttl_s", 15.0))
-            self._reb_locks[combo_key] = now + lock_ttl
 
 
         # --- 3) Budgets d’in-flight (branche×profil) & pacer ----------------------
@@ -16028,14 +16064,7 @@ class RiskManager:
         except Exception:
             if getattr(self, "log", None):
                 self.log.exception("RM.on_scanner_opportunity: mm_inventory_single failed")
-            # --- 6) REB (après TT/TM) : non-interférence -----------------------------
-        if needs_reb and not sent_any:
-            reb_bundle = self._build_bundle(opp, strategy="REB", decision_ctx=decision_ctx)
-            if reb_bundle:
-                self._multicast_shadow(reb_bundle)
-                decision_ctx["attempted"] = True
-                decision_ctx["submitted"] = decision_ctx.get("submitted") or True
-        
+
         # Instrumentation latence RM (P1)
         if tracing_enabled and getattr(self.bot_cfg.obs, "enable_segment_metrics_rm", True):
             rm_ms = (time.perf_counter_ns() - start_rm_ns) / 1e6

@@ -175,6 +175,20 @@ SCANNER_HINT_TOPQTY_MISSING_TOTAL = _metric(Counter,
     "Hints L1 (top_qty) manquants (non bloquant)",
     ["pair", "ex", "side"]
 )
+SCANNER_ROTATION_ERRORS_TOTAL = _metric(
+    Counter,
+    "scanner_rotation_errors_total",
+    "Errors during scanner rotation decisions",
+    ["stage"],
+)
+# Router – erreurs d'émission d'event sink (backpressure/telemetry)
+ROUTER_EVENT_SINK_ERRORS_TOTAL = _metric(
+    Counter,
+    "router_event_sink_errors_total",
+    "Errors while emitting router events to event sink",
+    ["reason"],
+)
+
 # Simulator priming
 SIM_PRIME_TOTAL = _metric(Counter,
     "sim_prime_total",
@@ -1064,7 +1078,8 @@ RM_SKIPS_TOTAL = _metric(Counter, 'rm_skips_total', 'RM skipped reasons', ['reas
 RM_QUEUE_DEPTH = _metric(Gauge, 'rm_queue_depth', 'Queue depth per stage', ['stage'])
 RM_FINAL_DECISIONS_TOTAL = _metric(Counter, 'rm_final_decisions_total', 'Final decisions emitted by RM, per route', ['route'])
 RM_ADMITTED_TOTAL = _metric(Counter, 'rm_admitted_total', 'Opportunities admitted by the RM', labelnames=('cohort',))
-
+RM_REB_LOCK_SET_TOTAL = _metric(Counter, 'rm_reb_lock_set_total', 'Total number of REB locks set', ['pair', 'route', 'source'])
+RM_REB_LOCK_ACTIVE = _metric(Gauge, 'rm_reb_lock_active', 'Number of active REB locks')
 RM_DROPPED_TOTAL = _metric(
     Counter,
     'rm_dropped_total',
