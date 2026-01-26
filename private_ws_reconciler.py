@@ -19,6 +19,7 @@ import logging
 import time
 from collections import deque
 from typing import Callable, Awaitable, Optional, Tuple, List, Dict, Any, Set, Deque
+from contracts.payloads import PrivateFillEvent, _norm_exchange, _norm_pair_key
 
 try:
     from modules.observability_pacer import PACER
@@ -577,9 +578,9 @@ class PrivateWSReconciler:
         if not ev:
             return
 
-        # Normalisation légère
-        ex = str((ev.get("exchange") or "UNKNOWN")).upper()
-        al = str((ev.get("alias") or "-")).upper()
+        # Normalisation canonique
+        ex = _norm_exchange(ev.get("exchange") or "UNKNOWN", kind="Reconciler")
+        al = _norm_exchange(ev.get("alias") or "-", kind="Reconciler")
         cid = self._extract_client_id(ev)
         key = (ex, al)
 

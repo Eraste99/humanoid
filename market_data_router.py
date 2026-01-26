@@ -36,10 +36,12 @@ from typing import Dict, Any, Deque, List, Optional, Tuple, Callable, Protocol, 
 # On les ré-importe localement ou on les laisse commentés ici pour éviter l'overhead import global?
 # L'issue demande de les utiliser pour le sampling.
 try:
-    from contracts.payloads import MarketEvent, ValidationError
+    from contracts.payloads import MarketEvent, ValidationError, _norm_exchange, _norm_pair_key
 except ImportError:
     MarketEvent = None
     ValidationError = Exception
+    def _norm_exchange(ex, **_): return str(ex or "").upper()
+    def _norm_pair_key(pk, **_): return str(pk or "").upper()
 
 logger = logging.getLogger("MarketDataRouter")
 
@@ -1244,9 +1246,9 @@ class MarketDataRouter:
             if data.get(self._STOP_SENTINEL_KEY):
                 return {self._STOP_SENTINEL_KEY: True}
 
-            # 1. FAST PATH : Extraction et validation minimale (types natifs)
-            ex = str(data.get("exchange") or "").upper()
-            pair = str(data.get("pair_key") or data.get("symbol") or "").replace("-", "").upper()
+            # 1. FAST PATH : Extraction et validation minimale (types natifs) avec normalisation instrumentée
+            ex = _norm_exchange(data.get("exchange"), kind="Router")
+            pair = _norm_pair_key(data.get("pair_key") or data.get("symbol"), kind="Router")
             
             # Top-of-book (float natif)
             try:
@@ -1256,7 +1258,12 @@ class MarketDataRouter:
                 bid, ask = 0.0, 0.0
 
             if not ex or not pair or bid <= 0 or ask <= 0 or ask < bid:
-                # Anomalie structurelle détectée -> on laisse Pydantic diagnostiquer ou on drop
+                # Anomalie structurelle détectée
+                try:
+                    from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                    if PAYLOAD_INVALID_TOTAL:
+                        PAYLOAD_INVALID_TOTAL.labels(kind="Router", reason="structural_anomaly").inc()
+                except Exception: pass
                 return None
 
             # Normalisation directe (In-place)
@@ -1265,7 +1272,7 @@ class MarketDataRouter:
             
             now_ms = int(time.time() * 1000)
             
-            # Timestamps uniformes (int ms) - Pas de datetime ici
+            # Timestamps uniformes (int ms)
             ex_ts = int(data.get("exchange_ts_ms") or 0)
             recv_ts = int(data.get("recv_ts_ms") or now_ms)
             data["recv_ts_ms"] = recv_ts
@@ -1287,8 +1294,14 @@ class MarketDataRouter:
                 try:
                     # On valide mais on ne garde pas l'objet Pydantic (trop cher de model_dump)
                     MarketEvent(**data)
-                except ValidationError:
-                    # Si la validation échoue, on drop l'event
+                except Exception as e:
+                    # Si la validation échoue, on drop l'event et on instrumente
+                    try:
+                        from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                        if PAYLOAD_INVALID_TOTAL:
+                            PAYLOAD_INVALID_TOTAL.labels(kind="Router", reason="pydantic_fail").inc()
+                    except Exception: pass
+                    
                     safe_inc(
                         ROUTER_DROPPED_TOTAL,
                         "router_dropped_total",

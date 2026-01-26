@@ -30,6 +30,7 @@ import logging
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Dict, Any, Callable, List, Optional, Tuple
+from contracts.payloads import SlipEvent, _norm_exchange, _norm_pair_key
 
 logger = logging.getLogger("SlippageHandler")
 
@@ -973,26 +974,35 @@ class SlippageHandler:
         Met à jour: self._slip_bps[(ex,pair,side)], self._slip_ts[(ex,pair)]
         """
         try:
-            ex = self._norm_ex(msg.get("exchange"))
-            pair = self._norm_pair(msg.get("pair_key") or msg.get("symbol") or "")
-            if not ex or not pair:
-                self._note_drop("missing_orderbook", ex or "UNKNOWN", pair or "UNKNOWN")
+            # P0 End-to-End Consistency: Validation via SlipEvent
+            try:
+                s_ev = SlipEvent(**msg)
+                ex = s_ev.exchange
+                pair = s_ev.pair_key
+            except Exception:
+                from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                if PAYLOAD_INVALID_TOTAL:
+                    PAYLOAD_INVALID_TOTAL.labels(kind="SlippageHandler", reason="payload_invalid").inc()
+                self._note_drop("schema_invalid", msg.get("exchange", "UKN"), msg.get("pair_key", "UKN"))
                 return
 
-            ob = (msg.get("orderbook") or {})
+            ob = (s_ev.orderbook or {})
             bids = ob.get("bids") or []
             asks = ob.get("asks") or []
-            best_bid = float(msg.get("best_bid") or (bids[0][0] if bids else 0.0))
-            best_ask = float(msg.get("best_ask") or (asks[0][0] if asks else 0.0))
-            top_bid_vol = float(msg.get("top_bid_vol") or 0.0)
-            top_ask_vol = float(msg.get("top_ask_vol") or 0.0)
+            
+            # Utilisation des valeurs canoniques coercées par SlipEvent
+            best_bid = float(s_ev.best_bid or (bids[0][0] if bids else 0.0))
+            best_ask = float(s_ev.best_ask or (asks[0][0] if asks else 0.0))
+            top_bid_vol = float(s_ev.top_bid_vol or 0.0)
+            top_ask_vol = float(s_ev.top_ask_vol or 0.0)
+            
             has_book = bool(bids and asks)
             best_prices_valid = best_bid > 0 and best_ask > best_bid
 
             slip_buy_bps: Optional[float] = None
-
             slip_sell_bps: Optional[float] = None
-            slip_metric = msg.get("slip_metric_bps")
+            
+            slip_metric = s_ev.slip_metric_bps
             if isinstance(slip_metric, dict):
                 if slip_metric.get("buy") is not None:
                     slip_buy_bps = max(0.0, float(slip_metric.get("buy")))
@@ -1038,15 +1048,11 @@ class SlippageHandler:
             self._slip_bps = getattr(self, "_slip_bps", {})
             self._slip_ts = getattr(self, "_slip_ts", {})
             self._slip_ts_mono = getattr(self, "_slip_ts_mono", {})
-            ts_ms = (
-                    msg.get("recv_ts_ms")
-                    or msg.get("exchange_ts_ms")
-                    or msg.get("ts_ms")
-                    or msg.get("ts_ex_ms")
-                    or 0
-            )
+            
+            ts_ms = s_ev.recv_ts_ms or s_ev.exchange_ts_ms or 0
             now_wall_s = (float(ts_ms) / 1000.0) if ts_ms else time.time()
             now_mono_s = time.monotonic()
+            
             if slip_buy_bps is not None:
                 self._slip_bps[(ex, pair, "buy")] = float(slip_buy_bps)
             if slip_sell_bps is not None:

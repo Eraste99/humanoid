@@ -83,14 +83,11 @@ VM_LAST_OB_AGE_S                = _NoMetric()
 VM_PRUDENCE_TRANSITIONS_TOTAL   = _NoMetric()
 
 # --- Petites aides -----------------------------------------------------------
-
+from contracts.payloads import _norm_pair_key
+def _norm_pair(pk: str) -> str: return _norm_pair_key(pk, kind="VolManager")
 def _safe_float(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-def _norm_pair(pk: str) -> str:
-    return (pk or "").replace("-", "").upper()
+    try: return float(x)
+    except Exception: return default
 
 class VolatilityManager:
     """

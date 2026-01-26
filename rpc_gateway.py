@@ -186,6 +186,7 @@ RPC_RETRIES_TOTAL = _get_metric("RPC_RETRIES_TOTAL")
 RPC_PAYLOAD_REJECTED_TOTAL = _get_metric("RPC_PAYLOAD_REJECTED_TOTAL")
 RPC_METRICS_DISABLED_TOTAL = _get_metric("RPC_METRICS_DISABLED_TOTAL")
 RPC_IDEMPOTENCY_HIT_TOTAL = _get_metric("RPC_IDEMPOTENCY_HIT_TOTAL")
+PAYLOAD_INVALID_TOTAL = _get_metric("PAYLOAD_INVALID_TOTAL")
 
 
 # ---------- Idempotency store (TTL) ----------
@@ -748,6 +749,7 @@ class RPCServer:
                 exclude_none=False)
             if data.get("_schema_invalid"):
                 _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="SubmitBundleRequest")
+                _inc(PAYLOAD_INVALID_TOTAL, 1.0, kind="RPCGateway", reason="schema_invalid")
                 reason = data.get("_schema_reason") or data.get("reason_code") or "invalid submit_bundle payload"
                 raise web.HTTPBadRequest(text=str(reason))
             if self._strict_validation:
@@ -757,6 +759,7 @@ class RPCServer:
             raise
         except Exception:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="SubmitBundleRequest")
+            _inc(PAYLOAD_INVALID_TOTAL, 1.0, kind="RPCGateway", reason="pydantic_fail")
             raise web.HTTPBadRequest(text="invalid submit_bundle payload")
 
     def _validate_cancel_payload(self, body: dict) -> dict:
@@ -766,6 +769,7 @@ class RPCServer:
                 exclude_none=False)
             if data.get("_schema_invalid"):
                 _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="CancelRequest")
+                _inc(PAYLOAD_INVALID_TOTAL, 1.0, kind="RPCGateway", reason="schema_invalid")
                 reason = data.get("_schema_reason") or data.get("reason_code") or "invalid cancel payload"
                 raise web.HTTPBadRequest(text=str(reason))
             return data
@@ -773,6 +777,7 @@ class RPCServer:
             raise
         except Exception:
             _inc(RPC_PAYLOAD_REJECTED_TOTAL, 1.0, model="CancelRequest")
+            _inc(PAYLOAD_INVALID_TOTAL, 1.0, kind="RPCGateway", reason="pydantic_fail")
             raise web.HTTPBadRequest(text="invalid cancel payload")
 
     def _require_admin(self, request: web.Request) -> None:

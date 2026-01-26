@@ -70,6 +70,7 @@ from typing import Any, Dict, List, Optional, Callable
 from modules.logger_historique.log_writer import LogWriter
 from modules.logger_historique.base_trade_logger import BaseTradeLogger
 from modules.logger_historique.pair_history_tracker import PairHistoryTracker, TrackerConfig
+from contracts.payloads import _norm_exchange, _norm_pair_key
 from modules.obs_metrics import update_storage_metrics, PAIR_ROTATION_AGE_SECONDS, PAIR_ROTATION_LAST_TS
 import os, time
 import hashlib, time
@@ -1780,21 +1781,14 @@ class LoggerHistoriqueManager:
         """
         Petites normalisations communes (exchanges, pair, champs clés).
         """
-
-        def _norm_ex(x):
-            if not x: return None
-            s = str(x).strip().replace("-", "").replace("_", "").upper()
-            if s.startswith("BINANCE"): return "BINANCE"
-            if s.startswith("BYBIT"): return "BYBIT"
-            if s.startswith("COINBASE") or s in {"CB", "COINBASEAT", "COINBASEADVANCEDTRADE"}: return "COINBASE"
-            return s
-
-        e["buy_ex"] = _norm_ex(e.get("buy_ex"))
-        e["sell_ex"] = _norm_ex(e.get("sell_ex"))
-        if "pair_key" in e and isinstance(e["pair_key"], str):
-            e["pair_key"] = e["pair_key"].replace("-", "").upper()
-        if "symbol" in e and isinstance(e["symbol"], str):
-            e["symbol"] = e["symbol"].replace("_", "-").upper()
+        e["buy_ex"] = _norm_exchange(e.get("buy_ex"), kind="LHM")
+        e["sell_ex"] = _norm_exchange(e.get("sell_ex"), kind="LHM")
+        if "pair_key" in e and e["pair_key"]:
+            e["pair_key"] = _norm_pair_key(e["pair_key"], kind="LHM")
+        if "symbol" in e and e["symbol"]:
+            # On maintient symbol avec tirets si possible, mais via norm canonique
+            from contracts.payloads import _norm_symbol
+            e["symbol"] = _norm_symbol(e["symbol"], keep_dash=True, kind="LHM")
         return e
 
     def _to_tracker_trade(self, e: dict) -> dict:
@@ -5296,9 +5290,7 @@ class LoggerHistoriqueManager:
         )
 
     def _build_idempotence_key(self, stream: str, payload: dict, id_key: str) -> str | None:
-        exchange = payload.get("exchange") or payload.get("ex")
-        if exchange is not None:
-            exchange = str(exchange).strip().replace("-", "").replace("_", "").upper()
+        exchange = _norm_exchange(payload.get("exchange") or payload.get("ex"), kind="LHM")
         account_alias = payload.get("account_alias")
         if stream in {"fills_normalized", "trades"}:
             trade_id = payload.get("trade_id") or payload.get("id") or payload.get(id_key)

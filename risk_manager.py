@@ -61,6 +61,11 @@ from contracts.payloads import (
     normalize_reason_code,
     ReasonCodes,
     canonical_transfer_id,
+    Opportunity,
+    RiskDecision,
+    SubmitBundleRequest,
+    _norm_exchange,
+    _norm_pair_key,
 )
 from modules.retry_policy import BackoffPolicy, awith_retry
 
@@ -4993,6 +4998,20 @@ class RiskManager:
 
                 Retourne True si le bundle a été accepté par l'Engine.
                 """
+
+        # P0 Consistency: Validation de la sortie (SubmitBundleRequest)
+        try:
+            # On laisse Pydantic valider le contrat RM -> Engine
+            SubmitBundleRequest(**bundle)
+        except Exception as e:
+            try:
+                from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                if PAYLOAD_INVALID_TOTAL:
+                    PAYLOAD_INVALID_TOTAL.labels(kind="RiskManagerEgress", reason="pydantic_fail").inc()
+            except Exception: pass
+            logger.error("[RiskManager] P0: SubmitBundleRequest schema violation: %s", e)
+            # En mode strict, on pourrait bloquer ici, mais on va juste instrumenter et laisser passer
+            # pour éviter un incident de production immédiat, sauf si c'est vraiment cassé.
 
         def _record_decision(ok: bool, reason: str = "") -> None:
             if decision_ctx is None:
@@ -15607,6 +15626,20 @@ class RiskManager:
         """
         if not opp:
             return None
+        
+        # P0 Consistency: Validation de l'entrée (Opportunity)
+        try:
+            # On laisse Pydantic valider le contrat Scanner -> RM
+            Opportunity(**opp)
+        except Exception as e:
+            try:
+                from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                if PAYLOAD_INVALID_TOTAL:
+                    PAYLOAD_INVALID_TOTAL.labels(kind="RiskManagerIngress", reason="pydantic_fail").inc()
+            except Exception: pass
+            logger.warning("[RiskManager] P0: Opportunity schema violation: %s", e)
+            return None
+
         # Canonisation défensive pour compat scanner_consumer (payload encapsulé).
         try:
             self._canonize_opportunity(opp)

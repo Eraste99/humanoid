@@ -3253,5 +3253,97 @@ class SmokeStressPack(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(size, dedup_max)
 
 
+# --------------------------------------------------------------------------------------
+# 6) MARKET MAKING P0 (Safety & Churn)
+# --------------------------------------------------------------------------------------
+
+class TestMarketMakingP0(unittest.IsolatedAsyncioTestCase):
+    """
+    Tests MM microstructure invariants: clamp strict, anti-churn, fail-closed.
+    """
+    async def asyncSetUp(self):
+        # Setup similar to Scenario 2 but focused on MM
+        # Note: we use aliases from the bootstrap section
+        self.cfg = bot_mod.BotConfig.from_env()
+        self.cfg.g = types.SimpleNamespace(mode='DRY_RUN', feature_switches={}, ac={'enabled': False})
+        
+        # Hard settings for tests
+        self.cfg.engine.mm_min_quote_lifetime_ms = 400
+        self.cfg.engine.mm_sticky_band_ticks = 1.0
+        self.cfg.engine.mm_replace_cooldown_ms = 200
+        self.cfg.engine.mm_jump_guard_threshold_bps = 10.0
+        
+        # Mock get_pair_filters
+        fn_mock = lambda ex, pair: {"tick_size": 0.01}
+        self.cfg.get_pair_filters = fn_mock
+        self.cfg.engine.get_pair_filters = fn_mock
+        
+        mock_rl = mock.MagicMock()
+        mock_rl.bucket_for.return_value = mock.AsyncMock()
+        mock_retry = mock.MagicMock()
+        mock_retry.with_retry = lambda coro, *a, **kw: coro
+        
+        self.eng = engine_mod.ExecutionEngine(config=self.cfg, private_ws=None, rate_limiter=mock_rl, retry_policy=mock_retry)
+        
+        # Mock RiskManager
+        self.eng.risk_manager = mock.MagicMock()
+        self.eng.risk_manager.get_top_of_book.return_value = (99000.0, 99010.0)
+        self.eng.risk_manager._volatility_bps.return_value = 10.0
+        self.eng.risk_manager.mm_reb_state = {}
+        self.eng.risk_manager._compute_mm_inventory_skews.return_value = (0.0, 1.0)
+        
+        self.eng._ready = True
+        self.eng.trading_state = "READY"
+        self.eng._ensure_ready = lambda: None
+
+    async def test_clamp_strict(self):
+        # BUY maker must be < ASK
+        px, clamped = self.eng.clamp_maker_price("BUY", 99015.0, 99000.0, 99010.0, 0.01, pad_ticks=1.0)
+        self.assertTrue(clamped)
+        self.assertLess(px, 99010.0)
+        self.assertAlmostEqual(px, 99010.0 - 0.01)
+
+        # SELL maker must be > BID
+        px, clamped = self.eng.clamp_maker_price("SELL", 98995.0, 99000.0, 99010.0, 0.01, pad_ticks=1.0)
+        self.assertTrue(clamped)
+        self.assertGreater(px, 99000.0)
+        self.assertAlmostEqual(px, 99000.0 + 0.01)
+
+    async def test_min_lifetime(self):
+        clid = "test_cid"
+        self.eng._mm_active_orders_info[clid] = {
+            "price": 99005.0, "side": "BUY", "placed_at_mono": time.monotonic(), "ladder_idx": 0
+        }
+        self.eng._mm_active_by_pair[("BINANCE", "NONE", "BTCUSDT")].add(clid)
+        self.eng._order_fsm[clid] = types.SimpleNamespace(state='ACK')
+        
+        new_clid = await self.eng._mm_place_maker(
+            pair_key="BTCUSDT", exchange="BINANCE", side="BUY", amount_quote=100.0, bundle_id="b1", meta={"mm_ladder_idx": 0}
+        )
+        self.assertEqual(new_clid, clid)
+
+    async def test_sticky_band(self):
+        clid = "test_cid_old"
+        new_price = 99000.01
+        self.eng._mm_active_orders_info[clid] = {
+            "price": new_price, "side": "BUY", "placed_at_mono": time.monotonic() - 1.0, "ladder_idx": 0
+        }
+        self.eng._mm_active_by_pair[("BINANCE", "NONE", "BTCUSDT")].add(clid)
+        self.eng._order_fsm[clid] = types.SimpleNamespace(state='ACK')
+        
+        # Bypass pricing to force sticky check
+        self.eng.clamp_maker_price = lambda *a, **kw: (new_price, False)
+        
+        new_clid = await self.eng._mm_place_maker(
+            pair_key="BTCUSDT", exchange="BINANCE", side="BUY", amount_quote=100.0, bundle_id="b1", meta={"mm_ladder_idx": 0}
+        )
+        self.assertEqual(new_clid, clid)
+
+    async def test_fail_closed_tob(self):
+        from contracts.errors import EngineSubmitError
+        self.eng.risk_manager.get_top_of_book.return_value = (0.0, 0.0)
+        with self.assertRaises(EngineSubmitError):
+            await self.eng._mm_place_maker(pair_key="BTCUSDT", exchange="BINANCE", side="BUY", amount_quote=100.0, bundle_id="b1")
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

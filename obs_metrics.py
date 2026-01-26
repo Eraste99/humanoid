@@ -109,6 +109,12 @@ OBS_LABEL_MISMATCH_TOTAL = _metric(Counter, "obs_label_mismatch_total", "Labels 
 # --- MANDATORY OBSERVABILITY (P0) ---
 ROUTER_EVENT_AGE_MS = _metric(Histogram, "router_event_age_ms", "Age des events à l'entrée du Router (ms)", ["exchange"], buckets=[10, 50, 100, 250, 500, 1000, 2000, 5000])
 SCANNER_EVENT_AGE_MS = _metric(Histogram, "scanner_event_age_ms", "Age des events à l'évaluation Scanner (ms)", ["exchange", "pair"], buckets=[50, 100, 250, 500, 1000, 1500, 2000, 5000])
+
+# --- Payload Consistency (Audit End-to-End) ---
+PAYLOAD_COERCED_TOTAL = _metric(Counter, "payload_coerced_total", "Nombre de champs de payload forcés vers un type canonique", ["kind", "field", "from_type", "to_type"])
+PAYLOAD_NORMALIZED_TOTAL = _metric(Counter, "payload_normalized_total", "Nombre de champs de payload normalisés vers un format canonique", ["kind", "field", "from_format", "to_format"])
+PAYLOAD_INVALID_TOTAL = _metric(Counter, "payload_invalid_total", "Nombre de payloads rejetés car invalides", ["kind", "reason"])
+PAYLOAD_SCHEMA_VERSION = _metric(Gauge, "payload_schema_version", "Version actuelle du schéma de payload canonique", ["version"])
 ROUTER_SLO_MISSING_TOTAL = _metric(Counter, "router_slo_missing_total", "SLO manquante lors de la résolution du stale_limit (Router)", ["mode", "exchange"])
 ROUTER_DEPLOYMENT_MODE_INVALID_TOTAL = _metric(Counter, "router_deployment_mode_invalid_total", "Deployment mode invalide (Router)", ["mode"])
 ROUTER_CLOCK_OFFSET_MS = _metric(Gauge, "router_clock_offset_ms", "Offset d'horloge détecté (Router) en ms", ["exchange"])
@@ -175,6 +181,13 @@ SCANNER_HINT_TOPQTY_MISSING_TOTAL = _metric(Counter,
     "Hints L1 (top_qty) manquants (non bloquant)",
     ["pair", "ex", "side"]
 )
+SCANNER_MM_LEG_RESTRICTED_TOTAL = _metric(
+    Counter,
+    "scanner_mm_leg_restricted_total",
+    "MM legs restricted by inventory drift or safety gating",
+    ["exchange", "side", "reason"],
+)
+
 SCANNER_ROTATION_ERRORS_TOTAL = _metric(
     Counter,
     "scanner_rotation_errors_total",
@@ -1481,6 +1494,93 @@ MM_CHURN_RATE = _metric(
     Gauge,
     'mm_churn_rate',
     'Taux de changement du carnet (updates/s)',
+    ['exchange', 'pair']
+)
+MM_LIFETIME_MS = _metric(
+    Histogram,
+    'mm_lifetime_ms',
+    'Quote lifetime before cancel/fill (ms)',
+    ['exchange', 'pair', 'variant'],
+    buckets=(100, 250, 500, 1000, 2500, 5000, 10000)
+)
+MM_DISTANCE_TO_BEST_BPS = _metric(
+    Histogram,
+    'mm_distance_to_best_bps',
+    'Distance to best bid/ask in bps',
+    ['exchange', 'pair', 'side'],
+    buckets=(0, 1, 2, 5, 10, 20, 50)
+)
+MM_CLAMP_TOTAL = _metric(
+    Counter,
+    'mm_clamp_total',
+    'Total number of hard price clamps applied',
+    ['exchange', 'pair', 'side']
+)
+MM_BOOK_STALE_TOTAL = _metric(
+    Counter,
+    'mm_book_stale_total',
+    'Total number of MM orders rejected due to stale orderbook',
+    ['exchange', 'pair']
+)
+MM_JUMP_GUARD_TOTAL = _metric(
+    Counter,
+    'mm_jump_guard_total',
+    'Total number of MM jump guard freezes',
+    ['exchange', 'pair']
+)
+MM_STICKY_SKIPS_TOTAL = _metric(
+    Counter,
+    'mm_sticky_skips_total',
+    'Total number of MM quote replaces skipped due to sticky band or cooldown',
+    ['exchange', 'pair', 'side', 'reason']
+)
+MM_POSTONLY_REJECT_TOTAL = _metric(
+    Counter,
+    'mm_postonly_reject_total',
+    'Total number of MM orders rejected by exchange as post-only',
+    ['exchange', 'pair', 'side']
+)
+MM_LIVE_QUOTES = _metric(
+    Gauge,
+    'mm_live_quotes',
+    'Current number of active MM quotes',
+    ['exchange', 'pair', 'side']
+)
+MM_LADDER_LEVELS_USED = _metric(
+    Gauge,
+    'mm_ladder_levels_used',
+    'Number of ladder levels actually being quoted',
+    ['exchange', 'pair']
+)
+MM_DISTANCE_TO_BEST_TICKS = _metric(
+    Histogram,
+    'mm_distance_to_best_ticks',
+    'Distance to best bid/ask in ticks',
+    ['exchange', 'pair', 'side'],
+    buckets=(0, 0.5, 1, 2, 5, 10, 20)
+)
+MM_PLACE_TOTAL = _metric(
+    Counter,
+    'mm_place_total',
+    'Total MM place orders',
+    ['exchange', 'pair', 'side']
+)
+MM_CANCEL_TOTAL = _metric(
+    Counter,
+    'mm_cancel_total',
+    'Total MM cancel orders',
+    ['exchange', 'pair', 'side']
+)
+MM_REPLACE_TOTAL = _metric(
+    Counter,
+    'mm_replace_total',
+    'Total MM replace (cancel+place) cycles',
+    ['exchange', 'pair', 'side']
+)
+MM_TOXICITY_SCORE = _metric(
+    Gauge,
+    'mm_toxicity_score',
+    'Current estimated toxicity score (0..1)',
     ['exchange', 'pair']
 )
 MM_DEPTH_PROFILE_RATIO = _metric(
@@ -3661,7 +3761,8 @@ __all__ = ['BUCKETS_MS',"LAT_ACK_MS", "LAT_FILL_FIRST_MS", "LAT_FILL_ALL_MS", "L
            'ROUTER_PAIR_QUEUE_DEPTH', 'ROUTER_QUEUE_HIGH_WATERMARK_TOTAL', 'ROUTER_QUEUE_DEPTH_BY_EX',
            'ROUTER_DROPPED_TOTAL', 'ROUTER_COMBO_SKEW_MS', 'ROUTER_TO_SCANNER_MS', 'ROUTER_TO_SCANNER_ERRORS_TOTAL',
            'mark_router_to_scanner', 'SCANNER_DECISION_MS', 'SCANNER_GLOBAL_LOAD', 'SCANNER_RATE_LIMITED_TOTAL',
-           'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SC_STRATEGY_SCORE', 'SC_ELIGIBLE', 'SC_BANNED',
+           'SCANNER_EMITTED_TOTAL', 'SCANNER_REJECTIONS_TOTAL', 'SCANNER_MM_LEG_RESTRICTED_TOTAL', 'SC_STRATEGY_SCORE',
+           'SC_ELIGIBLE', 'SC_BANNED',
            'SC_PROMOTED_PRIMARY', 'SC_ROTATION_PRIMARY_SIZE', 'SC_ROTATION_AUDITION_SIZE', 'RM_DECISION_MS',
            'mark_scanner_to_rm', 'INVENTORY_USD', 'RM_REJECT_TOTAL', 'PAIR_HEALTH_PENALTY_TOTAL', 'VOL_EWMA_BPS',
            'VOL_P95_BPS', 'FEE_MISMATCH_TOTAL', 'FEES_EXPECTED_BPS', 'FEES_REALIZED_BPS', 'FEESYNC_LAST_TS',

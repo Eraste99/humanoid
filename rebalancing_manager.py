@@ -19,7 +19,7 @@ Changements clés vs ancien :
 import time
 from collections import defaultdict, deque
 from typing import Dict, Any, Optional, List, Callable, Tuple, Iterable
-from contracts.payloads import canonical_transfer_id
+from contracts.payloads import canonical_transfer_id, _norm_exchange, _norm_pair_key
 
 # Observabilité — sous-module PASSIF (no Prometheus ici)
 from typing import Callable, Optional, Dict, Any
@@ -43,7 +43,7 @@ def _to_f(x) -> float:
 
 
 
-def _norm(s: str) -> str: return (s or "").strip().upper()
+def _norm(s: str) -> str: return _norm_exchange(s, kind="RebalancingManager")
 
 import json
 
@@ -77,7 +77,7 @@ def _norm_pairs(val, default):
     out = []
     for p in raw:
         try:
-            s = str(p).replace("-", "").upper()
+            s = _norm_pair_key(p, kind="RebalancingManager")
             if s:
                 out.append(s)
         except Exception:
@@ -464,11 +464,12 @@ class RebalancingManager:
                     possible_assets.append(str(val).upper())
             pair = op.get("pair") or op.get("symbol")
             if pair:
-                pk = str(pair).replace("-", "").upper()
+                pk = _norm_pair_key(pair, kind="RebalancingManager")
                 possible_assets.append(pk)
                 for q in self.quote_ccys or []:
-                    if pk.endswith(str(q).upper()) and len(pk) > len(q):
-                        possible_assets.append(pk[: -len(str(q))])
+                    qu = str(q).upper()
+                    if pk.endswith(qu) and len(pk) > len(qu):
+                        possible_assets.append(pk[: -len(qu)])
 
             for asset in possible_assets:
                 if asset:
@@ -1225,6 +1226,7 @@ class RebalancingManager:
         # Overlay: purement indicatif, laissé au RM
         for op in plan.get("overlay_comp") or []:
             base = dict(op or {})
+            if "exchange" in base: base["exchange"] = _norm(base["exchange"])
             ops.append({**base, "type": "overlay_compensation"})
             try:
                 REBAL_OPERATIONS_TOTAL.labels(type="overlay_compensation", exchange=base.get("exchange", "n/a")).inc()
@@ -1233,6 +1235,7 @@ class RebalancingManager:
         # Transferts entre wallets (SPOT/FUNDING/DERIV ...)
         for w in plan.get("wallet_transfers") or []:
             base = dict(w or {})
+            if "exchange" in base: base["exchange"] = _norm(base["exchange"])
             # On force le type attendu par le RM
             self._ensure_transfer_id(base, "internal_wallet_transfer")
             ops.append({**base, "type": "internal_wallet_transfer"})
@@ -1243,6 +1246,7 @@ class RebalancingManager:
         # Transferts intra-CEX entre alias (TT/TM/MM...)
         for it in plan.get("internal_transfers") or []:
             base = dict(it or {})
+            if "exchange" in base: base["exchange"] = _norm(base["exchange"])
             try:
                 REBAL_OPERATIONS_TOTAL.labels(type="internal_subaccount_transfer", exchange=base.get("exchange", "n/a")).inc()
             except Exception: pass
@@ -1260,9 +1264,9 @@ class RebalancingManager:
                 to_alias = dst.get("alias")
 
             if from_alias:
-                base["from_alias"] = from_alias
+                base["from_alias"] = str(from_alias).upper()
             if to_alias:
-                base["to_alias"] = to_alias
+                base["to_alias"] = str(to_alias).upper()
 
             # Type aligné sur l'API du RM
             self._ensure_transfer_id(base, "internal_subaccount_transfer")

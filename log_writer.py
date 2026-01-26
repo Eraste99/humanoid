@@ -171,14 +171,21 @@ class LogWriter:
     def _norm_ex(x: Optional[str]) -> Optional[str]:
         if not x:
             return None
-        s = str(x).strip().replace("-", "").replace("_", "").upper()
-        if s.startswith("BINANCE"):
-            return "BINANCE"
-        if s.startswith("BYBIT"):
-            return "BYBIT"
-        if s.startswith("COINBASE") or s in {"CB", "COINBASEAT", "COINBASEADVANCEDTRADE"}:
-            return "COINBASE"
-        return s
+        try:
+            from contracts.payloads import _norm_exchange
+            return _norm_exchange(x, kind="LogWriter")
+        except Exception:
+            return str(x).upper()
+
+    @staticmethod
+    def _norm_pair(pk: str) -> str:
+        if not pk:
+            return ""
+        try:
+            from contracts.payloads import _norm_pair_key
+            return _norm_pair_key(pk, kind="LogWriter")
+        except Exception:
+            return str(pk).replace("-", "").upper()
 
     @staticmethod
     def tt_contract_missing_fields(payload: Dict[str, Any]) -> List[str]:
@@ -925,6 +932,13 @@ class LogWriter:
                     payloads: List[Dict[str, Any]] = []
                     for payload in rows:
                         p0 = dict(payload or {})
+                        
+                        # P0 Consistency: Normalisation forcée avant stockage
+                        for k in ("pair", "symbol", "pair_key"):
+                            if p0.get(k): p0[k] = self._norm_pair(str(p0[k]))
+                        for k in ("exchange", "ex", "buy_ex", "sell_ex", "buy_exchange", "sell_exchange"):
+                            if p0.get(k): p0[k] = self._norm_ex(str(p0[k]))
+                            
                         p = {k: _safe(v) for k, v in p0.items() if k in cols}
 
                         # timestamp ISO UTC si absent
@@ -1993,6 +2007,11 @@ class LogWriter:
             pair_key = d.get("pair_key") or d.get("pair") or d.get("symbol") or ""
             buy_ex = d.get("buy_ex") or d.get("buy_exchange") or ""
             sell_ex = d.get("sell_ex") or d.get("sell_exchange") or ""
+            
+            # P0 Consistency: Normalisation forcée avant stockage
+            pair_key = self._norm_pair(str(pair_key))
+            buy_ex = self._norm_ex(str(buy_ex))
+            sell_ex = self._norm_ex(str(sell_ex))
 
             # id: si absent, on dérive un id déterministe minimal (évite PRIMARY KEY NULL)
             _id = d.get("id")

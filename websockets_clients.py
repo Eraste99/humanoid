@@ -41,6 +41,7 @@ from modules.retry_policy import with_retry, awith_retry, BackoffPolicy, ErrKind
 import asyncio, random, time, socket
 from modules.utils import json_utils as json
 # from contracts.payloads import MarketEvent # Removed for CPU optimization (Hot Path)
+from contracts.payloads import _norm_exchange, _norm_pair_key, _norm_symbol
 import aiohttp
 
 
@@ -912,7 +913,7 @@ class WebSocketExchangeClient:
 
     # ------------------- Émission pipeline -------------------
     async def _emit_if_ready(self, exchange: str, ex_symbol: str) -> None:
-        ex = exchange.upper()
+        ex = _norm_exchange(exchange, kind="WS")
         l1 = self._l1[ex].get(ex_symbol)
         if not l1:
             return
@@ -962,6 +963,9 @@ class WebSocketExchangeClient:
             self._note_drop(ex, reason="unknown_pair", kind="emit")
             self._unmapped_seen[ex] += 1
             return
+        
+        # Canonisation forcée de la pair_key
+        pk = _norm_pair_key(pk, kind="WS")
 
         if self._exchange_region_disabled(ex, pk):
             self._note_drop(ex, reason="region_disabled_jp", kind="emit")

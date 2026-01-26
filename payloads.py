@@ -72,6 +72,9 @@ try:  # pragma: no cover␊
     from modules.obs_metrics import (
         CONTRACTS_HELPERS_CALLS_TOTAL,
         CONTRACTS_VALIDATION_ERRORS_TOTAL,
+        PAYLOAD_COERCED_TOTAL,
+        PAYLOAD_NORMALIZED_TOTAL,
+        PAYLOAD_INVALID_TOTAL,
     )
 except Exception:  # pragma: no cover
     class _Noop:
@@ -83,6 +86,9 @@ except Exception:  # pragma: no cover
 
     CONTRACTS_HELPERS_CALLS_TOTAL = _Noop()
     CONTRACTS_VALIDATION_ERRORS_TOTAL = _Noop()
+    PAYLOAD_COERCED_TOTAL = _Noop()
+    PAYLOAD_NORMALIZED_TOTAL = _Noop()
+    PAYLOAD_INVALID_TOTAL = _Noop()
 
 _METRIC_CONVERT = CONTRACTS_HELPERS_CALLS_TOTAL
 _METRIC_ERRORS = CONTRACTS_VALIDATION_ERRORS_TOTAL
@@ -93,6 +99,38 @@ def _inc(counter, *labels):
         counter.labels(*labels).inc()
     except Exception:
         return None
+
+# --- Canon End-to-End (Audit end-to-end) ---
+PAYLOAD_SCHEMA_VERSION_VALUE = "1.0.0"
+
+def _coerce_type(value: Any, to_type: type, kind: str, field: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, to_type):
+        return value
+    try:
+        res = to_type(value)
+        _inc(PAYLOAD_COERCED_TOTAL, kind, field, type(value).__name__, to_type.__name__)
+        return res
+    except (ValueError, TypeError):
+        _inc(PAYLOAD_INVALID_TOTAL, kind, f"type_mismatch_{field}")
+        raise ValidationError(f"Cannot coerce {field} to {to_type.__name__}")
+
+def _norm_value(value: Any, kind: str, field: str, transform: callable, from_desc: str, to_desc: str) -> Any:
+    if value is None:
+        return None
+    res = transform(value)
+    if res != value:
+        _inc(PAYLOAD_NORMALIZED_TOTAL, kind, field, from_desc, to_desc)
+    return res
+
+# Helper global pour initialiser la version (appelé une fois au chargement)
+try:
+    from modules.obs_metrics import PAYLOAD_SCHEMA_VERSION
+    if PAYLOAD_SCHEMA_VERSION:
+        PAYLOAD_SCHEMA_VERSION.labels(version=PAYLOAD_SCHEMA_VERSION_VALUE).set(1)
+except Exception:
+    pass
 
 # -----------------------------------------------------------------------------
 # Pydantic compat v2/v1 (avec fallback no-op)
@@ -201,7 +239,7 @@ def _now_s() -> float:
 def _uuid() -> str:
     return uuid.uuid4().hex
 
-def _norm_symbol(sym: str, keep_dash: bool = True) -> str:
+def _norm_symbol(sym: str, keep_dash: bool = True, kind: str = "generic") -> str:
     """
     Normalise un symbole:
     - uppercase
@@ -209,30 +247,27 @@ def _norm_symbol(sym: str, keep_dash: bool = True) -> str:
     - `keep_dash=False` pour une clé compacte (ex: 'BTCUSDC')
     """
     if sym is None:
-        try:
-            if not getattr(_LOG, "_warned_empty_symbol", False):
-                setattr(_LOG, "_warned_empty_symbol", True)
-                _LOG.warning("[payloads] normalize symbol received None/empty; returning ''", exc_info=False)
-        except Exception:
-            pass
         return ""
-    s = str(sym).strip().upper().replace("/", "-")
-    if not s:
-        try:
-            if not getattr(_LOG, "_warned_empty_symbol", False):
-                setattr(_LOG, "_warned_empty_symbol", True)
-                _LOG.warning("[payloads] normalize symbol empty after stripping; returning ''", exc_info=False)
-        except Exception:
-            pass
-    return s if keep_dash else s.replace("-", "")
+    raw = str(sym)
+    res = raw.strip().upper().replace("/", "-")
+    if not keep_dash:
+        res = res.replace("-", "")
+    
+    if res != raw and raw:
+        _inc(PAYLOAD_NORMALIZED_TOTAL, kind, "symbol", raw[:20], res[:20])
+    return res
 
-def _norm_pair_key(sym: str) -> str:
+def _norm_pair_key(sym: str, kind: str = "generic") -> str:
     """Clé de paire compacte 'BTCUSDC' (sans tirets)."""
-    return _norm_symbol(sym, keep_dash=False)
+    return _norm_symbol(sym, keep_dash=False, kind=kind)
 
 
-def _norm_exchange(sym: str) -> str:
-    return (sym or "").strip().upper()
+def _norm_exchange(sym: str, kind: str = "generic") -> str:
+    raw = str(sym or "")
+    res = raw.strip().upper()
+    if res != raw and raw:
+        _inc(PAYLOAD_NORMALIZED_TOTAL, kind, "exchange", raw[:20], res[:20])
+    return res
 def _asset_list(value: Any) -> List[str]:
     if value is None:
         return []
@@ -380,19 +415,27 @@ class MarketEvent(_Cfg, BaseModel):
 
     @field_validator("exchange", mode="before")
     def _norm_exchange_field(cls, v: Any) -> str:
-        return _norm_exchange(v)
+        return _norm_exchange(v, kind="MarketEvent")
 
     @field_validator("symbol", mode="before")
     def _norm_symbol_field(cls, v: Any) -> Optional[str]:
-        return _norm_symbol(v) if v else v
+        return _norm_symbol(v, kind="MarketEvent") if v else v
 
     @field_validator("pair_key", mode="before")
     def _norm_pair_field(cls, v: Any) -> Optional[str]:
-        return _norm_pair_key(v) if v else v
+        return _norm_pair_key(v, kind="MarketEvent") if v else v
+
+    @field_validator("best_bid", "best_ask", "bid_volume", "ask_volume", mode="before")
+    def _coerce_floats(cls, v: Any, info: Any = None) -> Any:
+        # Pydantic v2 passe 'info', v1 non. 
+        field_name = getattr(info, "field_name", "unknown") if info else "float_field"
+        return _coerce_type(v, float, "MarketEvent", field_name)
 
     @field_validator("exchange_ts_ms", "recv_ts_ms", mode="before")
-    def _norm_ts(cls, v: Any) -> Optional[int]:
-        return int(v) if v not in (None, "") else None
+    def _norm_ts(cls, v: Any, info: Any = None) -> Optional[int]:
+        field_name = getattr(info, "field_name", "unknown") if info else "ts_field"
+        if v in (None, "", "null"): return None
+        return _coerce_type(v, int, "MarketEvent", field_name)
 
     @field_validator("orderbook", mode="before")
     def _fallback_orderbook(cls, v: Any) -> Dict[str, Any]:
@@ -454,19 +497,21 @@ class VolEvent(_Cfg, BaseModel):
 
     @field_validator("exchange", mode="before")
     def _norm_exchange_field(cls, v: Any) -> str:
-        return _norm_exchange(v)
+        return _norm_exchange(v, kind="VolEvent")
 
     @field_validator("symbol", mode="before")
     def _norm_symbol_field(cls, v: Any) -> Optional[str]:
-        return _norm_symbol(v) if v else v
+        return _norm_symbol(v, kind="VolEvent") if v else v
 
     @field_validator("pair_key", mode="before")
     def _norm_pair_field(cls, v: Any) -> Optional[str]:
-        return _norm_pair_key(v) if v else v
+        return _norm_pair_key(v, kind="VolEvent") if v else v
 
     @field_validator("exchange_ts_ms", "recv_ts_ms", mode="before")
-    def _norm_ts(cls, v: Any) -> Optional[int]:
-        return int(v) if v not in (None, "") else None
+    def _norm_ts(cls, v: Any, info: Any = None) -> Optional[int]:
+        field_name = getattr(info, "field_name", "unknown") if info else "ts_field"
+        if v in (None, "", "null"): return None
+        return _coerce_type(v, int, "VolEvent", field_name)
 
     @model_validator(mode="after")
     def _set_symbol_and_pair(self):
@@ -507,19 +552,21 @@ class SlipEvent(_Cfg, BaseModel):
 
     @field_validator("exchange", mode="before")
     def _norm_exchange_field(cls, v: Any) -> str:
-        return _norm_exchange(v)
+        return _norm_exchange(v, kind="SlipEvent")
 
     @field_validator("symbol", mode="before")
     def _norm_symbol_field(cls, v: Any) -> Optional[str]:
-        return _norm_symbol(v) if v else v
+        return _norm_symbol(v, kind="SlipEvent") if v else v
 
     @field_validator("pair_key", mode="before")
     def _norm_pair_field(cls, v: Any) -> Optional[str]:
-        return _norm_pair_key(v) if v else v
+        return _norm_pair_key(v, kind="SlipEvent") if v else v
 
     @field_validator("exchange_ts_ms", "recv_ts_ms", mode="before")
-    def _norm_ts(cls, v: Any) -> Optional[int]:
-        return int(v) if v not in (None, "") else None
+    def _norm_ts(cls, v: Any, info: Any = None) -> Optional[int]:
+        field_name = getattr(info, "field_name", "unknown") if info else "ts_field"
+        if v in (None, "", "null"): return None
+        return _coerce_type(v, int, "SlipEvent", field_name)
 
     @field_validator("orderbook", mode="before")
     def _fallback_orderbook(cls, v: Any) -> Dict[str, Any]:
@@ -1080,8 +1127,13 @@ class RecoAliasStatusSnapshot(_Cfg, BaseModel):
 
 class BalanceSnapshotRM(_Cfg, BaseModel):
     mode: str
-    balances: Dict[str, Any]
+    balances: Dict[str, Dict[str, Dict[str, float]]]
     meta: Dict[str, Any]
+
+    @field_validator("balances", mode="before")
+    def _norm_balances_exchanges(cls, v: Any) -> Any:
+        if not isinstance(v, dict): return v
+        return {_norm_exchange(ex): per_alias for ex, per_alias in v.items()}
 
 class CMExposure(_Cfg, BaseModel):
     asset: List[str] = Field(default_factory=list)
@@ -1264,6 +1316,19 @@ class SimResult(_Cfg, BaseModel):
     fills_expected_ratio: Optional[float] = None
     sim_latency_ms: Optional[float] = None
     guards: Dict[str, Any] = Field(default_factory=dict)
+
+class BalanceSnapshot(_Cfg, BaseModel):
+    """Snapshot consolidé des balances pour le RiskManager."""
+    balances: Dict[str, Dict[str, Dict[str, float]]]
+    meta_age: Dict[str, float] = Field(default_factory=dict)
+    meta_ws_accounts: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    meta_bal_health: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
+    ts_wall: float = Field(default_factory=time.time)
+
+    @field_validator("balances", mode="before")
+    def _norm_balances_exchanges(cls, v: Any) -> Any:
+        if not isinstance(v, dict): return v
+        return {_norm_exchange(ex): per_alias for ex, per_alias in v.items()}
 
 # -----------------------------------------------------------------------------
 # Helpers de conversion
@@ -1739,6 +1804,9 @@ KNOWN_REASON_CODES = {
     "TM_DISABLED",
     "MM_OFF_NOT_READY",
     "REB_CONTRACT_INVALID",
+    "MM_CONTRACT_INVALID",
+    "MM_BOOK_INVALID",
+    "MM_JUMP_GUARD_FREEZE",
     "REB_DISABLED",
     "WD_MODULE_DEAD",
     "WD_LOOP_STOPPED",
@@ -1779,14 +1847,14 @@ KNOWN_REASON_CODES = {
 }
 def canonical_transfer_id(payload: Dict[str, Any]) -> str:
     base = {
-        "exchange": str(payload.get("exchange") or ""),
-        "from_alias": str(payload.get("from_alias") or payload.get("from") or ""),
-        "to_alias": str(payload.get("to_alias") or payload.get("to") or ""),
-        "from_wallet": str(payload.get("from_wallet") or ""),
-        "to_wallet": str(payload.get("to_wallet") or ""),
-        "ccy": str(payload.get("ccy") or payload.get("currency") or ""),
+        "exchange": _norm_exchange(payload.get("exchange"), kind="TransferID"),
+        "from_alias": str(payload.get("from_alias") or payload.get("from") or "").upper(),
+        "to_alias": str(payload.get("to_alias") or payload.get("to") or "").upper(),
+        "from_wallet": str(payload.get("from_wallet") or "").upper(),
+        "to_wallet": str(payload.get("to_wallet") or "").upper(),
+        "ccy": str(payload.get("ccy") or payload.get("currency") or "").upper(),
         "amount": float(payload.get("amount") or payload.get("amount_quote") or payload.get("amount_usdc") or 0.0),
-        "type": str(payload.get("type") or payload.get("kind") or "transfer"),
+        "type": str(payload.get("type") or payload.get("kind") or "transfer").lower(),
     }
     if payload.get("transfer_bucket") is not None:
         base["transfer_bucket"] = int(payload.get("transfer_bucket") or 0)

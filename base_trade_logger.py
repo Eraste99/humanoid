@@ -314,22 +314,16 @@ class BaseTradeLogger:
     def _norm_pair(x: Optional[str]) -> Optional[str]:
         if not x:
             return None
-        return x.replace("-", "").upper()
+        from contracts.payloads import _norm_pair_key
+        return _norm_pair_key(x, kind="BTL")
 
     @staticmethod
     def _norm_ex(x: Optional[str]) -> Optional[str]:
         """Canonicalise vers BINANCE / BYBIT / COINBASE."""
         if not x:
             return None
-        s = str(x).strip().replace("-", "").replace("_", "").upper()
-        if s.startswith("BINANCE"):
-            return "BINANCE"
-        if s.startswith("BYBIT"):
-            return "BYBIT"
-        # Coinbase Advanced Trade: COINBASE, COINBASEAT, COINBASEADVANCEDTRADE, CB, etc.
-        if s.startswith("COINBASE") or s in {"CB", "COINBASEAT", "COINBASEADVANCEDTRADE"}:
-            return "COINBASE"
-        return s  # fallback: retourne la valeur upper
+        from contracts.payloads import _norm_exchange
+        return _norm_exchange(x, kind="BTL")
 
     @staticmethod
     def _first(*vals):

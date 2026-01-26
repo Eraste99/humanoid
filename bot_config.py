@@ -1345,6 +1345,8 @@ class EngineCfg:
     mm_hysteresis_ms: int = 600
     mm_ttl_ms: int = 2200
     mm_min_quote_lifetime_ms: int = 400
+    mm_replace_cooldown_ms: int = 200
+    mm_sticky_band_ticks: float = 1.0
     mm_allow_auto_hedge: bool = False
     mm_hedge_schedule: List[float] = field(default_factory=lambda: [0.33, 0.66, 1.0])
     mm_use_progressive_hedge: bool = False
@@ -1428,6 +1430,13 @@ class EngineCfg:
     mm_requote_min_ticks: float = 1.0
     mm_min_net_bps: float = 5.0
     mm_qpos_max_ahead_usd: float = 10000.0
+    mm_toxicity_threshold: float = 0.8
+    mm_jump_guard_threshold_bps: float = 10.0
+    mm_jump_guard_freeze_s: float = 5.0
+    mm_jitter_pct: float = 0.05
+    mm_edge_fees_bps: float = 2.0
+    mm_edge_buffer_bps: float = 1.0
+    mm_hedge_aggressive_pad_mult: float = 0.5
 
     price_band_bps_floor: float = 15.0
     price_band_bps_cap: float = 50.0
@@ -2039,7 +2048,16 @@ class BotConfig:
         _slip_ttl_env = _Env.get("SLIP_TTL_S", None)
         _vol_ttl_env = _Env.get("VOL_TTL_S", None)
         _legacy_ttl_present = _slip_ttl_env is not None or _vol_ttl_env is not None
-        if _legacy_ttl_present:
+        allow_legacy_ttl = _Env.get_bool("ALLOW_LEGACY_TTL_ENV", False)
+        if _legacy_ttl_present and not allow_legacy_ttl:
+            mode_upper = str(_Env.get("MODE", g.mode) or "").upper()
+            logging.getLogger(__name__).warning(
+                "Legacy SLIP_TTL_S/VOL_TTL_S détectés; ignorés (ALLOW_LEGACY_TTL_ENV=0)",
+            )
+            if mode_upper == "PROD":
+                raise ConfigError("CONFIG_SCHEMA_INVALID", "vol_slip_ttl")
+        elif _legacy_ttl_present:
+
             cfg._note_config_error("CONFIG_SCHEMA_INVALID", "vol_slip_ttl")
             logging.getLogger(__name__).warning(
                 "Legacy SLIP_TTL_S/VOL_TTL_S détectés; VOL_SLIP_TTL reste la source canonique",
@@ -3140,10 +3158,20 @@ class BotConfig:
             "RM_FF_FAIL_CLOSED_CAPS",
             cfg.rm.ff_fail_closed_caps,
         )
+        _ff_trading_state_unified_raw = _Env.get("FF_TRADING_STATE_UNIFIED", None)
         cfg.rm.ff_trading_state_unified = _Env.get_bool(
             "FF_TRADING_STATE_UNIFIED",
             cfg.rm.ff_trading_state_unified,
         )
+        if _ff_trading_state_unified_raw is None:
+            mode_upper = str(getattr(cfg.g, "mode", "") or "").upper()
+            feature_switches = getattr(cfg.g, "feature_switches", {}) or {}
+            if mode_upper == "PROD" and (
+                    bool(feature_switches.get("private_ws"))
+                    or bool(feature_switches.get("balance_fetcher"))
+            ):
+                cfg.rm.ff_trading_state_unified = True
+
         cfg.rm.ff_enforce_preemption = _Env.get_bool(
             "FF_ENFORCE_PREEMPTION",
             cfg.rm.ff_enforce_preemption,
@@ -3609,6 +3637,16 @@ class BotConfig:
         cfg.engine.mm_cross_defensive_lifetime_mult = _Env.get_float("ENGINE_MM_CROSS_DEFENSIVE_LIFETIME_MULT", cfg.engine.mm_cross_defensive_lifetime_mult)
         cfg.engine.mm_cross_429_threshold = _Env.get_float("ENGINE_MM_CROSS_429_THRESHOLD", cfg.engine.mm_cross_429_threshold)
         cfg.engine.mm_variants = _Env.get_dict("ENGINE_MM_VARIANTS", cfg.engine.mm_variants)
+        cfg.engine.mm_min_quote_lifetime_ms = _Env.get_int("ENGINE_MM_MIN_QUOTE_LIFETIME_MS", cfg.engine.mm_min_quote_lifetime_ms)
+        cfg.engine.mm_replace_cooldown_ms = _Env.get_int("ENGINE_MM_REPLACE_COOLDOWN_MS", cfg.engine.mm_replace_cooldown_ms)
+        cfg.engine.mm_sticky_band_ticks = _Env.get_float("ENGINE_MM_STICKY_BAND_TICKS", cfg.engine.mm_sticky_band_ticks)
+        cfg.engine.mm_toxicity_threshold = _Env.get_float("ENGINE_MM_TOXICITY_THRESHOLD", cfg.engine.mm_toxicity_threshold)
+        cfg.engine.mm_jump_guard_threshold_bps = _Env.get_float("ENGINE_MM_JUMP_GUARD_THRESHOLD_BPS", cfg.engine.mm_jump_guard_threshold_bps)
+        cfg.engine.mm_jump_guard_freeze_s = _Env.get_float("ENGINE_MM_JUMP_GUARD_FREEZE_S", cfg.engine.mm_jump_guard_freeze_s)
+        cfg.engine.mm_jitter_pct = _Env.get_float("ENGINE_MM_JITTER_PCT", cfg.engine.mm_jitter_pct)
+        cfg.engine.mm_edge_fees_bps = _Env.get_float("ENGINE_MM_EDGE_FEES_BPS", cfg.engine.mm_edge_fees_bps)
+        cfg.engine.mm_edge_buffer_bps = _Env.get_float("ENGINE_MM_EDGE_BUFFER_BPS", cfg.engine.mm_edge_buffer_bps)
+        cfg.engine.mm_hedge_aggressive_pad_mult = _Env.get_float("ENGINE_MM_HEDGE_AGGRESSIVE_PAD_MULT", cfg.engine.mm_hedge_aggressive_pad_mult)
 
         cfg.engine.workers_by_profile = _Env.get_dict(
             "ENGINE_WORKERS_BY_PROFILE",

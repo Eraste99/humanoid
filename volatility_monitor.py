@@ -23,6 +23,7 @@ import logging
 import math
 import time
 import asyncio
+from contracts.payloads import VolEvent, _norm_exchange, _norm_pair_key
 import numpy as np
 
 logger = logging.getLogger("VolatilityMonitor")
@@ -1100,24 +1101,33 @@ class VolatilityMonitor:
         puis alimente `_last_vol[(EX, PK)] = {"vol_rel": v, "ts_recv_s": ...}` pour le TTL.
         """
         try:
-            ex = str(msg.get("exchange") or "").upper()
-            pk = str(msg.get("pair_key") or "").upper()
-            bid = float(msg.get("best_bid") or 0.0)
-            ask = float(msg.get("best_ask") or 0.0)
-            if not ex or not pk:
-                inc_blocked("volatility_monitor", "schema_missing_field", _norm_pair(pk))
+            # P0 End-to-End Consistency: Validation via VolEvent
+            try:
+                # On utilise VolEvent pour la validation canonique
+                # Note: VolEvent attend exchange, symbol/pair_key, best_bid/best_ask
+                v_ev = VolEvent(**msg)
+                ex = v_ev.exchange
+                pk = v_ev.pair_key
+                bid = v_ev.best_bid
+                ask = v_ev.best_ask
+            except Exception:
+                from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                if PAYLOAD_INVALID_TOTAL:
+                    PAYLOAD_INVALID_TOTAL.labels(kind="VolatilityMonitor", reason="payload_invalid").inc()
+                inc_blocked("volatility_monitor", "schema_invalid", "UNKNOWN")
                 return
+
             if bid <= 0 or ask <= 0 or bid >= ask:
                 inc_blocked("volatility_monitor", "schema_mismatch", _norm_pair(pk))
                 return
 
             data = {
-                "active": bool(msg.get("active", True)),
+                "active": v_ev.active,
                 "pair_key": pk,
                 "best_bid": bid,
                 "best_ask": ask,
-                "exchange_ts_ms": int(msg.get("exchange_ts_ms") or 0),
-                "recv_ts_ms": int(msg.get("recv_ts_ms") or 0),
+                "exchange_ts_ms": v_ev.exchange_ts_ms or 0,
+                "recv_ts_ms": v_ev.recv_ts_ms or 0,
             }
 
             # Ingestion dans l'historique interne (signature à 1 seul param "data")
@@ -1128,7 +1138,7 @@ class VolatilityMonitor:
             vol_bps = self._to_bps(vol_rel)
 
             # TTL cache consommé par get_volatility()
-            ts_ms = msg.get("recv_ts_ms") or msg.get("exchange_ts_ms")
+            ts_ms = v_ev.recv_ts_ms or v_ev.exchange_ts_ms
             ts_recv_s = (float(ts_ms) / 1000.0) if ts_ms else time.time()
 
             if not hasattr(self, "_last_vol"):

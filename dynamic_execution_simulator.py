@@ -39,6 +39,7 @@ import time
 import math
 from datetime import datetime
 from typing import List, Tuple, Dict, Any, Optional, Callable, Set
+from contracts.payloads import Opportunity, SubmitBundleRequest, _norm_exchange, _norm_pair_key
 from contracts.errors import (
     RMError, NotReadyError, DataStaleError, InconsistentStateError, ExternalServiceError,SimulationError
 )
@@ -959,12 +960,30 @@ class DynamicExecutionSimulator:
           ``net_final_spread``, ``usage_ratio`` et ``status``.
         """
         _t0 = time.perf_counter()
-        symbol = str(opportunity.get("pair", "UNKNOWN")).replace("-", "").upper()
-        buy_ex = str(opportunity.get("buy_exchange", "")).upper()
-        sell_ex = str(opportunity.get("sell_exchange", "")).upper()
-        notional_quote = opportunity.get("notional_quote") or {}
-        notional_ccy = str(notional_quote.get("ccy") or "")
-        notional_amount = float(notional_quote.get("amount") or 0.0)
+        # P0 Consistency: Validation canonique de l'opportunité
+        try:
+            opp_canon = Opportunity(**opportunity)
+            # On utilise les valeurs normalisées par le Canon
+            symbol = str(opp_canon.pair_key).replace("-", "").upper()
+            buy_ex = opp_canon.buy_ex
+            sell_ex = opp_canon.sell_ex
+            notional_quote = opp_canon.notional_quote
+            notional_ccy = str(notional_quote.ccy)
+            notional_amount = float(notional_quote.amount)
+        except Exception as e:
+            try:
+                from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                if PAYLOAD_INVALID_TOTAL:
+                    PAYLOAD_INVALID_TOTAL.labels(kind="SimulatorIngress", reason="pydantic_fail").inc()
+            except Exception: pass
+            logger.warning("[Sim] P0: Opportunity schema violation: %s", e)
+            # On continue avec les valeurs brutes si possible pour éviter un blocage fatal
+            symbol = str(opportunity.get("pair", "UNKNOWN")).replace("-", "").upper()
+            buy_ex = str(opportunity.get("buy_exchange", "")).upper()
+            sell_ex = str(opportunity.get("sell_exchange", "")).upper()
+            notional_quote = opportunity.get("notional_quote") or {}
+            notional_ccy = str(notional_quote.get("ccy") or "")
+            notional_amount = float(notional_quote.get("amount") or 0.0)
 
         meta = dict(opportunity.get("meta") or {})
         opp_type = str(opportunity.get("type") or meta.get("type") or "").lower()
@@ -2071,6 +2090,10 @@ class DynamicExecutionSimulator:
         book_snapshot: Dict[str, Any],
         vol_size_factor: Optional[float] = None,
     ) -> None:
+        # P0 Consistency: Normalisation des entrées
+        branch = str(branch).upper()
+        pair = _norm_pair_key(pair, kind="SimPrime")
+        quote = str(quote).upper()
         try:
 
             k = int(

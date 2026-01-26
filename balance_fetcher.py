@@ -1,6 +1,11 @@
 # modules/balance_fetcher.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+import time
+import asyncio
+import logging
+from typing import Dict, Any, List, Optional, Tuple, Iterable, Callable, Awaitable
+from contracts.payloads import BalanceSnapshot, _norm_exchange
 
 """
 MultiBalanceFetcher — tri-CEX, alias-aware (TT/TM/MM) + Overlay virtuel

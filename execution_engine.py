@@ -38,7 +38,7 @@ import uuid
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Tuple
 from contextlib import asynccontextmanager
 from contracts import payloads as fraglib
-from contracts.payloads import normalize_reason_code, ReasonCodes
+from contracts.payloads import normalize_reason_code, ReasonCodes, SubmitBundleRequest, _norm_exchange, _norm_pair_key
 
 from modules.engine_pacer import EnginePacer  # ensure import top-level
 from contracts.errors import EngineSubmitError, EngineCancelError, ExternalServiceError, NotReadyError
@@ -1116,7 +1116,7 @@ class OrderFSM:
         self.client_id = client_id
         self.state = "NEW"
         self.exchange_order_id: Optional[str] = None
-        self.created_at = time.time()
+        self.created_at = time.monotonic()
         self.last_update = self.created_at
         self.ttl_s = float(ttl_s)
         self.filled_qty = 0.0
@@ -1137,30 +1137,30 @@ class OrderFSM:
             if target_qty is not None:
                 self.target_qty = float(target_qty)
             self.t_ack_ms = int(time.time() * 1000)
-            self.last_update = time.time()
+            self.last_update = time.monotonic()
 
     def on_partial(self, filled_qty: float):
         if self.state in {"ACK", "PARTIAL"}:
             self.state = "PARTIAL"
             self.filled_qty = float(filled_qty)
-            self.last_update = time.time()
+            self.last_update = time.monotonic()
 
     def on_filled(self):
         self.state = "FILLED"
         self.t_filled_ms = int(time.time() * 1000)
-        self.last_update = time.time()
+        self.last_update = time.monotonic()
 
     def on_reject(self, reason: str = ""):
         self.state = "REJECTED"
         self.reason = reason
-        self.last_update = time.time()
+        self.last_update = time.monotonic()
 
     def on_cancel(self):
         self.state = "CANCELED"
-        self.last_update = time.time()
+        self.last_update = time.monotonic()
 
     def expired_wo_ack(self) -> bool:
-        return self.state == "NEW" and (time.time() - self.created_at) > self.ttl_s
+        return self.state == "NEW" and (time.monotonic() - self.created_at) > self.ttl_s
 
 
 # =========================== ExecutionEngine =========================
@@ -1177,10 +1177,10 @@ class _InMemoryCIDStore:
         return cid in self._store
 
     def mark(self, cid: str, now: Optional[float] = None) -> None:
-        self._store[cid] = float(now or time.time())
+        self._store[cid] = float(now or time.monotonic())
 
     def prune(self, now: Optional[float] = None) -> None:
-        now = float(now or time.time())
+        now = float(now or time.monotonic())
         ttl = self.ttl_s
         stale = [k for k, ts in list(self._store.items()) if now - float(ts or 0.0) >= ttl]
         for cid in stale:
@@ -1543,6 +1543,7 @@ class ExecutionEngine:
         Engine piloté par cfg.engine.* + anti-crossing makers-only via cfg.g.ac.*
         Zéro os.getenv : tout est config-driven.
         """
+        from contracts.payloads import SubmitBundleRequest, _norm_exchange, _norm_pair_key
         import asyncio
         from collections import deque
         from typing import Optional, Dict, Any, Tuple, List
@@ -1900,13 +1901,24 @@ class ExecutionEngine:
 
         # Anti-churn et protections MM
         self.mm_min_quote_lifetime_ms = int(self.config.mm_min_quote_lifetime_ms)
+        self.mm_replace_cooldown_ms = int(self.config.mm_replace_cooldown_ms)
+        self.mm_sticky_band_ticks = float(self.config.mm_sticky_band_ticks)
         self.mm_requote_min_ticks = float(self.config.mm_requote_min_ticks)
         self.mm_min_net_bps = float(self.config.mm_min_net_bps)
         self.mm_slip_bps = float(getattr(self.config, "mm_slip_bps", 2.0))
         self.mm_qpos_max_ahead_usd = float(self.config.mm_qpos_max_ahead_usd)
         self.mm_pad_ticks_base = int(self.config.mm_pad_ticks_base)
         self.mm_pad_ticks_vol_boost = float(getattr(self.config, "mm_pad_ticks_vol_boost", 0.0))
-        self.mm_size_factor_base = float(self.config.mm_size_factor_base)
+        # Pilotabilité P1
+        self.mm_toxicity_threshold = float(getattr(self.config, "mm_toxicity_threshold", 0.8))
+        self.mm_jump_guard_threshold_bps = float(getattr(self.config, "mm_jump_guard_threshold_bps", 10.0))
+        self.mm_jump_guard_freeze_s = float(getattr(self.config, "mm_jump_guard_freeze_s", 5.0))
+        self.mm_jitter_pct = float(getattr(self.config, "mm_jitter_pct", 0.05))
+        self.mm_edge_fees_bps = float(getattr(self.config, "mm_edge_fees_bps", 2.0))
+        self.mm_edge_buffer_bps = float(getattr(self.config, "mm_edge_buffer_bps", 1.0))
+        self._mm_freeze_until: Dict[str, float] = {}  # pair -> monotonic_ts
+        self._mm_last_mid: Dict[str, float] = {}      # pair -> mid_price
+        self._mm_last_replace_mono: Dict[Tuple[str, str, str], float] = {} # (ex, pair, side) -> monotonic_ts
 
         # Support des variantes MM (Ticket D2)
         # Structure attendue dans config: mm_variants = { "neutral": { "LARGE": { "pad_ticks_base": 1, ... } } }
@@ -2569,10 +2581,94 @@ class ExecutionEngine:
         return order.get("type") in ("LIMIT", "POST_ONLY", "MAKER")
 
     def _tick_size(self, meta: dict, order: dict) -> float:
-        return float(meta.get("tick_size", 1e-6))
+        # P0.4.1 : Tick-size canonique
+        pair = meta.get("pair") or order.get("symbol")
+        ex = meta.get("exchange") or order.get("exchange")
+        return self._tick_size_simple(pair, exchange=ex)
 
-    def _tick_size_simple(self, pair: str) -> float:
-        return 1e-6
+    def _tick_size_simple(self, pair: str, exchange: Optional[str] = None) -> float:
+        """
+        P0.4.1 : Tick-size canonique avec cache local et fail-closed.
+        """
+        if not pair:
+            return 0.0
+        
+        ex = exchange or getattr(self, "default_exchange", "BINANCE")
+        
+        # Cache local minimal (LRU-like via dict simple)
+        cache_key = f"{ex}|{pair}"
+        if not hasattr(self, "_tick_size_cache"):
+            self._tick_size_cache = {}
+        
+        if cache_key in self._tick_size_cache:
+            return self._tick_size_cache[cache_key]
+            
+        gf = getattr(self.config, "get_pair_filters", None)
+        if callable(gf):
+            try:
+                f = gf(ex, pair) or {}
+                tick = float(f.get("tick_size", 0) or 0.0)
+                if tick > 0:
+                    self._tick_size_cache[cache_key] = tick
+                    return tick
+            except Exception:
+                pass
+        
+        # Si introuvable, on ne retourne pas de valeur par défaut "silencieuse" 
+        # pour MM (fail-closed nécessaire).
+        return 0.0
+
+    def _normalize_price_maker_safe(self, price: float, tick_size: float, side: str) -> float:
+        """
+        P0.4.2 : Rounding maker-safe.
+        BUY : floor (s'éloigne du touch).
+        SELL : ceil (s'éloigne du touch).
+        """
+        if tick_size <= 0:
+            return price
+        
+        side_u = str(side).upper()
+        # On utilise math.floor/ceil après normalisation par tick_size
+        # Le round(..., 8) évite les erreurs de précision flottante.
+        if side_u == "BUY":
+            return math.floor(round(price / tick_size, 8)) * tick_size
+        else:
+            return math.ceil(round(price / tick_size, 8)) * tick_size
+
+    def clamp_maker_price(self, side: str, px: float, bid: float, ask: float, tick: float, pad_ticks: float = 0.0) -> Tuple[float, bool]:
+        """
+        P0.4.4 : Clamp final no-touch/no-cross.
+        Garantit que le prix maker respecte les invariants TOB.
+        Retourne (clamped_price, was_clamped).
+        """
+        if bid <= 0 or ask <= 0 or bid >= ask:
+            return px, False
+            
+        clamped = False
+        new_px = px
+        side_u = side.upper()
+        
+        # On s'assure d'abord d'être du bon côté du carnet
+        # BUY doit être < ASK
+        # SELL doit être > BID
+        if side_u == "BUY":
+            # Hard limit: strictly below best ask
+            # On utilise tick pour s'assurer d'une distance minimale
+            upper_bound = ask - (max(1.0, pad_ticks) * tick)
+            if new_px > upper_bound:
+                new_px = upper_bound
+                clamped = True
+        else:
+            # Hard limit: strictly above best bid
+            lower_bound = bid + (max(1.0, pad_ticks) * tick)
+            if new_px < lower_bound:
+                new_px = lower_bound
+                clamped = True
+                
+        # Normalisation finale maker-safe après clamp
+        new_px = self._normalize_price_maker_safe(new_px, tick, side_u)
+        
+        return new_px, clamped
 
     def _now_ms(self) -> int:
         import time
@@ -3512,6 +3608,18 @@ class ExecutionEngine:
     def execute_bundle(self, bundle: Dict[str, Any]) -> Dict[str, Any]:
         """Interface synchrone utilisée par le RiskManager."""
         _t0 = time.perf_counter()
+        
+        # P0 Consistency: Validation de l'entrée (SubmitBundleRequest)
+        try:
+            SubmitBundleRequest(**bundle)
+        except Exception as e:
+            try:
+                from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                if PAYLOAD_INVALID_TOTAL:
+                    PAYLOAD_INVALID_TOTAL.labels(kind="ExecutionEngineIngress", reason="pydantic_fail").inc()
+            except Exception: pass
+            logger.error("[Engine] P0: SubmitBundleRequest schema violation: %s", e)
+
         meta = bundle.get("meta") or {}
         ack_base = {
             "trace_id": meta.get("trace_id") or bundle.get("trace_id"),
@@ -4006,7 +4114,9 @@ class ExecutionEngine:
             )
             try:
                 from modules.obs_metrics import MM_LADDER_LEVELS_USED
-                MM_LADDER_LEVELS_USED.labels(variant=variant, profile=profile).set(ladder_levels)
+                MM_LADDER_LEVELS_USED.labels(exchange=buy_ex, pair=pair).set(ladder_levels)
+                if sell_ex != buy_ex:
+                    MM_LADDER_LEVELS_USED.labels(exchange=sell_ex, pair=pair).set(ladder_levels)
             except Exception:
                 pass
 
@@ -7154,16 +7264,35 @@ class ExecutionEngine:
     ) -> None:
         """Track MM makers for TTL & preemption."""
         alias = str(account_alias or "").upper()
-        key = (exchange.upper(), alias, pair_key.upper())
+        ex_u = exchange.upper()
+        sym_u = pair_key.upper()
+        side_u = str(side).upper()
+        key = (ex_u, alias, sym_u)
         self._mm_active_by_pair[key].add(client_id)
-        expiry = time.time() + max(0.0, ttl_ms) / 1000.0
-        self._mm_expiry_by_cid[client_id] = (exchange.upper(), alias, pair_key.upper(), expiry)
+        
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        expiry = now_wall + max(0.0, ttl_ms) / 1000.0
+        
+        self._mm_expiry_by_cid[client_id] = (ex_u, alias, sym_u, expiry)
         self._mm_active_orders_info[client_id] = {
             "price": price,
-            "side": str(side).upper(),
+            "side": side_u,
             "variant": variant,
             "ladder_idx": int(ladder_idx or 0),
+            "placed_at_mono": now_mono,
+            "placed_at_wall": now_wall,
+            "bundle_id": bundle_id,
         }
+
+        # P0.5 : Instrumentation Placement & Live Quotes
+        try:
+            from modules.obs_metrics import MM_PLACE_TOTAL, MM_LIVE_QUOTES
+            if MM_PLACE_TOTAL:
+                MM_PLACE_TOTAL.labels(exchange=ex_u, pair=sym_u, side=side_u).inc()
+            if MM_LIVE_QUOTES:
+                MM_LIVE_QUOTES.labels(exchange=ex_u, pair=sym_u, side=side_u).inc()
+        except Exception: pass
 
         if ttl_ms > 0:
             self._spawn(self._mm_cancel_on_ttl(client_id, expiry, bundle_id=bundle_id, variant=variant), name=f"mm-ttl-{client_id[-6:]}")
@@ -7195,6 +7324,38 @@ class ExecutionEngine:
     def _mm_is_filled(self, client_id: str) -> bool:
         fsm = self._order_fsm.get(client_id)
         return bool(fsm and fsm.state == "FILLED")
+
+    def _mm_toxicity_score(self, pair: str, exchange: str) -> float:
+        """
+        P1.3 - Score de toxicité simple (0..1)
+        Basé sur Volatilité, Imbalance (via Sim) et Slippage.
+        """
+        score = 0.0
+        
+        # 1. Volatilité (max 0.4) - Sensible aux régimes agités
+        vol_bps = self._volatility_bps(pair)
+        score += min(0.4, (vol_bps / 50.0) * 0.4)
+        
+        # 2. Imbalance (max 0.4) - Détecte la pression unidirectionnelle
+        sim = getattr(self.risk_manager, "simulator", None)
+        if sim and hasattr(sim, "get_mm_hints"):
+            hints = sim.get_mm_hints(pair)
+            if hints:
+                imbalance = abs(float(hints.get("cancel_pressure_hint", 0.0)))
+                score += min(0.4, imbalance * 0.4)
+        
+        # 3. Slippage (max 0.2) - Reflète la profondeur disponible
+        slip_bps = 0.0
+        sh = getattr(self.risk_manager, "slippage_handler", None)
+        if sh and hasattr(sh, "get_slippage_bps"):
+            try:
+                sb = float(sh.get_slippage_bps(exchange, pair, "buy") or 0.0)
+                ss = float(sh.get_slippage_bps(exchange, pair, "sell") or 0.0)
+                slip_bps = max(sb, ss)
+            except Exception: pass
+        score += min(0.2, (slip_bps / 20.0) * 0.2)
+        
+        return score
 
     async def _mm_place_maker(self, *, pair_key: str, exchange: str, side: str,
                               amount_quote: float, bundle_id: str, ttl_ms: int | None = None, branch: str = "MM",
@@ -7235,6 +7396,11 @@ class ExecutionEngine:
         # 2) Calcul du pad ticks effectif
         vol_bps = self._volatility_bps(sym)
         pad_eff = mm_pad_resolved + (vol_bps * self.mm_pad_ticks_vol_boost / 100.0)
+
+        # P1.2 : Hedge passif plus agressif (si une jambe est déjà fill)
+        if (meta or {}).get("kind") == "HEDGE":
+            aggressive_mult = float(getattr(self.config, "mm_hedge_aggressive_pad_mult", 0.5))
+            pad_eff *= aggressive_mult
 
         # Application du size factor de base (Ticket D2)
         amount_quote *= mm_size_factor_resolved
@@ -7349,8 +7515,38 @@ class ExecutionEngine:
         except Exception:
             pass
 
-        # 4) Anti-churn : Requote Min Ticks
+        # 4) Anti-churn : min_lifetime + cooldown + sticky_band (P0.2)
+        now_mono = time.monotonic()
+        tick_size = self._tick_size_simple(sym, exchange=ex)
+        if tick_size <= 0:
+            self._abort("MM", "MM_TICK_SIZE_NOT_FOUND")
+            raise EngineSubmitError("MM_TICK_SIZE_NOT_FOUND")
+
+        # 2. Replace Cooldown Check (per pair x side) - P0.2.2
+        last_replace = self._mm_last_replace_mono.get((ex, sym, side_u), 0.0)
+        if (now_mono - last_replace) * 1000.0 < self.mm_replace_cooldown_ms:
+            # On cherche s'il y a déjà un ordre pour ce ladder_idx. 
+            # Si oui, on le garde (on skip le replace).
+            # Si non, on laisse passer (placement initial).
+            found_existing = False
+            existing_clid = None
+            active_cids = self._mm_active_for(ex, sym)
+            for clid in active_cids:
+                info = self._mm_active_orders_info.get(clid)
+                if info and info.get("side") == side_u and int(info.get("ladder_idx", 0) or 0) == ladder_idx:
+                    existing_clid = clid
+                    found_existing = True
+                    break
+            
+            if found_existing:
+                try:
+                    from modules.obs_metrics import MM_STICKY_SKIPS_TOTAL
+                    MM_STICKY_SKIPS_TOTAL.labels(exchange=ex, pair=sym, side=side_u, reason="COOLDOWN").inc()
+                except Exception: pass
+                return existing_clid
+
         active_cids = self._mm_active_for(ex, sym)
+        to_cancel = []
         for clid in active_cids:
             info = self._mm_active_orders_info.get(clid)
             if not info or info.get("side") != side_u:
@@ -7362,14 +7558,167 @@ class ExecutionEngine:
             if not fsm or fsm.state not in ("ACK", "PARTIAL", "NEW"):
                 continue
 
+            # 1. Min Quote Lifetime Check
+            placed_at = info.get("placed_at_mono", 0.0)
+            age_ms = (now_mono - placed_at) * 1000.0
+            if age_ms < self.mm_min_quote_lifetime_ms:
+                # Trop jeune pour être remplacé (churn control)
+                try:
+                    from modules.obs_metrics import MM_STICKY_SKIPS_TOTAL
+                    MM_STICKY_SKIPS_TOTAL.labels(exchange=ex, pair=sym, side=side_u, reason="MIN_LIFETIME").inc()
+                except Exception: pass
+                return clid
+
+            # 2. Sticky Band Check (+/- N ticks)
             old_price = float(info.get("price", 0.0))
-            if old_price > 0:
-                tick_size = self._tick_size_simple(sym)
-                if tick_size > 0:
-                    diff_ticks = abs(price - old_price) / tick_size
-                    if diff_ticks < self.mm_requote_min_ticks:
-                        # Prix trop proche, on réutilise l'ordre existant
-                        return clid
+            diff_ticks = abs(price - old_price) / tick_size
+            if diff_ticks <= self.mm_sticky_band_ticks:
+                # Dans la bande collante, on préserve l'ordre
+                try:
+                    from modules.obs_metrics import MM_STICKY_SKIPS_TOTAL
+                    MM_STICKY_SKIPS_TOTAL.labels(exchange=ex, pair=sym, side=side_u, reason="STICKY_BAND").inc()
+                except Exception: pass
+                return clid
+            
+            # Si on arrive ici, on a un ordre à remplacer
+            to_cancel.append(clid)
+
+        # --- P0.1 : Clamp hard non-touch/non-cross (Dernier mètre) ---
+        bid_ref, ask_ref = getattr(self.risk_manager, "get_top_of_book", lambda *a: (0.0, 0.0))(ex, sym) or (0.0, 0.0)
+        
+        # Validation TOB (Fail-closed)
+        if bid_ref <= 0 or ask_ref <= 0 or bid_ref >= ask_ref:
+            try:
+                from modules.obs_metrics import MM_BOOK_STALE_TOTAL
+                MM_BOOK_STALE_TOTAL.labels(exchange=ex, pair=sym).inc()
+            except Exception: pass
+            
+            self._abort("MM", "MM_BOOK_INVALID")
+            raise EngineSubmitError("MM_BOOK_INVALID")
+
+        # --- P1.2 : Jump Guard ---
+        mid = (bid_ref + ask_ref) / 2.0
+        last_mid = self._mm_last_mid.get(sym, mid)
+        self._mm_last_mid[sym] = mid
+        
+        jump_bps = abs(mid - last_mid) / last_mid * 10000.0 if last_mid > 0 else 0.0
+        if jump_bps >= self.mm_jump_guard_threshold_bps:
+            self._mm_freeze_until[sym] = now_mono + self.mm_jump_guard_freeze_s
+            try:
+                from modules.obs_metrics import MM_JUMP_GUARD_TOTAL
+                MM_JUMP_GUARD_TOTAL.labels(exchange=ex, pair=sym).inc()
+            except Exception: pass
+            
+        if now_mono < self._mm_freeze_until.get(sym, 0.0):
+            # En freeze Jump Guard
+            raise EngineSubmitError("MM_JUMP_GUARD_FREEZE")
+
+        # --- P1.1 : Toxic Flow / side policy ---
+        toxicity = self._mm_toxicity_score(sym, ex)
+        try:
+            from modules.obs_metrics import MM_TOXICITY_SCORE
+            if MM_TOXICITY_SCORE:
+                MM_TOXICITY_SCORE.labels(exchange=ex, pair=sym).set(toxicity)
+        except Exception: pass
+        
+        # --- P1.3 : Inventory Skew & Edge Floor Fee-aware ---
+        # 1. Inventory Skew (P1.3.1)
+        price_skew = 0.0
+        size_skew = 1.0
+        try:
+            # On tente de récupérer le skew depuis le RiskManager
+            rm_skews_fn = getattr(self.risk_manager, "_compute_mm_inventory_skews", None)
+            if callable(rm_skews_fn):
+                # On doit trouver le drift. On utilise une méthode indirecte ou on délègue.
+                # Pour simplifier dans l'Engine, on se base sur les skews déjà calculés/disponibles si possible.
+                # Ici, on simule l'appel si on a les infos.
+                # En réalité, on va passer par get_mm_leg_restriction qui est déjà utilisé par le scanner.
+                # Mais pour le skew fin du prix/size :
+                asset = sym.split("USDC")[0].split("USDT")[0].split("-")[0] # Extraction naïve asset
+                # On cherche si on a un drift stocké quelque part
+                drift_info = getattr(self.risk_manager, "mm_reb_state", {}).get((ex, "MM", asset))
+                if drift_info:
+                    drift_usd = drift_info.get("drift_usd", 0.0)
+                    price_skew, size_skew = rm_skews_fn(ex, sym, drift_usd)
+        except Exception: pass
+
+        # Application du skew prix (P1.3.1)
+        # price_skew > 0 (LONG) => on veut vendre plus bas / acheter plus bas
+        if price_skew != 0:
+            price *= (1.0 - price_skew / 10000.0)
+
+        # Application du skew taille (P1.3.1)
+        if size_skew != 1.0:
+            amount_quote *= size_skew
+
+        # 2. Edge Floor Fee-aware (P1.3.2)
+        # expected_capture_bps = (price - mid) / mid * 10000
+        # On ne quote que si expected_capture_bps >= fees + buffer
+        try:
+            mid = (bid_ref + ask_ref) / 2.0
+            fees_bps = float(getattr(self.config, "mm_edge_fees_bps", 2.0))
+            buffer_bps = float(getattr(self.config, "mm_edge_buffer_bps", 1.0))
+            
+            # Pour un BUY : price doit être <= mid - (fees + buffer)
+            # Pour un SELL : price doit être >= mid + (fees + buffer)
+            capture_bps = abs(price - mid) / mid * 10000.0
+            if capture_bps < (fees_bps + buffer_bps):
+                # Trop serré pour couvrir les frais + buffer
+                # On élargit au minimum requis
+                min_dist = mid * (fees_bps + buffer_bps) / 10000.0
+                if side_u == "BUY":
+                    price = min(price, mid - min_dist)
+                else:
+                    price = max(price, mid + min_dist)
+        except Exception: pass
+
+        # Détermination de la side policy (P1.1)
+        # Simplifié: si toxicité élevée, on n'autorise que les quotes qui s'éloignent du mouvement
+        # Ici on augmente juste le pad si la toxicité globale monte
+        if toxicity >= self.mm_toxicity_threshold:
+            pad_eff += self.mm_pad_ticks_base * 2.0
+            amount_quote *= 0.5
+
+        # P0.4.4 : Clamp final no-touch/no-cross + Maker-safe Rounding
+        price, was_clamped = self.clamp_maker_price(side_u, price, bid_ref, ask_ref, tick_size, pad_ticks=0.0)
+        if was_clamped:
+            try:
+                from modules.obs_metrics import MM_CLAMP_TOTAL
+                MM_CLAMP_TOTAL.labels(exchange=ex, pair=sym, side=side_u).inc()
+            except Exception: pass
+
+        # P1.4 : Jitter contrôlé (après clamp/rounding)
+        jitter_val = self.mm_jitter_pct
+        if jitter_val > 0:
+            import random
+            shift_ticks = 1 if random.random() < (jitter_val / 100.0) else 0
+            if shift_ticks > 0:
+                if side_u == "BUY":
+                    price -= shift_ticks * tick_size
+                else:
+                    price += shift_ticks * tick_size
+                # On reclamp après jitter au cas où
+                price, _ = self.clamp_maker_price(side_u, price, bid_ref, ask_ref, tick_size, pad_ticks=0.0)
+
+        # Distance to best (microstructure) in ticks (P0.5)
+        try:
+            from modules.obs_metrics import MM_DISTANCE_TO_BEST_TICKS, MM_DISTANCE_TO_BEST_BPS
+            ref = ask_ref if side_u == "SELL" else bid_ref
+            if ref > 0:
+                dist_bps = abs(price - ref) / ref * 10000.0
+                dist_ticks = abs(price - ref) / tick_size
+                MM_DISTANCE_TO_BEST_BPS.labels(exchange=ex, pair=sym, side=side_u).observe(dist_bps)
+                MM_DISTANCE_TO_BEST_TICKS.labels(exchange=ex, pair=sym, side=side_u).observe(dist_ticks)
+        except Exception: pass
+
+        if to_cancel:
+            await self._mm_cancel_open_makers(to_cancel, reason="mm_replace")
+            # Update last replace cooldown
+            self._mm_last_replace_mono[(ex, sym, side_u)] = now_mono
+            try:
+                from modules.obs_metrics import MM_REPLACE_TOTAL
+                MM_REPLACE_TOTAL.labels(exchange=ex, pair=sym, side=side_u).inc()
+            except Exception: pass
 
         clid = self._mm_new_client_id()
         quote = self._mm_quote(sym)
@@ -7607,7 +7956,7 @@ class ExecutionEngine:
 
             # Anti-churn: Min Quote Lifetime (seulement si c'est un cancel pour repricing, i.e. reason != "preempt" et reason != "ttl")
             if reason not in ("preempt", "ttl") and fsm.state in {"ACK", "PARTIAL"}:
-                age_ms = (time.time() - fsm.created_at) * 1000.0
+                age_ms = (time.monotonic() - fsm.created_at) * 1000.0
                 
                 min_life = float(self.mm_min_quote_lifetime_ms)
                 if is_single:
@@ -7635,6 +7984,26 @@ class ExecutionEngine:
                 try:
                     await self._cancel_order(ex, sym, cid, reason=reason)
                     
+                    # P0.5 : Instrumentation Lifetime & Live Quotes
+                    try:
+                        from modules.obs_metrics import MM_LIFETIME_MS, MM_LIVE_QUOTES, MM_CANCEL_TOTAL
+                        order_info = self._mm_active_orders_info.get(cid) or {}
+                        side = str(order_info.get("side", "")).upper()
+                        
+                        if MM_LIFETIME_MS:
+                            placed_at = order_info.get("placed_at_mono")
+                            if placed_at:
+                                lifetime_ms = (time.monotonic() - placed_at) * 1000.0
+                                variant_val = order_info.get("variant", "neutral")
+                                MM_LIFETIME_MS.labels(exchange=ex, pair=sym, variant=variant_val).observe(lifetime_ms)
+                        
+                        if MM_LIVE_QUOTES and side:
+                            MM_LIVE_QUOTES.labels(exchange=ex, pair=sym, side=side).dec()
+                        
+                        if MM_CANCEL_TOTAL and side:
+                            MM_CANCEL_TOTAL.labels(exchange=ex, pair=sym, side=side).inc()
+                    except Exception: pass
+
                     # Metrics cancels
                     order_info = self._mm_active_orders_info.get(cid) or {}
                     variant = order_info.get("variant", "neutral")
@@ -12046,6 +12415,25 @@ async def _on_filled(self: "ExecutionEngine", result: dict, *, order_type: str, 
             self.stats.total_rebalancing_executed += 1
         self.stats.last_executed_trade = dict(result or {})
         self.stats.trade_count += 1
+
+        # ==== MM Lifetime observability (P0.5) ====
+        try:
+            clid = result.get("client_id")
+            if clid and hasattr(self, "_mm_active_orders_info") and clid in self._mm_active_orders_info:
+                info = self._mm_active_orders_info.get(clid)
+                placed_at = info.get("placed_at_mono")
+                if placed_at:
+                    lifetime_ms = (time.monotonic() - placed_at) * 1000.0
+                    ex = result.get("exchange")
+                    sym = str(result.get("symbol") or "").replace("-", "").upper()
+                    variant = info.get("variant", "neutral")
+                    try:
+                        from modules.obs_metrics import MM_LIFETIME_MS
+                        if MM_LIFETIME_MS:
+                            MM_LIFETIME_MS.labels(exchange=ex, pair=sym, variant=variant).observe(lifetime_ms)
+                    except Exception: pass
+        except Exception:
+            pass
 
         # REB (TM neutral issu du RM) garde un chemin métrique dédié pour permettre
         # la ventilation des volumes exécutés et du PnL par branche.

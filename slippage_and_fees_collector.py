@@ -87,8 +87,9 @@ SFC_VIP_TIER              = _NoMetric()
 SFC_TOKEN_ENABLED         = _NoMetric()
 
 # --- Helpers ----------------------------------------------------------------
-def _norm_ex(x: str) -> str:   return (x or "").strip().upper()
-def _norm_pair(x: str) -> str: return (x or "").replace("-", "").upper()
+from contracts.payloads import _norm_exchange, _norm_pair_key
+def _norm_ex(x: str) -> str: return _norm_exchange(x, kind="SFC")
+def _norm_pair(x: str) -> str: return _norm_pair_key(x, kind="SFC")
 def _safe_f(x: Any, d: float=0.0) -> float:
     try: return float(x)
     except Exception: return float(d)

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+from contracts.payloads import Opportunity, _norm_exchange, _norm_pair_key
 """
 OpportunityScanner — tri-CEX (Binance / Coinbase / Bybit)
 
@@ -98,6 +99,7 @@ try:
         SC_STRATEGY_SCORE,            # gauge
         SC_ELIGIBLE,                  # gauge
         SCANNER_ROTATION_ERRORS_TOTAL,
+        SCANNER_MM_LEG_RESTRICTED_TOTAL,
         SIM_PRIME_TOTAL,
         SIM_PRIME_ERROR_TOTAL,
         inc_blocked,                  # function(module, reason, pair)
@@ -121,6 +123,7 @@ except Exception:
     SC_STRATEGY_SCORE = _MetricNoOp()
     SC_ELIGIBLE = _MetricNoOp()
     SCANNER_ROTATION_ERRORS_TOTAL = _MetricNoOp()
+    SCANNER_MM_LEG_RESTRICTED_TOTAL = _MetricNoOp()
     SIM_PRIME_TOTAL = _MetricNoOp()
     SIM_PRIME_ERROR_TOTAL = _MetricNoOp()
 
@@ -2882,7 +2885,15 @@ class OpportunityScanner:
                     if restriction == side:
                         # Ce côté aggrave l'inventaire -> on le désactive (Self-rebal passif)
                         payload.setdefault("meta", {})["leg_restricted"] = side
-                        self.logger.info("[Scanner] MM Rebalancing: disabling %s leg for %s on %s (inventory drift)", side, pair, ex)
+                        try:
+                            SCANNER_MM_LEG_RESTRICTED_TOTAL.labels(
+                                exchange=str(ex).upper(),
+                                side=str(side).upper(),
+                                reason="INVENTORY_DRIFT",
+                            ).inc()
+                        except Exception:
+                            pass
+
                     elif restriction == "BOTH":
                         # Les deux côtés sont restreints (phase 3 ou imbalance adverse)
                         payload.setdefault("meta", {})["mm_blocked_reason"] = "STUCK_OR_ADVERSE"
@@ -2893,6 +2904,14 @@ class OpportunityScanner:
                 
                 if not final_legs:
                     # Les deux côtés sont restreints (rare) ou un seul leg restant était restreint
+                    self._record_rejection(
+                        reason="mm_blocked_both_legs",
+                        route=route_combo,
+                        pair=pair,
+                        ctx={"restriction": "BOTH", "exchange": ex},
+                        strategy="MM",
+                    )
+
                     return
 
                 payload["legs"] = final_legs
@@ -3163,6 +3182,29 @@ class OpportunityScanner:
         reason_rm = "no_callback"
 
         try:
+            # Validation canonique de l'opportunité (P0 Consistency)
+            try:
+                # Normalisation finale avant validation
+                opp["pair_key"] = _norm_pair_key(opp.get("pair_key") or opp.get("pair"), kind="Scanner")
+                opp["buy_ex"] = _norm_exchange(opp.get("buy_ex"), kind="Scanner")
+                opp["sell_ex"] = _norm_exchange(opp.get("sell_ex"), kind="Scanner")
+                
+                Opportunity(**opp)
+            except Exception as e:
+                try:
+                    from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                    if PAYLOAD_INVALID_TOTAL:
+                        PAYLOAD_INVALID_TOTAL.labels(kind="OpportunityScanner", reason="pydantic_fail").inc()
+                except Exception: pass
+                
+                self._record_rejection(
+                    reason="payload_invalid",
+                    route=route_combo,
+                    pair=pair,
+                    ctx={"err": str(e)[:100]},
+                )
+                return
+
             if tracing_enabled:
                 opp["scanner_exit_ns"] = time.perf_counter_ns()
             cb = self.on_opportunity

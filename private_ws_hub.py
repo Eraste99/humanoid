@@ -86,6 +86,7 @@ Statut
 from dataclasses import dataclass
 from collections import OrderedDict, defaultdict, deque
 from typing import Callable, Optional, Any, Dict, Tuple, List
+from contracts.payloads import PrivateFillEvent, normalize_private_fill_event, _norm_exchange, _norm_pair_key
 import asyncio
 import aiohttp
 import base64
@@ -97,7 +98,7 @@ import logging
 import random
 import time
 import asyncio as _asyncio
-from contracts.payloads import canonical_transfer_id, normalize_reason_code
+from contracts.payloads import canonical_transfer_id, normalize_reason_code, PrivateFillEvent, _norm_exchange, _norm_pair_key
 # --- Prometheus metrics (fallback no-op si registre absent) -------------------
 try:
     from modules.obs_metrics import (
@@ -1685,10 +1686,27 @@ class PrivateWSHub:
         import time as _t
         ev = dict(event or {})
         self._normalize_event_fields(ev)
-        exu = _upper(ev.get("exchange") or "UNKNOWN")
-        alu = _upper(ev.get("alias") or "NA")
+        
+        # P0 Consistency: Normalisation instrumentée
+        exu = _norm_exchange(ev.get("exchange") or "UNKNOWN", kind="PrivateWSHub")
+        alu = _norm_exchange(ev.get("alias") or "NA", kind="PrivateWSHub")
+        
         status = _upper(ev.get("status") or "OTHER")
         source = ((ev.get("meta") or {}).get("source") or "ws")
+
+        # Validation canonique si c'est un fill
+        if status in ("FILL", "FILLED") or str(ev.get("type")).lower() == "fill":
+            try:
+                # Normalisation finale
+                if ev.get("pair"):
+                    ev["pair"] = _norm_pair_key(ev["pair"], kind="PrivateFill")
+                
+                PrivateFillEvent(**ev)
+            except Exception as e:
+                from modules.obs_metrics import PAYLOAD_INVALID_TOTAL
+                if PAYLOAD_INVALID_TOTAL:
+                    PAYLOAD_INVALID_TOTAL.labels(kind="PrivateFill", reason="pydantic_fail").inc()
+                log.warning("[PWS] PrivateFill schema violation: %s", e)
 
         # Normalisation légère pour cohérence
         if status == "FILLED":
