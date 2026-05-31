@@ -1,0 +1,32 @@
+=== FIX : fade sur MID synthetique de-bounced (Binance, cache, Jan-Avr) ===
+
+       sym    month  spread_est   volMID  volTRADE   nsig   net@3
+   BTCUSDT  2026-01        0.3b      0.1       0.1     42    -7.4
+   BTCUSDT  2026-02        0.5b      0.1       0.1     50     3.8
+   BTCUSDT  2026-03        0.4b      0.1       0.1     60   -19.6
+   BTCUSDT  2026-04        0.3b      0.1       0.1     55    22.2
+   ETHUSDT  2026-01        0.4b      0.1       0.2     44    -8.3
+   ETHUSDT  2026-02        0.5b      0.2       0.3     51   -12.5
+   ETHUSDT  2026-03        0.4b      0.1       0.3     62     2.1
+   ETHUSDT  2026-04        0.3b      0.1       0.2     61    -8.8
+   SOLUSDT  2026-01        0.8b      0.3       0.6     42   -22.5
+   SOLUSDT  2026-02        1.2b      0.4       1.0     38     4.9
+   SOLUSDT  2026-03        1.1b      0.4       0.9     52    16.0
+   SOLUSDT  2026-04        1.2b      0.3       0.9     51     2.0
+   XRPUSDT  2026-01        0.5b      0.3       0.4     39   -25.4
+   XRPUSDT  2026-02        0.7b      0.4       0.6     31     0.2
+   XRPUSDT  2026-03        0.7b      0.3       0.6     46    13.4
+   XRPUSDT  2026-04        0.7b      0.3       0.6     56     3.2
+
+======================================================================
+  SYNTHESE PAR MOIS (mid de-bounced) vs baseline prix-trade :
+     month   net MID  net TRADE(v1)
+   2026-01     -15.6          -18.0
+   2026-02      -1.5           -6.8
+   2026-03       1.8            2.2
+   2026-04       4.3            8.3
+
+  POOLED mid de-bounced = -1.9   (baseline prix-trade = -3.6)
+  -> si tres different : le bounce contaminait. si ~pareil : le verdict regime tient.
+
+[done] 935s

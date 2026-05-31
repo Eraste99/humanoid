@@ -1,0 +1,21 @@
+=== ENTREE SUR CONFIRMATION (Binance OOS de-bounced, TP100/SL50) ===
+
+  --- C=15bps (confirmation) ---
+    signals=2980  entres=2980 (100%, skip 0%)
+    TP=32% SL=65% TO=2%   NET=-3.0  std=70
+    par mois: 01= -0.5(n611) 02= -5.7(n892) 03= +1.1(n858) 04= -7.2(n619) 
+    mois positifs: 1/4    (fade nu: -1.4 net, 1/4 mois)
+
+  --- C=25bps (confirmation) ---
+    signals=2914  entres=2891 (99%, skip 1%)
+    TP=32% SL=65% TO=3%   NET=-3.2  std=70
+    par mois: 01= -3.1(n608) 02= -4.9(n860) 03= +1.1(n817) 04= -6.7(n606) 
+    mois positifs: 1/4    (fade nu: -1.4 net, 1/4 mois)
+
+  --- C=40bps (confirmation) ---
+    signals=2896  entres=2683 (93%, skip 7%)
+    TP=31% SL=66% TO=3%   NET=-3.9  std=69
+    par mois: 01= -3.6(n567) 02= -5.0(n816) 03= -1.8(n749) 04= -5.1(n551) 
+    mois positifs: 0/4    (fade nu: -1.4 net, 1/4 mois)
+
+[done] 934s

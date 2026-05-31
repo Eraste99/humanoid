@@ -1,0 +1,30 @@
+=== CROSS-WEEK du FADE-BULL ACCEL — 'fade le rip quand 1h accelere' tient-il W507 ET W516 ? — HL true-mid ===
+bull=tercile haut drift_4h ; accel=drift_1h>=mediane(bull). fade short up-leg, hold 30min, maker RT3.
+
+--- HYPEUSDC ---  (bull n=396, d1 median=+134)
+    W507: ACCEL n=  2 (insuff)  |  DECEL n= 12 net  +1.9 win 42%
+    W515: ACCEL n=  2 (insuff)  |  DECEL n=  1 (insuff)
+    W516: ACCEL n=194 net  -5.7 win 50%  |  DECEL n=185 net  -3.3 win 51%
+--- BTCUSDC ---  (bull n=51, d1 median=+53)
+    W507: ACCEL n= 23 net +16.6 win 70%  |  DECEL n= 21 net  -2.9 win 71%
+    W516: ACCEL n=  3 (insuff)  |  DECEL n=  4 (insuff)
+--- ETHUSDC ---  (bull n=77, d1 median=+55)
+    W507: ACCEL n= 26 net  +4.4 win 65%  |  DECEL n= 24 net  -4.8 win 46%
+    W516: ACCEL n= 13 net +10.6 win 54%  |  DECEL n= 14 net  +0.5 win 50%
+--- SOLUSDC ---  (bull n=94, d1 median=+61)
+    W507: ACCEL n= 25 net  +7.2 win 52%  |  DECEL n= 24 net  -4.6 win 46%
+    W515: ACCEL n=  0 (insuff)  |  DECEL n=  2 (insuff)
+    W516: ACCEL n= 22 net  +6.5 win 55%  |  DECEL n= 21 net  +3.6 win 57%
+--- XRPUSDC ---  (bull n=73, d1 median=+38)
+    W507: ACCEL n= 20 net  +5.1 win 45%  |  DECEL n= 22 net  +0.6 win 45%
+    W515: ACCEL n=  0 (insuff)  |  DECEL n=  0 (insuff)
+    W516: ACCEL n= 17 net  -3.7 win 47%  |  DECEL n= 14 net  +4.9 win 50%
+--- MAJORS POOLES ---  (bull n=293)
+    W507: ACCEL n= 92 net  +7.6 win 62%  |  DECEL n= 93 net  -3.4 win 53%
+    W515: ACCEL n=  1 (insuff)  |  DECEL n=  1 (insuff)
+    W516: ACCEL n= 54 net  +5.8 win 56%  |  DECEL n= 52 net  +2.6 win 52%
+
+  LECTURE : si ACCEL net>0 sur W507 ET W516 (majors) -> le fade-bull-accel est ROBUSTE cross-week (pas un artefact pool).
+    si ACCEL flippe par semaine -> le conditionnement n'a PAS sauve le bull, c'etait du pooling/chance.
+
+[done] 45s

@@ -1,0 +1,509 @@
+====================================================================================================
+CAN THE MARKET REGIME BE PREDICTED EX-ANTE (CAUSALLY) ON LIQUID MAJORS? — gating test
+4 majors x 4 months, tick-level (full series for all rolling calcs; eval grid every 50th tick).
+Indicators @ t use ONLY data<=t. Forward regime @ t uses ONLY data>t. Never mixed.
+====================================================================================================
+  BTCUSDT 2026-01: ticks=44,701,669  evalpts=894,034  (128s)  finite[ER_2h=893736,AC1_8h=893891,VR_8h=893844,VOLpct=893858,HURST=891604]
+  BTCUSDT 2026-02: ticks=84,154,790  evalpts=1,683,096  (303s)  finite[ER_2h=1680313,AC1_8h=1681866,VR_8h=1681300,VOLpct=1681454,HURST=1670159]
+  BTCUSDT 2026-03: ticks=65,679,960  evalpts=1,313,600  (227s)  finite[ER_2h=1312173,AC1_8h=1313062,VR_8h=1312784,VOLpct=1312863,HURST=1296870]
+  BTCUSDT 2026-04: ticks=41,544,040  evalpts=830,881  (140s)  finite[ER_2h=829470,AC1_8h=830404,VR_8h=830026,VOLpct=830126,HURST=820028]
+  ETHUSDT 2026-01: ticks=53,140,935  evalpts=1,062,819  (175s)  finite[ER_2h=1062409,AC1_8h=1062641,VR_8h=1062571,VOLpct=1062588,HURST=1060154]
+  ETHUSDT 2026-02: ticks=82,875,132  evalpts=1,657,503  (312s)  finite[ER_2h=1654402,AC1_8h=1656081,VR_8h=1655349,VOLpct=1655519,HURST=1643237]
+  ETHUSDT 2026-03: ticks=59,600,831  evalpts=1,192,017  (176s)  finite[ER_2h=1191065,AC1_8h=1191651,VR_8h=1191469,VOLpct=1191515,HURST=1175058]
+  ETHUSDT 2026-04: ticks=38,231,408  evalpts=764,629  (106s)  finite[ER_2h=763341,AC1_8h=764236,VR_8h=763989,VOLpct=764047,HURST=753843]
+  SOLUSDT 2026-01: ticks=11,499,877  evalpts=229,998  (31s)  finite[ER_2h=229829,AC1_8h=229937,VR_8h=229900,VOLpct=229909,HURST=228741]
+  SOLUSDT 2026-02: ticks=12,454,182  evalpts=249,084  (32s)  finite[ER_2h=248707,AC1_8h=248930,VR_8h=248846,VOLpct=248864,HURST=246609]
+  SOLUSDT 2026-03: ticks=11,028,631  evalpts=220,573  (28s)  finite[ER_2h=220292,AC1_8h=220471,VR_8h=220411,VOLpct=220425,HURST=217323]
+  SOLUSDT 2026-04: ticks=8,601,506  evalpts=172,031  (22s)  finite[ER_2h=171814,AC1_8h=171952,VR_8h=171910,VOLpct=171920,HURST=170032]
+  XRPUSDT 2026-01: ticks=10,785,790  evalpts=215,716  (28s)  finite[ER_2h=215505,AC1_8h=215649,VR_8h=215604,VOLpct=215620,HURST=214337]
+  XRPUSDT 2026-02: ticks=12,540,664  evalpts=250,814  (32s)  finite[ER_2h=250354,AC1_8h=250637,VR_8h=250524,VOLpct=250551,HURST=248315]
+  XRPUSDT 2026-03: ticks=8,854,719  evalpts=177,095  (23s)  finite[ER_2h=176863,AC1_8h=177005,VR_8h=176957,VOLpct=176970,HURST=174250]
+  XRPUSDT 2026-04: ticks=6,072,049  evalpts=121,441  (16s)  finite[ER_2h=121267,AC1_8h=121382,VR_8h=121341,VOLpct=121354,HURST=119860]
+
+====================================================================================================
+PREDICTIVE POWER OF EACH CAUSAL INDICATOR FOR THE FORWARD REGIME
+Spearman/Pearson (current indicator vs forward metric), quartile monotonicity, AUC (fwd>median).
+A real edge: |Spearman| meaningfully >0 AND same sign across ALL months AND AUC consistently away from 0.5.
+====================================================================================================
+
+############################################################################################
+### FORWARD METRIC = fwd_ER   HORIZON = H_2h
+############################################################################################
+
+  [ER_30m]  ->  fwd=fwd_ER  H=H_2h   (n=11004404)
+      POOLED:  Spearman=+0.2103   Pearson=+0.2748   AUC=0.5980   q-spread(Q4-Q1)=+0.0068  monotone=True
+      quartile means (Q1..Q4): +0.0100  +0.0106  +0.0123  +0.0168   ns=2751101,2751101,2751101,2751101
+      per-month Spearman: 01=+0.208 02=+0.204 03=+0.128 04=+0.120
+      per-month AUC:      01=0.597 02=0.595 03=0.553 04=0.553
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.120,0.208]; AUC range=[0.553,0.597]
+
+  [ER_2h]  ->  fwd=fwd_ER  H=H_2h   (n=10994739)
+      POOLED:  Spearman=+0.1622   Pearson=+0.2144   AUC=0.5760   q-spread(Q4-Q1)=+0.0053  monotone=True
+      quartile means (Q1..Q4): +0.0105  +0.0111  +0.0124  +0.0158   ns=2748685,2748684,2748685,2748685
+      per-month Spearman: 01=+0.135 02=+0.159 03=+0.079 04=+0.076
+      per-month AUC:      01=0.559 02=0.576 03=0.536 04=0.530
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.076,0.159]; AUC range=[0.530,0.576]
+
+  [ER_8h]  ->  fwd=fwd_ER  H=H_2h   (n=10948261)
+      POOLED:  Spearman=+0.0675   Pearson=+0.1109   AUC=0.5303   q-spread(Q4-Q1)=+0.0023  monotone=False
+      quartile means (Q1..Q4): +0.0119  +0.0116  +0.0121  +0.0142   ns=2737065,2737065,2737065,2737066
+      per-month Spearman: 01=+0.011 02=+0.056 03=+0.010 04=-0.001
+      per-month AUC:      01=0.499 02=0.525 03=0.502 04=0.499
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.001,0.056]; AUC range=[0.499,0.525]
+
+  [AC1_2h]  ->  fwd=fwd_ER  H=H_2h   (n=11002994)
+      POOLED:  Spearman=-0.0015   Pearson=-0.0095   AUC=0.4964   q-spread(Q4-Q1)=-0.0004  monotone=False
+      quartile means (Q1..Q4): +0.0125  +0.0126  +0.0126  +0.0121   ns=2750699,2750796,2750744,2750755
+      per-month Spearman: 01=+0.037 02=-0.003 03=-0.027 04=-0.033
+      per-month AUC:      01=0.511 02=0.490 03=0.489 04=0.487
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.003,0.037]; AUC range=[0.487,0.511]
+
+  [AC1_8h]  ->  fwd=fwd_ER  H=H_2h   (n=11002994)
+      POOLED:  Spearman=+0.0055   Pearson=-0.0014   AUC=0.5027   q-spread(Q4-Q1)=+0.0002  monotone=False
+      quartile means (Q1..Q4): +0.0120  +0.0131  +0.0124  +0.0123   ns=2750741,2750746,2750725,2750782
+      per-month Spearman: 01=+0.062 02=-0.017 03=-0.023 04=-0.037
+      per-month AUC:      01=0.524 02=0.484 03=0.492 04=0.485
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.017,0.062]; AUC range=[0.484,0.524]
+
+  [VR_2h]  ->  fwd=fwd_ER  H=H_2h   (n=11000024)
+      POOLED:  Spearman=-0.0218   Pearson=-0.0303   AUC=0.4873   q-spread(Q4-Q1)=-0.0010  monotone=True
+      quartile means (Q1..Q4): +0.0129  +0.0127  +0.0122  +0.0120   ns=2749937,2750074,2749999,2750014
+      per-month Spearman: 01=+0.057 02=-0.027 03=-0.022 04=-0.031
+      per-month AUC:      01=0.525 02=0.485 03=0.493 04=0.486
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.022,0.057]; AUC range=[0.485,0.525]
+
+  [VR_8h]  ->  fwd=fwd_ER  H=H_2h   (n=11000024)
+      POOLED:  Spearman=-0.0556   Pearson=-0.0540   AUC=0.4720   q-spread(Q4-Q1)=-0.0020  monotone=True
+      quartile means (Q1..Q4): +0.0135  +0.0128  +0.0120  +0.0115   ns=2749961,2750011,2750044,2750008
+      per-month Spearman: 01=+0.054 02=-0.081 03=-0.035 04=-0.055
+      per-month AUC:      01=0.522 02=0.454 03=0.491 04=0.476
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.035,0.081]; AUC range=[0.454,0.522]
+
+  [VOLpct_24h]  ->  fwd=fwd_ER  H=H_2h   (n=11000782)
+      POOLED:  Spearman=-0.1714   Pearson=-0.1762   AUC=0.4194   q-spread(Q4-Q1)=-0.0054  monotone=True
+      quartile means (Q1..Q4): +0.0152  +0.0128  +0.0118  +0.0099   ns=2745993,2746842,2747778,2760169
+      per-month Spearman: 01=-0.269 02=-0.168 03=-0.153 04=-0.103
+      per-month AUC:      01=0.371 02=0.425 03=0.428 04=0.455
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.103,0.269]; AUC range=[0.371,0.455]
+
+  [HURST_8h]  ->  fwd=fwd_ER  H=H_2h   (n=10903619)
+      POOLED:  Spearman=-0.0588   Pearson=-0.0824   AUC=0.4734   q-spread(Q4-Q1)=-0.0023  monotone=True
+      quartile means (Q1..Q4): +0.0139  +0.0123  +0.0118  +0.0116   ns=2725904,2725902,2725904,2725909
+      per-month Spearman: 01=-0.108 02=-0.025 03=-0.097 04=-0.079
+      per-month AUC:      01=0.448 02=0.488 03=0.457 04=0.464
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.025,0.108]; AUC range=[0.448,0.488]
+
+############################################################################################
+### FORWARD METRIC = fwd_ER   HORIZON = H_4h
+############################################################################################
+
+  [ER_30m]  ->  fwd=fwd_ER  H=H_4h   (n=10965959)
+      POOLED:  Spearman=+0.2181   Pearson=+0.2750   AUC=0.6033   q-spread(Q4-Q1)=+0.0046  monotone=True
+      quartile means (Q1..Q4): +0.0069  +0.0075  +0.0086  +0.0115   ns=2741490,2741489,2741490,2741490
+      per-month Spearman: 01=+0.223 02=+0.199 03=+0.141 04=+0.136
+      per-month AUC:      01=0.607 02=0.587 03=0.563 04=0.564
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.136,0.223]; AUC range=[0.563,0.607]
+
+  [ER_2h]  ->  fwd=fwd_ER  H=H_4h   (n=10956294)
+      POOLED:  Spearman=+0.1750   Pearson=+0.2230   AUC=0.5826   q-spread(Q4-Q1)=+0.0037  monotone=True
+      quartile means (Q1..Q4): +0.0073  +0.0076  +0.0086  +0.0110   ns=2739074,2739073,2739073,2739074
+      per-month Spearman: 01=+0.163 02=+0.173 03=+0.088 04=+0.068
+      per-month AUC:      01=0.576 02=0.574 03=0.535 04=0.530
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.068,0.173]; AUC range=[0.530,0.576]
+
+  [ER_8h]  ->  fwd=fwd_ER  H=H_4h   (n=10909816)
+      POOLED:  Spearman=+0.1012   Pearson=+0.1438   AUC=0.5471   q-spread(Q4-Q1)=+0.0022  monotone=False
+      quartile means (Q1..Q4): +0.0080  +0.0078  +0.0084  +0.0102   ns=2727454,2727454,2727454,2727454
+      per-month Spearman: 01=+0.055 02=+0.075 03=+0.033 04=+0.053
+      per-month AUC:      01=0.519 02=0.535 03=0.512 04=0.521
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.033,0.075]; AUC range=[0.512,0.535]
+
+  [AC1_2h]  ->  fwd=fwd_ER  H=H_4h   (n=10964549)
+      POOLED:  Spearman=-0.0020   Pearson=-0.0038   AUC=0.4979   q-spread(Q4-Q1)=-0.0000  monotone=False
+      quartile means (Q1..Q4): +0.0086  +0.0086  +0.0087  +0.0086   ns=2741128,2741098,2741183,2741140
+      per-month Spearman: 01=+0.027 02=-0.033 03=+0.026 04=-0.039
+      per-month AUC:      01=0.511 02=0.478 03=0.516 04=0.484
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.026,0.039]; AUC range=[0.478,0.516]
+
+  [AC1_8h]  ->  fwd=fwd_ER  H=H_4h   (n=10964549)
+      POOLED:  Spearman=-0.0107   Pearson=-0.0087   AUC=0.4966   q-spread(Q4-Q1)=-0.0001  monotone=False
+      quartile means (Q1..Q4): +0.0085  +0.0090  +0.0086  +0.0084   ns=2741115,2741157,2741138,2741139
+      per-month Spearman: 01=+0.050 02=-0.034 03=-0.031 04=-0.054
+      per-month AUC:      01=0.530 02=0.472 03=0.489 04=0.476
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.031,0.054]; AUC range=[0.472,0.530]
+
+  [VR_2h]  ->  fwd=fwd_ER  H=H_4h   (n=10961579)
+      POOLED:  Spearman=-0.0181   Pearson=-0.0157   AUC=0.4881   q-spread(Q4-Q1)=-0.0004  monotone=False
+      quartile means (Q1..Q4): +0.0089  +0.0086  +0.0085  +0.0085   ns=2740371,2740414,2740392,2740402
+      per-month Spearman: 01=+0.068 02=-0.052 03=+0.021 04=-0.030
+      per-month AUC:      01=0.531 02=0.471 03=0.514 04=0.486
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.021,0.068]; AUC range=[0.471,0.531]
+
+  [VR_8h]  ->  fwd=fwd_ER  H=H_4h   (n=10961579)
+      POOLED:  Spearman=-0.0673   Pearson=-0.0563   AUC=0.4670   q-spread(Q4-Q1)=-0.0014  monotone=True
+      quartile means (Q1..Q4): +0.0094  +0.0089  +0.0082  +0.0080   ns=2740383,2740377,2740423,2740396
+      per-month Spearman: 01=+0.051 02=-0.075 03=-0.053 04=-0.088
+      per-month AUC:      01=0.527 02=0.459 03=0.480 04=0.457
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.051,0.088]; AUC range=[0.457,0.527]
+
+  [VOLpct_24h]  ->  fwd=fwd_ER  H=H_4h   (n=10962337)
+      POOLED:  Spearman=-0.1255   Pearson=-0.1355   AUC=0.4398   q-spread(Q4-Q1)=-0.0027  monotone=True
+      quartile means (Q1..Q4): +0.0101  +0.0088  +0.0082  +0.0074   ns=2738382,2739551,2739927,2744477
+      per-month Spearman: 01=-0.173 02=-0.173 03=-0.092 04=-0.045
+      per-month AUC:      01=0.418 02=0.424 03=0.457 04=0.480
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.045,0.173]; AUC range=[0.418,0.480]
+
+  [HURST_8h]  ->  fwd=fwd_ER  H=H_4h   (n=10865174)
+      POOLED:  Spearman=-0.0668   Pearson=-0.0870   AUC=0.4688   q-spread(Q4-Q1)=-0.0017  monotone=True
+      quartile means (Q1..Q4): +0.0098  +0.0086  +0.0080  +0.0080   ns=2716246,2716335,2716264,2716329
+      per-month Spearman: 01=-0.129 02=-0.005 03=-0.110 04=-0.096
+      per-month AUC:      01=0.436 02=0.497 03=0.450 04=0.453
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.005,0.129]; AUC range=[0.436,0.497]
+
+############################################################################################
+### FORWARD METRIC = fwd_ER   HORIZON = H_8h
+############################################################################################
+
+  [ER_30m]  ->  fwd=fwd_ER  H=H_8h   (n=10820445)
+      POOLED:  Spearman=+0.2079   Pearson=+0.2565   AUC=0.5994   q-spread(Q4-Q1)=+0.0030  monotone=True
+      quartile means (Q1..Q4): +0.0051  +0.0054  +0.0063  +0.0081   ns=2705111,2705111,2705111,2705112
+      per-month Spearman: 01=+0.195 02=+0.193 03=+0.127 04=+0.101
+      per-month AUC:      01=0.591 02=0.587 03=0.561 04=0.545
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.101,0.195]; AUC range=[0.545,0.591]
+
+  [ER_2h]  ->  fwd=fwd_ER  H=H_8h   (n=10810780)
+      POOLED:  Spearman=+0.1771   Pearson=+0.2169   AUC=0.5845   q-spread(Q4-Q1)=+0.0026  monotone=True
+      quartile means (Q1..Q4): +0.0052  +0.0056  +0.0063  +0.0079   ns=2702695,2702695,2702695,2702695
+      per-month Spearman: 01=+0.112 02=+0.184 03=+0.106 04=+0.066
+      per-month AUC:      01=0.548 02=0.584 03=0.552 04=0.528
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.066,0.184]; AUC range=[0.528,0.584]
+
+  [ER_8h]  ->  fwd=fwd_ER  H=H_8h   (n=10764302)
+      POOLED:  Spearman=+0.1093   Pearson=+0.1417   AUC=0.5535   q-spread(Q4-Q1)=+0.0017  monotone=True
+      quartile means (Q1..Q4): +0.0057  +0.0057  +0.0061  +0.0074   ns=2691076,2691075,2691075,2691076
+      per-month Spearman: 01=+0.067 02=+0.075 03=+0.026 04=+0.064
+      per-month AUC:      01=0.524 02=0.535 03=0.512 04=0.526
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.026,0.075]; AUC range=[0.512,0.535]
+
+  [AC1_2h]  ->  fwd=fwd_ER  H=H_8h   (n=10819035)
+      POOLED:  Spearman=-0.0028   Pearson=-0.0038   AUC=0.4969   q-spread(Q4-Q1)=-0.0000  monotone=False
+      quartile means (Q1..Q4): +0.0063  +0.0060  +0.0062  +0.0063   ns=2704733,2704779,2704760,2704763
+      per-month Spearman: 01=-0.005 02=-0.057 03=+0.022 04=+0.029
+      per-month AUC:      01=0.498 02=0.461 03=0.513 04=0.512
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.005,0.057]; AUC range=[0.461,0.513]
+
+  [AC1_8h]  ->  fwd=fwd_ER  H=H_8h   (n=10819035)
+      POOLED:  Spearman=-0.0052   Pearson=-0.0063   AUC=0.4939   q-spread(Q4-Q1)=+0.0001  monotone=False
+      quartile means (Q1..Q4): +0.0062  +0.0063  +0.0061  +0.0063   ns=2704706,2704810,2704744,2704775
+      per-month Spearman: 01=-0.005 02=-0.022 03=-0.078 04=+0.054
+      per-month AUC:      01=0.498 02=0.478 03=0.465 04=0.522
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.005,0.078]; AUC range=[0.465,0.522]
+
+  [VR_2h]  ->  fwd=fwd_ER  H=H_8h   (n=10816065)
+      POOLED:  Spearman=-0.0347   Pearson=-0.0330   AUC=0.4778   q-spread(Q4-Q1)=-0.0004  monotone=False
+      quartile means (Q1..Q4): +0.0065  +0.0062  +0.0061  +0.0061   ns=2703988,2704039,2703988,2704050
+      per-month Spearman: 01=+0.008 02=-0.060 03=+0.002 04=-0.013
+      per-month AUC:      01=0.505 02=0.456 03=0.501 04=0.485
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.002,0.060]; AUC range=[0.456,0.505]
+
+  [VR_8h]  ->  fwd=fwd_ER  H=H_8h   (n=10816065)
+      POOLED:  Spearman=-0.0806   Pearson=-0.0654   AUC=0.4555   q-spread(Q4-Q1)=-0.0011  monotone=True
+      quartile means (Q1..Q4): +0.0069  +0.0063  +0.0060  +0.0058   ns=2704009,2703968,2704061,2704027
+      per-month Spearman: 01=-0.014 02=-0.073 03=-0.110 04=-0.021
+      per-month AUC:      01=0.489 02=0.449 03=0.447 04=0.480
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.014,0.110]; AUC range=[0.447,0.489]
+
+  [VOLpct_24h]  ->  fwd=fwd_ER  H=H_8h   (n=10816823)
+      POOLED:  Spearman=-0.0898   Pearson=-0.0897   AUC=0.4551   q-spread(Q4-Q1)=-0.0013  monotone=True
+      quartile means (Q1..Q4): +0.0069  +0.0063  +0.0061  +0.0056   ns=2703913,2698540,2704866,2709504
+      per-month Spearman: 01=-0.089 02=-0.168 03=-0.067 04=+0.029
+      per-month AUC:      01=0.453 02=0.410 03=0.466 04=0.516
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.029,0.168]; AUC range=[0.410,0.516]
+
+  [HURST_8h]  ->  fwd=fwd_ER  H=H_8h   (n=10719660)
+      POOLED:  Spearman=-0.0536   Pearson=-0.0679   AUC=0.4701   q-spread(Q4-Q1)=-0.0010  monotone=True
+      quartile means (Q1..Q4): +0.0069  +0.0062  +0.0059  +0.0059   ns=2679908,2679901,2679922,2679929
+      per-month Spearman: 01=-0.173 02=+0.032 03=-0.118 04=-0.054
+      per-month AUC:      01=0.411 02=0.517 03=0.435 04=0.475
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.032,0.173]; AUC range=[0.411,0.517]
+
+############################################################################################
+### FORWARD METRIC = fwd_TS   HORIZON = H_2h
+############################################################################################
+
+  [ER_30m]  ->  fwd=fwd_TS  H=H_2h   (n=11004404)
+      POOLED:  Spearman=-0.1276   Pearson=-0.1387   AUC=0.4382   q-spread(Q4-Q1)=-214.7615  monotone=True
+      quartile means (Q1..Q4): +681.5527  +654.2177  +572.5347  +466.7912   ns=2751101,2751101,2751101,2751101
+      per-month Spearman: 01=-0.113 02=-0.114 03=-0.091 04=-0.078
+      per-month AUC:      01=0.440 02=0.447 03=0.454 04=0.460
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.078,0.114]; AUC range=[0.440,0.460]
+
+  [ER_2h]  ->  fwd=fwd_TS  H=H_2h   (n=10994739)
+      POOLED:  Spearman=-0.1016   Pearson=-0.1086   AUC=0.4511   q-spread(Q4-Q1)=-157.8419  monotone=True
+      quartile means (Q1..Q4): +658.9335  +649.5453  +565.8767  +501.0916   ns=2748685,2748684,2748685,2748685
+      per-month Spearman: 01=-0.083 02=-0.100 03=-0.052 04=-0.025
+      per-month AUC:      01=0.458 02=0.447 03=0.474 04=0.483
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.025,0.100]; AUC range=[0.447,0.483]
+
+  [ER_8h]  ->  fwd=fwd_TS  H=H_2h   (n=10948261)
+      POOLED:  Spearman=-0.0661   Pearson=-0.0707   AUC=0.4662   q-spread(Q4-Q1)=-87.3344  monotone=False
+      quartile means (Q1..Q4): +614.5523  +642.2629  +594.1382  +527.2178   ns=2737065,2737065,2737065,2737066
+      per-month Spearman: 01=-0.038 02=-0.049 03=-0.028 04=-0.034
+      per-month AUC:      01=0.479 02=0.468 03=0.485 04=0.478
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.028,0.049]; AUC range=[0.468,0.485]
+
+  [AC1_2h]  ->  fwd=fwd_TS  H=H_2h   (n=11002994)
+      POOLED:  Spearman=+0.0061   Pearson=-0.0067   AUC=0.5045   q-spread(Q4-Q1)=-11.5461  monotone=False
+      quartile means (Q1..Q4): +595.2764  +604.9917  +591.1170  +583.7302   ns=2750699,2750796,2750744,2750755
+      per-month Spearman: 01=+0.024 02=-0.019 03=+0.032 04=+0.029
+      per-month AUC:      01=0.508 02=0.492 03=0.517 04=0.512
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.019,0.032]; AUC range=[0.492,0.517]
+
+  [AC1_8h]  ->  fwd=fwd_TS  H=H_2h   (n=11002994)
+      POOLED:  Spearman=-0.0252   Pearson=-0.0460   AUC=0.4913   q-spread(Q4-Q1)=-83.7960  monotone=True
+      quartile means (Q1..Q4): +634.6490  +623.1138  +566.5002  +550.8530   ns=2750741,2750746,2750725,2750782
+      per-month Spearman: 01=-0.023 02=-0.039 03=+0.010 04=+0.005
+      per-month AUC:      01=0.484 02=0.488 03=0.505 04=0.502
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.005,0.039]; AUC range=[0.484,0.505]
+
+  [VR_2h]  ->  fwd=fwd_TS  H=H_2h   (n=11000024)
+      POOLED:  Spearman=+0.0356   Pearson=+0.0089   AUC=0.5184   q-spread(Q4-Q1)=+15.9023  monotone=False
+      quartile means (Q1..Q4): +587.2353  +568.5902  +616.2169  +603.1377   ns=2749937,2750074,2749999,2750014
+      per-month Spearman: 01=+0.025 02=+0.008 03=+0.071 04=+0.010
+      per-month AUC:      01=0.509 02=0.507 03=0.533 04=0.506
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.008,0.071]; AUC range=[0.506,0.533]
+
+  [VR_8h]  ->  fwd=fwd_TS  H=H_2h   (n=11000024)
+      POOLED:  Spearman=+0.0099   Pearson=-0.0276   AUC=0.5079   q-spread(Q4-Q1)=-40.3654  monotone=False
+      quartile means (Q1..Q4): +592.7920  +621.8348  +608.1259  +552.4266   ns=2749961,2750011,2750044,2750008
+      per-month Spearman: 01=-0.010 02=-0.020 03=+0.034 04=-0.011
+      per-month AUC:      01=0.492 02=0.498 03=0.516 04=0.497
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.010,0.034]; AUC range=[0.492,0.516]
+
+  [VOLpct_24h]  ->  fwd=fwd_TS  H=H_2h   (n=11000782)
+      POOLED:  Spearman=+0.0996   Pearson=+0.1117   AUC=0.5476   q-spread(Q4-Q1)=+165.0464  monotone=True
+      quartile means (Q1..Q4): +497.9838  +574.5339  +639.2244  +663.0302   ns=2745993,2746842,2747778,2760169
+      per-month Spearman: 01=+0.116 02=+0.105 03=+0.044 04=+0.132
+      per-month AUC:      01=0.560 02=0.548 03=0.521 04=0.563
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.044,0.132]; AUC range=[0.521,0.563]
+
+  [HURST_8h]  ->  fwd=fwd_TS  H=H_2h   (n=10903619)
+      POOLED:  Spearman=+0.0350   Pearson=+0.0085   AUC=0.5220   q-spread(Q4-Q1)=+35.2735  monotone=True
+      quartile means (Q1..Q4): +577.9806  +593.6291  +595.3701  +613.2540   ns=2725904,2725902,2725904,2725909
+      per-month Spearman: 01=+0.101 02=-0.048 03=+0.127 04=+0.021
+      per-month AUC:      01=0.550 02=0.480 03=0.563 04=0.513
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.021,0.127]; AUC range=[0.480,0.563]
+
+############################################################################################
+### FORWARD METRIC = fwd_TS   HORIZON = H_4h
+############################################################################################
+
+  [ER_30m]  ->  fwd=fwd_TS  H=H_4h   (n=10965959)
+      POOLED:  Spearman=-0.0969   Pearson=-0.1135   AUC=0.4547   q-spread(Q4-Q1)=-215.0453  monotone=True
+      quartile means (Q1..Q4): +860.7902  +851.1761  +761.4789  +645.7449   ns=2741490,2741489,2741490,2741490
+      per-month Spearman: 01=-0.066 02=-0.100 03=-0.039 04=-0.040
+      per-month AUC:      01=0.468 02=0.455 03=0.479 04=0.479
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.039,0.100]; AUC range=[0.455,0.479]
+
+  [ER_2h]  ->  fwd=fwd_TS  H=H_4h   (n=10956294)
+      POOLED:  Spearman=-0.0821   Pearson=-0.0900   AUC=0.4598   q-spread(Q4-Q1)=-171.7028  monotone=True
+      quartile means (Q1..Q4): +858.2830  +824.6482  +751.2925  +686.5802   ns=2739074,2739073,2739073,2739074
+      per-month Spearman: 01=-0.037 02=-0.074 03=-0.035 04=-0.028
+      per-month AUC:      01=0.475 02=0.465 03=0.484 04=0.484
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.028,0.074]; AUC range=[0.465,0.484]
+
+  [ER_8h]  ->  fwd=fwd_TS  H=H_4h   (n=10909816)
+      POOLED:  Spearman=-0.0445   Pearson=-0.0580   AUC=0.4779   q-spread(Q4-Q1)=-97.7004  monotone=False
+      quartile means (Q1..Q4): +804.7694  +835.7371  +774.6243  +707.0691   ns=2727454,2727454,2727454,2727454
+      per-month Spearman: 01=+0.024 02=-0.044 03=-0.021 04=+0.001
+      per-month AUC:      01=0.508 02=0.476 03=0.485 04=0.505
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.001,0.044]; AUC range=[0.476,0.508]
+
+  [AC1_2h]  ->  fwd=fwd_TS  H=H_4h   (n=10964549)
+      POOLED:  Spearman=-0.0061   Pearson=-0.0178   AUC=0.4987   q-spread(Q4-Q1)=-31.1124  monotone=True
+      quartile means (Q1..Q4): +796.0914  +780.7819  +777.5205  +764.9790   ns=2741128,2741098,2741183,2741140
+      per-month Spearman: 01=+0.000 02=-0.038 03=+0.055 04=-0.001
+      per-month AUC:      01=0.504 02=0.479 03=0.527 04=0.499
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.000,0.055]; AUC range=[0.479,0.527]
+
+  [AC1_8h]  ->  fwd=fwd_TS  H=H_4h   (n=10964549)
+      POOLED:  Spearman=-0.0507   Pearson=-0.0556   AUC=0.4769   q-spread(Q4-Q1)=-136.7882  monotone=True
+      quartile means (Q1..Q4): +836.9969  +816.3207  +765.8466  +700.2087   ns=2741115,2741157,2741138,2741139
+      per-month Spearman: 01=-0.062 02=-0.032 03=-0.033 04=-0.031
+      per-month AUC:      01=0.474 02=0.484 03=0.483 04=0.480
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.031,0.062]; AUC range=[0.474,0.484]
+
+  [VR_2h]  ->  fwd=fwd_TS  H=H_4h   (n=10961579)
+      POOLED:  Spearman=+0.0298   Pearson=+0.0180   AUC=0.5148   q-spread(Q4-Q1)=+43.9000  monotone=False
+      quartile means (Q1..Q4): +754.7739  +752.9890  +813.3978  +798.6740   ns=2740371,2740414,2740392,2740402
+      per-month Spearman: 01=+0.033 02=+0.001 03=+0.069 04=-0.010
+      per-month AUC:      01=0.517 02=0.496 03=0.532 04=0.496
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.001,0.069]; AUC range=[0.496,0.532]
+
+  [VR_8h]  ->  fwd=fwd_TS  H=H_4h   (n=10961579)
+      POOLED:  Spearman=-0.0078   Pearson=-0.0148   AUC=0.4970   q-spread(Q4-Q1)=-24.0839  monotone=False
+      quartile means (Q1..Q4): +749.8153  +836.2867  +808.0013  +725.7314   ns=2740383,2740377,2740423,2740396
+      per-month Spearman: 01=-0.015 02=+0.005 03=-0.024 04=-0.064
+      per-month AUC:      01=0.494 02=0.502 03=0.489 04=0.466
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.005,0.064]; AUC range=[0.466,0.502]
+
+  [VOLpct_24h]  ->  fwd=fwd_TS  H=H_4h   (n=10962337)
+      POOLED:  Spearman=+0.0836   Pearson=+0.0786   AUC=0.5417   q-spread(Q4-Q1)=+154.0198  monotone=True
+      quartile means (Q1..Q4): +698.0804  +762.1724  +807.1894  +852.1002   ns=2738382,2739551,2739927,2744477
+      per-month Spearman: 01=+0.141 02=+0.049 03=+0.042 04=+0.126
+      per-month AUC:      01=0.565 02=0.527 03=0.522 04=0.563
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.042,0.141]; AUC range=[0.522,0.565]
+
+  [HURST_8h]  ->  fwd=fwd_TS  H=H_4h   (n=10865174)
+      POOLED:  Spearman=+0.0106   Pearson=+0.0006   AUC=0.5084   q-spread(Q4-Q1)=+9.2140  monotone=False
+      quartile means (Q1..Q4): +759.9874  +803.4966  +793.7771  +769.2014   ns=2716246,2716335,2716264,2716329
+      per-month Spearman: 01=+0.063 02=-0.029 03=+0.067 04=-0.007
+      per-month AUC:      01=0.533 02=0.490 03=0.531 04=0.501
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.007,0.067]; AUC range=[0.490,0.533]
+
+############################################################################################
+### FORWARD METRIC = fwd_TS   HORIZON = H_8h
+############################################################################################
+
+  [ER_30m]  ->  fwd=fwd_TS  H=H_8h   (n=10820445)
+      POOLED:  Spearman=-0.0609   Pearson=-0.0808   AUC=0.4709   q-spread(Q4-Q1)=-207.6295  monotone=True
+      quartile means (Q1..Q4): +1131.1883  +1075.4396  +1014.1753  +923.5588   ns=2705111,2705111,2705111,2705112
+      per-month Spearman: 01=+0.013 02=-0.064 03=-0.021 04=-0.031
+      per-month AUC:      01=0.502 02=0.475 03=0.486 04=0.483
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.013,0.064]; AUC range=[0.475,0.502]
+
+  [ER_2h]  ->  fwd=fwd_TS  H=H_8h   (n=10810780)
+      POOLED:  Spearman=-0.0456   Pearson=-0.0614   AUC=0.4743   q-spread(Q4-Q1)=-125.3805  monotone=True
+      quartile means (Q1..Q4): +1090.9754  +1088.3273  +1000.1356  +965.5948   ns=2702695,2702695,2702695,2702695
+      per-month Spearman: 01=+0.005 02=-0.023 03=+0.009 04=-0.030
+      per-month AUC:      01=0.497 02=0.487 03=0.498 04=0.480
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.005,0.030]; AUC range=[0.480,0.498]
+
+  [ER_8h]  ->  fwd=fwd_TS  H=H_8h   (n=10764302)
+      POOLED:  Spearman=-0.0291   Pearson=-0.0649   AUC=0.4887   q-spread(Q4-Q1)=-138.0116  monotone=False
+      quartile means (Q1..Q4): +1073.6500  +1124.3219  +1012.5679  +935.6384   ns=2691076,2691075,2691075,2691076
+      per-month Spearman: 01=+0.073 02=-0.039 03=-0.005 04=-0.004
+      per-month AUC:      01=0.535 02=0.484 03=0.502 04=0.492
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.004,0.073]; AUC range=[0.484,0.535]
+
+  [AC1_2h]  ->  fwd=fwd_TS  H=H_8h   (n=10819035)
+      POOLED:  Spearman=-0.0066   Pearson=-0.0276   AUC=0.4964   q-spread(Q4-Q1)=-72.6604  monotone=False
+      quartile means (Q1..Q4): +1089.5959  +1012.8784  +1024.8523  +1016.9355   ns=2704733,2704779,2704760,2704763
+      per-month Spearman: 01=-0.019 02=-0.045 03=+0.029 04=+0.051
+      per-month AUC:      01=0.493 02=0.482 03=0.509 04=0.520
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.019,0.051]; AUC range=[0.482,0.520]
+
+  [AC1_8h]  ->  fwd=fwd_TS  H=H_8h   (n=10819035)
+      POOLED:  Spearman=-0.0312   Pearson=-0.0332   AUC=0.4805   q-spread(Q4-Q1)=-101.7980  monotone=False
+      quartile means (Q1..Q4): +1081.6699  +1035.4152  +1047.3058  +979.8719   ns=2704706,2704810,2704744,2704775
+      per-month Spearman: 01=-0.090 02=+0.023 03=-0.095 04=+0.063
+      per-month AUC:      01=0.458 02=0.512 03=0.449 04=0.519
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.023,0.095]; AUC range=[0.449,0.519]
+
+  [VR_2h]  ->  fwd=fwd_TS  H=H_8h   (n=10816065)
+      POOLED:  Spearman=+0.0203   Pearson=+0.0033   AUC=0.5079   q-spread(Q4-Q1)=+30.3323  monotone=False
+      quartile means (Q1..Q4): +1013.2219  +1019.9721  +1067.5050  +1043.5541   ns=2703988,2704039,2703988,2704050
+      per-month Spearman: 01=+0.004 02=+0.015 03=+0.021 04=+0.000
+      per-month AUC:      01=0.499 02=0.512 03=0.508 04=0.494
+      STABILITY: spearman sign consistent across months = True; |sp| range=[0.000,0.021]; AUC range=[0.494,0.512]
+
+  [VR_8h]  ->  fwd=fwd_TS  H=H_8h   (n=10816065)
+      POOLED:  Spearman=-0.0075   Pearson=-0.0116   AUC=0.4944   q-spread(Q4-Q1)=-23.2280  monotone=False
+      quartile means (Q1..Q4): +1004.3116  +1092.9714  +1065.8870  +981.0836   ns=2704009,2703968,2704061,2704027
+      per-month Spearman: 01=-0.054 02=+0.047 03=-0.094 04=-0.016
+      per-month AUC:      01=0.475 02=0.527 03=0.456 04=0.485
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.016,0.094]; AUC range=[0.456,0.527]
+
+  [VOLpct_24h]  ->  fwd=fwd_TS  H=H_8h   (n=10816823)
+      POOLED:  Spearman=+0.0409   Pearson=+0.0147   AUC=0.5247   q-spread(Q4-Q1)=+30.8787  monotone=False
+      quartile means (Q1..Q4): +1027.7695  +1019.6406  +1038.0992  +1058.6482   ns=2703913,2698540,2704866,2709504
+      per-month Spearman: 01=+0.094 02=-0.004 03=+0.006 04=+0.117
+      per-month AUC:      01=0.552 02=0.508 03=0.504 04=0.557
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.004,0.117]; AUC range=[0.504,0.557]
+
+  [HURST_8h]  ->  fwd=fwd_TS  H=H_8h   (n=10719660)
+      POOLED:  Spearman=+0.0045   Pearson=+0.0021   AUC=0.5031   q-spread(Q4-Q1)=+13.0364  monotone=False
+      quartile means (Q1..Q4): +1006.2920  +1075.4626  +1049.1439  +1019.3284   ns=2679908,2679901,2679922,2679929
+      per-month Spearman: 01=-0.018 02=+0.005 03=+0.045 04=+0.011
+      per-month AUC:      01=0.497 02=0.503 03=0.520 04=0.506
+      STABILITY: spearman sign consistent across months = False; |sp| range=[0.005,0.045]; AUC range=[0.497,0.520]
+
+====================================================================================================
+COMPACT SUMMARY: pooled Spearman & AUC, and cross-month STABILITY (sign-consistent & |sp| min)
+====================================================================================================
+   indicator     fwd     H | pooled_sp pooled_AUC | mo_sp_signOK min|sp|_mo  AUCmin  AUCmax
+----------------------------------------------------------------------------------------------------
+      ER_30m  fwd_ER  H_2h |   +0.2103     0.5980 |         True     0.1197   0.553   0.597
+       ER_2h  fwd_ER  H_2h |   +0.1622     0.5760 |         True     0.0763   0.530   0.576
+       ER_8h  fwd_ER  H_2h |   +0.0675     0.5303 |        False     0.0008   0.499   0.525
+      AC1_2h  fwd_ER  H_2h |   -0.0015     0.4964 |        False     0.0035   0.487   0.511
+      AC1_8h  fwd_ER  H_2h |   +0.0055     0.5027 |        False     0.0175   0.484   0.524
+       VR_2h  fwd_ER  H_2h |   -0.0218     0.4873 |        False     0.0219   0.485   0.525
+       VR_8h  fwd_ER  H_2h |   -0.0556     0.4720 |        False     0.0346   0.454   0.522
+  VOLpct_24h  fwd_ER  H_2h |   -0.1714     0.4194 |         True     0.1034   0.371   0.455
+    HURST_8h  fwd_ER  H_2h |   -0.0588     0.4734 |         True     0.0246   0.448   0.488
+      ER_30m  fwd_ER  H_4h |   +0.2181     0.6033 |         True     0.1358   0.563   0.607
+       ER_2h  fwd_ER  H_4h |   +0.1750     0.5826 |         True     0.0684   0.530   0.576
+       ER_8h  fwd_ER  H_4h |   +0.1012     0.5471 |         True     0.0325   0.512   0.535
+      AC1_2h  fwd_ER  H_4h |   -0.0020     0.4979 |        False     0.0263   0.478   0.516
+      AC1_8h  fwd_ER  H_4h |   -0.0107     0.4966 |        False     0.0312   0.472   0.530
+       VR_2h  fwd_ER  H_4h |   -0.0181     0.4881 |        False     0.0205   0.471   0.531
+       VR_8h  fwd_ER  H_4h |   -0.0673     0.4670 |        False     0.0508   0.457   0.527
+  VOLpct_24h  fwd_ER  H_4h |   -0.1255     0.4398 |         True     0.0445   0.418   0.480
+    HURST_8h  fwd_ER  H_4h |   -0.0668     0.4688 |         True     0.0052   0.436   0.497
+      ER_30m  fwd_ER  H_8h |   +0.2079     0.5994 |         True     0.1005   0.545   0.591
+       ER_2h  fwd_ER  H_8h |   +0.1771     0.5845 |         True     0.0657   0.528   0.584
+       ER_8h  fwd_ER  H_8h |   +0.1093     0.5535 |         True     0.0263   0.512   0.535
+      AC1_2h  fwd_ER  H_8h |   -0.0028     0.4969 |        False     0.0052   0.461   0.513
+      AC1_8h  fwd_ER  H_8h |   -0.0052     0.4939 |        False     0.0049   0.465   0.522
+       VR_2h  fwd_ER  H_8h |   -0.0347     0.4778 |        False     0.0021   0.456   0.505
+       VR_8h  fwd_ER  H_8h |   -0.0806     0.4555 |         True     0.0137   0.447   0.489
+  VOLpct_24h  fwd_ER  H_8h |   -0.0898     0.4551 |        False     0.0293   0.410   0.516
+    HURST_8h  fwd_ER  H_8h |   -0.0536     0.4701 |        False     0.0322   0.411   0.517
+      ER_30m  fwd_TS  H_2h |   -0.1276     0.4382 |         True     0.0776   0.440   0.460
+       ER_2h  fwd_TS  H_2h |   -0.1016     0.4511 |         True     0.0251   0.447   0.483
+       ER_8h  fwd_TS  H_2h |   -0.0661     0.4662 |         True     0.0283   0.468   0.485
+      AC1_2h  fwd_TS  H_2h |   +0.0061     0.5045 |        False     0.0189   0.492   0.517
+      AC1_8h  fwd_TS  H_2h |   -0.0252     0.4913 |        False     0.0049   0.484   0.505
+       VR_2h  fwd_TS  H_2h |   +0.0356     0.5184 |         True     0.0081   0.506   0.533
+       VR_8h  fwd_TS  H_2h |   +0.0099     0.5079 |        False     0.0096   0.492   0.516
+  VOLpct_24h  fwd_TS  H_2h |   +0.0996     0.5476 |         True     0.0437   0.521   0.563
+    HURST_8h  fwd_TS  H_2h |   +0.0350     0.5220 |        False     0.0209   0.480   0.563
+      ER_30m  fwd_TS  H_4h |   -0.0969     0.4547 |         True     0.0392   0.455   0.479
+       ER_2h  fwd_TS  H_4h |   -0.0821     0.4598 |         True     0.0284   0.465   0.484
+       ER_8h  fwd_TS  H_4h |   -0.0445     0.4779 |        False     0.0005   0.476   0.508
+      AC1_2h  fwd_TS  H_4h |   -0.0061     0.4987 |        False     0.0004   0.479   0.527
+      AC1_8h  fwd_TS  H_4h |   -0.0507     0.4769 |         True     0.0313   0.474   0.484
+       VR_2h  fwd_TS  H_4h |   +0.0298     0.5148 |        False     0.0006   0.496   0.532
+       VR_8h  fwd_TS  H_4h |   -0.0078     0.4970 |        False     0.0047   0.466   0.502
+  VOLpct_24h  fwd_TS  H_4h |   +0.0836     0.5417 |         True     0.0422   0.522   0.565
+    HURST_8h  fwd_TS  H_4h |   +0.0106     0.5084 |        False     0.0070   0.490   0.533
+      ER_30m  fwd_TS  H_8h |   -0.0609     0.4709 |        False     0.0127   0.475   0.502
+       ER_2h  fwd_TS  H_8h |   -0.0456     0.4743 |        False     0.0050   0.480   0.498
+       ER_8h  fwd_TS  H_8h |   -0.0291     0.4887 |        False     0.0045   0.484   0.535
+      AC1_2h  fwd_TS  H_8h |   -0.0066     0.4964 |        False     0.0190   0.482   0.520
+      AC1_8h  fwd_TS  H_8h |   -0.0312     0.4805 |        False     0.0232   0.449   0.519
+       VR_2h  fwd_TS  H_8h |   +0.0203     0.5079 |         True     0.0003   0.494   0.512
+       VR_8h  fwd_TS  H_8h |   -0.0075     0.4944 |        False     0.0155   0.456   0.527
+  VOLpct_24h  fwd_TS  H_8h |   +0.0409     0.5247 |        False     0.0043   0.504   0.557
+    HURST_8h  fwd_TS  H_8h |   +0.0045     0.5031 |        False     0.0050   0.497   0.520
+
+====================================================================================================
+VERDICT HEURISTIC (automated; final judgment in the written report)
+====================================================================================================
+  13 (indicator,fwd,H) combos pass the cross-month-stable predictive bar:
+          ER_30m -> fwd_ER H_4h: pooled_sp=+0.2181 min_mo|sp|=0.1358 pooled_AUC=0.6033 (|AUC-.5|=0.103)
+          ER_30m -> fwd_ER H_2h: pooled_sp=+0.2103 min_mo|sp|=0.1197 pooled_AUC=0.5980 (|AUC-.5|=0.098)
+          ER_30m -> fwd_ER H_8h: pooled_sp=+0.2079 min_mo|sp|=0.1005 pooled_AUC=0.5994 (|AUC-.5|=0.099)
+           ER_2h -> fwd_ER H_8h: pooled_sp=+0.1771 min_mo|sp|=0.0657 pooled_AUC=0.5845 (|AUC-.5|=0.084)
+           ER_2h -> fwd_ER H_4h: pooled_sp=+0.1750 min_mo|sp|=0.0684 pooled_AUC=0.5826 (|AUC-.5|=0.083)
+      VOLpct_24h -> fwd_ER H_2h: pooled_sp=-0.1714 min_mo|sp|=0.1034 pooled_AUC=0.4194 (|AUC-.5|=0.081)
+           ER_2h -> fwd_ER H_2h: pooled_sp=+0.1622 min_mo|sp|=0.0763 pooled_AUC=0.5760 (|AUC-.5|=0.076)
+          ER_30m -> fwd_TS H_2h: pooled_sp=-0.1276 min_mo|sp|=0.0776 pooled_AUC=0.4382 (|AUC-.5|=0.062)
+      VOLpct_24h -> fwd_ER H_4h: pooled_sp=-0.1255 min_mo|sp|=0.0445 pooled_AUC=0.4398 (|AUC-.5|=0.060)
+           ER_8h -> fwd_ER H_4h: pooled_sp=+0.1012 min_mo|sp|=0.0325 pooled_AUC=0.5471 (|AUC-.5|=0.047)
+      VOLpct_24h -> fwd_TS H_2h: pooled_sp=+0.0996 min_mo|sp|=0.0437 pooled_AUC=0.5476 (|AUC-.5|=0.048)
+          ER_30m -> fwd_TS H_4h: pooled_sp=-0.0969 min_mo|sp|=0.0392 pooled_AUC=0.4547 (|AUC-.5|=0.045)
+      VOLpct_24h -> fwd_TS H_4h: pooled_sp=+0.0836 min_mo|sp|=0.0422 pooled_AUC=0.5417 (|AUC-.5|=0.042)
+
+[done] total 2401s

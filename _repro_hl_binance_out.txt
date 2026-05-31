@@ -1,0 +1,14 @@
+=== REPRODUCTION HL vs BINANCE (memes dates, meme fade) ===
+
+    pair   week  HL_n  HL_net  BN_n  BN_net   ecart
+     BTC   W507    14    10.4    14   -29.3   -39.7  (58s)
+     BTC   W516    15     6.5    13    -8.3   -14.9  (115s)
+     ETH   W507    14    19.0    15    30.8    11.8  (168s)
+     ETH   W516    16     4.2    14     6.7     2.4  (226s)
+     SOL   W507    16     5.3    14    55.7    50.4  (288s)
+     SOL   W516    14    30.2    14    18.2   -12.0  (321s)
+     XRP   W507    15    35.8    17     7.8   -28.1  (383s)
+     XRP   W516    13    17.1    15     4.0   -13.1  (409s)
+
+  -> si HL_net ~= BN_net partout : pipeline Binance REPRODUIT HL -> reconstruction saine.
+[done] 409s

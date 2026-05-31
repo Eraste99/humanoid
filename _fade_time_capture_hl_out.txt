@@ -1,0 +1,33 @@
+=== TEMPS DE CAPTURE fade-extension (regimes tendanciels) — HL vrai mid L2, in-sample, cap 2h ===
+question user : temps moyen pour capturer +7 bps + MAE (chaleur) avant rebond.
+
+--- HYPEUSDC (regimes tendanciels, fade) ---
+                     all | n=  798 | +5:  97% +7:  96% +10:  95% | t+7 med=  0.5m mean=  4.9m | MAEmed=  -8.8 MFEmed=+120.2 | final~ +0.9
+                MEAN-REV | n=  483 | +5:  97% +7:  96% +10:  94% | t+7 med=  0.5m mean=  5.2m | MAEmed=  -8.8 MFEmed=+112.5 | final~ +8.8
+                  CONTIN | n=  315 | +5:  98% +7:  97% +10:  97% | t+7 med=  0.4m mean=  4.4m | MAEmed=  -8.3 MFEmed=+132.6 | final~-11.3
+--- BTCUSDC (regimes tendanciels, fade) ---
+                     all | n=  102 | +5:  98% +7:  97% +10:  95% | t+7 med=  1.3m mean=  7.8m | MAEmed=  -6.3 MFEmed=+48.9 | final~+14.1
+                MEAN-REV | n=   78 | +5:  97% +7:  96% +10:  94% | t+7 med=  1.3m mean=  7.2m | MAEmed=  -6.3 MFEmed=+46.5 | final~+12.7
+                  CONTIN | n=   24 | +5: 100% +7: 100% +10: 100% | t+7 med=  1.5m mean=  9.8m | MAEmed=  -6.0 MFEmed=+55.6 | final~+18.7
+--- ETHUSDC (regimes tendanciels, fade) ---
+                     all | n=  154 | +5:  91% +7:  90% +10:  88% | t+7 med=  1.2m mean=  6.7m | MAEmed=  -7.9 MFEmed=+49.7 | final~ +4.7
+                MEAN-REV | n=  118 | +5:  92% +7:  91% +10:  90% | t+7 med=  0.7m mean=  4.2m | MAEmed=  -7.0 MFEmed=+55.1 | final~+12.5
+                  CONTIN | n=   36 | +5:  86% +7:  86% +10:  83% | t+7 med=  3.8m mean= 15.4m | MAEmed= -11.7 MFEmed=+35.9 | final~-21.0
+--- SOLUSDC (regimes tendanciels, fade) ---
+                     all | n=  188 | +5:  94% +7:  94% +10:  89% | t+7 med=  1.5m mean=  8.2m | MAEmed=  -7.8 MFEmed=+58.2 | final~+13.3
+                MEAN-REV | n=  136 | +5:  94% +7:  93% +10:  89% | t+7 med=  1.5m mean=  7.0m | MAEmed=  -7.9 MFEmed=+60.0 | final~+17.7
+                  CONTIN | n=   52 | +5:  94% +7:  94% +10:  90% | t+7 med=  2.6m mean= 11.4m | MAEmed=  -6.4 MFEmed=+55.2 | final~ +1.6
+--- XRPUSDC (regimes tendanciels, fade) ---
+                     all | n=  144 | +5:  93% +7:  92% +10:  91% | t+7 med=  1.6m mean=  6.5m | MAEmed=  -6.4 MFEmed=+51.7 | final~+15.3
+                MEAN-REV | n=  111 | +5:  93% +7:  92% +10:  90% | t+7 med=  1.6m mean=  6.8m | MAEmed=  -7.1 MFEmed=+50.8 | final~+19.6
+                  CONTIN | n=   33 | +5:  94% +7:  94% +10:  94% | t+7 med=  1.8m mean=  5.8m | MAEmed=  -5.8 MFEmed=+53.5 | final~ +0.6
+
+=== POOL 5 actifs ===
+                     all | n= 1386 | +5:  96% +7:  95% +10:  93% | t+7 med=  0.8m mean=  5.9m | MAEmed=  -7.8 MFEmed=+75.9 | final~ +5.5
+                MEAN-REV | n=  926 | +5:  95% +7:  94% +10:  92% | t+7 med=  0.8m mean=  5.7m | MAEmed=  -7.9 MFEmed=+71.9 | final~+12.2
+                  CONTIN | n=  460 | +5:  96% +7:  96% +10:  95% | t+7 med=  0.8m mean=  6.4m | MAEmed=  -7.5 MFEmed=+83.8 | final~ -8.2
+
+  LECTURE : t+7 med/mean = combien de minutes pour capturer 7 bps. MAEmed = creux adverse median a tenir
+            avant le rebond (si MAE ~ -spread c'est doux ; si MAE tres negatif = il faut encaisser une plonge).
+
+[done] 46s

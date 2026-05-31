@@ -1,0 +1,49 @@
+=== BORNE SUP du SWITCH DE REGIME PARFAIT (hindsight) — Binance 4 majors Jan->Mai ===
+PERFECT: semaine TREND(|drift| hebdo realise >= median)->RIDE ; CHOP->FADE. vs always/random/realized(causal).
+
+  BTCUSDT 2026-01: events=46
+  BTCUSDT 2026-02: events=51
+  BTCUSDT 2026-03: events=64
+  BTCUSDT 2026-04: events=61
+  BTCUSDT MAY: events=33
+  ETHUSDT 2026-01: events=47
+  ETHUSDT 2026-02: events=54
+  ETHUSDT 2026-03: events=66
+  ETHUSDT 2026-04: events=64
+  ETHUSDT MAY: events=32
+  SOLUSDT 2026-01: events=43
+  SOLUSDT 2026-02: events=40
+  SOLUSDT 2026-03: events=55
+  SOLUSDT 2026-04: events=59
+  SOLUSDT MAY: events=31
+  XRPUSDT 2026-01: events=42
+  XRPUSDT 2026-02: events=32
+  XRPUSDT 2026-03: events=48
+  XRPUSDT 2026-04: events=59
+  XRPUSDT MAY: events=33
+
+  total events = 960
+
+  seuil TREND/CHOP = mediane |drift| hebdo = 355 bps ; #weeks trend(parfait)=480/960
+
+========================================================================================================
+(1) FEE-ONLY fixe 4h (maker 3bps) — borne sup GROSS.     01     02     03     04     05
+========================================================================================================
+      ALWAYS-TREND(ride) | net= +3.54 t= +0.7 (n=960) |  +27.2  +20.6   -5.1  -11.6   -8.4
+             ALWAYS-FADE | net= -9.54 t= -2.0 (n=960) |  -33.2  -26.6   -0.9   +5.6   +2.4
+          PERFECT-SWITCH | net= +1.16 t= +0.2 (n=960) |  +13.4  -10.9   +2.9   -1.0   +1.6
+   REALIZED-SWITCH(caus) | net= +1.79 t= +0.4 (n=960) |  +10.2   +2.5   -1.1   +2.3   -6.4
+                  RANDOM | net= -3.00 t= -6.8 (n=960) |   -3.4   -2.2   -2.5   -4.0   -2.5
+
+========================================================================================================
+(2) REALISTE — fade=TP100mk/SL150tk ; trend=trailing50/30 tk.     01     02     03     04     05
+========================================================================================================
+       ALWAYS-FADE(real) | net= -4.54 t= -1.3 (n=960) |  -18.3   -8.2   -4.5   +8.5   -5.2
+      ALWAYS-TREND(real) | net= -0.78 t= -0.2 (n=960) |  +15.5  -10.9   +1.4   -6.2   -3.3
+    PERFECT-SWITCH(real) | net= +0.45 t= +0.1 (n=960) |   +6.2  -19.1   +7.4   +4.5   -0.6
+   REALIZED-SWITCH(real) | net= +0.03 t= +0.0 (n=960) |  +10.4   -8.9   -2.4   +6.0   -8.9
+
+  LECTURE : si PERFECT-SWITCH(real) >> 0 et >> REALIZED -> la DETECTION est le goulot (ca vaut le coup).
+            si PERFECT-SWITCH(real) ~ break-even -> edge trop fin (efficience), detecter ne sauve rien.
+
+[done] 740s

@@ -1,0 +1,80 @@
+=== FLOW-EXHAUSTION MECHANISM — Binance 4 majors Jan->May, MAY=OOS, tick-level ===
+    EXHAUSTING (deceleration<0) -> fade should win ; SUSTAINED (>=0) -> ride should win.
+    Tested separately for UP-moves and DOWN-moves. Leading vs coincident checked.
+
+  total events = 954  (UP=443 DOWN=511 | MAY OOS=125)
+  deceleration: median=+0.254  EXHAUSTING(decel<0)=234  SUSTAINED(decel>=0)=720
+
+========================================================================================================
+A  CORE MECHANISM — split by DECELERATION sign. RIDE_net (move-dir fwd - 3bps). FADE_net = -that-... here = -sf-3.
+   EXHAUSTING => expect RIDE<0 (fade wins) ; SUSTAINED => expect RIDE>0 (continuation). [n] in parens.
+========================================================================================================
+
+  --- ALL ---
+                subset |     RIDE@1h     RIDE@4h     RIDE@8h | t(ride4)
+    EXHAUSTING decel<0 |    +9.8[234]    +7.7[234]    +6.4[234] |    +0.68
+    SUSTAINED decel>=0 |    +0.4[720]    +2.6[720]    +0.2[720] |    +0.49
+     -> FADE@4h E vs S | exh=  -13.7  sus=   -8.6  sep(E-S)=   -5.1
+
+  --- UP (d>0) ---
+                subset |     RIDE@1h     RIDE@4h     RIDE@8h | t(ride4)
+    EXHAUSTING decel<0 |    +4.0[110]    -1.2[110]    +4.6[110] |    -0.07
+    SUSTAINED decel>=0 |    -2.0[333]    +2.0[333]    +0.7[333] |    +0.26
+     -> FADE@4h E vs S | exh=   -4.8  sus=   -8.0  sep(E-S)=   +3.2
+
+  --- DOWN (d<0) ---
+                subset |     RIDE@1h     RIDE@4h     RIDE@8h | t(ride4)
+    EXHAUSTING decel<0 |   +14.9[124]   +15.6[124]    +8.0[124] |    +1.01
+    SUSTAINED decel>=0 |    +2.5[387]    +3.1[387]    -0.2[387] |    +0.42
+     -> FADE@4h E vs S | exh=  -21.6  sus=   -9.1  sep(E-S)=  -12.4
+
+========================================================================================================
+B  DOSE-RESPONSE — deceleration quartiles (Q1=most exhausting ... Q4=most sustained). RIDE_net@4h.
+   Monotone (Q1 most negative ride / Q4 most positive) = mechanism real, not threshold artifact.
+========================================================================================================
+      UP (d>0) | Q1:  -0.9[111]  Q2:  +5.5[111]  Q3:  +7.8[110]  Q4:  -7.5[111]
+    DOWN (d<0) | Q1: +20.5[128]  Q2:  +7.1[128]  Q3:  +3.1[127]  Q4:  -6.1[128]
+
+========================================================================================================
+C  LEADING vs COINCIDENT — when we flag EXHAUSTING, is price STILL EXTENDED shortly after?
+   lead = move-dir return at +30m / +60m. If EXHAUSTING & lead>0 then reversal (fade@4h) but price
+   still up at +30/60m => signal LEADS the turn. If lead<=0 already => coincident with the turn.
+========================================================================================================
+                  subset |  lead+30m  lead+60m   ride@4h | reading
+     UP (d>0) EXHAUSTING |      -2.9      +7.0      -1.2 | coincident/already-turned
+      UP (d>0) SUSTAINED |      -1.0      +1.0      +2.0 | continuation
+   DOWN (d<0) EXHAUSTING |      +6.9     +17.9     +15.6 | extended+no reversal
+    DOWN (d<0) SUSTAINED |      -0.5      +5.5      +3.1 | continuation
+
+========================================================================================================
+D  ROBUSTNESS — FADE_net@4h on the EXHAUSTING subset (the tradeable claim), split UP / DOWN.
+   per ASSET and per MONTH (MAY=OOS). Positive = fading exhausting moves profitable.
+========================================================================================================
+
+  --- UP exhausting (pooled n=110  FADE@4h=-4.8  t=-0.29) ---
+    by asset |         BTC         ETH         SOL         XRP
+    FADE_net |  +11.6[13]  -98.1[15]  +12.9[38]   +6.9[44]
+    by month |          01          02          03          04         MAY
+    FADE_net |  -23.5[16]  -65.4[17]  +50.4[26]  -25.5[35]  +34.0[16]
+
+  --- DOWN exhausting (pooled n=124  FADE@4h=-21.6  t=-1.40) ---
+    by asset |         BTC         ETH         SOL         XRP
+    FADE_net |  -22.5[18]  -11.4[14]  -20.1[51]  -26.4[41]
+    by month |          01          02          03          04         MAY
+    FADE_net |  -71.6[19]  -68.0[26]  -17.3[26]   +8.3[32]  +30.3[21]
+
+========================================================================================================
+E  NULL — strategy: FADE if EXHAUSTING else RIDE (net@4h). Compare to 200 shuffles of the exh label.
+   The real split must beat random labelling. Reported pooled + UP + DOWN + MAY-OOS.
+========================================================================================================
+   POOLED | real net= -1.39 t=-0.29 (n=954) | null mean= +0.53+/-4.05  z=-0.47  p(null>=real)=69.5% | MAY-OOS net= +4.56(n=125)
+       UP | real net= +0.31 t=+0.04 (n=443) | null mean= -0.14+/-5.95  z=+0.08  p(null>=real)=46.0% | MAY-OOS net= +5.14(n=53)
+     DOWN | real net= -2.86 t=-0.42 (n=511) | null mean= +1.55+/-6.13  z=-0.72  p(null>=real)=77.5% | MAY-OOS net= +4.13(n=72)
+
+========================================================================================================
+F  ALT PROXY — |TFI| shrinking (abstrend<0) as exhaustion. RIDE_net@4h by dir. (cross-check of A)
+========================================================================================================
+      UP (d>0) | |TFI|SHRINK ride@4h=  +28.6[71]  |  |TFI|STABLE/GROW ride@4h=   -4.0[372]
+    DOWN (d<0) | |TFI|SHRINK ride@4h=  +19.0[95]  |  |TFI|STABLE/GROW ride@4h=   +3.2[416]
+
+[done] 1488

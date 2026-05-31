@@ -1,0 +1,39 @@
+=== CROSS-WEEK HL TRUE-MID — fade bear & bull, hold 15min & 2h, par SEMAINE (W507 vs W516) — donnees propres ===
+teste si l'edge tient sur les 2 semaines distinctes SANS dependre du Binance reconstruit.
+
+      actif regime    wk |    n |  net15 win15 |  net2h win2h
+  ------------------------------------------------------------------
+   HYPEUSDC   bear  W507 |   54 |   -1.9    41 |   +9.6    54
+   HYPEUSDC   bear  W516 |  343 |   +4.6    52 |   +5.7    52
+  ..................................................................
+   HYPEUSDC   bull  W507 |   14 |  -10.2    36 |  +21.5    50
+   HYPEUSDC   bull  W516 |  382 |   -4.1    49 |  -11.8    49
+  ..................................................................
+    BTCUSDC   bear  W507 |   21 |   +3.7    62 |  +12.9    62
+    BTCUSDC   bear  W516 |   30 |   +7.7    70 |  +10.1    60
+  ..................................................................
+    BTCUSDC   bull  W507 |   44 |   +1.8    59 |  +11.9    66
+  ..................................................................
+    ETHUSDC   bear  W507 |   29 |   -1.9    52 |  +25.9    72
+    ETHUSDC   bear  W516 |   48 |   +0.4    58 |   -8.5    46
+  ..................................................................
+    ETHUSDC   bull  W507 |   50 |   -2.9    48 |   -8.1    44
+    ETHUSDC   bull  W516 |   27 |   +4.4    63 |  +11.5    63
+  ..................................................................
+    SOLUSDC   bear  W507 |   22 |   -3.2    50 |  +11.5    50
+    SOLUSDC   bear  W516 |   71 |  +11.1    65 |  +16.7    63
+  ..................................................................
+    SOLUSDC   bull  W507 |   49 |   -2.6    53 |   +2.7    59
+    SOLUSDC   bull  W516 |   43 |   +2.5    65 |   +7.6    51
+  ..................................................................
+    XRPUSDC   bear  W507 |   18 |   +5.5    72 |  +29.1    61
+    XRPUSDC   bear  W516 |   54 |  +11.0    65 |  +22.7    69
+  ..................................................................
+    XRPUSDC   bull  W507 |   42 |   +1.4    60 |   -4.6    52
+    XRPUSDC   bull  W516 |   31 |   -2.6    48 |   +5.7    68
+  ..................................................................
+
+  LECTURE : net15/net2h = bps/trade (maker RT3) par SEMAINE. Si net15 BEAR > 0 sur W507 ET W516 -> pas un fluke
+            d'une semaine, et le Binance reconstruit etait juste aveugle au hold court (artefact). Idem pour BULL.
+
+[done] 46s

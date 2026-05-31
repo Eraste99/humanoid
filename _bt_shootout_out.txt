@@ -1,0 +1,146 @@
+==========================================================================================
+EXIT SHOOTOUT : LOCK vs RIDE vs HYBRIDE  (tick level, zero sampling)
+==========================================================================================
+
+[W507/BTCUSDC] load + features + entries + paths ...
+  ticks=1,094,784 days=7.00 | LONG n=44 SHORT n=44 | LONG MFE med=15 MAE med=-20
+
+[W507/ETHUSDC] load + features + entries + paths ...
+  ticks=1,094,780 days=7.00 | LONG n=46 SHORT n=43 | LONG MFE med=26 MAE med=-18
+
+[W507/SOLUSDC] load + features + entries + paths ...
+  ticks=1,094,788 days=7.00 | LONG n=36 SHORT n=51 | LONG MFE med=23 MAE med=-15
+
+[W507/XRPUSDC] load + features + entries + paths ...
+  ticks=1,094,791 days=7.00 | LONG n=43 SHORT n=42 | LONG MFE med=16 MAE med=-18
+
+[W507/HYPEUSDC] load + features + entries + paths ...
+  ticks=1,094,789 days=7.00 | LONG n=49 SHORT n=42 | LONG MFE med=35 MAE med=-22
+
+[W516/BTCUSDC] load + features + entries + paths ...
+  ticks=1,115,030 days=7.00 | LONG n=53 SHORT n=40 | LONG MFE med=23 MAE med=-12
+
+[W516/ETHUSDC] load + features + entries + paths ...
+  ticks=1,115,029 days=7.00 | LONG n=50 SHORT n=36 | LONG MFE med=20 MAE med=-26
+
+[W516/SOLUSDC] load + features + entries + paths ...
+  ticks=1,115,034 days=7.00 | LONG n=45 SHORT n=43 | LONG MFE med=23 MAE med=-22
+
+[W516/XRPUSDC] load + features + entries + paths ...
+  ticks=1,115,040 days=7.00 | LONG n=50 SHORT n=38 | LONG MFE med=23 MAE med=-30
+
+[W516/HYPEUSDC] load + features + entries + paths ...
+  ticks=1,115,035 days=7.00 | LONG n=47 SHORT n=40 | LONG MFE med=65 MAE med=-48
+
+==========================================================================================
+SWEEP LOCK (9 configs)
+==========================================================================================
+
+==========================================================================================
+SWEEP RIDE (27 configs)
+==========================================================================================
+
+==========================================================================================
+SWEEP HYBR (4 configs)
+==========================================================================================
+
+
+##########################################################################################
+# RESULTATS
+##########################################################################################
+days W507=7.00  W516=7.00  total=14.00
+
+==========================================================================================
+TABLEAU 1 : MEILLEURE CONFIG PAR FAMILLE (pooled W507+W516, LONG+SHORT)
+==========================================================================================
+FAM   config                           n   gross   win%   avgW    avgL   worst  netMk/d  netTk/d  robust
+--------------------------------------------------------------------------------------------------------
+LOCK  TP100/SL40                     882    +0.3    48%  +31.6   -28.5     -40   -169.1   -358.1      no
+RIDE  arm20/trail25/SL40             882    +0.7    53%  +23.8   -25.1     -40   -144.0   -333.0      no
+HYBR  TP150/arm30/trail15/SL50       882    -0.0    55%  +25.4   -31.2     -50   -192.1   -381.1      no
+
+==========================================================================================
+TABLEAU 2 : BEST CONFIG par famille -- detail per-week (pooled) + per-direction
+==========================================================================================
+
+[LOCK] TP100/SL40
+  week/dir           n   gross   win%   worst    netMk    netTk  netMk/d
+  W507/LONG        218    +4.5    51%     -40     +333     -321    +47.6
+  W507/SHORT       222    +0.8    50%     -40     -477    -1143    -68.2
+  W516/LONG        245    +0.8    49%     -40     -549    -1284    -78.4
+  W516/SHORT       197    -5.5    41%     -40    -1674    -2265   -239.1
+
+[RIDE] arm20/trail25/SL40
+  week/dir           n   gross   win%   worst    netMk    netTk  netMk/d
+  W507/LONG        218    +4.2    56%     -40     +251     -403    +35.8
+  W507/SHORT       222    -0.3    51%     -40     -734    -1400   -104.8
+  W516/LONG        245    +0.7    55%     -40     -557    -1292    -79.6
+  W516/SHORT       197    -2.0    49%     -40     -977    -1568   -139.5
+
+[HYBR] TP150/arm30/trail15/SL50
+  week/dir           n   gross   win%   worst    netMk    netTk  netMk/d
+  W507/LONG        218    +3.1    56%     -50      +13     -641     +1.8
+  W507/SHORT       222    -0.1    56%     -50     -677    -1343    -96.8
+  W516/LONG        245    -0.2    56%     -50     -783    -1518   -111.8
+  W516/SHORT       197    -3.3    51%     -50    -1241    -1832   -177.3
+
+==========================================================================================
+TABLEAU 3 : BEST CONFIG par famille -- ROBUSTESSE per-pair (net maker/jour)
+  (combine LONG+SHORT par paire/week ; cherche positif W507 ET W516 sur majorite des paires)
+==========================================================================================
+
+[LOCK] TP100/SL40
+  pair        W507 netMk/d   W516 netMk/d  both pos?
+  BTCUSDC            -66.0          -46.6         no
+  ETHUSDC            +18.7          -86.3         no
+  SOLUSDC            +28.2          -70.7         no
+  XRPUSDC             -0.3          -50.1         no
+  HYPEUSDC            -1.2          -64.0         no
+  --> 0/5 paires positives W507 ET W516
+
+[RIDE] arm20/trail25/SL40
+  pair        W507 netMk/d   W516 netMk/d  both pos?
+  BTCUSDC            -46.6          -19.7         no
+  ETHUSDC            +20.1          -70.6         no
+  SOLUSDC            -11.4          -28.1         no
+  XRPUSDC             -7.2          -24.8         no
+  HYPEUSDC           -23.8          -75.9         no
+  --> 0/5 paires positives W507 ET W516
+
+[HYBR] TP150/arm30/trail15/SL50
+  pair        W507 netMk/d   W516 netMk/d  both pos?
+  BTCUSDC            -57.5           -7.9         no
+  ETHUSDC             -3.7          -78.2         no
+  SOLUSDC             +2.4          -83.1         no
+  XRPUSDC            -20.3          -50.3         no
+  HYPEUSDC           -15.9          -69.6         no
+  --> 0/5 paires positives W507 ET W516
+
+==========================================================================================
+TABLEAU 4 : IMPACT DU SL DE SECURITE (pooled both weeks, LONG+SHORT)
+==========================================================================================
+
+[LOCK] TP=100 fixe, SL_safety varie :
+     SL     n   gross   worst  netMk/d  netTk/d
+     40   882    +0.3     -40   -169.1   -358.1
+     50   882    -0.1     -50   -196.8   -385.8
+     75   882    -0.7     -75   -233.8   -422.8
+
+[RIDE] arm=20/trail=25 fixe, SL_safety varie :
+     SL     n   gross   worst  netMk/d  netTk/d
+     40   882    +0.7     -40   -144.0   -333.0
+     50   882    +0.5     -50   -156.8   -345.8
+     75   882    +0.4     -75   -160.7   -349.7
+
+==========================================================================================
+VERDICT
+==========================================================================================
+  FAM   config                        netMk/d(both)  rob W507&W516  rob pairs
+  RIDE  arm20/trail25/SL40                   -144.0             no        0/5
+  LOCK  TP100/SL40                           -169.1             no        0/5
+  HYBR  TP150/arm30/trail15/SL50             -192.1             no        0/5
+
+  >>> GAGNANT NET CROSS-PAIR : RIDE (arm20/trail25/SL40)
+      net maker/jour (both weeks) = -144.0 bps/j | robuste W507&W516 = False | paires robustes = 0/5
+
+[done] total 86s

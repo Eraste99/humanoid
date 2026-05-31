@@ -1,0 +1,27 @@
+================================================================================
+AUDIT QUALITE — BTCUSDT aggTrades 2026-01 (Binance USDT-M perp)
+================================================================================
+  fichier=BTCUSDT-aggTrades-2026-01.csv  header=oui  colonnes=7  lignes=44,701,670
+  1ere ligne brute: agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker
+
+  [TEMPS] span=31.00 j   trades/j=1,441,990
+     out-of-order (avant tri): 0    timestamps dupliques: 27,966,475 (62.6%)
+     gap inter-trade: max=11.9s   >1s=347,486   >60s=0   >600s=0
+     temps dans gaps>10s = 0.02h (0.00% du span)
+
+  [PRIX] min=75500.0  max=97932.1  prix<=0: 0
+     |ret| consecutif (bps): max=68   >50bps=1   >100bps=0   >300bps=0
+
+  [FLUX] valeurs is_buyer_maker uniques: ['false', 'true']
+     buy-taker (touche ask)=49.8%   sell-taker (touche bid)=50.2%
+
+  [MID RECONSTRUIT] ticks avec mid defini: 100.0%
+     spread reconstruit (bps): mediane=0.32  moyenne=0.64  p95=2.20  p99=5.12
+     spread NEGATIF (ask<bid = croise/artefact): 0.46%    spread=0: 0.78%
+     STALENESS du cote perime (s): mediane=0.15  moyenne=0.36  p95=1.4  max=32
+     ticks ou le cote perime >10s: 0.01%   >60s: 0.00%  (mid peu fiable la)
+
+  [DE-BOUNCE] |mid_reconstruit - prix_trade| (bps): mediane=0.16  moyenne=0.32  p95=1.10
+     (petit = le bounce bid-ask est negligeable face aux moves de 50 bps)
+
+[done] 50s

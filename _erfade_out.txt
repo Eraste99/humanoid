@@ -1,0 +1,130 @@
+  loaded BTCUSDC W507: 1,094,784 ticks
+  loaded ETHUSDC W507: 1,094,780 ticks
+  loaded SOLUSDC W507: 1,094,788 ticks
+  loaded XRPUSDC W507: 1,094,791 ticks
+  loaded BTCUSDC W516: 1,115,030 ticks
+  loaded ETHUSDC W516: 1,115,029 ticks
+  loaded SOLUSDC W516: 1,115,034 ticks
+  loaded XRPUSDC W516: 1,115,040 ticks
+  precomputed 96 entry sets (55s)
+
+Sweeping 576 configs x 4 pairs x 2 weeks...
+  ...50/576 (61s)
+  ...100/576 (66s)
+  ...150/576 (69s)
+  ...200/576 (73s)
+  ...250/576 (78s)
+  ...300/576 (82s)
+  ...350/576 (85s)
+  ...400/576 (87s)
+  ...450/576 (91s)
+  ...500/576 (93s)
+  ...550/576 (95s)
+
+==========================================================================================
+TOP CONFIGS BY min(net507,net516)  [robust = positive BOTH weeks, n>=8 each]
+==========================================================================================
+ W ERq   mag  hold  tp  sl  net507  net516  minnet  n507  n516
+4h P75  True   480  50 120   12.32   12.91   12.32    90   118
+4h P75  True   240  80 120   11.54   10.61   10.61    89   117
+4h P75  True   240  80  80   10.41   14.26   10.41    98   121
+4h P75  True   480  80 120   14.32   10.11   10.11    78    96
+4h P75  True   480  80  80   10.48    9.02    9.02    88   102
+4h P75  True   480  30 120    9.00    8.93    8.93   118   167
+1h P75  True   480  80 120    8.12   11.36    8.12   123   121
+4h P75 False   480  80 120   11.45    7.22    7.22    92   100
+4h P90  True   480  50 120    6.83    7.91    6.83    58    86
+4h P75  True   120  80  80    6.50    7.70    6.50   124   155
+4h P90  True   480  30 120    9.89    6.46    6.46    67   110
+4h P90  True   240  80 120    8.97    6.27    6.27    58    84
+1h P90 False   480  80 120    6.21   20.81    6.21   102   121
+4h P75  True   240  80  50    6.05   11.31    6.05   115   142
+1h P75  True   480  80  80    6.03   10.08    6.03   145   151
+
+==========================================================================================
+STRICT-SYMMETRIC: ALL 4 (dir x week) cells > 0, each cell n>=5  [ranked by worst cell]
+==========================================================================================
+ W ERq  mag  hold  tp  sl  up507  dn507  up516  dn516  worst_cell  n507  n516
+4h P75 True   240  80  50   4.90   8.47  26.74   2.12        2.12   115   142
+4h P90 True   480  30 120   6.82  17.09  17.49   1.93        1.93    67   110
+4h P75 True   240  30  80   1.81   5.14  18.03   3.46        1.81   135   176
+4h P75 True   120  30  80   1.55   4.22  10.72   2.80        1.55   149   195
+4h P90 True   240  80  80   2.20  11.37  26.34   1.15        1.15    67    86
+4h P75 True   480  30 120   6.75  12.66  21.83   0.91        0.91   118   167
+4h P90 True   480  50 120   1.84  17.90  23.86   0.61        0.61    58    86
+4h P75 True   480  30  80   0.50  10.45  19.48   4.26        0.50   134   174
+2h P75 True   240  80  80   0.59   6.71  18.21   0.47        0.47   153   159
+4h P75 True   480  50  80   0.75  12.54  30.93   0.27        0.27   108   123
+4h P75 True   240  80  80  11.77   7.62  37.40   0.07        0.07    98   121
+4h P90 True   240  30 120   5.28   2.72  14.53   0.02        0.02    68   111
+
+==========================================================================================
+DEEP DIVE: per-direction & per-pair NET (mean bps/entry), + MAE on winners
+==========================================================================================
+
+#1 [4h ERP75 mag=True hold480 TP50 SL120]  net507=12.32 net516=12.91 n=(90,118)
+   W507 fade-up  (SHORT) n= 60  net= 10.59  win=  70%
+   W507 fade-down(LONG ) n= 30  net= 15.78  win=  73%
+   W516 fade-up  (SHORT) n= 49  net= 33.87  win=  84%
+   W516 fade-down(LONG ) n= 69  net= -1.98  win=  64%
+   per-pair (both weeks pooled):
+     BTCUSDC  n= 48  net= 15.18  win=  75%
+     ETHUSDC  n= 49  net= 12.59  win=  69%
+     SOLUSDC  n= 55  net= 11.08  win=  73%
+     XRPUSDC  n= 56  net= 12.09  win=  70%
+   MAE bps: mean=47.1 median=33.6 P90=120.1 max=131.0
+   overall: net/entry=12.65  win=72%  gross/entry=15.65  n=208
+
+#2 [4h ERP75 mag=True hold240 TP80 SL120]  net507=11.54 net516=10.61 n=(89,117)
+   W507 fade-up  (SHORT) n= 60  net= 15.27  win=  62%
+   W507 fade-down(LONG ) n= 29  net=  3.82  win=  52%
+   W516 fade-up  (SHORT) n= 45  net= 40.07  win=  80%
+   W516 fade-down(LONG ) n= 72  net= -7.80  win=  47%
+   per-pair (both weeks pooled):
+     BTCUSDC  n= 51  net=  9.46  win=  63%
+     ETHUSDC  n= 47  net= 17.84  win=  60%
+     SOLUSDC  n= 53  net=  3.70  win=  57%
+     XRPUSDC  n= 55  net= 13.66  win=  58%
+   MAE bps: mean=44.5 median=33.2 P90=119.7 max=128.9
+   overall: net/entry=11.01  win=59%  gross/entry=14.01  n=206
+
+#3 [4h ERP75 mag=True hold240 TP80 SL80]  net507=10.41 net516=14.26 n=(98,121)
+   W507 fade-up  (SHORT) n= 66  net= 11.77  win=  59%
+   W507 fade-down(LONG ) n= 32  net=  7.62  win=  53%
+   W516 fade-up  (SHORT) n= 46  net= 37.40  win=  78%
+   W516 fade-down(LONG ) n= 75  net=  0.07  win=  49%
+   per-pair (both weeks pooled):
+     BTCUSDC  n= 53  net= 10.16  win=  66%
+     ETHUSDC  n= 50  net= 16.16  win=  56%
+     SOLUSDC  n= 55  net=  8.05  win=  56%
+     XRPUSDC  n= 61  net= 15.69  win=  57%
+   MAE bps: mean=39.2 median=33.2 P90=80.8 max=116.8
+   overall: net/entry=12.54  win=59%  gross/entry=15.54  n=219
+
+#4 [4h ERP75 mag=True hold480 TP80 SL120]  net507=14.32 net516=10.11 n=(78,96)
+   W507 fade-up  (SHORT) n= 53  net= 10.99  win=  57%
+   W507 fade-down(LONG ) n= 25  net= 21.40  win=  68%
+   W516 fade-up  (SHORT) n= 33  net= 46.16  win=  76%
+   W516 fade-down(LONG ) n= 63  net= -8.77  win=  48%
+   per-pair (both weeks pooled):
+     BTCUSDC  n= 40  net= 11.76  win=  60%
+     ETHUSDC  n= 40  net= 17.04  win=  62%
+     SOLUSDC  n= 46  net=  9.73  win=  59%
+     XRPUSDC  n= 48  net= 10.17  win=  54%
+   MAE bps: mean=54.9 median=49.8 P90=120.3 max=131.0
+   overall: net/entry=12.00  win=59%  gross/entry=15.00  n=174
+
+#5 [4h ERP75 mag=True hold480 TP80 SL80]  net507=10.48 net516=9.02 n=(88,102)
+   W507 fade-up  (SHORT) n= 57  net=  6.52  win=  51%
+   W507 fade-down(LONG ) n= 31  net= 17.76  win=  68%
+   W516 fade-up  (SHORT) n= 34  net= 42.36  win=  74%
+   W516 fade-down(LONG ) n= 68  net= -7.65  win=  44%
+   per-pair (both weeks pooled):
+     BTCUSDC  n= 43  net=  3.70  win=  53%
+     ETHUSDC  n= 43  net= 12.62  win=  56%
+     SOLUSDC  n= 50  net= 11.03  win=  56%
+     XRPUSDC  n= 54  net= 10.91  win=  56%
+   MAE bps: mean=47.8 median=48.8 P90=81.4 max=116.8
+   overall: net/entry=9.70  win=55%  gross/entry=12.70  n=190
+
+Done in 97s

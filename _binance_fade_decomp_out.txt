@@ -1,0 +1,17 @@
+=== DECOMPOSITION fade (Binance OOS de-bounced) � d'ou vient le +1.7 ? ===
+
+  --- HOLD 4h --- (n=1151)
+    TP +100 :   38% (438)   contrib = 38% x +100 = +38.1
+    SL -150 :   23% (269)   contrib = 23% x -150 = -35.1
+    timeout :   39% (444)   moyenne timeout = -3.7  contrib = -1.4
+    => GROSS moyen = +1.6   NET = -1.4   ECART-TYPE/trade = 99 bps
+       (les trades bougent ENORME (std 99), mais TP et SL se compensent -> moyenne minuscule)
+
+  --- HOLD 8h --- (n=780)
+    TP +100 :   50% (389)   contrib = 50% x +100 = +49.9
+    SL -150 :   31% (244)   contrib = 31% x -150 = -46.9
+    timeout :   19% (147)   moyenne timeout = -9.9  contrib = -1.9
+    => GROSS moyen = +1.1   NET = -1.9   ECART-TYPE/trade = 112 bps
+       (les trades bougent ENORME (std 112), mais TP et SL se compensent -> moyenne minuscule)
+
+[done] 729s

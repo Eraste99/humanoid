@@ -1,0 +1,194 @@
+=== REGIME-SWITCH DIRECTION TEST (Binance OOS, 4 majors x Jan-Avr, tick-level, ZERO sampling) ===
+Arms on IDENTICAL events; only DIRECTION differs. Net of 3bps maker-maker. NULL = RANDOM coin-flip.
+
+  BTCUSDT 2026-01: ev=46 ER2h:trend%=  57 ER8h:trend%=  57 AUTOCORR:trend%=  20 VR:trend%=  30
+  BTCUSDT 2026-02: ev=51 ER2h:trend%=  80 ER8h:trend%=  71 AUTOCORR:trend%=  10 VR:trend%=  31
+  BTCUSDT 2026-03: ev=64 ER2h:trend%=  81 ER8h:trend%=  57 AUTOCORR:trend%=  21 VR:trend%=  68
+  BTCUSDT 2026-04: ev=61 ER2h:trend%=  72 ER8h:trend%=  67 AUTOCORR:trend%=  28 VR:trend%=  60
+  ETHUSDT 2026-01: ev=47 ER2h:trend%=  70 ER8h:trend%=  70 AUTOCORR:trend%=   4 VR:trend%=  40
+  ETHUSDT 2026-02: ev=54 ER2h:trend%=  85 ER8h:trend%=  72 AUTOCORR:trend%=  11 VR:trend%=  57
+  ETHUSDT 2026-03: ev=66 ER2h:trend%=  71 ER8h:trend%=  58 AUTOCORR:trend%=  29 VR:trend%=  65
+  ETHUSDT 2026-04: ev=64 ER2h:trend%=  86 ER8h:trend%=  60 AUTOCORR:trend%=  19 VR:trend%=  63
+  SOLUSDT 2026-01: ev=43 ER2h:trend%=  60 ER8h:trend%=  56 AUTOCORR:trend%=  28 VR:trend%=  53
+  SOLUSDT 2026-02: ev=40 ER2h:trend%=  75 ER8h:trend%=  68 AUTOCORR:trend%=  20 VR:trend%=  18
+  SOLUSDT 2026-03: ev=55 ER2h:trend%=  67 ER8h:trend%=  63 AUTOCORR:trend%=  26 VR:trend%=  46
+  SOLUSDT 2026-04: ev=59 ER2h:trend%=  66 ER8h:trend%=  59 AUTOCORR:trend%=  41 VR:trend%=  57
+  XRPUSDT 2026-01: ev=42 ER2h:trend%=  48 ER8h:trend%=  52 AUTOCORR:trend%=  31 VR:trend%=  38
+  XRPUSDT 2026-02: ev=32 ER2h:trend%=  56 ER8h:trend%=  53 AUTOCORR:trend%=  12 VR:trend%=  16
+  XRPUSDT 2026-03: ev=48 ER2h:trend%=  62 ER8h:trend%=  66 AUTOCORR:trend%=  36 VR:trend%=  45
+  XRPUSDT 2026-04: ev=59 ER2h:trend%=  53 ER8h:trend%=  50 AUTOCORR:trend%=  20 VR:trend%=  48
+
+========================================================================================================
+TOTAL EVENTS (rising-edge, no-overlap 8h, vol>=P75 & drift extreme tail): 831
+Net mean bps (after 3bps). For each classifier: SWITCH must beat ALWAYS-FADE, ALWAYS-TREND, AND RANDOM.
+========================================================================================================
+
+############ CLASSIFIER = ER2h   (avg events labelled TREND = 68%) ############
+
+  --- H = 60 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   824 |    -6.93 |   -2.05 |    +5.6 |   -18.8 |    -5.4 |    -9.0
+      ALWAYS-FADE |   824 |    -9.82 |   -2.92 |   -29.7 |    -7.0 |   -10.2 |    +3.2
+     ALWAYS-TREND |   824 |    +3.82 |   +1.13 |   +23.7 |    +1.0 |    +4.2 |    -9.2
+           RANDOM |   824 |    -4.01 |   -5.27 |    -1.4 |    -5.0 |    -5.1 |    -4.2
+    SWITCH>RANDOM per-month: Y n n n   (SWITCH net -6.93 vs RANDOM -4.01)
+
+  --- H = 120 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   824 |    -6.55 |   -1.52 |   -10.8 |    -2.3 |    -4.6 |    -8.3
+      ALWAYS-FADE |   824 |    -7.38 |   -1.71 |   -31.8 |    -5.7 |    -4.5 |    +6.8
+     ALWAYS-TREND |   824 |    +1.38 |   +0.32 |   +25.8 |    -0.3 |    -1.5 |   -12.8
+           RANDOM |   824 |    -2.74 |   -2.59 |    -4.8 |    -4.2 |    -2.7 |    -0.2
+    SWITCH>RANDOM per-month: n Y n n   (SWITCH net -6.55 vs RANDOM -2.74)
+
+  --- H = 240 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   823 |    +1.29 |   +0.24 |   -11.7 |    +8.4 |    +9.6 |    -2.2
+      ALWAYS-FADE |   823 |   -12.71 |   -2.31 |   -33.2 |   -26.2 |    -3.7 |    +3.8
+     ALWAYS-TREND |   823 |    +6.71 |   +1.22 |   +27.2 |   +20.2 |    -2.3 |    -9.8
+           RANDOM |   823 |    -1.28 |   -0.99 |    +2.5 |    -1.4 |    +0.3 |    -5.5
+    SWITCH>RANDOM per-month: n Y Y Y   (SWITCH net +1.29 vs RANDOM -1.28)
+
+  --- H = 480 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   818 |    +5.98 |   +0.79 |   +19.8 |   +16.5 |    -7.7 |    +1.3
+      ALWAYS-FADE |   818 |    -9.91 |   -1.31 |   -30.1 |   -16.3 |    -7.0 |    +6.7
+     ALWAYS-TREND |   818 |    +3.91 |   +0.52 |   +24.1 |   +10.3 |    +1.0 |   -12.7
+           RANDOM |   818 |    -3.36 |   -1.82 |    -2.6 |   -10.2 |    -4.0 |    +1.6
+    SWITCH>RANDOM per-month: Y Y n n   (SWITCH net +5.98 vs RANDOM -3.36)
+
+############ CLASSIFIER = ER8h   (avg events labelled TREND = 61%) ############
+
+  --- H = 60 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   823 |    -2.26 |   -0.67 |   +11.4 |   -16.7 |    -3.9 |    -0.2
+      ALWAYS-FADE |   823 |    -9.91 |   -2.94 |   -29.7 |    -7.0 |   -10.2 |    +2.9
+     ALWAYS-TREND |   823 |    +3.91 |   +1.16 |   +23.7 |    +1.0 |    +4.2 |    -8.9
+           RANDOM |   823 |    -3.83 |   -5.00 |    -1.4 |    -5.0 |    -5.1 |    -3.5
+    SWITCH>RANDOM per-month: Y n Y Y   (SWITCH net -2.26 vs RANDOM -3.83)
+
+  --- H = 120 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   823 |    -1.28 |   -0.30 |    -4.8 |    +5.9 |    -4.8 |    -0.6
+      ALWAYS-FADE |   823 |    -7.63 |   -1.77 |   -31.8 |    -5.7 |    -4.5 |    +6.0
+     ALWAYS-TREND |   823 |    +1.63 |   +0.38 |   +25.8 |    -0.3 |    -1.5 |   -12.0
+           RANDOM |   823 |    -2.90 |   -2.76 |    -4.8 |    -4.2 |    -2.7 |    -0.7
+    SWITCH>RANDOM per-month: n Y n Y   (SWITCH net -1.28 vs RANDOM -2.90)
+
+  --- H = 240 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   822 |    +0.10 |   +0.02 |   +10.9 |   +10.1 |   -13.0 |    -2.8
+      ALWAYS-FADE |   822 |   -12.86 |   -2.34 |   -33.2 |   -26.2 |    -3.7 |    +3.4
+     ALWAYS-TREND |   822 |    +6.86 |   +1.25 |   +27.2 |   +20.2 |    -2.3 |    -9.4
+           RANDOM |   822 |    -1.24 |   -0.92 |    +2.5 |    -1.4 |    +0.3 |    -5.4
+    SWITCH>RANDOM per-month: Y Y n Y   (SWITCH net +0.10 vs RANDOM -1.24)
+
+  --- H = 480 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   817 |    -2.62 |   -0.35 |   +12.3 |    +3.0 |   -14.6 |    -6.2
+      ALWAYS-FADE |   817 |   -10.04 |   -1.33 |   -30.1 |   -16.3 |    -7.0 |    +6.3
+     ALWAYS-TREND |   817 |    +4.04 |   +0.54 |   +24.1 |   +10.3 |    +1.0 |   -12.3
+           RANDOM |   817 |    -4.57 |   -2.45 |    -2.6 |   -10.2 |    -4.0 |    -2.5
+    SWITCH>RANDOM per-month: Y Y n n   (SWITCH net -2.62 vs RANDOM -4.57)
+
+############ CLASSIFIER = AUTOCORR   (avg events labelled TREND = 22%) ############
+
+  --- H = 60 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   824 |    -5.86 |   -1.74 |   -25.7 |    -1.2 |    -3.3 |    +3.0
+      ALWAYS-FADE |   824 |    -9.82 |   -2.92 |   -29.7 |    -7.0 |   -10.2 |    +3.2
+     ALWAYS-TREND |   824 |    +3.82 |   +1.13 |   +23.7 |    +1.0 |    +4.2 |    -9.2
+           RANDOM |   824 |    -4.01 |   -5.27 |    -1.4 |    -5.0 |    -5.1 |    -4.2
+    SWITCH>RANDOM per-month: n Y Y Y   (SWITCH net -5.86 vs RANDOM -4.01)
+
+  --- H = 120 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   824 |    -8.13 |   -1.88 |   -20.9 |   -16.1 |    -4.4 |    +3.7
+      ALWAYS-FADE |   824 |    -7.38 |   -1.71 |   -31.8 |    -5.7 |    -4.5 |    +6.8
+     ALWAYS-TREND |   824 |    +1.38 |   +0.32 |   +25.8 |    -0.3 |    -1.5 |   -12.8
+           RANDOM |   824 |    -2.74 |   -2.59 |    -4.8 |    -4.2 |    -2.7 |    -0.2
+    SWITCH>RANDOM per-month: n n n Y   (SWITCH net -8.13 vs RANDOM -2.74)
+
+  --- H = 240 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   823 |   -11.97 |   -2.18 |   -20.0 |   -36.8 |    -2.3 |    +3.0
+      ALWAYS-FADE |   823 |   -12.71 |   -2.31 |   -33.2 |   -26.2 |    -3.7 |    +3.8
+     ALWAYS-TREND |   823 |    +6.71 |   +1.22 |   +27.2 |   +20.2 |    -2.3 |    -9.8
+           RANDOM |   823 |    -1.28 |   -0.99 |    +2.5 |    -1.4 |    +0.3 |    -5.5
+    SWITCH>RANDOM per-month: n n n Y   (SWITCH net -11.97 vs RANDOM -1.28)
+
+  --- H = 480 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   818 |    -8.78 |   -1.17 |   -13.7 |   -29.1 |    +6.4 |    -4.8
+      ALWAYS-FADE |   818 |    -9.91 |   -1.31 |   -30.1 |   -16.3 |    -7.0 |    +6.7
+     ALWAYS-TREND |   818 |    +3.91 |   +0.52 |   +24.1 |   +10.3 |    +1.0 |   -12.7
+           RANDOM |   818 |    -3.36 |   -1.82 |    -2.6 |   -10.2 |    -4.0 |    +1.6
+    SWITCH>RANDOM per-month: n n Y n   (SWITCH net -8.78 vs RANDOM -3.36)
+
+############ CLASSIFIER = VR   (avg events labelled TREND = 46%) ############
+
+  --- H = 60 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   823 |    -7.03 |   -2.08 |   -17.4 |   -13.2 |    -1.5 |    -0.0
+      ALWAYS-FADE |   823 |    -9.91 |   -2.94 |   -29.7 |    -7.0 |   -10.2 |    +2.9
+     ALWAYS-TREND |   823 |    +3.91 |   +1.16 |   +23.7 |    +1.0 |    +4.2 |    -8.9
+           RANDOM |   823 |    -3.83 |   -5.00 |    -1.4 |    -5.0 |    -5.1 |    -3.5
+    SWITCH>RANDOM per-month: n n Y Y   (SWITCH net -7.03 vs RANDOM -3.83)
+
+  --- H = 120 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   823 |    -6.10 |   -1.41 |   -18.6 |    -9.8 |    +0.6 |    -0.4
+      ALWAYS-FADE |   823 |    -7.63 |   -1.77 |   -31.8 |    -5.7 |    -4.5 |    +6.0
+     ALWAYS-TREND |   823 |    +1.63 |   +0.38 |   +25.8 |    -0.3 |    -1.5 |   -12.0
+           RANDOM |   823 |    -2.90 |   -2.76 |    -4.8 |    -4.2 |    -2.7 |    -0.7
+    SWITCH>RANDOM per-month: n n Y Y   (SWITCH net -6.10 vs RANDOM -2.90)
+
+  --- H = 240 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   822 |   -10.98 |   -1.99 |   -13.2 |   -28.7 |   -10.9 |    +3.6
+      ALWAYS-FADE |   822 |   -12.86 |   -2.34 |   -33.2 |   -26.2 |    -3.7 |    +3.4
+     ALWAYS-TREND |   822 |    +6.86 |   +1.25 |   +27.2 |   +20.2 |    -2.3 |    -9.4
+           RANDOM |   822 |    -1.24 |   -0.92 |    +2.5 |    -1.4 |    +0.3 |    -5.4
+    SWITCH>RANDOM per-month: n n n Y   (SWITCH net -10.98 vs RANDOM -1.24)
+
+  --- H = 480 min ---
+              arm |     n |  net mean |  t-stat |      01 |      02 |      03 |      04
+           SWITCH |   817 |    -7.89 |   -1.05 |   +17.4 |   -29.6 |   -23.3 |    +4.4
+      ALWAYS-FADE |   817 |   -10.04 |   -1.33 |   -30.1 |   -16.3 |    -7.0 |    +6.3
+     ALWAYS-TREND |   817 |    +4.04 |   +0.54 |   +24.1 |   +10.3 |    +1.0 |   -12.3
+           RANDOM |   817 |    -4.57 |   -2.45 |    -2.6 |   -10.2 |    -4.0 |    -2.5
+    SWITCH>RANDOM per-month: Y n n Y   (SWITCH net -7.89 vs RANDOM -4.57)
+
+========================================================================================================
+VERDICT SUMMARY — pooled net mean (bps) [t-stat] per arm; SWITCH wins only if > all 3 others.
+========================================================================================================
+
+  ER2h
+        H |          SWITCH |     ALWAYS-FADE |    ALWAYS-TREND |          RANDOM | win?
+       60 |    -6.93[-2.05] |    -9.82[-2.92] |    +3.82[+1.13] |    -4.01[-5.27] | no
+      120 |    -6.55[-1.52] |    -7.38[-1.71] |    +1.38[+0.32] |    -2.74[-2.59] | no
+      240 |    +1.29[+0.24] |   -12.71[-2.31] |    +6.71[+1.22] |    -1.28[-0.99] | no
+      480 |    +5.98[+0.79] |    -9.91[-1.31] |    +3.91[+0.52] |    -3.36[-1.82] | YES
+
+  ER8h
+        H |          SWITCH |     ALWAYS-FADE |    ALWAYS-TREND |          RANDOM | win?
+       60 |    -2.26[-0.67] |    -9.91[-2.94] |    +3.91[+1.16] |    -3.83[-5.00] | no
+      120 |    -1.28[-0.30] |    -7.63[-1.77] |    +1.63[+0.38] |    -2.90[-2.76] | no
+      240 |    +0.10[+0.02] |   -12.86[-2.34] |    +6.86[+1.25] |    -1.24[-0.92] | no
+      480 |    -2.62[-0.35] |   -10.04[-1.33] |    +4.04[+0.54] |    -4.57[-2.45] | no
+
+  AUTOCORR
+        H |          SWITCH |     ALWAYS-FADE |    ALWAYS-TREND |          RANDOM | win?
+       60 |    -5.86[-1.74] |    -9.82[-2.92] |    +3.82[+1.13] |    -4.01[-5.27] | no
+      120 |    -8.13[-1.88] |    -7.38[-1.71] |    +1.38[+0.32] |    -2.74[-2.59] | no
+      240 |   -11.97[-2.18] |   -12.71[-2.31] |    +6.71[+1.22] |    -1.28[-0.99] | no
+      480 |    -8.78[-1.17] |    -9.91[-1.31] |    +3.91[+0.52] |    -3.36[-1.82] | no
+
+  VR
+        H |          SWITCH |     ALWAYS-FADE |    ALWAYS-TREND |          RANDOM | win?
+       60 |    -7.03[-2.08] |    -9.91[-2.94] |    +3.91[+1.16] |    -3.83[-5.00] | no
+      120 |    -6.10[-1.41] |    -7.63[-1.77] |    +1.63[+0.38] |    -2.90[-2.76] | no
+      240 |   -10.98[-1.99] |   -12.86[-2.34] |    +6.86[+1.25] |    -1.24[-0.92] | no
+      480 |    -7.89[-1.05] |   -10.04[-1.33] |    +4.04[+0.54] |    -4.57[-2.45] | no
+
+[done] 1260s

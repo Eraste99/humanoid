@@ -1,0 +1,43 @@
+=== SIGNAL UNIFIE 'fade la sur-extension 1h sharp' (bull+bear ensemble) — HL true-mid, par semaine ===
+SHARP = jambe etend le macro 4h + le 1h a bouge fort dans ce sens. FADE = long dip / short rip. hold 30min.
+
+--- HYPEUSDC ---  (extensions n=481, seuil recext_1h=+124bps)
+    W507: SHARP n=  6 net +32.6 win100%   |  DULL n= 46 net  +7.4 win 52%
+    W515: SHARP n=  3(insuf)   |  DULL n=  0(insuf)
+    W516: SHARP n=232 net -18.8 win 51%   |  DULL n=194 net  +2.3 win 51%
+    SHARP-BEAR n= 97 net  +1.5 win 61%   |  SHARP-BULL n=144 net -28.8 win 47%
+    SHARP net poolE = -16.6  vs NULL(signe alea) =  -2.8  [n=241]
+--- BTCUSDC ---  (extensions n=78, seuil recext_1h=+63bps)
+    W507: SHARP n= 26 net +18.5 win 69%   |  DULL n= 20 net  +3.3 win 75%
+    W516: SHARP n= 13 net  -8.7 win 46%   |  DULL n= 19 net  +8.8 win 79%
+    SHARP-BEAR n= 20 net  +6.1 win 60%   |  SHARP-BULL n= 19 net +13.0 win 63%
+    SHARP net poolE =  +9.5  vs NULL(signe alea) =  -2.5  [n=39]
+--- ETHUSDC ---  (extensions n=119, seuil recext_1h=+73bps)
+    W507: SHARP n= 28 net +14.5 win 64%   |  DULL n= 31 net  +5.5 win 61%
+    W516: SHARP n= 32 net -12.2 win 47%   |  DULL n= 28 net  +7.3 win 57%
+    SHARP-BEAR n= 32 net  -6.1 win 53%   |  SHARP-BULL n= 28 net  +7.6 win 57%
+    SHARP net poolE =  +0.3  vs NULL(signe alea) =  -3.3  [n=60]
+--- SOLUSDC ---  (extensions n=135, seuil recext_1h=+70bps)
+    W507: SHARP n= 25 net +10.7 win 52%   |  DULL n= 28 net  -0.6 win 54%
+    W515: SHARP n=  0(insuf)   |  DULL n=  1(insuf)
+    W516: SHARP n= 43 net  +6.0 win 60%   |  DULL n= 38 net  +8.7 win 58%
+    SHARP-BEAR n= 36 net  +7.5 win 67%   |  SHARP-BULL n= 32 net  +8.0 win 47%
+    SHARP net poolE =  +7.7  vs NULL(signe alea) =  -2.8  [n=68]
+--- XRPUSDC ---  (extensions n=113, seuil recext_1h=+55bps)
+    W507: SHARP n= 23 net +12.2 win 57%   |  DULL n= 25 net  +5.9 win 52%
+    W515: SHARP n=  0(insuf)   |  DULL n=  1(insuf)
+    W516: SHARP n= 34 net +16.3 win 71%   |  DULL n= 30 net  +4.7 win 53%
+    SHARP-BEAR n= 32 net +19.9 win 72%   |  SHARP-BULL n= 25 net  +8.0 win 56%
+    SHARP net poolE = +14.7  vs NULL(signe alea) =  -2.7  [n=57]
+--- MAJORS POOLES (BTC+ETH+SOL+XRP) ---  (extensions n=444, seuil recext_1h=+68bps)
+    W507: SHARP n=100 net +12.6 win 61%   |  DULL n=107 net  +4.4 win 63%
+    W515: SHARP n=  0(insuf)   |  DULL n=  2(insuf)
+    W516: SHARP n=122 net  +2.5 win 57%   |  DULL n=113 net +10.2 win 63%
+    SHARP-BEAR n=122 net  +6.9 win 62%   |  SHARP-BULL n=100 net  +7.2 win 55%
+    SHARP net poolE =  +7.0  vs NULL(signe alea) =  -3.5  [n=222]
+
+  LECTURE : si SHARP net>0 sur W507 ET W516, ET SHARP-BEAR>0 ET SHARP-BULL>0, ET SHARP>>NULL
+    -> UN SEUL signal 'fade sur-extension 1h sharp' marche dans les DEUX regimes = la vision user VALIDEE (in-sample).
+    si SHARP~DULL ou ~NULL ou flippe -> l'unification etait une jolie phrase, pas un signal.
+
+[done] 45s

@@ -1,0 +1,53 @@
+=== OU EST LA STRUCTURE ? 4 QUADRANTS (Binance OOS, 4 majors x Jan-Avr, tick-level) ===
+
+  BTCUSDT 2026-01: FADE_SHORT=28 FADE_LONG=29 PB_LONG=16 PB_SHORT=23
+  BTCUSDT 2026-02: FADE_SHORT=27 FADE_LONG=35 PB_LONG=17 PB_SHORT=23
+  BTCUSDT 2026-03: FADE_SHORT=38 FADE_LONG=43 PB_LONG=31 PB_SHORT=31
+  BTCUSDT 2026-04: FADE_SHORT=35 FADE_LONG=37 PB_LONG=35 PB_SHORT=23
+  ETHUSDT 2026-01: FADE_SHORT=22 FADE_LONG=35 PB_LONG=13 PB_SHORT=25
+  ETHUSDT 2026-02: FADE_SHORT=31 FADE_LONG=32 PB_LONG=21 PB_SHORT=24
+  ETHUSDT 2026-03: FADE_SHORT=43 FADE_LONG=42 PB_LONG=33 PB_SHORT=29
+  ETHUSDT 2026-04: FADE_SHORT=39 FADE_LONG=37 PB_LONG=28 PB_SHORT=21
+  SOLUSDT 2026-01: FADE_SHORT=24 FADE_LONG=32 PB_LONG=21 PB_SHORT=25
+  SOLUSDT 2026-02: FADE_SHORT=21 FADE_LONG=28 PB_LONG=15 PB_SHORT=28
+  SOLUSDT 2026-03: FADE_SHORT=35 FADE_LONG=36 PB_LONG=26 PB_SHORT=25
+  SOLUSDT 2026-04: FADE_SHORT=37 FADE_LONG=33 PB_LONG=39 PB_SHORT=30
+  XRPUSDT 2026-01: FADE_SHORT=24 FADE_LONG=27 PB_LONG=20 PB_SHORT=28
+  XRPUSDT 2026-02: FADE_SHORT=19 FADE_LONG=23 PB_LONG=15 PB_SHORT=19
+  XRPUSDT 2026-03: FADE_SHORT=30 FADE_LONG=35 PB_LONG=29 PB_SHORT=27
+  XRPUSDT 2026-04: FADE_SHORT=37 FADE_LONG=41 PB_LONG=34 PB_SHORT=32
+
+==========================================================================================
+E[retour forward en direction du pari], NET de 3bps  (POOLED 4 majors x 4 mois)
+  martingale => ~ -3 (=0 gross - fee) ; structure exploitable => net > 0 & t-stat > 2 & stable cross-mois
+==========================================================================================
+
+  --- Q_FADE_SHORT  (n entrees=490) ---
+     H(min) |     n |  net mean |  t-stat |     01 |     02 |     03 |     04
+         60 |   489 |    -2.25 |   -0.50 |  -11.5 |  +12.3 |   -7.7 |   -0.5
+        120 |   488 |    -4.37 |   -0.77 |  -19.0 |  +21.2 |  -15.2 |   -0.9
+        240 |   488 |    -5.95 |   -0.80 |  -14.2 |  +15.2 |   -3.2 |  -17.1
+        480 |   486 |   -10.58 |   -1.03 |  -19.5 |   +4.1 |   -5.1 |  -19.7
+
+  --- Q_FADE_LONG  (n entrees=545) ---
+     H(min) |     n |  net mean |  t-stat |     01 |     02 |     03 |     04
+         60 |   545 |    -7.33 |   -1.75 |  -25.1 |   -5.7 |   +2.7 |   -4.4
+        120 |   545 |    -4.52 |   -0.86 |  -11.4 |  -13.0 |   +6.4 |   -3.7
+        240 |   545 |    -7.48 |   -1.13 |  -16.3 |  -16.2 |   +1.0 |   -2.1
+        480 |   541 |    +2.59 |   +0.27 |  -12.6 |  -32.1 |  +40.8 |   +2.2
+
+  --- Q_PB_LONG  (n entrees=393) ---
+     H(min) |     n |  net mean |  t-stat |     01 |     02 |     03 |     04
+         60 |   392 |    -7.14 |   -1.89 |   +8.1 |  -20.3 |   -4.2 |  -10.9
+        120 |   392 |    -4.69 |   -0.86 |   +3.1 |  -19.2 |   -8.8 |   +2.2
+        240 |   392 |    -3.23 |   -0.45 |   +1.8 |   -6.1 |  -19.2 |   +9.6
+        480 |   389 |    +5.95 |   +0.61 |   +6.4 |  +27.9 |   -9.6 |   +8.0
+
+  --- Q_PB_SHORT  (n entrees=413) ---
+     H(min) |     n |  net mean |  t-stat |     01 |     02 |     03 |     04
+         60 |   413 |    -5.19 |   -1.12 |   -4.3 |   -6.3 |  -13.4 |   +3.6
+        120 |   413 |    -2.46 |   -0.39 |  -29.2 |  +14.1 |  -11.6 |  +18.0
+        240 |   413 |    -7.04 |   -0.88 |  -14.7 |  +19.0 |  -28.3 |   -0.4
+        480 |   409 |    -0.07 |   -0.01 |  +21.6 |  +49.5 |  -61.2 |   +0.8
+
+[done] 728s

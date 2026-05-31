@@ -1,0 +1,117 @@
+=== ML GATE on base contrarian+vol signal (tick-level, zero sampling, strict OOS) ===
+
+Forward horizon=120min, gap-aware (>10min gap rejected), fee=3.0bps
+
+[W507] loading 5 pairs from C:\Users\erast\hl_data\week_20260507
+   BTCUSDC: 766 entries, base win=0.521, 7.00j (12s)
+   ETHUSDC: 752 entries, base win=0.545, 7.00j (9s)
+   SOLUSDC: 725 entries, base win=0.477, 7.00j (8s)
+   XRPUSDC: 885 entries, base win=0.572, 7.00j (8s)
+   HYPEUSDC: 1,036 entries, base win=0.551, 7.00j (9s)
+[W516] loading 5 pairs from C:\Users\erast\hl_data\week_20260516
+   BTCUSDC: 785 entries, base win=0.470, 7.00j (10s)
+   ETHUSDC: 749 entries, base win=0.417, 7.00j (9s)
+   SOLUSDC: 859 entries, base win=0.561, 7.00j (8s)
+   XRPUSDC: 1,203 entries, base win=0.475, 7.00j (8s)
+   HYPEUSDC: 1,138 entries, base win=0.506, 7.00j (13s)
+
+W507 pooled: 4,164 entries across 5 pairs, base win=0.536
+W516 pooled: 4,734 entries across 5 pairs, base win=0.488
+
+========================================================================================
+FOLD: train=W507  test=W516
+========================================================================================
+  train entries=4,164 (win 0.536) | test entries=4,734 (win 0.488)
+  [logreg  ] test AUC = 0.4659
+  [tree_d3 ] test AUC = 0.4594
+  [tree_d4 ] test AUC = 0.4675
+  [rf      ] test AUC = 0.4722
+
+  --- CONDITIONAL TABLE (test set, OOS) ---
+  model        cut      n    win  net_bps   bps/day     MFE     MAE  MFE/MAE
+  BASELINE     all   4734  0.488    -1.18    -795.9    76.4   -86.0     0.89
+  random     top30   1420  0.491    -0.31     -62.0                     0.90
+  random     top20    947  0.489    -0.34     -46.0                     0.91
+  random     top10    473  0.489    -1.75    -118.2                     0.88
+  logreg     top30   1420  0.454    -2.67    -541.1    78.5   -82.1     0.96
+  logreg     top20    947  0.459     5.50     744.7    82.7   -78.6     1.05
+  logreg     top10    473  0.459     1.06      71.5    77.9   -74.5     1.05
+  tree_d3    top30   1420  0.478     4.18     848.6    82.5   -86.3     0.96
+  tree_d3    top20    947  0.451    13.65    1846.4    88.4   -72.7     1.22
+  tree_d3    top10    473  0.442    18.58    1255.4   109.8   -90.7     1.21
+  tree_d4    top30   1420  0.472     6.56    1331.3    84.8   -83.7     1.01
+  tree_d4    top20    947  0.454    12.86    1739.2    90.3   -80.1     1.13
+  tree_d4    top10    473  0.412    29.30    1979.8   111.1   -71.8     1.55
+  rf         top30   1420  0.449     3.23     655.0    76.4   -73.7     1.04
+  rf         top20    947  0.471     4.46     603.7    75.5   -68.2     1.11
+  rf         top10    473  0.480     5.09     344.2    74.3   -63.7     1.17
+
+  --- TOP PREDICTIVE FEATURES ---
+  logreg coefs (|largest| first, standardized features):
+     side                 -0.298
+     drift_30min          -0.186
+     tfi_5min             +0.162
+     n_large_5min         -0.153
+     avg_size_5min        +0.148
+     vol_30min            -0.147
+     drift_5min           -0.105
+     drift_1h             -0.095
+  RF importances:
+     vol_30min            0.157
+     drift_1h             0.121
+     spread_mean          0.089
+     drift_15min          0.065
+     drift_30min          0.060
+     vol_5min             0.058
+     intensity_5min       0.052
+     eng_vol_accel        0.050
+
+========================================================================================
+FOLD: train=W516  test=W507
+========================================================================================
+  train entries=4,734 (win 0.488) | test entries=4,164 (win 0.536)
+  [logreg  ] test AUC = 0.4776
+  [tree_d3 ] test AUC = 0.4939
+  [tree_d4 ] test AUC = 0.5102
+  [rf      ] test AUC = 0.4848
+
+  --- CONDITIONAL TABLE (test set, OOS) ---
+  model        cut      n    win  net_bps   bps/day     MFE     MAE  MFE/MAE
+  BASELINE     all   4164  0.536     5.14    3056.9    60.2   -53.4     1.13
+  random     top30   1249  0.534     4.76     850.0                     1.12
+  random     top20    833  0.532     4.51     537.0                     1.11
+  random     top10    416  0.532     4.09     243.1                     1.11
+  logreg     top30   1249  0.521     7.76    1384.1    63.2   -51.9     1.22
+  logreg     top20    833  0.515     7.23     859.8    63.7   -51.7     1.23
+  logreg     top10    416  0.478     1.59      94.2    61.9   -53.0     1.17
+  tree_d3    top30   1249  0.528     4.45     794.8    61.7   -53.5     1.15
+  tree_d3    top20    833  0.529     6.81     810.2    61.3   -48.2     1.27
+  tree_d3    top10    416  0.493     0.63      37.4    62.1   -50.4     1.23
+  tree_d4    top30   1249  0.534     8.23    1469.2    62.7   -47.4     1.32
+  tree_d4    top20    833  0.516     6.04     718.6    60.4   -47.9     1.26
+  tree_d4    top10    416  0.531     9.85     585.6    67.9   -45.4     1.50
+  rf         top30   1249  0.512     5.41     965.7    62.2   -50.1     1.24
+  rf         top20    833  0.499     4.06     483.1    61.0   -50.0     1.22
+  rf         top10    416  0.493     1.82     108.0    63.9   -49.3     1.30
+
+  --- TOP PREDICTIVE FEATURES ---
+  logreg coefs (|largest| first, standardized features):
+     volume_total_5min    -0.502
+     side                 +0.417
+     avg_size_5min        +0.304
+     n_large_5min         +0.230
+     liq_imb5             -0.128
+     drift_1h             +0.109
+     drift_15min          +0.090
+     eng_vol_accel        +0.082
+  RF importances:
+     drift_30min          0.134
+     drift_1h             0.105
+     side                 0.088
+     drift_15min          0.072
+     vol_30min            0.069
+     n_large_5min         0.065
+     tfi_5min             0.055
+     spread_mean          0.051
+
+[done] total 96s

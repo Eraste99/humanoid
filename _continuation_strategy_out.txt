@@ -1,0 +1,55 @@
+=== STRATEGIE DE CONTINUATION (idee user) — ride la reprise post-consolidation, Binance 4 majors Jan->Mai ===
+ENTREE (tous ticks): extension + imbalance flux aligne modere + decel. Sorties sur grille 1-min. maker 3 / stop taker 6.
+
+  BTCUSDT 2026-01: entries=41
+  BTCUSDT 2026-02: entries=49
+  BTCUSDT 2026-03: entries=61
+  BTCUSDT 2026-04: entries=58
+  BTCUSDT MAY: entries=30
+  ETHUSDT 2026-01: entries=43
+  ETHUSDT 2026-02: entries=51
+  ETHUSDT 2026-03: entries=61
+  ETHUSDT 2026-04: entries=61
+  ETHUSDT MAY: entries=30
+  SOLUSDT 2026-01: entries=42
+  SOLUSDT 2026-02: entries=40
+  SOLUSDT 2026-03: entries=54
+  SOLUSDT 2026-04: entries=55
+  SOLUSDT MAY: entries=30
+  XRPUSDT 2026-01: entries=40
+  XRPUSDT 2026-02: entries=27
+  XRPUSDT 2026-03: entries=45
+  XRPUSDT 2026-04: entries=55
+  XRPUSDT MAY: entries=32
+
+  total entries continuation = 905
+
+======================================================================================================================
+NET bps/trade par REGLE DE SORTIE (POOLED + par mois). win% & queue. RIDE la continuation.
+======================================================================================================================
+        sortie |    net     t  win%   pire     p5 |     01     02     03     04     05
+  ------------------------------------------------------------------------------------
+        FIX-1h |   -2.3  -0.7    43   -510   -144 |  +14.0   -5.4   -3.2   -8.9   -6.3
+        FIX-4h |   -2.1  -0.4    45   -586   -241 |  +16.8   +9.2  -11.1   -7.3  -17.1
+        FIX-8h |   -5.3  -0.8    47  -1028   -289 |   +7.9  +12.3  -16.3  -12.8  -13.1
+          TP15 |  -13.6  -5.0    86   -864   -189 |   -8.9  -23.0   -6.8  -19.3   -8.2
+          TP30 |  -11.0  -3.6    78   -864   -209 |   -9.4  -13.2   -2.6  -18.5  -11.0
+          TP50 |  -11.6  -3.1    70   -864   -245 |  -10.7   -4.4  -14.2  -16.6   -9.0
+         TP100 |   -9.0  -1.9    58   -864   -265 |   -4.6   -0.5  -10.9  -16.5   -9.1
+     TP50/SL50 |   -6.7  -4.0    48    -56    -56 |   +1.2   -9.7   -8.6   -7.0   -9.4
+   TP100/SL100 |   -7.4  -2.4    48   -106   -106 |   +2.2   -4.1   -6.4  -16.4   -9.6
+   TP100/SL150 |   -7.7  -2.1    53   -156   -156 |   -5.5   -6.8   -5.6  -10.1  -11.0
+    TRAIL30/20 |   -4.9  -1.4    72   -864   -209 |   +6.8   -9.4   +3.5  -13.8  -13.4
+    TRAIL50/30 |   -6.4  -1.5    68   -864   -245 |   +7.5   -1.9   -8.4  -15.2  -11.1
+
+  --- par ACTIF (net bps/trade) : petit-target vs laisser-courir ---
+        sortie |     BTC     ETH     SOL     XRP
+          TP15 |   -5.1  -18.4  -16.0  -15.0
+          TP30 |   -3.7  -14.9  -10.5  -15.3
+        FIX-8h |   +1.5  -10.2   +1.2  -14.5
+    TRAIL50/30 |   -5.7   -9.4   +1.9  -12.6
+   TP100/SL150 |  -14.1   -4.2   +3.2  -16.2
+
+  NULL (direction aleatoire) pour meilleure regle = FIX-4h : real=-2.08  null=-2.75+-4.46  z=+0.15  p(null>=real)=48.0%
+
+[done] 1108s

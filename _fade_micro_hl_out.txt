@@ -1,0 +1,50 @@
+=== FADE-EXTENSION + MICROSTRUCTURE (L2 imbalance + taker flow) sur HL — vrai mid, tick-level, AVEC HYPE ===
+entry: fade-extension FILTRE par liq_imb5/tfi_5min dans le sens du fade. net 3bps. NONE/+L2/+FLOW/+BOTH.
+
+  BTCUSDC/W507: 464 signaux (132L/332S)
+  BTCUSDC/W515: 7 signaux (7L/0S)
+  BTCUSDC/W516: 547 signaux (396L/151S)
+  ETHUSDC/W507: 507 signaux (237L/270S)
+  ETHUSDC/W515: 0 signaux (0L/0S)
+  ETHUSDC/W516: 440 signaux (281L/159S)
+  SOLUSDC/W507: 449 signaux (129L/320S)
+  SOLUSDC/W515: 1 signaux (1L/0S)
+  SOLUSDC/W516: 553 signaux (416L/137S)
+  XRPUSDC/W507: 597 signaux (235L/362S)
+  XRPUSDC/W515: 18 signaux (18L/0S)
+  XRPUSDC/W516: 824 signaux (641L/183S)
+  HYPEUSDC/W507: 506 signaux (197L/309S)
+  HYPEUSDC/W515: 2 signaux (0L/2S)
+  HYPEUSDC/W516: 710 signaux (205L/505S)
+
+==============================================================================================================
+EXIT = hold  h240  | net/trade, n, win%, par semaine, par actif, queue
+==============================================================================================================
+   filtre |    net     n  win%   pire     p5 |   W507   W515   W516 |     BTC     ETH     SOL     XRP     HYP
+     NONE |    8.4   220    53   -469   -165 |   16.1   32.2    0.5 |   22.5   40.3   22.1    9.9  -51.0
+      +L2 |   11.8   136    57   -455   -155 |   14.6  125.4    8.0 |   16.5   10.4   34.0   21.2  -23.2
+    +FLOW |    8.4   186    58   -471   -136 |    4.5   42.3   10.7 |   11.8   16.7   21.7   11.8  -19.4
+    +BOTH |    6.3   109    57   -485   -196 |   17.8  125.4   -3.1 |   15.8   11.0   42.2   21.2  -70.5
+
+==============================================================================================================
+EXIT = tpsl tp80,sl120 h480  | net/trade, n, win%, par semaine, par actif, queue
+==============================================================================================================
+   filtre |    net     n  win%   pire     p5 |   W507   W515   W516 |     BTC     ETH     SOL     XRP     HYP
+     NONE |    7.5   149    58   -123   -123 |    8.4   18.6    6.0 |   10.7   13.2   20.6   10.5  -17.7
+      +L2 |    2.6   103    58   -123   -123 |   -2.6   77.0    5.9 |    8.2   15.2    7.6    8.9  -24.3
+    +FLOW |    0.1   130    57   -123   -123 |   -9.1   23.2    7.4 |    4.5    5.3    2.9    8.4  -21.3
+    +BOTH |    7.2    85    64   -123   -123 |   -1.3   77.0   11.8 |    8.5   13.2   13.6   10.1  -10.5
+
+==============================================================================================================
+EXIT = trail arm50,trail25 h480  | net/trade, n, win%, par semaine, par actif, queue
+==============================================================================================================
+   filtre |    net     n  win%   pire     p5 |   W507   W515   W516 |     BTC     ETH     SOL     XRP     HYP
+     NONE |    5.4   149    74   -592   -161 |   10.0   11.0    0.6 |    9.4   13.6   21.5   14.8  -32.2
+      +L2 |    0.7   103    75   -470   -211 |   11.2   36.2   -9.2 |   22.7   -1.2   22.2   -4.0  -35.9
+    +FLOW |   -0.2   130    70   -492   -202 |    5.1   13.0   -5.6 |   18.5    1.8    7.1    8.4  -38.0
+    +BOTH |   10.9    85    79   -470   -202 |   20.3   36.2    3.7 |   26.8   -3.6   27.8   18.9  -22.6
+
+  LECTURE : si +L2/+FLOW/+BOTH > NONE (net + queue + robustesse par actif/semaine), la microstructure HL
+            time la reversion -> c'est l'edge que Binance ne pouvait pas voir. Sinon, le price-only suffisait.
+
+[done] 45s

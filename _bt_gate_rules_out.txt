@@ -1,0 +1,99 @@
+=== CONFIRMATION GATE SEARCH (tick-level, zero sampling, gap-aware, strict OOS) ===
+H=120min, fee=3.0bps, TP/SL=50.0/50.0, min_n/week=30
+
+  W507/BTCUSDC: n=1094784 valid=1094764 LONG_e=367 SHORT_e=403 -> kept L=367 S=403
+  W507/ETHUSDC: n=1094780 valid=1094760 LONG_e=403 SHORT_e=352 -> kept L=403 S=352
+  W507/SOLUSDC: n=1094788 valid=1094768 LONG_e=367 SHORT_e=385 -> kept L=367 S=385
+  W507/XRPUSDC: n=1094791 valid=1094771 LONG_e=444 SHORT_e=496 -> kept L=444 S=496
+  W507/HYPEUSDC: n=1094789 valid=1094769 LONG_e=575 SHORT_e=462 -> kept L=575 S=462
+  W516/BTCUSDC: n=1115030 valid=1115020 LONG_e=418 SHORT_e=372 -> kept L=418 S=372
+  W516/ETHUSDC: n=1115029 valid=1115019 LONG_e=323 SHORT_e=427 -> kept L=323 S=427
+  W516/SOLUSDC: n=1115034 valid=1115024 LONG_e=471 SHORT_e=389 -> kept L=471 S=389
+  W516/XRPUSDC: n=1115040 valid=1115030 LONG_e=678 SHORT_e=559 -> kept L=678 S=559
+  W516/HYPEUSDC: n=1115035 valid=1115025 LONG_e=550 SHORT_e=614 -> kept L=550 S=614
+
+==========================================================================================
+UNGATED BASELINE (base contrarian+vol signal, all entries):
+  W507: n= 4254  net= +618.8 bps/day  win=53.8%  MFE_med= +47.6 MAE_med= -42.3 |ratio|=1.12  mean_net/entry=+5.09bps
+  W516: n= 4801  net= -220.8 bps/day  win=48.7%  MFE_med= +48.7 MAE_med= -52.5 |ratio|=0.93  mean_net/entry=-1.61bps
+
+==========================================================================================
+SINGLE-FEATURE GATES  (calibrate net_d on CAL week, report EVAL week OOS):
+
+gate (rank thr)                   cal->oos         n  OOSnet/d   win%  baseNet/d baseWin% |MFE/MAE|
+----------------------------------------------------------------------------------------------------
+vol_5min<0.90                     W516->W507    2915    +576.1   55.3     +618.8     53.8      1.15
+spread_mean<0.90                  W516->W507    3142    +543.9   53.9     +618.8     53.8      1.11
+tfi_5min>=0.55                    W516->W507    1934    +520.5   56.2     +618.8     53.8      1.22
+intensity_5min<0.85               W516->W507    2681    +494.3   55.8     +618.8     53.8      1.14
+intensity_5min>=0.55              W516->W507    3511    +480.8   53.5     +618.8     53.8      1.12
+drift_5min>=0.25                  W516->W507    2777    +452.8   53.8     +618.8     53.8      1.06
+avg_size_5min>=0.60               W516->W507    2319    +448.2   55.1     +618.8     53.8      1.22
+volume_total_5min<0.85            W516->W507    3029    +411.7   53.7     +618.8     53.8      1.10
+n_large_5min>=0.65                W516->W507    2584    +399.8   53.4     +618.8     53.8      1.14
+volume_total_5min>=0.75           W516->W507    2081    +353.3   53.6     +618.8     53.8      1.19
+drift_5min<0.85                   W516->W507    3147    +311.2   53.2     +618.8     53.8      1.13
+drift_15min>=0.60                 W516->W507    1852    +310.8   55.3     +618.8     53.8      1.04
+spread_mean>=0.70                 W516->W507    2633    +214.5   53.2     +618.8     53.8      1.05
+spread_mean<0.90                  W507->W516    3238    +186.5   47.6     -220.8     48.7      0.91
+top_imb>=0.55                     W516->W507    1790    +154.6   52.5     +618.8     53.8      1.13
+vol_5min>=0.80                    W516->W507    2542    +142.1   52.0     +618.8     53.8      1.08
+drift_1h<0.10                     W516->W507     687    +141.8   56.8     +618.8     53.8      1.14
+drift_1h>=0.90                    W516->W507     804    +131.0   53.0     +618.8     53.8      0.94
+liq_imb5>=0.70                    W516->W507    1181    +127.2   54.4     +618.8     53.8      1.18
+buy_ratio_30s>=0.85               W516->W507     433    +116.4   61.7     +618.8     53.8      1.11
+
+==========================================================================================
+PAIRWISE AND GATES  (calibrate both thresholds on CAL, report EVAL OOS):
+
+gate A AND gate B                                   cal->oos         n  OOSnet/d   win%  baseNet/d |MFE/MAE|
+--------------------------------------------------------------------------------------------------------------
+vol_5min<0.9 & intensity_5min<0.9                   W516->W507    2642    +586.9   56.0     +618.8      1.17
+vol_5min<0.9 & top_imb>=0.1                         W516->W507    2685    +562.9   55.3     +618.8      1.14
+vol_5min<0.9 & spread_mean<0.9                      W516->W507    2671    +547.1   55.3     +618.8      1.14
+drift_5min>=0.1 & vol_5min<0.9                      W516->W507    2452    +528.3   55.3     +618.8      1.12
+intensity_5min<0.9 & volume_total_5min<0.9          W516->W507    3105    +527.6   54.7     +618.8      1.14
+intensity_5min<0.9 & liq_imb5<0.9                   W516->W507    3070    +517.1   54.8     +618.8      1.11
+intensity_5min<0.9 & n_large_5min<0.9               W516->W507    3088    +511.8   54.7     +618.8      1.13
+drift_5min>=0.2 & top_imb>=0.1                      W516->W507    2780    +510.4   54.5     +618.8      1.08
+intensity_5min<0.9 & spread_mean<0.9                W516->W507    2732    +507.1   54.5     +618.8      1.13
+drift_5min>=0.1 & spread_mean<0.9                   W516->W507    2623    +506.5   53.9     +618.8      1.09
+drift_5min>=0.2 & top_imb<0.9                       W516->W507    2729    +502.7   54.2     +618.8      1.07
+tfi_5min>=0.6 & top_imb>=0.1                        W516->W507    1559    +493.1   57.2     +618.8      1.23
+drift_5min>=0.1 & intensity_5min<0.9                W516->W507    2748    +493.0   54.4     +618.8      1.09
+liq_imb5<0.9 & spread_mean<0.9                      W516->W507    2912    +492.6   54.1     +618.8      1.10
+tfi_5min>=0.6 & volume_total_5min<0.9               W516->W507    1345    +488.8   58.4     +618.8      1.29
+drift_1h>=0.2 & vol_5min<0.9                        W516->W507    2234    +487.0   55.7     +618.8      1.16
+avg_size_5min>=0.6 & top_imb<0.9                    W516->W507    2153    +483.6   55.7     +618.8      1.22
+intensity_5min<0.9 & spread_mean>=0.4               W516->W507    2660    +482.1   55.2     +618.8      1.13
+volume_total_5min<0.9 & n_large_5min<0.9            W516->W507    3344    +469.4   53.9     +618.8      1.12
+tfi_5min>=0.6 & spread_mean<0.9                     W516->W507    1258    +466.5   58.2     +618.8      1.32
+
+==========================================================================================
+VERDICT
+==========================================================================================
+
+SINGLE gates OOS-net-positive in BOTH directions: 2
+  spread_mean<  | 507->516(thr0.90): n=3238 net=+186.5 win=48% | 516->507(thr0.90): n=3142 net=+543.9 win=54% | baseNet 516=-220.8/507=+618.8
+  drift_5min>=  | 507->516(thr0.05): n=4187 net=+6.8 win=48% | 516->507(thr0.25): n=2777 net=+452.8 win=54% | baseNet 516=-220.8/507=+618.8
+
+PAIRWISE gates OOS-net-positive in BOTH directions: 105
+  vol_5min< & spread_mean< | 507->516: n=2790 net=+328.7 win=48% | 516->507: n=2671 net=+547.1 win=55%
+  drift_5min>= & intensity_5min< | 507->516: n=2945 net=+344.0 win=49% | 516->507: n=2748 net=+493.0 win=54%
+  drift_5min>= & top_imb>= | 507->516: n=3539 net=+245.6 win=49% | 516->507: n=2780 net=+510.4 win=55%
+  intensity_5min< & spread_mean< | 507->516: n=2877 net=+244.5 win=48% | 516->507: n=2732 net=+507.1 win=55%
+  vol_5min< & intensity_5min< | 507->516: n=2954 net=+158.8 win=48% | 516->507: n=2642 net=+586.9 win=56%
+  vol_5min< & top_imb>= | 507->516: n=2912 net=+175.1 win=47% | 516->507: n=2685 net=+562.9 win=55%
+  liq_imb5< & spread_mean< | 507->516: n=2956 net=+237.8 win=48% | 516->507: n=2912 net=+492.6 win=54%
+  intensity_5min< & spread_mean>= | 507->516: n=3329 net=+245.2 win=49% | 516->507: n=2660 net=+482.1 win=55%
+
+------------------------------------------------------------------------------------------
+CHAMPION per-pair breakdown (OOS eval weeks):
+  CHAMPION (single, both-dir +): spread_mean < threshold
+    W507->W516 (thr0.90) OOS n=3238 net=+186.5/d win=48% |MFE/MAE|=0.91 :: BTC:n520 -443 ETH:n498 -1028 SOL:n567 +661 XRP:n789 -832 HYP:n864 +2574
+    W516->W507 (thr0.90) OOS n=3142 net=+543.9/d win=54% |MFE/MAE|=1.11 :: BTC:n560 +290 ETH:n560 +903 SOL:n575 +50 XRP:n687 +887 HYP:n760 +590
+
+  Ungated baseline best week net_d = +618.8 bps/day (W507=+618.8, W516=-220.8)
+  -> A confirmation gate is OOS-net-positive in BOTH directions; best avg OOS net_d = +365.2 bps/day.
+
+[done in 337s]

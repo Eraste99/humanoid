@@ -1,0 +1,22 @@
+==============================================================================
+BTC JANVIER 2026 — SEQUENCE des legs 50 bps : alternance vs persistance + timing retournement
+==============================================================================
+  legs=549   UP=265 (48.3%)  DOWN=284 (51.7%)
+
+  MATRICE DE TRANSITION (548 transitions) :
+    apres UP   -> UP   :  128   |  -> DOWN :  136   (P(DOWN|UP)  = 0.515)
+    apres DOWN -> UP   :  136   |  -> DOWN :  148   (P(UP|DOWN)  = 0.479)
+
+  TAUX D'ALTERNANCE (leg suivant de sens OPPOSE) = 49.6%
+  BASELINE i.i.d. (si independant) : P(alternance) ~ 2*p_up*p_dn = 49.9%
+    P(DOWN|UP) observe 0.515  vs  P(DOWN) global 0.517
+    P(UP|DOWN) observe 0.479  vs  P(UP) global   0.483
+    => ~ HASARD : enchainement des legs ~ independant (pile/face)
+
+  TEMPS DU LEG DE RETOURNEMENT (de A a B du 2e leg, contigu au 1er) :
+    UP -> DOWN  (pic -> creux) : moyenne=  1.44 h   mediane=  33.1 min  (n=136)
+    DOWN -> UP  (creux -> pic) : moyenne=  1.10 h   mediane=  22.1 min  (n=136)
+    UP -> UP    (continuation): moyenne=  1.60 h   mediane=  28.4 min  (n=128)
+    DOWN -> DOWN(continuation): moyenne=  1.29 h   mediane=  14.4 min  (n=148)
+
+[done] 42s

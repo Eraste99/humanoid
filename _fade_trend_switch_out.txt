@@ -1,0 +1,40 @@
+=== TWO-SIDED SWITCH keyed on TREND MAGNITUDE (l'idee user) — Binance OOS 4 majors Jan->May ===
+RIDE si |trend| fort (falling knife -> on suit) ; FADE si chop. Switch causal (seuil expansif, no-lookahead).
+PnL = fwd 8h net 3.0bps. 4 bras memes events : SWITCH / ALWAYS-FADE / ALWAYS-TREND / RANDOM.
+
+  BTCUSDT 2026-01: events=46
+  BTCUSDT 2026-02: events=51
+  BTCUSDT 2026-03: events=64
+  BTCUSDT 2026-04: events=61
+  BTCUSDT MAY: events=33
+  ETHUSDT 2026-01: events=47
+  ETHUSDT 2026-02: events=54
+  ETHUSDT 2026-03: events=66
+  ETHUSDT 2026-04: events=64
+  ETHUSDT MAY: events=32
+  SOLUSDT 2026-01: events=43
+  SOLUSDT 2026-02: events=40
+  SOLUSDT 2026-03: events=55
+  SOLUSDT 2026-04: events=59
+  SOLUSDT MAY: events=31
+  XRPUSDT 2026-01: events=42
+  XRPUSDT 2026-02: events=32
+  XRPUSDT 2026-03: events=48
+  XRPUSDT 2026-04: events=59
+  XRPUSDT MAY: events=33
+
+====================================================================================================
+RESULTATS — net bps/trade @8h, par bras. SWITCH doit battre ALWAYS-FADE & ALWAYS-TREND & RANDOM.
+====================================================================================================
+               (par mois ->) |        |               |     01     02     03     04     05
+                 ALWAYS-FADE | n= 951 | net= -7.25 t=-1.09 |  -30.1  -16.3   -5.1   +8.2   +3.0
+                ALWAYS-TREND | n= 951 | net= +1.25 t=+0.19 |  +24.1  +10.3   -0.9  -14.2   -9.0
+       RANDOM(null,200seeds) | n= 951 | net= -3.02 t=-6.49 |   -3.3   -3.4   -2.5   -3.4   -2.3
+             SWITCH[tm8>P50] | n= 951 | net= -0.87 t=-0.13 |   -3.1  +26.0  -20.1   +2.8   -7.5
+             SWITCH[tm8>P75] | n= 951 | net= -4.38 t=-0.66 |  -11.3  -16.1   -2.7   +5.7   -1.3
+            SWITCH[tm24>P50] | n= 951 | net=-11.61 t=-1.75 |   -7.0   -8.8  -17.5  -13.7   -6.6
+            SWITCH[tm24>P75] | n= 951 | net= -6.01 t=-0.91 |  -11.5  -12.2   -4.6   -2.8   +1.6
+            SWITCH[tm72>P50] | n= 951 | net= -4.44 t=-0.67 |   -6.9   +2.7  -12.1   +2.4  -10.7
+            SWITCH[tm72>P75] | n= 951 | net= -2.69 t=-0.41 |   +5.0   -1.9  -16.0   +2.9   -0.8
+
+[done] 896s

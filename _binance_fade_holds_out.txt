@@ -1,0 +1,15 @@
+=== HOLD SWEEP (fade de-bounced, Binance Jan-Avr, cache) ===
+
+  --- HOLD 120min ---  n_total=1583  POOLED net=-1.3
+     par mois: 01= -6.0(n327) 02= +3.3(n330) 03= -0.0(n473) 04= -2.7(n453) 
+     mois positifs: 1/4
+
+  --- HOLD 240min ---  n_total=1151  POOLED net=-1.4
+     par mois: 01= -6.0(n243) 02= -8.1(n239) 03= +6.1(n345) 04= -1.0(n324) 
+     mois positifs: 1/4
+
+  --- HOLD 480min ---  n_total=780  POOLED net=-1.9
+     par mois: 01=-15.6(n167) 02= -1.5(n170) 03= +1.8(n220) 04= +4.3(n223) 
+     mois positifs: 2/4
+
+[done] 734s

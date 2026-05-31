@@ -1,0 +1,47 @@
+=== IDEE USER LITTERALE : move 50bps -> entre dans son sens -> +10 avant -10 ? (Binance 4 majors Jan->Mai) ===
+   chaine zigzag 50bps ; a chaque B entre dans le sens du leg ; race +10/-10 ; UP vs DOWN.
+
+  BTCUSDT 2026-01: legs=549
+  BTCUSDT 2026-02: legs=1431
+  BTCUSDT 2026-03: legs=906
+  BTCUSDT 2026-04: legs=501
+  BTCUSDT MAY: legs=178
+  ETHUSDT 2026-01: legs=1193
+  ETHUSDT 2026-02: legs=2870
+  ETHUSDT 2026-03: legs=1653
+  ETHUSDT 2026-04: legs=800
+  ETHUSDT MAY: legs=279
+  SOLUSDT 2026-01: legs=1361
+  SOLUSDT 2026-02: legs=3041
+  SOLUSDT 2026-03: legs=1661
+  SOLUSDT 2026-04: legs=804
+  SOLUSDT MAY: legs=365
+  XRPUSDT 2026-01: legs=1385
+  XRPUSDT 2026-02: legs=2918
+  XRPUSDT 2026-03: legs=1121
+  XRPUSDT 2026-04: legs=577
+  XRPUSDT MAY: legs=258
+
+============================================================================================
+P(+10 atteint AVANT -10 | entre dans le sens du move de 50bps)  — 50% = pile/face
+============================================================================================
+     actif |   UP n  P(+10) UP |  DOWN n  P(+10) DOWN |   ALL n  P(+10) ALL
+  ------------------------------------------------------------------------------
+   BTCUSDT |   1772      51.0% |    1793        51.8% |    3565       51.4%
+   ETHUSDT |   3366      51.7% |    3429        50.3% |    6795       51.0%
+   SOLUSDT |   3582      52.9% |    3649        53.0% |    7231       53.0%
+   XRPUSDT |   3098      53.5% |    3161        53.4% |    6259       53.4%
+  ------------------------------------------------------------------------------
+    POOLED |  11818      52.4% |   12032        52.2% |   23850       52.3%
+
+============================================================================================
+CE QUE CA DONNE PAR TRADE (TP=+10 / SL=-10) :
+============================================================================================
+  P(+10 first) poole = 52.3%
+  edge GROSS = (2P-1)*10 = +0.46 bps/trade
+  net maker-maker (RT 3bps)            = -2.54 bps
+  net maker-in + taker-stop (~6bps RT) = -3.97 bps   (win +7 / loss -16)
+
+  seuil break-even maker-maker : P >= 65.0%   |   pour +3 net : P >= 80.0%
+
+[done] 669s

@@ -1,0 +1,58 @@
+=== OFI RIDE + LEAD-vs-COINCIDENT — HYPE vs majors, HL vrai mid L2, tick-level ===
+    lead = corr(OFI_roulant, ret FUTUR) ; coincident = corr(OFI_roulant, ret PASSE).
+    si lead>>0 et ride_edge>0 -> RIDABLE (flux pas price-in) ; si coincident>>lead -> deja price-in.
+
+  [l2 cols] ['ts_ms', 'b1p', 'b1s', 'b2p', 'b2s', 'b3p', 'b3s', 'b4p', 'b4s', 'b5p', 'b5s', 'a1p', 'a1s', 'a2p', 'a2s', 'a3p', 'a3s', 'a4p', 'a4s', 'a5p', 'a5s', 'liq_b5', 'liq_a5', 'spread_bps']
+  HYPEUSDC/W507: l2 snaps=1,094,789  (4s)
+  HYPEUSDC/W515: l2 snaps=75,685  (4s)
+  HYPEUSDC/W516: l2 snaps=1,115,035  (10s)
+  BTCUSDC/W507: l2 snaps=1,094,784  (16s)
+  BTCUSDC/W515: l2 snaps=75,684  (16s)
+  BTCUSDC/W516: l2 snaps=1,115,030  (21s)
+  ETHUSDC/W507: l2 snaps=1,094,780  (26s)
+  ETHUSDC/W515: l2 snaps=75,683  (26s)
+  ETHUSDC/W516: l2 snaps=1,115,029  (30s)
+  SOLUSDC/W507: l2 snaps=1,074,440  (34s)
+  SOLUSDC/W515: l2 snaps=75,684  (34s)
+  SOLUSDC/W516: l2 snaps=1,115,034  (38s)
+  XRPUSDC/W507: l2 snaps=1,094,791  (42s)
+  XRPUSDC/W515: l2 snaps=75,685  (42s)
+  XRPUSDC/W516: l2 snaps=1,115,040  (46s)
+
+============================================================================================
+W = H = 10s
+============================================================================================
+      actif | LEAD corr(OFI,fwd) |  COINCIDENT corr(OFI,past) |  ride_edge (bps)
+  ------------------------------------------------------------------------------
+   HYPEUSDC |             +0.041 |                     +0.477 |           +0.258
+    BTCUSDC |             +0.150 |                     +0.658 |           +0.255
+    ETHUSDC |             +0.129 |                     +0.699 |           +0.290
+    SOLUSDC |             +0.131 |                     +0.670 |           +0.286
+    XRPUSDC |             +0.080 |                     +0.649 |           +0.180
+
+============================================================================================
+W = H = 60s
+============================================================================================
+      actif | LEAD corr(OFI,fwd) |  COINCIDENT corr(OFI,past) |  ride_edge (bps)
+  ------------------------------------------------------------------------------
+   HYPEUSDC |             +0.022 |                     +0.501 |           +0.398
+    BTCUSDC |             +0.007 |                     +0.644 |           +0.124
+    ETHUSDC |             +0.017 |                     +0.686 |           +0.158
+    SOLUSDC |             +0.016 |                     +0.682 |           +0.125
+    XRPUSDC |             +0.000 |                     +0.681 |           +0.031
+
+============================================================================================
+W = H = 300s
+============================================================================================
+      actif | LEAD corr(OFI,fwd) |  COINCIDENT corr(OFI,past) |  ride_edge (bps)
+  ------------------------------------------------------------------------------
+   HYPEUSDC |             -0.027 |                     +0.454 |           -0.119
+    BTCUSDC |             -0.080 |                     +0.489 |           -0.236
+    ETHUSDC |             -0.065 |                     +0.559 |           -0.255
+    SOLUSDC |             +0.011 |                     +0.535 |           -0.101
+    XRPUSDC |             -0.012 |                     +0.574 |           +0.118
+
+  LECTURE : HYPE avec LEAD>0 et ride_edge>0 vs majors LEAD~0/coincident>>lead -> tu VOIS la difference :
+            HYPE = le flux MENE le prix (ridable, pas price-in) ; majors = OFI coincident (deja price-in).
+
+[done] 46s

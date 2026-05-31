@@ -1,0 +1,50 @@
+=== FADE-BULL CONDITIONNE — short rips : QUAND ca marche (force / acceleration de l'uptrend) — HL true-mid ===
+fade=short up-leg, hold 30min, maker RT3. bull=tercile haut drift_4h ; splits median DANS le bull.
+
+--- HYPEUSDC ---
+              bear_all (ref) | n= 397 | net   +0.3 | win   50%
+                    bull_all | n= 397 | net   -4.2 | win   51%
+        bull_mod (4h faible) | n= 198 | net   -7.7 | win   49%
+       bull_strong (4h fort) | n= 199 | net   -0.8 | win   52%
+     bull_decel (1h<mediane) | n= 198 | net   -3.3 | win   51%
+    bull_accel (1h>=mediane) | n= 199 | net   -5.2 | win   51%
+--- BTCUSDC ---
+              bear_all (ref) | n=  51 | net   +9.6 | win   71%
+                    bull_all | n=  51 | net   +6.8 | win   69%
+        bull_mod (4h faible) | n=  25 | net   +4.7 | win   72%
+       bull_strong (4h fort) | n=  26 | net   +8.8 | win   65%
+     bull_decel (1h<mediane) | n=  25 | net   -1.7 | win   68%
+    bull_accel (1h>=mediane) | n=  26 | net  +15.0 | win   69%
+--- ETHUSDC ---
+              bear_all (ref) | n=  77 | net   -0.7 | win   53%
+                    bull_all | n=  77 | net   +1.9 | win   55%
+        bull_mod (4h faible) | n=  38 | net   +2.2 | win   58%
+       bull_strong (4h fort) | n=  39 | net   +1.5 | win   51%
+     bull_decel (1h<mediane) | n=  38 | net   -2.8 | win   47%
+    bull_accel (1h>=mediane) | n=  39 | net   +6.5 | win   62%
+--- SOLUSDC ---
+              bear_all (ref) | n=  94 | net   +7.9 | win   60%
+                    bull_all | n=  94 | net   +3.7 | win   53%
+        bull_mod (4h faible) | n=  47 | net   +4.5 | win   60%
+       bull_strong (4h fort) | n=  47 | net   +3.0 | win   47%
+     bull_decel (1h<mediane) | n=  47 | net   +0.6 | win   53%
+    bull_accel (1h>=mediane) | n=  47 | net   +6.9 | win   53%
+--- XRPUSDC ---
+              bear_all (ref) | n=  73 | net  +12.5 | win   64%
+                    bull_all | n=  73 | net   +1.7 | win   47%
+        bull_mod (4h faible) | n=  36 | net   -3.0 | win   36%
+       bull_strong (4h fort) | n=  37 | net   +6.2 | win   57%
+     bull_decel (1h<mediane) | n=  36 | net   +2.3 | win   47%
+    bull_accel (1h>=mediane) | n=  37 | net   +1.1 | win   46%
+--- MAJORS POOLES (BTC+ETH+SOL+XRP) ---
+              bear_all (ref) | n= 293 | net   +7.5 | win   61%
+                    bull_all | n= 293 | net   +3.0 | win   56%
+        bull_mod (4h faible) | n= 146 | net   +0.9 | win   60%
+       bull_strong (4h fort) | n= 147 | net   +5.2 | win   53%
+     bull_decel (1h<mediane) | n= 146 | net   -1.2 | win   53%
+    bull_accel (1h>=mediane) | n= 147 | net   +7.3 | win   60%
+
+  LECTURE : si bull_decel >> bull_accel (et > 0) -> 'shorter le rip quand l'uptrend s'essouffle' = la bonne regle.
+    si bull_mod > bull_strong -> fader seulement les uptrends MODERES. si tout ~0/negatif -> fade-bull pas sauvable.
+
+[done] 45s

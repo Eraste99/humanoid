@@ -1,0 +1,30 @@
+# === SECRETS — NE JAMAIS COMMITTER ===
+.env*
+*secret*
+secrets/
+*credential*
+*.key
+*.pem
+
+# === DATA / MODÈLES / CACHES LOURDS (exclus du backup recherche) ===
+_archive_20260524/
+mic_p2_outputs/
+_tune_cache/
+logs/
+state/
+params/
+__pycache__/
+*.joblib
+*.onnx
+*.npz
+*.pkl
+*.parquet
+*.csv
+*.zip
+*.log
+
+# === venv / IDE ===
+.venv/
+venv/
+.idea/
+.vscode/

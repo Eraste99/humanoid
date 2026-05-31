@@ -1,0 +1,56 @@
+=== FULL REGIME-SWITCH STRATEGY (Binance OOS, 4 majors x Jan-Avr, tick-level, ZERO sampling) ===
+KER_WIN=12h  KER_THR=trailing-median-24h  PCT=trailing-24h  TP=100.0 STOP=150.0 TRAIL_ARM=60.0 GIVE=40.0  FEE mm=3.0 mt=6.0  MAX_HOLD=8h
+
+  BTCUSDT 2026-01: triggers hi=306 lo=329 (TREND-state=294 MR-state=341) days=31.0
+  BTCUSDT 2026-02: triggers hi=272 lo=281 (TREND-state=293 MR-state=260) days=28.0
+  BTCUSDT 2026-03: triggers hi=287 lo=298 (TREND-state=309 MR-state=276) days=31.0
+  BTCUSDT 2026-04: triggers hi=295 lo=272 (TREND-state=293 MR-state=274) days=30.0
+  ETHUSDT 2026-01: triggers hi=311 lo=328 (TREND-state=318 MR-state=321) days=31.0
+  ETHUSDT 2026-02: triggers hi=271 lo=263 (TREND-state=284 MR-state=250) days=28.0
+  ETHUSDT 2026-03: triggers hi=280 lo=298 (TREND-state=304 MR-state=274) days=31.0
+  ETHUSDT 2026-04: triggers hi=271 lo=287 (TREND-state=278 MR-state=280) days=30.0
+  SOLUSDT 2026-01: triggers hi=310 lo=317 (TREND-state=287 MR-state=340) days=31.0
+  SOLUSDT 2026-02: triggers hi=284 lo=276 (TREND-state=285 MR-state=275) days=28.0
+  SOLUSDT 2026-03: triggers hi=290 lo=287 (TREND-state=291 MR-state=286) days=31.0
+  SOLUSDT 2026-04: triggers hi=284 lo=274 (TREND-state=247 MR-state=311) days=30.0
+  XRPUSDT 2026-01: triggers hi=308 lo=322 (TREND-state=345 MR-state=285) days=31.0
+  XRPUSDT 2026-02: triggers hi=279 lo=268 (TREND-state=256 MR-state=291) days=28.0
+  XRPUSDT 2026-03: triggers hi=293 lo=294 (TREND-state=274 MR-state=313) days=31.0
+  XRPUSDT 2026-04: triggers hi=308 lo=275 (TREND-state=276 MR-state=307) days=30.0
+
+====================================================================================================
+NET PnL PER TRADE (bps, net of correct maker/taker fees).  POOLED 4 majors x 4 months.
+====================================================================================================
+  ARM            |      n | net/trade |   tot bps |    worst |       p5
+  ---------------------------------------------------------------------
+  SWITCHED       |   9318 |     -5.13 |    -47800 |   -156.0 |   -156.0
+  ALWAYS_FADE    |   9318 |     -5.62 |    -52351 |   -156.0 |   -156.0
+  ALWAYS_TREND   |   9318 |     -5.16 |    -48123 |   -156.0 |   -156.0
+  RANDOM(avg5)   |   9318 |     -5.64 |    -52532 |   -156.0 |   -156.0   (mean sd across seeds 0.73)
+
+====================================================================================================
+PER MONTH net/trade (bps)  [n in brackets].  Robustness check: SWITCHED must beat all 3 every month.
+====================================================================================================
+  ARM            |               01 |               02 |               03 |               04
+  --------------------------------------------------------------------------------
+  SWITCHED       |    -7.45[2531] |    -2.99[2194] |    -4.51[2327] |    -5.25[2266]
+  ALWAYS_FADE    |    -9.51[2531] |    -6.09[2194] |    -1.64[2327] |    -4.90[2266]
+  ALWAYS_TREND   |    -8.26[2531] |    -3.18[2194] |    -4.46[2327] |    -4.35[2266]
+  RANDOM(avg5)   |    -8.35[2531] |    -5.55[2194] |    -3.76[2327] |    -4.61[2266]
+
+====================================================================================================
+VERDICT
+====================================================================================================
+  POOLED net/trade:  SWITCHED -5.13 | FADE -5.62 | TREND -5.16 | RANDOM -5.64
+    2026-01: SWITCHED -7.45 vs FADE -9.51 / TREND -8.26 / RAND -8.35  -> BEATS all
+    2026-02: SWITCHED -2.99 vs FADE -6.09 / TREND -3.18 / RAND -5.55  -> BEATS all
+    2026-03: SWITCHED -4.51 vs FADE -1.64 / TREND -4.46 / RAND -3.76  -> does NOT beat all
+    2026-04: SWITCHED -5.25 vs FADE -4.90 / TREND -4.35 / RAND -4.61  -> does NOT beat all
+
+  POOLED: SWITCHED beats FADE & TREND & RANDOM ? True
+  ROBUST: months where SWITCHED beats all 3 = 2/4
+  => SWITCH beats pooled but NOT robust across all 4 months -> NOT a clean win.
+
+  [sanity] trigger-event state mix: TREND=4634 MR=4684 (50% / 50%)
+
+[done] 1234s

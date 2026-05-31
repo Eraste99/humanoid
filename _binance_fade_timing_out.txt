@@ -1,0 +1,18 @@
+=== TIMING du fade : quand TP/SL frappent + time-stop a H ? (Binance OOS) ===
+
+  TEMPS jusqu'au TP+100 (trades qui l'atteignent, n=429) :
+    median=95min  p25=41  p75=214
+  TEMPS jusqu'au SL-150 (trades qui l'atteignent, n=316) :
+    median=128min  p25=43  p75=263
+
+  NET par TIME-STOP a H (sortie au prix courant si ni TP ni SL avant H) :
+     H(min)     net   TP%   SL% sortie-temps%     n
+         60    -3.8   20%   13%           68%   780
+        120    -1.2   30%   17%           53%   780
+        180    -3.0   36%   21%           43%   780
+        240    -2.7   40%   25%           35%   780
+        360    -2.8   46%   28%           26%   780
+        480    -1.9   50%   31%           19%   780
+
+  -> si net monte quand H BAISSE : sortir TOT (avant que le -150 se developpe) aide.
+[done] 766s

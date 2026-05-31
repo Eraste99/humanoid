@@ -1,0 +1,19 @@
+=== EXTENSION FILTER (signal Agent 1) sur Binance OOS � tient en TREND ? ===
+
+  n=780  net global=-1.9
+
+  NET par quartile d'EXTENSION |drift_8h| (Agent1 : Q4 haute-ext doit reverter +) :
+    Q1(faible ext)   n= 195 net=   +7.3 med|d8|=   16b
+    Q2               n= 195 net=  -13.8 med|d8|=   80b
+    Q3               n= 195 net=   -7.4 med|d8|=  148b
+    Q4(forte ext)    n= 195 net=   +6.2 med|d8|=  281b
+
+  Q4 (forte extension) PAR MOIS � le test trend :
+    2026-01: TOUT net= -15.6(n167)  |  Q4-ext net= -14.6(n38)
+    2026-02: TOUT net=  -1.5(n170)  |  Q4-ext net=  +3.2(n72)
+    2026-03: TOUT net=  +1.8(n220)  |  Q4-ext net= +19.7(n56)
+    2026-04: TOUT net=  +4.3(n223)  |  Q4-ext net= +14.7(n29)
+
+  -> si Q4-ext POSITIF en Jan/Fev (trend) : edge cross-regime REEL. Sinon : MR-specifique.
+
+[done] 1451s

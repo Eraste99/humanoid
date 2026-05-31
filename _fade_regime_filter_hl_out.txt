@@ -1,0 +1,63 @@
+=== FILTRE DE REGIME sur le FADE (kill-switch trend-informe, recherche-informe) — HL true-mid ===
+SKIP le fade si flux soutient la jambe / vol expand / surge. But : couper la QUEUE sans tuer l'EV.
+
+
+=== HYPEUSDC (n_entrees=375) ===
+      filtre | %gardé | net/tr  win% |  worst1  worst10   maxDD |   total
+  --------------------------------------------------------------------------
+    BASELINE |   100% |  -11.2    52 |  -353.6  -1745.9    6298 |   -4187
+      noFLOW |    71% |  -15.0    50 |  -353.6  -1722.4    5619 |   -3979
+      noVOLX |    70% |  -12.9    52 |  -353.6  -2064.3    4409 |   -3367
+     noSURGE |    70% |   -7.9    56 |  -259.6  -1475.3    3124 |   -2071
+       noANY |    39% |   -9.7    55 |  -249.5  -1199.3    2098 |   -1417
+
+=== BTCUSDC (n_entrees=63) ===
+      filtre | %gardé | net/tr  win% |  worst1  worst10   maxDD |   total
+  --------------------------------------------------------------------------
+    BASELINE |   100% |  +13.0    73 |   -78.1    -59.3      91 |    +817
+      noFLOW |    70% |  +15.7    73 |   -78.1    +15.4      82 |    +689
+      noVOLX |    70% |  +11.9    73 |   -78.1    -30.0      82 |    +523
+     noSURGE |    70% |   +9.2    75 |   -78.1    -38.3      78 |    +404
+       noANY |    40% |  +11.2    76 |   -78.1    +31.1      78 |    +279
+
+=== ETHUSDC (n_entrees=92) ===
+      filtre | %gardé | net/tr  win% |  worst1  worst10   maxDD |   total
+  --------------------------------------------------------------------------
+    BASELINE |   100% |   +3.8    59 |  -237.6   -586.4     735 |    +350
+      noFLOW |    70% |   +2.3    53 |  -237.6   -295.5     364 |    +147
+      noVOLX |    70% |   +3.9    58 |  -237.6   -359.4     368 |    +248
+     noSURGE |    68% |   +3.3    60 |  -237.6   -565.9     628 |    +208
+       noANY |    36% |   -6.1    52 |  -237.6   -361.8     545 |    -202
+
+=== SOLUSDC (n_entrees=105) ===
+      filtre | %gardé | net/tr  win% |  worst1  worst10   maxDD |   total
+  --------------------------------------------------------------------------
+    BASELINE |   100% |   +9.1    58 |  -134.0   -259.1     316 |    +950
+      noFLOW |    70% |  +13.2    60 |   -70.9    -85.0     127 |    +963
+      noVOLX |    70% |   +9.9    59 |  -134.0   -224.1     275 |    +724
+     noSURGE |    70% |   +4.3    55 |  -134.0   -280.9     354 |    +316
+       noANY |    40% |   +9.0    57 |   -70.3    -78.4     125 |    +378
+
+=== XRPUSDC (n_entrees=90) ===
+      filtre | %gardé | net/tr  win% |  worst1  worst10   maxDD |   total
+  --------------------------------------------------------------------------
+    BASELINE |   100% |  +12.0    62 |   -92.2   -104.0     156 |   +1076
+      noFLOW |    72% |   +8.7    65 |   -92.2   -119.8     127 |    +567
+      noVOLX |    70% |  +11.4    63 |   -92.2    -73.9     156 |    +715
+     noSURGE |    70% |   +9.4    62 |   -92.2    -86.7     111 |    +590
+       noANY |    41% |   +3.7    59 |   -92.2    -96.7     115 |    +138
+
+=== MAJORS POOLES (n_entrees=350) ===
+      filtre | %gardé | net/tr  win% |  worst1  worst10   maxDD |   total
+  --------------------------------------------------------------------------
+    BASELINE |   100% |   +9.1    62 |  -237.6  -1116.9    1159 |   +3194
+      noFLOW |    71% |   +9.5    62 |  -237.6   -338.3     477 |   +2350
+      noVOLX |    70% |   +8.7    62 |  -237.6   -565.6     800 |   +2126
+     noSURGE |    70% |   +7.9    61 |  -237.6   -564.3     840 |   +1931
+       noANY |    40% |   +6.3    60 |  -237.6   -274.7     528 |    +882
+
+  LECTURE : un bon filtre = maxDD & worst1/worst10 BAISSENT nettement, net/tr ~ tenu (ou baisse << que la queue).
+    si net s'ecroule autant que la queue -> le filtre coupe surtout des bons fades (info!=noise pas separe).
+    rappel lit. : attendre une COUPE de queue avec cout EV modeste = succes ; alpha-add improbable.
+
+[done] 44s

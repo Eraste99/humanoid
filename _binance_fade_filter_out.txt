@@ -1,0 +1,47 @@
+=== FILTRE DE R�GIME v2 (|drift macro| 24/48/72h, causal) sur le fade ===
+
+  total entrees (avec regime valide) : 855   net unfiltered = -3.6
+
+  --- regime = |drift_24h| ---  (p50=196 bps)
+    NET du fade par quartile (bas=chop doit etre +, haut=trend doit etre -) :
+      Q1(chop)   n= 214 net=   -3.3 med|drift|=   46b
+      Q2         n= 213 net=   -0.5 med|drift|=  140b
+      Q3         n= 214 net=   -2.0 med|drift|=  270b
+      Q4(trend)  n= 214 net=   -8.4 med|drift|=  520b
+    FILTRE |drift_24h| < seuil :
+      < 200b : n= 434 (51%)  net=   -1.8
+      < 300b : n= 572 (67%)  net=   -1.4
+      < 500b : n= 734 (86%)  net=   -3.4
+      < 800b : n= 817 (96%)  net=   -3.2
+
+  --- regime = |drift_48h| ---  (p50=265 bps)
+    NET du fade par quartile (bas=chop doit etre +, haut=trend doit etre -) :
+      Q1(chop)   n= 214 net=   -8.9 med|drift|=   60b
+      Q2         n= 213 net=   +1.1 med|drift|=  184b
+      Q3         n= 214 net=   -2.5 med|drift|=  354b
+      Q4(trend)  n= 214 net=   -4.0 med|drift|=  715b
+    FILTRE |drift_48h| < seuil :
+      < 200b : n= 342 (40%)  net=   -3.8
+      < 300b : n= 467 (55%)  net=   -4.0
+      < 500b : n= 646 (76%)  net=   -3.5
+      < 800b : n= 768 (90%)  net=   -2.1
+
+  --- regime = |drift_72h| ---  (p50=317 bps)
+    NET du fade par quartile (bas=chop doit etre +, haut=trend doit etre -) :
+      Q1(chop)   n= 214 net=   +5.7 med|drift|=   62b
+      Q2         n= 213 net=  -10.0 med|drift|=  216b
+      Q3         n= 214 net=   +3.4 med|drift|=  421b
+      Q4(trend)  n= 214 net=  -13.4 med|drift|=  813b
+    FILTRE |drift_72h| < seuil :
+      < 200b : n= 295 (35%)  net=   +5.6
+      < 300b : n= 414 (48%)  net=   -1.8
+      < 500b : n= 610 (71%)  net=   -0.2
+      < 800b : n= 741 (87%)  net=   -0.6
+
+  PAR MOIS, fade filtre |drift_48h| < 400 (chop only) :
+    2026-01: unfilt  -14.2 (n186)  ->  filtre  -11.2 (n114)
+    2026-02: unfilt   -8.3 (n195)  ->  filtre   -9.7 (n94)
+    2026-03: unfilt   -1.4 (n247)  ->  filtre  -11.0 (n165)
+    2026-04: unfilt   +6.9 (n227)  ->  filtre  +11.1 (n197)
+
+[done] 744s

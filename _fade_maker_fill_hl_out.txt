@@ -1,0 +1,140 @@
+=== SIM EXECUTION MAKER (fill via carnet L2) — fade-extension HL in-sample, adverse-selection reelle ===
+post bid(long)/ask(short) ; fill si l'ask descend/le bid monte a nous ; timeout 10min=miss ; frais reels.
+
+  [ok] HYPEUSDC
+  [ok] BTCUSDC
+  [ok] ETHUSDC
+  [ok] SOLUSDC
+  [ok] XRPUSDC
+
+====================================================================================================================
+FADE MAKER (fill carnet L2) : fill_rate, net/trade-rempli, win%, NET/SIGNAL (miss=0) — par actif/regime/post/exit
+====================================================================================================================
+      actif  reg  post      exit |  sig fill% | net/fill  win% |  NET/SIG
+  ------------------------------------------------------------------------------------
+   HYPEUSDC bear   mid   tp7sl15 |  399    95 |     -7.7    53 |     -7.4
+   HYPEUSDC bear   mid hold2h_mk |  399    95 |     +4.4    52 |     +4.2
+   HYPEUSDC bear   mid hold2h_tk |  399    95 |     +1.4    51 |     +1.3
+  ....................................................................................
+   HYPEUSDC bear  best   tp7sl15 |  399    94 |     -7.9    52 |     -7.4
+   HYPEUSDC bear  best hold2h_mk |  399    94 |     +3.2    52 |     +3.0
+   HYPEUSDC bear  best hold2h_tk |  399    94 |     +0.2    51 |     +0.1
+  ....................................................................................
+   HYPEUSDC bear deep3   tp7sl15 |  399    90 |     -8.5    50 |     -7.7
+   HYPEUSDC bear deep3 hold2h_mk |  399    90 |     +6.1    52 |     +5.5
+   HYPEUSDC bear deep3 hold2h_tk |  399    90 |     +3.1    51 |     +2.8
+  ....................................................................................
+   HYPEUSDC bull   mid   tp7sl15 |  399    98 |     -8.5    50 |     -8.3
+   HYPEUSDC bull   mid hold2h_mk |  399    98 |    -10.7    49 |    -10.4
+   HYPEUSDC bull   mid hold2h_tk |  399    98 |    -13.7    48 |    -13.4
+  ....................................................................................
+   HYPEUSDC bull  best   tp7sl15 |  399    96 |     -8.2    51 |     -7.9
+   HYPEUSDC bull  best hold2h_mk |  399    96 |    -11.2    49 |    -10.8
+   HYPEUSDC bull  best hold2h_tk |  399    96 |    -14.2    48 |    -13.7
+  ....................................................................................
+   HYPEUSDC bull deep3   tp7sl15 |  399    92 |     -8.6    50 |     -7.9
+   HYPEUSDC bull deep3 hold2h_mk |  399    92 |    -13.6    48 |    -12.5
+   HYPEUSDC bull deep3 hold2h_tk |  399    92 |    -16.6    48 |    -15.2
+  ....................................................................................
+    BTCUSDC bear   mid   tp7sl15 |   51    96 |     -2.6    73 |     -2.5
+    BTCUSDC bear   mid hold2h_mk |   51    96 |    +10.4    61 |    +10.0
+    BTCUSDC bear   mid hold2h_tk |   51    96 |     +7.4    57 |     +7.1
+  ....................................................................................
+    BTCUSDC bear  best   tp7sl15 |   51    92 |     -4.0    68 |     -3.7
+    BTCUSDC bear  best hold2h_mk |   51    92 |    +11.1    60 |    +10.2
+    BTCUSDC bear  best hold2h_tk |   51    92 |     +8.1    55 |     +7.5
+  ....................................................................................
+    BTCUSDC bear deep3   tp7sl15 |   51    86 |     -4.5    66 |     -3.9
+    BTCUSDC bear deep3 hold2h_mk |   51    86 |    +12.7    64 |    +10.9
+    BTCUSDC bear deep3 hold2h_tk |   51    86 |     +9.7    55 |     +8.4
+  ....................................................................................
+    BTCUSDC bull   mid   tp7sl15 |   51    92 |     -4.0    68 |     -3.7
+    BTCUSDC bull   mid hold2h_mk |   51    92 |     +9.3    66 |     +8.6
+    BTCUSDC bull   mid hold2h_tk |   51    92 |     +6.3    64 |     +5.8
+  ....................................................................................
+    BTCUSDC bull  best   tp7sl15 |   51    92 |     -3.4    70 |     -3.2
+    BTCUSDC bull  best hold2h_mk |   51    92 |     +9.9    66 |     +9.1
+    BTCUSDC bull  best hold2h_tk |   51    92 |     +6.9    64 |     +6.4
+  ....................................................................................
+    BTCUSDC bull deep3   tp7sl15 |   51    78 |     -4.1    68 |     -3.2
+    BTCUSDC bull deep3 hold2h_mk |   51    78 |     +9.4    68 |     +7.4
+    BTCUSDC bull deep3 hold2h_tk |   51    78 |     +6.4    65 |     +5.0
+  ....................................................................................
+    ETHUSDC bear   mid   tp7sl15 |   77    92 |     -9.7    45 |     -9.0
+    ETHUSDC bear   mid hold2h_mk |   77    92 |     +1.0    51 |     +0.9
+    ETHUSDC bear   mid hold2h_tk |   77    92 |     -2.0    48 |     -1.8
+  ....................................................................................
+    ETHUSDC bear  best   tp7sl15 |   77    92 |     -9.4    46 |     -8.6
+    ETHUSDC bear  best hold2h_mk |   77    92 |     +1.9    52 |     +1.8
+    ETHUSDC bear  best hold2h_tk |   77    92 |     -1.1    48 |     -1.0
+  ....................................................................................
+    ETHUSDC bear deep3   tp7sl15 |   77    86 |     -8.9    48 |     -7.6
+    ETHUSDC bear deep3 hold2h_mk |   77    86 |     +6.2    53 |     +5.3
+    ETHUSDC bear deep3 hold2h_tk |   77    86 |     +3.2    50 |     +2.8
+  ....................................................................................
+    ETHUSDC bull   mid   tp7sl15 |   77    94 |     -5.0    64 |     -4.7
+    ETHUSDC bull   mid hold2h_mk |   77    94 |     -3.0    49 |     -2.8
+    ETHUSDC bull   mid hold2h_tk |   77    94 |     -6.0    49 |     -5.6
+  ....................................................................................
+    ETHUSDC bull  best   tp7sl15 |   77    91 |     -4.2    67 |     -3.8
+    ETHUSDC bull  best hold2h_mk |   77    91 |     -3.9    49 |     -3.6
+    ETHUSDC bull  best hold2h_tk |   77    91 |     -6.9    49 |     -6.3
+  ....................................................................................
+    ETHUSDC bull deep3   tp7sl15 |   77    82 |     -4.7    65 |     -3.9
+    ETHUSDC bull deep3 hold2h_mk |   77    82 |     -6.8    51 |     -5.6
+    ETHUSDC bull deep3 hold2h_tk |   77    82 |     -9.8    46 |     -8.0
+  ....................................................................................
+    SOLUSDC bear   mid   tp7sl15 |   94    96 |     -6.7    57 |     -6.4
+    SOLUSDC bear   mid hold2h_mk |   94    96 |    +13.9    57 |    +13.3
+    SOLUSDC bear   mid hold2h_tk |   94    96 |    +10.9    56 |    +10.5
+  ....................................................................................
+    SOLUSDC bear  best   tp7sl15 |   94    94 |     -6.6    57 |     -6.2
+    SOLUSDC bear  best hold2h_mk |   94    94 |    +14.3    58 |    +13.4
+    SOLUSDC bear  best hold2h_tk |   94    94 |    +11.3    55 |    +10.6
+  ....................................................................................
+    SOLUSDC bear deep3   tp7sl15 |   94    80 |     -7.0    56 |     -5.6
+    SOLUSDC bear deep3 hold2h_mk |   94    80 |    +16.1    57 |    +12.9
+    SOLUSDC bear deep3 hold2h_tk |   94    80 |    +13.1    53 |    +10.5
+  ....................................................................................
+    SOLUSDC bull   mid   tp7sl15 |   94    91 |     -4.4    66 |     -4.1
+    SOLUSDC bull   mid hold2h_mk |   94    91 |     +5.0    55 |     +4.6
+    SOLUSDC bull   mid hold2h_tk |   94    91 |     +2.0    55 |     +1.8
+  ....................................................................................
+    SOLUSDC bull  best   tp7sl15 |   94    90 |     -4.2    67 |     -3.8
+    SOLUSDC bull  best hold2h_mk |   94    90 |     +6.1    56 |     +5.5
+    SOLUSDC bull  best hold2h_tk |   94    90 |     +3.1    56 |     +2.8
+  ....................................................................................
+    SOLUSDC bull deep3   tp7sl15 |   94    73 |     -4.0    68 |     -2.9
+    SOLUSDC bull deep3 hold2h_mk |   94    73 |     +0.8    52 |     +0.6
+    SOLUSDC bull deep3 hold2h_tk |   94    73 |     -2.2    52 |     -1.7
+  ....................................................................................
+    XRPUSDC bear   mid   tp7sl15 |   72    89 |     -4.2    67 |     -3.7
+    XRPUSDC bear   mid hold2h_mk |   72    89 |    +20.8    64 |    +18.5
+    XRPUSDC bear   mid hold2h_tk |   72    89 |    +17.8    59 |    +15.9
+  ....................................................................................
+    XRPUSDC bear  best   tp7sl15 |   72    88 |     -3.9    68 |     -3.4
+    XRPUSDC bear  best hold2h_mk |   72    88 |    +20.4    63 |    +17.8
+    XRPUSDC bear  best hold2h_tk |   72    88 |    +17.4    60 |    +15.2
+  ....................................................................................
+    XRPUSDC bear deep3   tp7sl15 |   72    74 |     -4.5    66 |     -3.3
+    XRPUSDC bear deep3 hold2h_mk |   72    74 |    +17.2    64 |    +12.7
+    XRPUSDC bear deep3 hold2h_tk |   72    74 |    +14.2    64 |    +10.5
+  ....................................................................................
+    XRPUSDC bull   mid   tp7sl15 |   72    97 |     -5.3    63 |     -5.1
+    XRPUSDC bull   mid hold2h_mk |   72    97 |     +1.4    59 |     +1.3
+    XRPUSDC bull   mid hold2h_tk |   72    97 |     -1.6    56 |     -1.6
+  ....................................................................................
+    XRPUSDC bull  best   tp7sl15 |   72    96 |     -5.1    64 |     -4.8
+    XRPUSDC bull  best hold2h_mk |   72    96 |     +1.5    59 |     +1.4
+    XRPUSDC bull  best hold2h_tk |   72    96 |     -1.5    55 |     -1.4
+  ....................................................................................
+    XRPUSDC bull deep3   tp7sl15 |   72    82 |     -4.1    68 |     -3.3
+    XRPUSDC bull deep3 hold2h_mk |   72    82 |     +6.9    63 |     +5.6
+    XRPUSDC bull deep3 hold2h_tk |   72    82 |     +3.9    59 |     +3.2
+  ....................................................................................
+
+  LECTURE : NET/SIGNAL = ce que tu gagnes REELLEMENT par opportunite (fill_rate x net/fill ; un miss = 0, pas une perte).
+    si NET/SIG > 0 nettement (surtout 'best'/'mid') -> le maker capture l'edge malgre l'adverse-selection = DEPLOYABLE.
+    si fill_rate eleve mais net/fill s'effondre vs baseline mid -> on se fait remplir surtout sur les continuations (AS mange tout).
+
+[done] 47s

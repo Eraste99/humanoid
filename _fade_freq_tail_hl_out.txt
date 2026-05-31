@@ -1,0 +1,40 @@
+=== FREQUENCE trades + worst-cases — livre fade deployable (fade+FLOW, no stop) — HL in-sample ===
+
+=== 4 MAJORS (BTC/ETH/SOL/XRP) ===
+  trades total = 246 sur 14 jours actifs -> 17.6 trades/jour (median 16, min 1, max 46)
+  pertes : mean +9.6 | worst -238 | p1 -104 | p5 -65 bps
+     seuil | #trades |  1 tous les N trades |  1 tous les N jours
+  < - 50 |      19 |               1 / 13 |           1 / 0.7 j
+  < -100 |       4 |               1 / 62 |           1 / 3.5 j
+  < -150 |       1 |              1 / 246 |          1 / 14.0 j
+  < -200 |       1 |              1 / 246 |          1 / 14.0 j
+  worst 8 trades :
+        -238 bps    ETHUSDC  2026-05-17 23:40
+        -114 bps    ETHUSDC  2026-05-04 01:51
+        -106 bps    ETHUSDC  2026-05-16 06:49
+        -101 bps    ETHUSDC  2026-05-22 19:09
+         -92 bps    XRPUSDC  2026-05-17 23:40
+         -82 bps    XRPUSDC  2026-05-04 01:51
+         -78 bps    BTCUSDC  2026-05-04 14:45
+         -72 bps    XRPUSDC  2026-05-21 17:11
+
+=== 3 MAJORS (sans ETH = le driver de queue) ===
+  trades total = 182 sur 14 jours actifs -> 13.0 trades/jour (median 12, min 1, max 33)
+  pertes : mean +12.2 | worst -92 | p1 -79 | p5 -56 bps
+     seuil | #trades |  1 tous les N trades |  1 tous les N jours
+  < - 50 |      12 |               1 / 15 |           1 / 1.2 j
+  < -100 |       0 |             (jamais) |            (jamais)
+  < -150 |       0 |             (jamais) |            (jamais)
+  < -200 |       0 |             (jamais) |            (jamais)
+  worst 8 trades :
+         -92 bps    XRPUSDC  2026-05-17 23:40
+         -82 bps    XRPUSDC  2026-05-04 01:51
+         -78 bps    BTCUSDC  2026-05-04 14:45
+         -72 bps    XRPUSDC  2026-05-21 17:11
+         -71 bps    SOLUSDC  2026-05-21 17:15
+         -70 bps    SOLUSDC  2026-05-22 19:08
+         -66 bps    SOLUSDC  2026-05-07 07:30
+         -61 bps    SOLUSDC  2026-05-03 23:56
+
+  LECTURE : trades/jour = frequence d'activite ; '1 tous les N jours' = a quel rythme une grosse perte tombe.
+    sans ETH la queue est bien plus douce (worst ~-90 vs -237). in-sample/mai, le 11 juin juge.

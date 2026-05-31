@@ -1,0 +1,80 @@
+=== FADE MECHANISM : LONG-dip vs SHORT-rip, par mois (Binance OOS, 4 majors, tick-level, ZERO sampling) ===
+
+hold=480min  fee=3.0bps  legs: SHORT_rip(d30>=p75 & d8>0), LONG_dip(d30<=p25 & d8<0)
+
+  2026-01 BTCUSDT | SHORT_rip=28 | LONG_dip=29
+  2026-02 BTCUSDT | SHORT_rip=27 | LONG_dip=35
+  2026-03 BTCUSDT | SHORT_rip=38 | LONG_dip=43
+  2026-04 BTCUSDT | SHORT_rip=35 | LONG_dip=37
+  2026-05 BTCUSDT | SHORT_rip=17 | LONG_dip=19
+  2026-01 ETHUSDT | SHORT_rip=22 | LONG_dip=35
+  2026-02 ETHUSDT | SHORT_rip=31 | LONG_dip=32
+  2026-03 ETHUSDT | SHORT_rip=43 | LONG_dip=42
+  2026-04 ETHUSDT | SHORT_rip=39 | LONG_dip=37
+  2026-05 ETHUSDT | SHORT_rip=18 | LONG_dip=23
+  2026-01 SOLUSDT | SHORT_rip=24 | LONG_dip=32
+  2026-02 SOLUSDT | SHORT_rip=21 | LONG_dip=28
+  2026-03 SOLUSDT | SHORT_rip=35 | LONG_dip=36
+  2026-04 SOLUSDT | SHORT_rip=37 | LONG_dip=33
+  2026-05 SOLUSDT | SHORT_rip=16 | LONG_dip=23
+  2026-01 XRPUSDT | SHORT_rip=24 | LONG_dip=27
+  2026-02 XRPUSDT | SHORT_rip=19 | LONG_dip=23
+  2026-03 XRPUSDT | SHORT_rip=30 | LONG_dip=35
+  2026-04 XRPUSDT | SHORT_rip=37 | LONG_dip=41
+  2026-05 XRPUSDT | SHORT_rip=16 | LONG_dip=25
+
+====================================================================================================
+TABLE 1 — FADE NET bps/trade @ 8h hold (net 3 bps), LONG-dip vs SHORT-rip, PER MONTH
+  perte si net<0 ; gagne si net>0.  mkt_drift = trend du marche sur la periode (moyenne 4 majors)
+====================================================================================================
+    period | mkt_drift | LONG_dip n     net      t | SHORT_rip n     net      t | COMBINED net
+  --------------------------------------------------------------------------------------------
+   2026-01 |     -1341 |        119   -12.6   -0.6 |          97   -19.5   -1.0 |   -15.7 (n=216)
+   2026-02 |     -1783 |        118   -32.1   -1.2 |          97    +4.1   +0.1 |   -15.8 (n=215)
+   2026-03 |      +130 |        156   +40.8   +2.3 |         144    -5.1   -0.3 |   +18.8 (n=300)
+   2026-04 |      +522 |        148    +2.2   +0.2 |         148   -19.7   -1.4 |    -8.7 (n=296)
+   2026-05 |      -240 |         86   +12.9   +1.0 |          67    +3.9   +0.4 |    +9.0 (n=153)
+
+====================================================================================================
+TABLE 2 — CONDITIONAL REVERSION : E[retour fwd EN direction du pari] (bps, GROSS), PER MONTH x LEG
+  >0 = le marche reverse en notre faveur (reversion) ; <0 = continuation (le trend continue, on saigne)
+====================================================================================================
+
+  --- SHORT_rip ---
+      period |      n |     +60m |    +120m |    +240m |    +480m
+     2026-01 |     97 |     -8.5 |    -16.0 |    -11.2 |    -16.5
+     2026-02 |     98 |    +15.3 |    +24.2 |    +18.2 |     +7.1
+     2026-03 |    146 |     -4.7 |    -12.2 |     -0.2 |     -2.1
+     2026-04 |    148 |     +2.5 |     +2.1 |    -14.1 |    -16.7
+     2026-05 |     67 |     +6.2 |     +9.8 |     +9.0 |     +6.9
+
+  --- LONG_dip ---
+      period |      n |     +60m |    +120m |    +240m |    +480m
+     2026-01 |    123 |    -22.1 |     -8.4 |    -13.3 |     -9.6
+     2026-02 |    118 |     -2.7 |    -10.0 |    -13.2 |    -29.1
+     2026-03 |    156 |     +5.7 |     +9.4 |     +4.0 |    +43.8
+     2026-04 |    148 |     -1.4 |     -0.7 |     +0.9 |     +5.2
+     2026-05 |     89 |     +1.0 |     +1.6 |    +11.6 |    +15.9
+
+====================================================================================================
+TABLE 3 — MEDIAN MAE (max adverse excursion sur le hold 8h, bps), PER MONTH x LEG  +  mkt_drift
+  knife-catching => MAE PROFONDE sur LONG_dip dans les mois downtrend (mkt_drift<0)
+====================================================================================================
+    period | mkt_drift | LONG_dip medMAE     (n) | SHORT_rip medMAE     (n)
+  -------------------------------------------------------------------------
+   2026-01 |     -1341 |           121.9     119 |            130.7      97
+   2026-02 |     -1783 |           190.4     118 |            136.0      97
+   2026-03 |      +130 |           115.3     156 |            128.1     144
+   2026-04 |      +522 |            88.9     148 |            101.5     148
+   2026-05 |      -240 |            63.9      86 |             74.6      67
+
+====================================================================================================
+APPENDIX — market net drift per period (bps), individual majors (trend direction)
+====================================================================================================
+   2026-01 :    -1016     -1751     -1536     -1060   (mean -1341)
+   2026-02 :    -1495     -1986     -2006     -1645   (mean -1783)
+   2026-03 :     +195      +719      -135      -258   (mean +130)
+   2026-04 :    +1182      +722       -14      +200   (mean +522)
+   2026-05 :      -31      -829      +157      -255   (mean -240)
+
+[done] 908s

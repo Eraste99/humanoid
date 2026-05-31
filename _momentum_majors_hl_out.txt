@@ -1,0 +1,30 @@
+=== MOMENTUM LONG-SCALE (trend aligne 1h+4h, exit trailing, hold 8h) — 5 paires HL, par semaine ===
+entry |drift_4h|>=100 & drift_1h meme sens ; arm50/trail30/sl120 ; taker RT6. vs NULL(dir alea).
+
+      actif    wk |    n | TREND net  win% |   NULL | TREND-NULL |   total
+  --------------------------------------------------------------------------------
+   HYPEUSDC  W507 |   49 |      +8.2    76 |   -7.9 |      +16.1 |    +403
+   HYPEUSDC  W515 |    6 |     +32.8    83 |  +19.9 |      +12.9 |    +197
+   HYPEUSDC  W516 |  169 |      +2.0    72 |   -6.6 |       +8.6 |    +340
+  ................................................................................
+    BTCUSDC  W507 |   25 |     -16.2    60 |   +3.7 |      -19.8 |    -404
+    BTCUSDC  W515 | n= 0 (insuf)
+    BTCUSDC  W516 |   14 |     -29.6    50 |  -11.2 |      -18.5 |    -415
+  ................................................................................
+    ETHUSDC  W507 |   35 |     -15.0    60 |  -10.8 |       -4.1 |    -524
+    ETHUSDC  W515 | n= 0 (insuf)
+    ETHUSDC  W516 |   25 |      -4.3    56 |   -7.5 |       +3.2 |    -107
+  ................................................................................
+    SOLUSDC  W507 |   28 |     -26.9    46 |   -3.2 |      -23.7 |    -753
+    SOLUSDC  W515 | n= 1 (insuf)
+    SOLUSDC  W516 |   29 |      -9.2    59 |   +4.0 |      -13.2 |    -267
+  ................................................................................
+    XRPUSDC  W507 |   23 |     -28.5    48 |   -3.5 |      -25.0 |    -655
+    XRPUSDC  W515 | n= 1 (insuf)
+    XRPUSDC  W516 |   28 |     -14.7    64 |   -3.5 |      -11.2 |    -412
+  ................................................................................
+
+  LECTURE : TREND net>0 ET TREND-NULL>0 sur les 2 semaines (majors) -> le momentum long-scale PAIE sur majors,
+    et le TIMING ajoute (pas juste le drift). Sinon -> momentum reste HYPE-only / pas un edge majors.
+
+[done] 59s

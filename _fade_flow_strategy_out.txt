@@ -1,0 +1,105 @@
+=== FADE-EXTENSION + FLOW-DIVERGENCE FILTER : realistic costs / MAE tail / queue / sizing ===
+event: vol30>=P75 & |d30| extreme & d8 SAME-sign ; rising-edge ; no-overlap 8h. hold<=8h.
+FILTER: fade only if fresh TFI(5m) DIVERGES (up->TFI<-tau / dn->TFI>+tau). tau in [0.1, 0.2].
+COSTS: maker TP RT=3.0bps ; reactive STOP & timeout = TAKER RT=6.0bps (gap-aware fill).
+sweep TP in [50.0, 100.0] bps, STOP in [100.0, 150.0] bps. arms: FLOW-filtered / RAW / RANDOM(50 seeds).
+
+  loaded BTCUSDT 2026-01: events=42  ticks=44701669
+  loaded BTCUSDT 2026-02: events=50  ticks=84154790
+  loaded BTCUSDT 2026-03: events=60  ticks=65679960
+  loaded BTCUSDT 2026-04: events=55  ticks=41544040
+  loaded BTCUSDT MAY: events=29  ticks=18242723
+  loaded ETHUSDT 2026-01: events=44  ticks=53140935
+  loaded ETHUSDT 2026-02: events=51  ticks=82875132
+  loaded ETHUSDT 2026-03: events=62  ticks=59600831
+  loaded ETHUSDT 2026-04: events=61  ticks=38231408
+  loaded ETHUSDT MAY: events=30  ticks=14863456
+  loaded SOLUSDT 2026-01: events=42  ticks=11499877
+  loaded SOLUSDT 2026-02: events=38  ticks=12454182
+  loaded SOLUSDT 2026-03: events=52  ticks=11028631
+  loaded SOLUSDT 2026-04: events=51  ticks=8601506
+  loaded SOLUSDT MAY: events=28  ticks=3750398
+  loaded XRPUSDT 2026-01: events=39  ticks=10785790
+  loaded XRPUSDT 2026-02: events=31  ticks=12540664
+  loaded XRPUSDT 2026-03: events=46  ticks=8854719
+  loaded XRPUSDT 2026-04: events=56  ticks=6072049
+  loaded XRPUSDT MAY: events=31  ticks=2915807
+
+==============================================================================================================
+ARM (a) FLOW-FILTERED FADE — net bps/trade after REAL costs (maker TP / taker stop), pooled + MAY-OOS
+==============================================================================================================
+     config(tau,TP,stop) | POOLED net      t     n  win%    wrst      p5  t/day |  MAY net    n  win%
+            (0.1,50,100) |       -7.3  -0.88    77    64    -108    -107   0.13 |     +2.3   15    67
+            (0.1,50,150) |       -6.9  -0.72    77    69    -157    -157   0.13 |     -0.4   15    67
+           (0.1,100,100) |       -5.5  -0.50    77    49    -108    -107   0.13 |     +3.4   15    47
+           (0.1,100,150) |       -3.2  -0.25    77    56    -157    -157   0.13 |     -2.6   15    47
+            (0.2,50,100) |       -8.9  -0.68    33    64    -108    -108   0.06 |    -21.3    9    56
+            (0.2,50,150) |      -12.9  -0.84    33    67    -157    -157   0.06 |    -25.7    9    56
+           (0.2,100,100) |       -6.5  -0.38    33    48    -108    -108   0.06 |    -12.9    9    44
+           (0.2,100,150) |       -5.8  -0.29    33    55    -157    -157   0.06 |    -17.3    9    44
+
+==============================================================================================================
+ARM (b) RAW FADE (same extension events, NO flow filter)
+==============================================================================================================
+     config(tau,TP,stop) | POOLED net      t     n  win%    wrst      p5  t/day |  MAY net    n  win%
+            (0.1,50,100) |       -5.0  -2.09   890    64    -111    -107   1.56 |     -3.1  114    61
+            (0.1,50,150) |       -3.5  -1.26   890    71    -166    -157   1.56 |     +6.9  114    68
+           (0.1,100,100) |       -3.7  -1.15   890    51    -117    -107   1.56 |     -6.9  114    48
+           (0.1,100,150) |       -2.5  -0.67   890    58    -166    -157   1.56 |     +2.2  114    54
+            (0.2,50,100) |       -5.0  -2.09   890    64    -111    -107   1.56 |     -3.1  114    61
+            (0.2,50,150) |       -3.5  -1.26   890    71    -166    -157   1.56 |     +6.9  114    68
+           (0.2,100,100) |       -3.7  -1.15   890    51    -117    -107   1.56 |     -6.9  114    48
+           (0.2,100,150) |       -2.5  -0.67   890    58    -166    -157   1.56 |     +2.2  114    54
+
+==============================================================================================================
+ARM (c) RANDOM-entry NULL (same count as flow arm, random times+dir, ~50 seeds, same costs)
+==============================================================================================================
+     config(tau,TP,stop) | POOLED net      t     n  win%    wrst      p5  t/day |  MAY net    n  win%
+            (0.1,50,100) |       -3.9  -3.58    79    35     -22     -21   0.14 |     -3.7   16    31
+            (0.1,50,150) |       -2.1  -1.83    79    38     -29     -19   0.14 |     +0.3   16    50
+           (0.1,100,100) |       -4.6  -2.73    79    43     -46     -29   0.14 |    -12.2   16    31
+           (0.1,100,150) |       -2.0  -1.11    79    43     -45     -25   0.14 |     -5.0   16    50
+            (0.2,50,100) |       -3.9  -3.58    79    35     -22     -21   0.14 |     -3.7   16    31
+            (0.2,50,150) |       -2.1  -1.83    79    38     -29     -19   0.14 |     +0.3   16    50
+           (0.2,100,100) |       -4.6  -2.73    79    43     -46     -29   0.14 |    -12.2   16    31
+           (0.2,100,150) |       -2.0  -1.11    79    43     -45     -25   0.14 |     -5.0   16    50
+
+==============================================================================================================
+FLOW-FILTERED FADE — MAE TAIL (max adverse excursion over hold, bps) + OUTCOME mix
+  short-gamma readout: medMAE / p95 MAE / max MAE ; %TP / %STOP / %TIMEOUT
+==============================================================================================================
+     config(tau,TP,stop) |  medMAE  p95MAE  maxMAE |   %TP  %STOP  %TMO
+            (0.1,50,100) |      62     101     102 |    64     34     3
+            (0.1,50,150) |      62     151     151 |    69     18    13
+           (0.1,100,100) |      83     101     102 |    42     44    14
+           (0.1,100,150) |      83     151     151 |    48     26    26
+            (0.2,50,100) |      62     102     102 |    64     36     0
+            (0.2,50,150) |      62     151     151 |    67     21    12
+           (0.2,100,100) |      78     102     102 |    42     45    12
+           (0.2,100,150) |      78     151     151 |    48     27    24
+
+==============================================================================================================
+SIZING — best ROBUST FLOW config, pooled chronological per-trade net PnL. equity mult + maxDD at f=0.5% & 1%
+==============================================================================================================
+  best config = (tau=0.1, TP=100, stop=150)  [*** NO config is robust; showing least-bad (pooled or May NEGATIVE) ***]
+  pooled net=-3.2 bps  t=-0.25  n=77  MAY-OOS net=-2.6 (n=15)
+  per-trade PnL: mean=-3.2  p5=-157  worst=-157  win%=56  n=77
+  worst 10-trade cluster sum = -380 bps
+  f=0.5% : equity mult x1.000  maxDD=0.0%  (over 77 trades, full window)
+  f=1.0% : equity mult x1.000  maxDD=0.1%  (over 77 trades, full window)
+
+==============================================================================================================
+FLOW-FILTERED FADE @ best config (tau=0.1,TP=100,stop=150) — PER-ASSET x PER-MONTH net bps (n). '.'=n<3
+==============================================================================================================
+     asset |          01          02          03          04         MAY
+   BTCUSDT |      -35(4)      +13(3)     -125(3)           .           .
+   ETHUSDT |           .           .      +13(3)      -30(6)           .
+   SOLUSDT |           .      +13(3)      +34(8)      -85(5)       -7(7)
+   XRPUSDT |      +13(3)      -72(3)       -8(4)     +22(12)      -13(6)
+
+==============================================================================================================
+VERDICT (machine-readable)
+==============================================================================================================
+  NOT-DEPLOYABLE  no (tau,TP,stop) is net-positive pooled AND positive on May-OOS after real costs.
+
+[done] 1354s

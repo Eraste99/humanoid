@@ -1,0 +1,34 @@
+=== IDEE USER sur HYPE (+ majors HL meme venue) : move 50bps -> entre dans son sens -> +10 avant -10 ? ===
+
+  HYPEUSDC week_20260507: legs=201
+  HYPEUSDC week_20260515: legs=30
+  HYPEUSDC week_20260516: legs=987
+  BTCUSDC week_20260507: legs=89
+  BTCUSDC week_20260515: legs=1
+  BTCUSDC week_20260516: legs=64
+  ETHUSDC week_20260507: legs=114
+  ETHUSDC week_20260515: legs=3
+  ETHUSDC week_20260516: legs=119
+  SOLUSDC week_20260507: legs=109
+  SOLUSDC week_20260515: legs=10
+  SOLUSDC week_20260516: legs=172
+  XRPUSDC week_20260507: legs=86
+  XRPUSDC week_20260515: legs=6
+  XRPUSDC week_20260516: legs=130
+
+============================================================================================
+P(+10 atteint AVANT -10 | entre dans le sens du move de 50bps) — HL, vrai mid L2
+  seuils : break-even maker-maker P>=65% ; +3 net P>=80%
+============================================================================================
+      actif |   UP n    P UP |  DOWN n  P DOWN |   ALL n   P ALL |  gross  net mk3
+  --------------------------------------------------------------------------------------
+   HYPEUSDC |    645   53.5% |     573   55.0% |    1218   54.2% |  +0.8    -2.2
+    BTCUSDC |     78   43.6% |      76   48.7% |     154   46.1% |  -0.8    -3.8
+    ETHUSDC |    114   43.9% |     122   54.9% |     236   49.6% |  -0.1    -3.1
+    SOLUSDC |    148   52.7% |     141   46.8% |     289   49.8% |  -0.0    -3.0
+    XRPUSDC |    108   52.8% |     114   46.5% |     222   49.5% |  -0.1    -3.1
+
+  LECTURE : si HYPE P(+10) >> majors (et vers 65%+) -> l'illiquidite donne le momentum, ton idee passe sur HYPE.
+            si HYPE ~ majors (~52%) -> meme mur, l'illiquidite ne suffit pas.
+
+[done] 57s

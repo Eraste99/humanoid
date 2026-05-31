@@ -1,0 +1,37 @@
+=== BOT UNIFIE (regime-aware fade) — fills CARNET REELS, splitte REGIME x SEMAINE x PAIRE — HL ===
+bear=fade down-leg en downtrend (buy dip) ; bull=fade up-leg accel-1h en uptrend (short rip). hold 30min, maker.
+
+      actif  reg    wk |  sig fill% | net/fill win% | NET/SIG
+  --------------------------------------------------------------------------
+   HYPEUSDC bear  W507 |   40    92 |     +9.0   59 |    +8.3
+   HYPEUSDC bear  W516 |  200    93 |     -9.1   51 |    -8.4
+   HYPEUSDC bull  W516 |  133    95 |    -37.0   42 |   -35.0
+  ..........................................................................
+    BTCUSDC bear  W507 |   14    86 |    +28.7   92 |   +24.6
+    BTCUSDC bear  W516 |   26    92 |     +2.3   71 |    +2.2
+    BTCUSDC bull  W507 |   20    90 |    +17.5   67 |   +15.7
+  ..........................................................................
+    ETHUSDC bear  W507 |   20   100 |    +23.1   70 |   +23.1
+    ETHUSDC bear  W516 |   37    86 |    -19.2   47 |   -16.6
+    ETHUSDC bull  W507 |   23    91 |     +8.5   62 |    +7.8
+    ETHUSDC bull  W516 |   12    83 |     +7.5   50 |    +6.3
+  ..........................................................................
+    SOLUSDC bear  W507 |   15    93 |    +10.9   57 |   +10.2
+    SOLUSDC bear  W516 |   48    92 |    +10.5   61 |    +9.7
+    SOLUSDC bull  W507 |   22    86 |     +6.7   53 |    +5.7
+    SOLUSDC bull  W516 |   20    95 |     +6.6   53 |    +6.3
+  ..........................................................................
+    XRPUSDC bear  W507 |   14    86 |    +19.6   67 |   +16.8
+    XRPUSDC bear  W516 |   40    85 |    +17.0   76 |   +14.4
+    XRPUSDC bull  W507 |   19   100 |     +8.8   47 |    +8.8
+    XRPUSDC bull  W516 |   16    94 |     -3.3   47 |    -3.1
+  ..........................................................................
+     MAJORS bear  W507 |   63    92 |    +20.6   71 |   +19.0
+     MAJORS bear  W516 |  151    89 |     +3.6   63 |    +3.2
+     MAJORS bull  W507 |   84    92 |    +10.2   57 |    +9.4
+     MAJORS bull  W516 |   51    92 |     +3.5   51 |    +3.2
+
+  LECTURE : robuste SSI bear NET/SIG>0 sur W507 ET W516, ET bull NET/SIG>0 sur W507 ET W516 (majors).
+    chaque cellule = un cote sur une semaine, fills reels. Si un cote flippe une semaine -> PAS robuste, on le dit.
+
+[done] 46s

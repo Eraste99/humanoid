@@ -1,0 +1,116 @@
+=== WINNER vs LOSER ENTRY-FEATURE CONTRAST (gap-aware, zero sampling) ===
+PAIRS=['BTCUSDC', 'ETHUSDC', 'SOLUSDC', 'XRPUSDC', 'HYPEUSDC']  WEEKS=['W507', 'W516']  FWD=120min  Bonferroni N=30
+
+  BTCUSDC W507: ticks=1,094,784 long_sig_rise/short -> collected (12s)
+  BTCUSDC W516: ticks=1,115,030 long_sig_rise/short -> collected (23s)
+  ETHUSDC W507: ticks=1,094,780 long_sig_rise/short -> collected (32s)
+  ETHUSDC W516: ticks=1,115,029 long_sig_rise/short -> collected (42s)
+  SOLUSDC W507: ticks=1,094,788 long_sig_rise/short -> collected (50s)
+  SOLUSDC W516: ticks=1,115,034 long_sig_rise/short -> collected (58s)
+  XRPUSDC W507: ticks=1,094,791 long_sig_rise/short -> collected (66s)
+  XRPUSDC W516: ticks=1,115,040 long_sig_rise/short -> collected (74s)
+  HYPEUSDC W507: ticks=1,094,789 long_sig_rise/short -> collected (83s)
+  HYPEUSDC W516: ticks=1,115,035 long_sig_rise/short -> collected (95s)
+
+--- BASE SIGNAL OUTCOME SUMMARY (favorable ret @120min, per segment) ---
+pair     wk    side      n     mean      med   win%
+BTCUSDC  W507  long    367     8.44    -2.23   46.9
+BTCUSDC  W507  short   403     4.29    10.58   61.8
+BTCUSDC  W516  long    416    -6.88     2.32   51.9
+BTCUSDC  W516  short   372     5.73     1.05   51.1
+ETHUSDC  W507  long    403     0.15    -2.63   46.9
+ETHUSDC  W507  short   352    27.49    25.62   67.6
+ETHUSDC  W516  long    323   -18.17     5.45   55.1
+ETHUSDC  W516  short   427    -4.99   -13.59   36.8
+SOLUSDC  W507  long    359    -3.86    -6.88   42.9
+SOLUSDC  W507  short   370     8.27     9.64   56.8
+SOLUSDC  W516  long    471    21.81    21.52   70.3
+SOLUSDC  W516  short   389    -0.53    -2.94   44.5
+XRPUSDC  W507  long    444    20.10    11.44   61.9
+XRPUSDC  W507  short   496     4.47     9.41   57.1
+XRPUSDC  W516  long    678    -4.67     7.39   53.5
+XRPUSDC  W516  short   559    -0.93    -8.03   44.5
+HYPEUSDC W507  long    575     7.17    22.13   61.4
+HYPEUSDC W507  short   462     5.75     2.05   51.9
+HYPEUSDC W516  long    525    -2.67    22.59   54.5
+HYPEUSDC W516  short   614    21.12    -8.85   48.0
+  POOLED long: n=4561 mean=2.59 med=7.99 win%=55.2 std=96.2
+  POOLED short: n=4444 mean=7.11 med=1.90 win%=51.4 std=92.3
+
+==============================================================================
+### TERCILE split (top/bottom 1/3 within pair-week) ###
+==============================================================================
+Bonferroni alpha = 1.67e-03  (sig if p<this on a side)
+feature            |  LONG d   auc  p<B cons | SHORT d   auc  p<B cons | mirror?
+----------------------------------------------------------------------------------------------------
+vol_30min          |   0.129 0.539    Y 2/5 |  -0.382 0.391    Y 5/5 | MIRROR
+drift_15min        |  -0.180 0.448    Y 3/5 |   0.326 0.590    Y 5/5 | MIRROR
+drift_1h           |  -0.190 0.433    Y 3/5 |   0.259 0.569    Y 5/5 | MIRROR
+spread_mean        |   0.156 0.542    Y 4/5 |  -0.226 0.423    Y 4/5 | MIRROR
+drift_5min         |  -0.103 0.464    . 2/5 |   0.237 0.568    Y 5/5 | MIRROR
+tfi_5min           |   0.016 0.504    . 2/5 |   0.245 0.573    Y 4/5 | SAME
+drift_30min        |  -0.109 0.475    . 3/5 |   0.132 0.507    Y 2/5 | MIRROR
+liq_imb5           |  -0.156 0.457    Y 3/5 |   0.069 0.520    . 3/5 | MIRROR
+avg_size_5min      |   0.130 0.535    Y 3/5 |   0.085 0.525    . 1/5 | SAME
+n_large_5min       |   0.102 0.524    . 2/5 |   0.038 0.506    . 1/5 | SAME
+top_imb            |  -0.069 0.481    . 2/5 |   0.054 0.515    . 3/5 | MIRROR
+vol_5min           |   0.022 0.518    . 3/5 |  -0.092 0.452    . 4/5 | MIRROR
+volume_total_5min  |   0.075 0.520    . 2/5 |   0.026 0.502    . 3/5 | SAME
+buy_ratio_30s      |   0.011 0.502    . 2/5 |   0.032 0.509    . 2/5 | SAME
+intensity_5min     |  -0.010 0.497    . 2/5 |  -0.027 0.482    . 3/5 | SAME
+
+  per-pair AUC (LONG / SHORT) for top-3 by |d|:
+    vol_30min          L[BTC:0.48 ETH:0.51 SOL:0.59 XRP:0.60 HYP:0.49]
+                       S[BTC:0.46 ETH:0.39 SOL:0.38 XRP:0.37 HYP:0.37]
+    drift_15min        L[BTC:0.41 ETH:0.42 SOL:0.49 XRP:0.40 HYP:0.49]
+                       S[BTC:0.59 ETH:0.56 SOL:0.63 XRP:0.58 HYP:0.60]
+    drift_1h           L[BTC:0.46 ETH:0.52 SOL:0.50 XRP:0.33 HYP:0.43]
+                       S[BTC:0.60 ETH:0.57 SOL:0.56 XRP:0.57 HYP:0.55]
+
+==============================================================================
+### FIXED split (win ret>+3bps, lose ret<-3bps) ###
+==============================================================================
+Bonferroni alpha = 1.67e-03  (sig if p<this on a side)
+feature            |  LONG d   auc  p<B cons | SHORT d   auc  p<B cons | mirror?
+----------------------------------------------------------------------------------------------------
+drift_15min        |  -0.118 0.467    Y 3/5 |   0.303 0.588    Y 5/5 | MIRROR
+vol_30min          |   0.094 0.528    . 3/5 |  -0.241 0.430    Y 5/5 | MIRROR
+drift_1h           |  -0.119 0.459    Y 3/5 |   0.205 0.558    Y 4/5 | MIRROR
+spread_mean        |   0.141 0.533    Y 4/5 |  -0.153 0.456    Y 3/5 | MIRROR
+drift_5min         |  -0.085 0.473    . 3/5 |   0.192 0.557    Y 5/5 | MIRROR
+tfi_5min           |   0.044 0.513    . 3/5 |   0.178 0.555    Y 4/5 | SAME
+liq_imb5           |  -0.134 0.463    Y 2/5 |   0.060 0.518    . 2/5 | MIRROR
+top_imb            |  -0.102 0.470    Y 2/5 |   0.062 0.517    . 3/5 | MIRROR
+avg_size_5min      |   0.057 0.515    . 2/5 |   0.090 0.529    . 2/5 | SAME
+drift_30min        |  -0.036 0.494    . 2/5 |   0.093 0.504    . 0/5 | MIRROR
+intensity_5min     |  -0.096 0.474    Y 3/5 |  -0.013 0.494    . 1/5 | SAME
+buy_ratio_30s      |   0.098 0.527    Y 3/5 |   0.009 0.503    . 1/5 | SAME
+n_large_5min       |   0.039 0.506    . 1/5 |   0.055 0.517    . 2/5 | SAME
+volume_total_5min  |  -0.016 0.497    . 2/5 |   0.034 0.512    . 2/5 | MIRROR
+vol_5min           |  -0.027 0.503    . 1/5 |  -0.002 0.485    . 3/5 | SAME
+
+  per-pair AUC (LONG / SHORT) for top-3 by |d|:
+    drift_15min        L[BTC:0.41 ETH:0.46 SOL:0.52 XRP:0.43 HYP:0.50]
+                       S[BTC:0.57 ETH:0.57 SOL:0.60 XRP:0.62 HYP:0.57]
+    vol_30min          L[BTC:0.46 ETH:0.51 SOL:0.58 XRP:0.53 HYP:0.55]
+                       S[BTC:0.47 ETH:0.40 SOL:0.42 XRP:0.40 HYP:0.46]
+    drift_1h           L[BTC:0.43 ETH:0.51 SOL:0.50 XRP:0.40 HYP:0.47]
+                       S[BTC:0.54 ETH:0.63 SOL:0.52 XRP:0.56 HYP:0.55]
+
+==============================================================================
+### BEST 2-FEATURE INTERACTION (tercile split) ###
+==============================================================================
+Top feature = vol_30min. Conditioning its winner/loser AUC on quartiles of a 2nd feature.
+(pooled across pairs & both sides; for SHORT we keep rank as-is since rank is per-pair)
+
+Baseline AUC of vol_30min alone (pooled L+S, rank already side-agnostic) = 0.468
+
+cond feature (quartile)  best-quartile AUC of vol_30min
+drift_30min                             0.389     [Q1:0.54 Q2:0.53 Q3:0.40 Q4:0.39]
+drift_15min                             0.400     [Q1:0.50 Q2:0.51 Q3:0.46 Q4:0.40]
+drift_1h                                0.402     [Q1:0.48 Q2:0.45 Q3:0.51 Q4:0.40]
+top_imb                                 0.419     [Q1:0.49 Q2:0.45 Q3:0.42 Q4:0.51]
+n_large_5min                            0.419     [Q1:0.47 Q2:0.46 Q3:0.42 Q4:0.50]
+volume_total_5min                       0.420     [Q1:0.48 Q2:0.46 Q3:0.42 Q4:0.50]
+
+DONE 95s

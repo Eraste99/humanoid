@@ -1,0 +1,15 @@
+==============================================================================
+BTC JANVIER 2026 — recensement des moves de 50 bps (UP & DOWN), first-passage chaine
+==============================================================================
+  ticks=44,701,669   span=31.00 jours   mid 87608.2 -> 78704.3  (-1016 bps net sur le mois)
+
+  TOTAL legs de 50 bps = 549     (17.7 par jour)
+     UP   (mid prend +50 bps) :   265   (48.3%)
+     DOWN (mid prend -50 bps) :   284   (51.7%)
+
+  TEMPS POUR ATTEINDRE 50 bps (de A a B) :
+     GLOBAL : moyenne=  1.35 h    mediane=  22.1 min   p25=   5.7 min  p75=  1.20 h 
+     UP     : moyenne=  1.35 h    mediane=  23.3 min
+     DOWN   : moyenne=  1.36 h    mediane=  20.9 min
+
+[done] 42s

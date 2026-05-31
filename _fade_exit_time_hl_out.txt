@@ -1,0 +1,55 @@
+=== EXIT COURT vs 2H — bear fade, bps/HEURE (capital) — HL in-sample, jambes 50bps, maker RT3 ===
+on cherche l'exit qui capture l'edge en MINUTES. bps/h = mean(net)/mean(hold_h).
+
+      actif       exit |    n    net  win% holdmed holdmean | bps/HEURE
+  ------------------------------------------------------------------------------
+   HYPEUSDC        t5m |  399   -2.7    45    5.0m     5.0m |     -32.9
+   HYPEUSDC       t15m |  399   +3.6    50   15.0m    14.9m |     +14.4
+   HYPEUSDC       t30m |  399   +0.3    50   30.0m    29.8m |      +0.6
+   HYPEUSDC       t60m |  399   +1.9    49   60.0m    59.2m |      +2.0
+   HYPEUSDC      t120m |  399   +6.1    52  120.0m   117.1m |      +3.1
+   HYPEUSDC      tr5/4 |  399   +1.4    68    0.7m     8.1m |     +10.1
+   HYPEUSDC      tr8/6 |  399   +2.7    76    1.2m    10.1m |     +15.8
+   HYPEUSDC     tr10/8 |  399   +1.1    81    1.9m    13.4m |      +5.0
+  ..............................................................................
+    BTCUSDC        t5m |   51   -1.8    53    5.0m     5.0m |     -22.0
+    BTCUSDC       t15m |   51   +6.1    67   15.0m    15.0m |     +24.2
+    BTCUSDC       t30m |   51   +9.6    71   30.0m    30.0m |     +19.3
+    BTCUSDC       t60m |   51  +12.2    63   60.0m    60.0m |     +12.2
+    BTCUSDC      t120m |   51  +11.2    59  120.0m   119.3m |      +5.7
+    BTCUSDC      tr5/4 |   51   +2.7    65    2.6m    11.2m |     +14.5
+    BTCUSDC      tr8/6 |   51   +4.9    75    6.3m    16.5m |     +17.7
+    BTCUSDC     tr10/8 |   51   +6.9    82    9.9m    19.6m |     +21.0
+  ..............................................................................
+    ETHUSDC        t5m |   77   -5.1    51    5.0m     5.0m |     -60.7
+    ETHUSDC       t15m |   77   -0.5    56   15.0m    14.9m |      -1.8
+    ETHUSDC       t30m |   77   -0.3    55   30.0m    29.7m |      -0.7
+    ETHUSDC       t60m |   77   +1.4    58   60.0m    59.2m |      +1.4
+    ETHUSDC      t120m |   77   +4.6    56  120.0m   117.6m |      +2.3
+    ETHUSDC      tr5/4 |   77   -6.4    56    1.7m    19.7m |     -19.3
+    ETHUSDC      tr8/6 |   77   -2.8    75    5.3m    24.2m |      -7.0
+    ETHUSDC     tr10/8 |   77   -0.5    74    6.5m    27.1m |      -1.1
+  ..............................................................................
+    SOLUSDC        t5m |   94   -2.4    48    5.0m     5.0m |     -29.1
+    SOLUSDC       t15m |   94   +7.6    61   15.0m    14.9m |     +30.7
+    SOLUSDC       t30m |   94   +7.6    59   30.0m    29.7m |     +15.4
+    SOLUSDC       t60m |   94   +4.5    51   60.0m    59.4m |      +4.5
+    SOLUSDC      t120m |   94  +15.3    60  120.0m   118.7m |      +7.7
+    SOLUSDC      tr5/4 |   94   +1.2    65    2.9m    14.7m |      +4.9
+    SOLUSDC      tr8/6 |   94   +3.8    80    4.4m    18.5m |     +12.4
+    SOLUSDC     tr10/8 |   94   +2.3    81    6.2m    23.9m |      +5.8
+  ..............................................................................
+    XRPUSDC        t5m |   73   +1.1    56    5.0m     5.0m |     +13.1
+    XRPUSDC       t15m |   73   +9.6    67   15.0m    15.0m |     +38.6
+    XRPUSDC       t30m |   73  +12.5    64   30.0m    30.0m |     +25.1
+    XRPUSDC       t60m |   73  +12.5    67   60.0m    60.0m |     +12.5
+    XRPUSDC      t120m |   73  +24.2    67  120.0m   119.7m |     +12.1
+    XRPUSDC      tr5/4 |   73   +1.1    52    1.2m     9.7m |      +7.0
+    XRPUSDC      tr8/6 |   73   +4.9    75    2.8m    14.5m |     +20.0
+    XRPUSDC     tr10/8 |   73   +5.9    82    4.5m    16.8m |     +21.1
+  ..............................................................................
+
+  LECTURE : bps/HEURE = efficience capital. Tenir 2h pour +5 = +2.5/h ; capter +8 en 15min = +32/h.
+    on veut net>0 ROBUSTE avec le hold le plus court / le meilleur bps-heure. trailing = capture le rebond rapide.
+
+[done] 47s
