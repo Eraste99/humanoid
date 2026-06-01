@@ -30,7 +30,13 @@
 
 **CAVEATS DURS :** tout est **in-sample mai 2 semaines** ; seuils (Q70, 30bps/120s) fittés ; **Binance = SIGNAL only** (exec interdite MiCA → feed WS temps-réel requis en live, latence OK car lead 1-2min) ; mid Binance reconstruit. **LE JUGE = OOS 11 juin** (carnet HL frais ; juge fade+FLUX+Binance-lead cross-période). **NE PAS sizer avant.**
 
-**CE QUI RESTE :** (1) OOS 11 juin ; (2) re-chiffrer le sizing avec la queue réduite (−71/−101) → nouveau rendement déployable (probablement > ~4-6%/mois) ; (3) infra : feed Binance WS sur VM ; (4) plus tard, si fade confirmé : couche news (catastrophe + béta directionnel) + collecte Binance ticks/L2.
+**CE QUI RESTE :** (1) OOS 11 juin ; (2) ~~re-chiffrer le sizing~~ ✅ FAIT (`_fade_sizing_binlead_hl.py`, voir ci-dessous) ; (3) infra : feed Binance WS sur VM ; (4) plus tard, si fade confirmé : couche news (catastrophe + béta directionnel) + collecte Binance ticks/L2.
+
+**SIZING / % DÉPLOYABLE (`_fade_sizing_binlead_hl.py`, 2026-06-01, livre BTC/SOL/XRP, fade+FLOW+Binance-lead, no stop) :**
+- Le filtre Binance-lead (binSAME) rend le stream plus sélectif ET plus sûr : trades 182→121, **mean/tr +12.2→+15.4**, **worst −92→−78**, **cluster corrélé 30min −225→−117**, **maxDD livre 225→148**, **concurrence 8→5**.
+- **DÉPLOYABLE PRUDENT** (le + contraignant entre risk 0.25%/tr [=1.5×worst] et expo simultanée ≤100% = SANS levier) : **notionnel ~20%/trade, ~+8.6%/mois in-sample** (vs baseline sans Binance-lead +5.9% — le filtre booste via conc 8→5 + cluster ÷2 + mean↑). Risque à cette taille : perte@1.5×worst ~0.25% du capital, maxDD compte ~0.30%. À 0.5%/tr (levier ~2×) : ~+18%/mois.
+- **On NE size PAS sur le maxDD in-sample** (148bps=1.5% → impliquerait ~6× levier = absurde/dangereux OOS) ; ancrage = worst single-trade + expo. **ETH reste EXCLU même avec Binance-lead** : +ETH → worst −78→−106, cluster −117→−157, rdt **+8.6→+6.9%/mois** (ré-introduit la queue sans gain net).
+- vs HLP ~0.9%/mois → ~10× in-sample. ⚠️ **in-sample/mai** ; si l'edge OOS se réduit de moitié → ~4%/mois (toujours > HLP) ; sizer PETIT au départ (vraie queue OOS possiblement pire). Le 11 juin juge.
 
 ---
 
